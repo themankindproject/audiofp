@@ -1,0 +1,33 @@
+[package]
+name         = "afp"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85.0"
+license      = "MIT"
+description  = "Audio fingerprinting SDK: Wang, Panako, Haitsma–Kalker, neural (ONNX), watermark, streaming."
+repository   = "https://github.com/themankindproject/afp"
+authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
+keywords     = ["audio", "fingerprint", "dsp", "shazam", "panako"]
+categories   = ["multimedia::audio", "algorithms", "no-std"]
+readme       = "README.md"
+
+[features]
+default = ["std"]
+
+# Pulls cpal/symphonia/rubato and the streaming orchestrator. Without it the
+# crate compiles `no_std + alloc` (DSP + classical fingerprinters only).
+std = []
+
+# ONNX-based neural fingerprinter (Resona-FP). Requires std.
+neural = ["std"]
+
+# AudioSeal-compatible watermark detector. Requires std.
+watermark = ["std"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[lib]
+name = "afp"
+path = "src/lib.rs"

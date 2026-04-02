@@ -1,0 +1,21 @@
+/target
+*.swp
+*.swo
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Coverage / profiling
+*.profraw
+tarpaulin-report.html
+cobertura.xml
+
+# Local env
+.env
+.env.local
