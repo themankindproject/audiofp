@@ -1,0 +1,5 @@
+avoid-breaking-exported-api = true
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use a time source param for testability" },
+]
