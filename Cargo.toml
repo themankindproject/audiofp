@@ -25,6 +25,7 @@ neural = ["std"]
 watermark = ["std"]
 
 [dependencies]
+thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
 
