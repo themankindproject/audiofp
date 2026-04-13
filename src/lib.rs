@@ -17,6 +17,10 @@
 
 extern crate alloc;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod error;
 mod fp;
 mod types;

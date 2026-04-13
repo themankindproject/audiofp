@@ -24,8 +24,14 @@ neural = ["std"]
 # AudioSeal-compatible watermark detector. Requires std.
 watermark = ["std"]
 
+# Install mimalloc as the process-wide #[global_allocator]. Requires std.
+# Off by default because libraries should not pick the allocator on behalf of
+# downstream binaries; flip this into `default` if you want it always-on.
+mimalloc = ["std", "dep:mimalloc"]
+
 [dependencies]
 thiserror = { version = "2", default-features = false }
+mimalloc  = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 
