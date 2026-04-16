@@ -32,6 +32,7 @@ mimalloc = ["std", "dep:mimalloc"]
 [dependencies]
 thiserror = { version = "2", default-features = false }
 mimalloc  = { version = "0.1", default-features = false, optional = true }
+libm      = "0.2"
 
 [dev-dependencies]
 
