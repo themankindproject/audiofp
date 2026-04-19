@@ -4,5 +4,6 @@
 //! on Cortex-M targets via `--no-default-features`.
 
 pub mod mel;
+pub mod peaks;
 pub mod stft;
 pub mod windows;
