@@ -30,11 +30,16 @@ watermark = ["std"]
 mimalloc = ["std", "dep:mimalloc"]
 
 [dependencies]
-thiserror = { version = "2", default-features = false }
-mimalloc  = { version = "0.1", default-features = false, optional = true }
-libm      = "0.2"
+thiserror   = { version = "2", default-features = false }
+mimalloc    = { version = "0.1", default-features = false, optional = true }
+libm        = "0.2"
+num-traits  = { version = "0.2", default-features = false, features = ["libm"] }
+num-complex = { version = "0.4", default-features = false, features = ["libm"] }
+realfft     = { version = "3.4", default-features = false }
+bytemuck    = { version = "1.18", features = ["derive"] }
 
 [dev-dependencies]
+approx = "0.5"
 
 [lib]
 name = "afp"

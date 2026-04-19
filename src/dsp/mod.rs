@@ -3,4 +3,5 @@
 //! All modules in `dsp` compile under `no_std + alloc` so they can be reused
 //! on Cortex-M targets via `--no-default-features`.
 
+pub mod stft;
 pub mod windows;
