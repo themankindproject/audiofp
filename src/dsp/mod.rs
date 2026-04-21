@@ -5,5 +5,6 @@
 
 pub mod mel;
 pub mod peaks;
+pub mod resample;
 pub mod stft;
 pub mod windows;
