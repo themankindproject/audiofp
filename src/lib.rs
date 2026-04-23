@@ -23,6 +23,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod classical;
 pub mod dsp;
+#[cfg(feature = "std")]
+pub mod io;
 
 mod error;
 mod fp;
