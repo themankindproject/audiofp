@@ -106,4 +106,36 @@ mod tests {
         assert!(make_window(WindowKind::Hann, 0).is_empty());
         assert_eq!(make_window(WindowKind::Hann, 1), alloc::vec![1.0]);
     }
+
+    #[test]
+    fn periodic_windows_have_zero_at_endpoint_only_for_hann_blackman() {
+        // Hann and Blackman bottom out at zero at index 0 (periodic form).
+        // Hamming has a non-zero floor (0.08).
+        let h = make_window(WindowKind::Hann, 256);
+        let b = make_window(WindowKind::Blackman, 256);
+        assert!(h[0].abs() < 1e-5);
+        assert!(b[0].abs() < 1e-5);
+        let hm = make_window(WindowKind::Hamming, 256);
+        assert!(hm[0] > 0.05, "Hamming floor too low: {}", hm[0]);
+    }
+
+    #[test]
+    fn window_lengths_match_request() {
+        for kind in [WindowKind::Hann, WindowKind::Hamming, WindowKind::Blackman] {
+            for n in [2_usize, 4, 16, 100, 1024, 4096] {
+                let w = make_window(kind, n);
+                assert_eq!(w.len(), n, "kind={kind:?} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn windows_are_non_negative() {
+        for kind in [WindowKind::Hann, WindowKind::Hamming, WindowKind::Blackman] {
+            let w = make_window(kind, 1024);
+            for (i, &v) in w.iter().enumerate() {
+                assert!(v >= -1e-6, "kind={kind:?} idx={i} v={v}");
+            }
+        }
+    }
 }

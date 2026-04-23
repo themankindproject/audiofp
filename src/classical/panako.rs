@@ -558,6 +558,64 @@ mod tests {
     }
 
     #[test]
+    fn mag_order_picks_largest_of_three() {
+        // mag_order = 1 (b largest)
+        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 1.0 };
+        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 5.0 };
+        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 3.0 };
+        let h = pack_triplet(&a, &b, &c);
+        assert_eq!((h >> 28) & 0x3, 1);
+
+        // mag_order = 2 (c largest)
+        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 1.0 };
+        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 2.0 };
+        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 9.0 };
+        let h = pack_triplet(&a, &b, &c);
+        assert_eq!((h >> 28) & 0x3, 2);
+
+        // mag_order = 0 (anchor largest)
+        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 9.0 };
+        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 2.0 };
+        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 3.0 };
+        let h = pack_triplet(&a, &b, &c);
+        assert_eq!((h >> 28) & 0x3, 0);
+    }
+
+    #[test]
+    fn sign_bit_combinations() {
+        // Both descending: f_b < f_a, f_c < f_b → sign = 0b00
+        let a = Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 };
+        let b = Peak { t_frame: 5, f_bin: 80, _pad: 0, mag: 0.0 };
+        let c = Peak { t_frame: 10, f_bin: 60, _pad: 0, mag: 0.0 };
+        assert_eq!((pack_triplet(&a, &b, &c) >> 30) & 0x3, 0b00);
+
+        // Both ascending: f_b > f_a, f_c > f_b → sign = 0b11
+        let a = Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 };
+        let b = Peak { t_frame: 5, f_bin: 120, _pad: 0, mag: 0.0 };
+        let c = Peak { t_frame: 10, f_bin: 140, _pad: 0, mag: 0.0 };
+        assert_eq!((pack_triplet(&a, &b, &c) >> 30) & 0x3, 0b11);
+    }
+
+    #[test]
+    fn beta_saturates_near_extremes() {
+        // β ≈ 31 when t_b is right after t_a (ratio (t_c - t_b)/(t_c - t_a) → 1).
+        let a = Peak { t_frame: 0, f_bin: 0, _pad: 0, mag: 0.0 };
+        let b = Peak { t_frame: 1, f_bin: 5, _pad: 0, mag: 0.0 };
+        let c = Peak { t_frame: 95, f_bin: 8, _pad: 0, mag: 0.0 };
+        let h = pack_triplet(&a, &b, &c);
+        let beta = (h >> 23) & 0x1F;
+        assert!(beta >= 30, "beta should saturate near 31, got {beta}");
+
+        // β ≈ 0 when t_b is just before t_c.
+        let a = Peak { t_frame: 0, f_bin: 0, _pad: 0, mag: 0.0 };
+        let b = Peak { t_frame: 90, f_bin: 5, _pad: 0, mag: 0.0 };
+        let c = Peak { t_frame: 91, f_bin: 8, _pad: 0, mag: 0.0 };
+        let h = pack_triplet(&a, &b, &c);
+        let beta = (h >> 23) & 0x1F;
+        assert!(beta <= 1, "beta should saturate near 0, got {beta}");
+    }
+
+    #[test]
     fn streaming_offline_equivalence() {
         let samples = synthetic_audio(0xBEEF, 8_000 * 6);
 

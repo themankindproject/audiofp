@@ -118,3 +118,55 @@ pub struct AudioBuffer<'a> {
 /// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimestampMs(pub u64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_rate_constants_match_their_names() {
+        assert_eq!(SampleRate::HZ_8000.hz(), 8_000);
+        assert_eq!(SampleRate::HZ_11025.hz(), 11_025);
+        assert_eq!(SampleRate::HZ_16000.hz(), 16_000);
+        assert_eq!(SampleRate::HZ_22050.hz(), 22_050);
+        assert_eq!(SampleRate::HZ_44100.hz(), 44_100);
+        assert_eq!(SampleRate::HZ_48000.hz(), 48_000);
+    }
+
+    #[test]
+    fn sample_rate_eq() {
+        let a = SampleRate::HZ_44100;
+        let b = SampleRate::new(44_100).unwrap();
+        let c = SampleRate::HZ_48000;
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn sample_rate_new_rejects_zero() {
+        assert!(SampleRate::new(0).is_none());
+        assert_eq!(SampleRate::new(1).unwrap().hz(), 1);
+    }
+
+    #[test]
+    fn timestamp_ord() {
+        let a = TimestampMs(100);
+        let b = TimestampMs(200);
+        assert!(a < b);
+        assert_eq!(a.cmp(&b), core::cmp::Ordering::Less);
+        assert_eq!(b.cmp(&a), core::cmp::Ordering::Greater);
+        assert_eq!(a.cmp(&a), core::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn audio_buffer_borrow() {
+        let samples = alloc::vec![0.1_f32, 0.2, 0.3];
+        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+        // The buffer is a borrowed view — original samples still owned.
+        assert_eq!(buf.samples.len(), 3);
+        assert_eq!(buf.rate.hz(), 16_000);
+        // Vec still usable via the original binding after the buffer's
+        // last use.
+        assert_eq!(samples.len(), 3);
+    }
+}

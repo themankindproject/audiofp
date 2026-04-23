@@ -90,3 +90,39 @@ pub enum AfpError {
 /// # at_least_one_second(&vec![0.0; 16_000]).unwrap();
 /// ```
 pub type Result<T> = core::result::Result<T, AfpError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    #[test]
+    fn audio_too_short_displays_both_numbers() {
+        let e = AfpError::AudioTooShort { needed: 16_000, got: 8_000 };
+        let s = e.to_string();
+        assert!(s.contains("16000"), "got: {s}");
+        assert!(s.contains("8000"), "got: {s}");
+    }
+
+    #[test]
+    fn unsupported_sample_rate_shows_value_and_supported_list() {
+        let s = AfpError::UnsupportedSampleRate(7_000).to_string();
+        assert!(s.contains("7000"));
+        // The supported list mentions all six canonical rates.
+        for rate in ["8000", "11025", "16000", "22050", "44100", "48000"] {
+            assert!(s.contains(rate), "missing {rate} in: {s}");
+        }
+    }
+
+    #[test]
+    fn buffer_overrun_reports_drop_count() {
+        let s = AfpError::BufferOverrun { dropped: 1024 }.to_string();
+        assert!(s.contains("1024"));
+    }
+
+    #[test]
+    fn result_ok_path() {
+        let f = |x: u32| -> Result<u32> { Ok(x * 2) };
+        assert_eq!(f(21).unwrap(), 42);
+    }
+}

@@ -396,4 +396,78 @@ mod tests {
         let picker = PeakPicker::new(PeakPickerConfig::default());
         assert!(picker.pick(&[], 0, 0, 62.5).is_empty());
     }
+
+    #[test]
+    fn plateaus_emit_every_equal_cell_as_a_local_max() {
+        // A 3×3 plateau of value 1.0 surrounded by zeros. Every cell in
+        // the plateau is `>=` the rolling max within its neighbourhood,
+        // so all 9 are picked.
+        let n_frames = 9;
+        let n_bins = 9;
+        let mut spec = vec![0.0_f32; n_frames * n_bins];
+        for t in 3..6 {
+            for f in 3..6 {
+                spec[t * n_bins + f] = 1.0;
+            }
+        }
+        let picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: 1,
+            neighborhood_f: 1,
+            min_magnitude: 0.1,
+            target_per_sec: 0,
+        });
+        let peaks = picker.pick(&spec, n_frames, n_bins, 100.0);
+        assert_eq!(peaks.len(), 9);
+    }
+
+    #[test]
+    fn boundary_peak_at_corner_is_picked() {
+        let mut spec = vec![0.0_f32; 16 * 16];
+        spec[0] = 1.0;
+        let picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: 3,
+            neighborhood_f: 3,
+            min_magnitude: 0.1,
+            target_per_sec: 0,
+        });
+        let peaks = picker.pick(&spec, 16, 16, 100.0);
+        assert!(peaks.iter().any(|p| (p.t_frame, p.f_bin) == (0, 0)));
+    }
+
+    #[test]
+    fn rolling_max_2d_matches_naive_brute_force() {
+        // 8×8 input with deterministic xorshift values; verify against
+        // the obvious O(N·M·K²) reference.
+        let n_rows = 8;
+        let n_cols = 8;
+        let mut input = vec![0.0_f32; n_rows * n_cols];
+        let mut x: u32 = 1;
+        for v in input.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *v = (x % 100) as f32;
+        }
+
+        let kt = 2;
+        let kf = 2;
+        let mut got = vec![0.0_f32; input.len()];
+        rolling_max_2d(&input, n_rows, n_cols, kt, kf, &mut got);
+
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let r_lo = r.saturating_sub(kt);
+                let r_hi = (r + kt).min(n_rows - 1);
+                let c_lo = c.saturating_sub(kf);
+                let c_hi = (c + kf).min(n_cols - 1);
+                let mut want = f32::NEG_INFINITY;
+                for rr in r_lo..=r_hi {
+                    for cc in c_lo..=c_hi {
+                        want = want.max(input[rr * n_cols + cc]);
+                    }
+                }
+                assert_eq!(got[r * n_cols + c], want, "cell ({r}, {c})");
+            }
+        }
+    }
 }

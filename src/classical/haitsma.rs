@@ -487,6 +487,53 @@ mod tests {
     }
 
     #[test]
+    fn band_lookup_table_covers_in_band_frequencies() {
+        let cfg = HaitsmaConfig::default();
+        let n_bins = HAITSMA_N_FFT / 2 + 1;
+        let lookup = build_bin_to_band(&cfg, n_bins);
+        assert_eq!(lookup.len(), n_bins);
+
+        let bin_hz = HAITSMA_SR as f32 / HAITSMA_N_FFT as f32;
+        // At least one bin in each band should be tagged.
+        let mut hit_per_band = [false; HAITSMA_N_BANDS];
+        for &b in &lookup {
+            if let Some(b) = b {
+                hit_per_band[b as usize] = true;
+            }
+        }
+        for (i, &h) in hit_per_band.iter().enumerate() {
+            assert!(h, "band {i} has no FFT bins");
+        }
+
+        // Bins outside [fmin, fmax) are None.
+        let bin_at_100hz = (100.0 / bin_hz) as usize;
+        assert!(lookup[bin_at_100hz].is_none(), "100 Hz should be below fmin=300");
+    }
+
+    #[test]
+    fn custom_band_range() {
+        let cfg = HaitsmaConfig { fmin: 500.0, fmax: 1500.0 };
+        let mut h = Haitsma::new(cfg.clone());
+        let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
+        let buf = AudioBuffer { samples: &samples, rate: sr_5khz() };
+        let f = h.extract(buf).unwrap();
+        // Should still produce frames; band edges differ but algorithm runs.
+        assert!(!f.frames.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "fmax must exceed fmin")]
+    fn invalid_band_range_panics() {
+        let _ = Haitsma::new(HaitsmaConfig { fmin: 1000.0, fmax: 1000.0 });
+    }
+
+    #[test]
+    #[should_panic(expected = "below Nyquist")]
+    fn fmax_above_nyquist_panics() {
+        let _ = Haitsma::new(HaitsmaConfig { fmin: 300.0, fmax: 3_000.0 });
+    }
+
+    #[test]
     fn streaming_offline_equivalence() {
         let samples = synthetic_audio(0xBEEF, 5_000 * 5);
 

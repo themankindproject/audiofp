@@ -242,6 +242,34 @@ mod tests {
     }
 
     #[test]
+    fn htk_and_slaney_diverge_above_1khz() {
+        // Below 1 kHz the two scales should agree to within ~5 mel.
+        // Above 1 kHz Slaney is logarithmic with a different slope, so the
+        // converted mel values diverge.
+        let lo = 500.0_f32;
+        let hi = 4_000.0_f32;
+        let m_htk_lo = MelScale::Htk.hz_to_mel(lo);
+        let m_sla_lo = MelScale::Slaney.hz_to_mel(lo);
+        let m_htk_hi = MelScale::Htk.hz_to_mel(hi);
+        let m_sla_hi = MelScale::Slaney.hz_to_mel(hi);
+
+        let diff_lo = (m_htk_lo - m_sla_lo).abs();
+        let diff_hi = (m_htk_hi - m_sla_hi).abs();
+        assert!(
+            diff_hi > diff_lo,
+            "expected divergence to grow above 1 kHz: lo={diff_lo} hi={diff_hi}",
+        );
+    }
+
+    #[test]
+    fn matrix_rows_are_non_negative() {
+        let fb = MelFilterBank::new(64, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
+        for &w in fb.matrix() {
+            assert!(w >= 0.0, "negative weight in mel matrix: {w}");
+        }
+    }
+
+    #[test]
     fn log_mel_picks_up_dirac_in_band() {
         let fb = MelFilterBank::new(40, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
         // Dirac at bin 200 ≈ 200 * 22050/2048 ≈ 2154 Hz.

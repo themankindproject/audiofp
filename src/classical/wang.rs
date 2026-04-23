@@ -583,6 +583,63 @@ mod tests {
     }
 
     #[test]
+    fn smaller_fan_out_yields_fewer_hashes() {
+        let samples = synthetic_audio(0xFEED, 8_000 * 4);
+        let buf_a = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf_b = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+
+        let mut wide = Wang::new(WangConfig { fan_out: 10, ..WangConfig::default() });
+        let mut narrow = Wang::new(WangConfig { fan_out: 3, ..WangConfig::default() });
+        let f_wide = wide.extract(buf_a).unwrap();
+        let f_narrow = narrow.extract(buf_b).unwrap();
+        assert!(
+            f_narrow.hashes.len() < f_wide.hashes.len(),
+            "narrow={} wide={}",
+            f_narrow.hashes.len(),
+            f_wide.hashes.len(),
+        );
+    }
+
+    #[test]
+    fn quantise_freq_covers_full_range() {
+        // Bin 0 maps to bucket 0; bin 512 (≈ Nyquist - 1 step) ≈ bucket 511.
+        assert_eq!(quantise_freq(0), 0);
+        assert!(quantise_freq(512) < WANG_FREQ_BUCKETS);
+        // Quantisation is monotonic non-decreasing.
+        let mut prev = 0;
+        for b in 0..513_u16 {
+            let q = quantise_freq(b);
+            assert!(q >= prev);
+            assert!(q < WANG_FREQ_BUCKETS);
+            prev = q;
+        }
+    }
+
+    #[test]
+    fn streaming_with_one_sample_chunks_still_matches_offline() {
+        let samples = synthetic_audio(0xABCD, 8_000 * 3);
+        let mut offline = Wang::default();
+        let off = offline
+            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .unwrap();
+
+        let mut s = StreamingWang::default();
+        let mut online = Vec::new();
+        // Push one sample at a time — pathological case for any incremental
+        // streaming impl.
+        for &sample in &samples {
+            online.extend(s.push(&[sample]).into_iter().map(|(_, h)| h));
+        }
+        online.extend(s.flush().into_iter().map(|(_, h)| h));
+
+        let mut a = off.hashes;
+        let mut b = online;
+        a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn target_zone_filters_far_peaks() {
         let peaks = alloc::vec![
             Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 },

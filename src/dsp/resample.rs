@@ -355,6 +355,83 @@ mod tests {
     }
 
     #[test]
+    fn linear_output_length_matches_ratio() {
+        // Output length follows ceil(n_in * to / from).
+        for (n_in, from, to, expect) in [
+            (100, 8_000, 16_000, 200),
+            (100, 16_000, 8_000, 50),
+            (1000, 44_100, 22_050, 500),
+            (3, 2, 1, 2),  // ceil(3/2) = 2
+        ] {
+            let x = vec![1.0_f32; n_in];
+            let y = linear(&x, from, to);
+            assert_eq!(y.len(), expect, "n_in={n_in} {from}->{to}");
+        }
+    }
+
+    #[test]
+    fn sinc_resampler_with_higher_quality_has_lower_passband_droop() {
+        // A 1 kHz tone at sr=16k stays well below the cutoff after a
+        // 16k→8k downsample. Higher Kaiser β should preserve amplitude
+        // closer to 1.0 at midband.
+        let sr_in = 16_000u32;
+        let sr_out = 8_000u32;
+        let freq = 1000.0_f32;
+        let n = sr_in as usize;
+        let x: Vec<f32> = (0..n)
+            .map(|i| libm::sinf(2.0 * PI * freq * i as f32 / sr_in as f32))
+            .collect();
+
+        let low_q = SincResampler::with_quality(
+            sr_in,
+            sr_out,
+            SincQuality { half_taps: 8, kaiser_beta: 4.0 },
+        );
+        let high_q = SincResampler::with_quality(
+            sr_in,
+            sr_out,
+            SincQuality { half_taps: 64, kaiser_beta: 12.0 },
+        );
+
+        let y_low = low_q.process(&x);
+        let y_high = high_q.process(&x);
+
+        // RMS ≈ 0.707 for a clean unit-amplitude sine. Use the centre
+        // region to avoid boundary roll-off.
+        let mid = |v: &[f32]| {
+            let lo = v.len() / 4;
+            let hi = 3 * v.len() / 4;
+            let s: f32 = v[lo..hi].iter().map(|x| x * x).sum();
+            sqrtf(s / (hi - lo) as f32)
+        };
+        let rms_low = mid(&y_low);
+        let rms_high = mid(&y_high);
+
+        // High quality should be closer to ideal RMS than low quality.
+        let ideal = 1.0_f32 / sqrtf(2.0);
+        assert!(
+            (rms_high - ideal).abs() <= (rms_low - ideal).abs() + 1e-3,
+            "low_q={rms_low} high_q={rms_high} ideal={ideal}",
+        );
+    }
+
+    #[test]
+    fn linear_doubling_then_halving_recovers_signal() {
+        // Round-trip: 1× → 2× → 1× should recover the original up to
+        // bilinear interpolation error.
+        let n = 64;
+        let x: Vec<f32> = (0..n)
+            .map(|i| libm::sinf(2.0 * PI * i as f32 / 16.0))
+            .collect();
+        let up = linear(&x, 1, 2);
+        let down = linear(&up, 2, 1);
+        assert_eq!(down.len(), n);
+        for (a, b) in x.iter().zip(down.iter()) {
+            assert!((a - b).abs() < 0.05, "a={a} b={b}");
+        }
+    }
+
+    #[test]
     fn modified_bessel_i0_matches_known_values() {
         // I0(0) = 1, I0(1) ≈ 1.2660658, I0(5) ≈ 27.2398718
         assert_relative_eq!(modified_bessel_i0(0.0), 1.0, max_relative = 1e-6);
