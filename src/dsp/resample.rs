@@ -71,7 +71,10 @@ pub struct SincQuality {
 
 impl Default for SincQuality {
     fn default() -> Self {
-        Self { half_taps: 32, kaiser_beta: 8.6 }
+        Self {
+            half_taps: 32,
+            kaiser_beta: 8.6,
+        }
     }
 }
 
@@ -141,14 +144,26 @@ impl SincResampler {
         let half = quality.half_taps as isize;
         for k in -half..=half {
             let x = k as f32;
-            let w = kaiser_window_input(x, quality.half_taps as f32, quality.kaiser_beta, inv_i0_beta);
+            let w = kaiser_window_input(
+                x,
+                quality.half_taps as f32,
+                quality.kaiser_beta,
+                inv_i0_beta,
+            );
             dc_gain += sinc(x * 2.0 * cutoff) * w * (2.0 * cutoff);
         }
         if dc_gain.abs() < 1e-10 {
             dc_gain = 1.0;
         }
 
-        Self { from_sr, to_sr, quality, cutoff, inv_i0_beta, dc_gain }
+        Self {
+            from_sr,
+            to_sr,
+            quality,
+            cutoff,
+            inv_i0_beta,
+            dc_gain,
+        }
     }
 
     /// Borrow the quality knobs this resampler was built with.
@@ -361,7 +376,7 @@ mod tests {
             (100, 8_000, 16_000, 200),
             (100, 16_000, 8_000, 50),
             (1000, 44_100, 22_050, 500),
-            (3, 2, 1, 2),  // ceil(3/2) = 2
+            (3, 2, 1, 2), // ceil(3/2) = 2
         ] {
             let x = vec![1.0_f32; n_in];
             let y = linear(&x, from, to);
@@ -385,12 +400,18 @@ mod tests {
         let low_q = SincResampler::with_quality(
             sr_in,
             sr_out,
-            SincQuality { half_taps: 8, kaiser_beta: 4.0 },
+            SincQuality {
+                half_taps: 8,
+                kaiser_beta: 4.0,
+            },
         );
         let high_q = SincResampler::with_quality(
             sr_in,
             sr_out,
-            SincQuality { half_taps: 64, kaiser_beta: 12.0 },
+            SincQuality {
+                half_taps: 64,
+                kaiser_beta: 12.0,
+            },
         );
 
         let y_low = low_q.process(&x);

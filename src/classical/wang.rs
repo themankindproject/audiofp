@@ -26,7 +26,9 @@ use libm::log10f;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{AfpError, AudioBuffer, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
+use crate::{
+    AfpError, AudioBuffer, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs,
+};
 
 /// One anchor-target landmark pair packed into a 32-bit hash.
 #[repr(C)]
@@ -355,8 +357,7 @@ impl StreamingWang {
         let mut emitted = Vec::with_capacity(result.hashes.len());
         for h in result.hashes {
             if h.t_anchor >= self.next_anchor_frame && h.t_anchor < cutoff {
-                let t_ms =
-                    (h.t_anchor as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
+                let t_ms = (h.t_anchor as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
                 emitted.push((TimestampMs(t_ms), h));
             }
         }
@@ -417,7 +418,10 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Wang::default();
         let samples = vec![0.0_f32; 16_000];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
         match fp.extract(buf) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
@@ -427,10 +431,16 @@ mod tests {
     #[test]
     fn rejects_short_audio() {
         let mut fp = Wang::default();
-        let samples = vec![0.0_f32; 8_000];  // 1 second, need 2
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let samples = vec![0.0_f32; 8_000]; // 1 second, need 2
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         match fp.extract(buf) {
-            Err(AfpError::AudioTooShort { needed: 16_000, got: 8_000 }) => {}
+            Err(AfpError::AudioTooShort {
+                needed: 16_000,
+                got: 8_000,
+            }) => {}
             other => panic!("expected AudioTooShort, got {other:?}"),
         }
     }
@@ -439,7 +449,10 @@ mod tests {
     fn silence_gives_empty_fingerprint() {
         let mut fp = Wang::default();
         let samples = vec![0.0_f32; 8_000 * 3];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let fpr = fp.extract(buf).unwrap();
         assert_eq!(fpr.frames_per_sec, 62.5);
         assert!(fpr.hashes.is_empty());
@@ -449,7 +462,10 @@ mod tests {
     fn synthetic_signal_produces_hashes() {
         let mut fp = Wang::default();
         let samples = synthetic_audio(0xC0FFEE, 8_000 * 5);
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let fpr = fp.extract(buf).unwrap();
         assert!(!fpr.hashes.is_empty(), "expected hashes from a 5s tone");
         // Ordering invariant.
@@ -463,11 +479,17 @@ mod tests {
         let samples = synthetic_audio(0xDEAD, 8_000 * 4);
 
         let mut fp1 = Wang::default();
-        let buf1 = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf1 = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let f1 = fp1.extract(buf1).unwrap();
 
         let mut fp2 = Wang::default();
-        let buf2 = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf2 = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let f2 = fp2.extract(buf2).unwrap();
 
         assert_eq!(f1.hashes.len(), f2.hashes.len());
@@ -483,10 +505,16 @@ mod tests {
 
         let mut fp = Wang::default();
         let fa = fp
-            .extract(AudioBuffer { samples: &samples_a, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples_a,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
         let fb = fp
-            .extract(AudioBuffer { samples: &samples_b, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples_b,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
         // Different noise streams must yield non-identical hash sequences.
         assert_ne!(fa.hashes, fb.hashes);
@@ -497,8 +525,18 @@ mod tests {
         // Smoke: feed a known peak set and verify hash-field decode.
         // Build fake peaks: one anchor, one target inside zone.
         let peaks = alloc::vec![
-            Peak { t_frame: 100, f_bin: 50, _pad: 0, mag: -10.0 },
-            Peak { t_frame: 110, f_bin: 70, _pad: 0, mag: -12.0 },
+            Peak {
+                t_frame: 100,
+                f_bin: 50,
+                _pad: 0,
+                mag: -10.0
+            },
+            Peak {
+                t_frame: 110,
+                f_bin: 70,
+                _pad: 0,
+                mag: -12.0
+            },
         ];
         let cfg = WangConfig::default();
         let hashes = build_hashes(&peaks, &cfg);
@@ -559,7 +597,10 @@ mod tests {
         // Offline reference.
         let mut offline = Wang::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
 
         // Streaming with random chunks.
@@ -568,7 +609,12 @@ mod tests {
         let mut cursor = 0;
         for n in chunk_sizes(0xCAFE, samples.len(), 4_000) {
             let end = cursor + n;
-            online.extend(streaming.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(
+                streaming
+                    .push(&samples[cursor..end])
+                    .into_iter()
+                    .map(|(_, h)| h),
+            );
             cursor = end;
         }
         online.extend(streaming.flush().into_iter().map(|(_, h)| h));
@@ -585,11 +631,23 @@ mod tests {
     #[test]
     fn smaller_fan_out_yields_fewer_hashes() {
         let samples = synthetic_audio(0xFEED, 8_000 * 4);
-        let buf_a = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-        let buf_b = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf_a = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let buf_b = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
 
-        let mut wide = Wang::new(WangConfig { fan_out: 10, ..WangConfig::default() });
-        let mut narrow = Wang::new(WangConfig { fan_out: 3, ..WangConfig::default() });
+        let mut wide = Wang::new(WangConfig {
+            fan_out: 10,
+            ..WangConfig::default()
+        });
+        let mut narrow = Wang::new(WangConfig {
+            fan_out: 3,
+            ..WangConfig::default()
+        });
         let f_wide = wide.extract(buf_a).unwrap();
         let f_narrow = narrow.extract(buf_b).unwrap();
         assert!(
@@ -620,7 +678,10 @@ mod tests {
         let samples = synthetic_audio(0xABCD, 8_000 * 3);
         let mut offline = Wang::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
 
         let mut s = StreamingWang::default();
@@ -642,15 +703,40 @@ mod tests {
     #[test]
     fn target_zone_filters_far_peaks() {
         let peaks = alloc::vec![
-            Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 },
+            Peak {
+                t_frame: 0,
+                f_bin: 100,
+                _pad: 0,
+                mag: 0.0
+            },
             // Same time → skipped (Δt < 1).
-            Peak { t_frame: 0, f_bin: 200, _pad: 0, mag: 0.0 },
+            Peak {
+                t_frame: 0,
+                f_bin: 200,
+                _pad: 0,
+                mag: 0.0
+            },
             // Δt = 70 > target_zone_t (63) → skipped.
-            Peak { t_frame: 70, f_bin: 100, _pad: 0, mag: 0.0 },
+            Peak {
+                t_frame: 70,
+                f_bin: 100,
+                _pad: 0,
+                mag: 0.0
+            },
             // Inside zone.
-            Peak { t_frame: 5, f_bin: 110, _pad: 0, mag: 0.0 },
+            Peak {
+                t_frame: 5,
+                f_bin: 110,
+                _pad: 0,
+                mag: 0.0
+            },
             // |Δf| = 200 > 64 → skipped.
-            Peak { t_frame: 5, f_bin: 300, _pad: 0, mag: 0.0 },
+            Peak {
+                t_frame: 5,
+                f_bin: 300,
+                _pad: 0,
+                mag: 0.0
+            },
         ];
         // Note: peaks vec must be sorted by (t_frame, f_bin) for the
         // "break on dt > zone" optimisation to fire correctly.

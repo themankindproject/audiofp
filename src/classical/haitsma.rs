@@ -51,7 +51,10 @@ pub struct HaitsmaConfig {
 
 impl Default for HaitsmaConfig {
     fn default() -> Self {
-        Self { fmin: 300.0, fmax: 2_000.0 }
+        Self {
+            fmin: 300.0,
+            fmax: 2_000.0,
+        }
     }
 }
 
@@ -123,7 +126,11 @@ impl Haitsma {
 
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
 
-        Self { cfg, stft, bin_to_band }
+        Self {
+            cfg,
+            stft,
+            bin_to_band,
+        }
     }
 }
 
@@ -274,7 +281,7 @@ impl StreamingHaitsma {
         Self {
             cfg,
             accumulated: Vec::new(),
-            next_frame_idx: 1,  // hash index 0 is for frame 1 (first hashable frame)
+            next_frame_idx: 1, // hash index 0 is for frame 1 (first hashable frame)
         }
     }
 
@@ -301,8 +308,7 @@ impl StreamingHaitsma {
             // Frame index in spectrogram terms is i+1 (we skip frame 0).
             let frame_idx = (i as u32) + 1;
             if frame_idx >= self.next_frame_idx {
-                let t_ms =
-                    (frame_idx as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
+                let t_ms = (frame_idx as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
                 emitted.push((TimestampMs(t_ms), hash));
             }
         }
@@ -379,7 +385,10 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 10_000];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
         match fp.extract(buf) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
@@ -390,9 +399,15 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 5_000];
-        let buf = AudioBuffer { samples: &samples, rate: sr_5khz() };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: sr_5khz(),
+        };
         match fp.extract(buf) {
-            Err(AfpError::AudioTooShort { needed: 10_000, got: 5_000 }) => {}
+            Err(AfpError::AudioTooShort {
+                needed: 10_000,
+                got: 5_000,
+            }) => {}
             other => panic!("expected AudioTooShort, got {other:?}"),
         }
     }
@@ -401,7 +416,10 @@ mod tests {
     fn silence_gives_all_zero_frames() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 5_000 * 3];
-        let buf = AudioBuffer { samples: &samples, rate: sr_5khz() };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: sr_5khz(),
+        };
         let fpr = fp.extract(buf).unwrap();
         assert_eq!(fpr.frames_per_sec, 78.125);
         assert!(!fpr.frames.is_empty());
@@ -414,7 +432,10 @@ mod tests {
     fn synthetic_signal_produces_nonzero_hashes() {
         let mut fp = Haitsma::default();
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 4);
-        let buf = AudioBuffer { samples: &samples, rate: sr_5khz() };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: sr_5khz(),
+        };
         let fpr = fp.extract(buf).unwrap();
         assert!(!fpr.frames.is_empty());
         let nonzero = fpr.frames.iter().filter(|&&h| h != 0).count();
@@ -431,12 +452,18 @@ mod tests {
 
         let mut fp1 = Haitsma::default();
         let f1 = fp1
-            .extract(AudioBuffer { samples: &samples, rate: sr_5khz() })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: sr_5khz(),
+            })
             .unwrap();
 
         let mut fp2 = Haitsma::default();
         let f2 = fp2
-            .extract(AudioBuffer { samples: &samples, rate: sr_5khz() })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: sr_5khz(),
+            })
             .unwrap();
 
         assert_eq!(f1.frames, f2.frames);
@@ -448,8 +475,18 @@ mod tests {
         let b = synthetic_audio(0x2222, 5_000 * 3);
 
         let mut fp = Haitsma::default();
-        let fa = fp.extract(AudioBuffer { samples: &a, rate: sr_5khz() }).unwrap();
-        let fb = fp.extract(AudioBuffer { samples: &b, rate: sr_5khz() }).unwrap();
+        let fa = fp
+            .extract(AudioBuffer {
+                samples: &a,
+                rate: sr_5khz(),
+            })
+            .unwrap();
+        let fb = fp
+            .extract(AudioBuffer {
+                samples: &b,
+                rate: sr_5khz(),
+            })
+            .unwrap();
         assert_ne!(fa.frames, fb.frames);
     }
 
@@ -507,15 +544,24 @@ mod tests {
 
         // Bins outside [fmin, fmax) are None.
         let bin_at_100hz = (100.0 / bin_hz) as usize;
-        assert!(lookup[bin_at_100hz].is_none(), "100 Hz should be below fmin=300");
+        assert!(
+            lookup[bin_at_100hz].is_none(),
+            "100 Hz should be below fmin=300"
+        );
     }
 
     #[test]
     fn custom_band_range() {
-        let cfg = HaitsmaConfig { fmin: 500.0, fmax: 1500.0 };
+        let cfg = HaitsmaConfig {
+            fmin: 500.0,
+            fmax: 1500.0,
+        };
         let mut h = Haitsma::new(cfg.clone());
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
-        let buf = AudioBuffer { samples: &samples, rate: sr_5khz() };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: sr_5khz(),
+        };
         let f = h.extract(buf).unwrap();
         // Should still produce frames; band edges differ but algorithm runs.
         assert!(!f.frames.is_empty());
@@ -524,13 +570,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "fmax must exceed fmin")]
     fn invalid_band_range_panics() {
-        let _ = Haitsma::new(HaitsmaConfig { fmin: 1000.0, fmax: 1000.0 });
+        let _ = Haitsma::new(HaitsmaConfig {
+            fmin: 1000.0,
+            fmax: 1000.0,
+        });
     }
 
     #[test]
     #[should_panic(expected = "below Nyquist")]
     fn fmax_above_nyquist_panics() {
-        let _ = Haitsma::new(HaitsmaConfig { fmin: 300.0, fmax: 3_000.0 });
+        let _ = Haitsma::new(HaitsmaConfig {
+            fmin: 300.0,
+            fmax: 3_000.0,
+        });
     }
 
     #[test]
@@ -539,7 +591,10 @@ mod tests {
 
         let mut offline = Haitsma::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: sr_5khz() })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: sr_5khz(),
+            })
             .unwrap();
 
         let mut streaming = StreamingHaitsma::default();
@@ -547,7 +602,12 @@ mod tests {
         let mut cursor = 0;
         for n in chunk_sizes(0xCAFE, samples.len(), 3_000) {
             let end = cursor + n;
-            online.extend(streaming.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(
+                streaming
+                    .push(&samples[cursor..end])
+                    .into_iter()
+                    .map(|(_, h)| h),
+            );
             cursor = end;
         }
         online.extend(streaming.flush().into_iter().map(|(_, h)| h));

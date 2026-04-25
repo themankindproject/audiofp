@@ -25,8 +25,8 @@ use crate::{AfpError, Result};
 /// enabled in `Cargo.toml`).
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
     let path = path.as_ref();
-    let file = File::open(path)
-        .map_err(|e| AfpError::Io(format!("open {}: {e}", path.display())))?;
+    let file =
+        File::open(path).map_err(|e| AfpError::Io(format!("open {}: {e}", path.display())))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -53,7 +53,12 @@ pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<
 
 fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> {
     let probed = symphonia::default::get_probe()
-        .format(hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| AfpError::Io(format!("probe: {e}")))?;
     let mut format = probed.format;
 
@@ -79,9 +84,7 @@ fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> 
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(SymphoniaError::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => continue,

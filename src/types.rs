@@ -20,28 +20,22 @@ pub struct SampleRate(pub NonZeroU32);
 
 impl SampleRate {
     /// 8 kHz — the rate `afp`'s classical fingerprinters consume.
-    pub const HZ_8000: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(8_000)) };
+    pub const HZ_8000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(8_000)) };
 
     /// 11.025 kHz.
-    pub const HZ_11025: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(11_025)) };
+    pub const HZ_11025: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(11_025)) };
 
     /// 16 kHz — typical speech rate.
-    pub const HZ_16000: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(16_000)) };
+    pub const HZ_16000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(16_000)) };
 
     /// 22.05 kHz — common for music workflows.
-    pub const HZ_22050: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(22_050)) };
+    pub const HZ_22050: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(22_050)) };
 
     /// 44.1 kHz — CD-quality audio.
-    pub const HZ_44100: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(44_100)) };
+    pub const HZ_44100: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(44_100)) };
 
     /// 48 kHz — DAT / professional audio.
-    pub const HZ_48000: SampleRate =
-        unsafe { SampleRate(NonZeroU32::new_unchecked(48_000)) };
+    pub const HZ_48000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(48_000)) };
 
     /// Build a [`SampleRate`] from any non-zero `u32`.
     ///
@@ -161,7 +155,10 @@ mod tests {
     #[test]
     fn audio_buffer_borrow() {
         let samples = alloc::vec![0.1_f32, 0.2, 0.3];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
         // The buffer is a borrowed view — original samples still owned.
         assert_eq!(buf.samples.len(), 3);
         assert_eq!(buf.rate.hz(), 16_000);

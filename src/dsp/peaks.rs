@@ -154,8 +154,11 @@ fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize)
     peaks.sort_unstable_by(|a, b| {
         let ba = (a.t_frame as f32 / frames_per_sec) as u32;
         let bb = (b.t_frame as f32 / frames_per_sec) as u32;
-        ba.cmp(&bb)
-            .then_with(|| b.mag.partial_cmp(&a.mag).unwrap_or(core::cmp::Ordering::Equal))
+        ba.cmp(&bb).then_with(|| {
+            b.mag
+                .partial_cmp(&a.mag)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        })
     });
 
     let mut kept = Vec::with_capacity(peaks.len());
@@ -275,7 +278,10 @@ mod tests {
             .map(|i| {
                 let lo = i.saturating_sub(k);
                 let hi = (i + k).min(n - 1);
-                input[lo..=hi].iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                input[lo..=hi]
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max)
             })
             .collect()
     }
@@ -322,8 +328,8 @@ mod tests {
     #[test]
     fn min_magnitude_filters_low_energy() {
         let mut spec = vec![0.0_f32; 64];
-        spec[10] = 0.05;  // below floor
-        spec[20] = 0.5;   // above
+        spec[10] = 0.05; // below floor
+        spec[20] = 0.5; // above
         let picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,

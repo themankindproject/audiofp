@@ -111,7 +111,13 @@ impl ShortTimeFFT {
         let scratch_in = fft.make_input_vec();
         let scratch_out = fft.make_output_vec();
 
-        Self { cfg, fft, window, scratch_in, scratch_out }
+        Self {
+            cfg,
+            fft,
+            window,
+            scratch_in,
+            scratch_out,
+        }
     }
 
     /// Borrow the configuration this instance was built with.
@@ -156,7 +162,11 @@ impl ShortTimeFFT {
         let n_frames = self.n_frames(samples.len());
         let n_bins = self.n_bins();
 
-        let center_off = if self.cfg.center { (n_fft / 2) as isize } else { 0 };
+        let center_off = if self.cfg.center {
+            (n_fft / 2) as isize
+        } else {
+            0
+        };
 
         let mut out = Vec::with_capacity(n_frames);
 
@@ -185,11 +195,7 @@ impl ShortTimeFFT {
     ///
     /// Panics if `frame.len() != n_fft` or `out.len() != n_bins`.
     pub fn process_frame(&mut self, frame: &[f32], out: &mut [f32]) {
-        assert_eq!(
-            frame.len(),
-            self.cfg.n_fft,
-            "frame length must equal n_fft"
-        );
+        assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
         assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
 
         for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {

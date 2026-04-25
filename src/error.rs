@@ -37,9 +37,7 @@ pub enum AfpError {
     },
 
     /// The audio's sample rate is not one of the supported rates.
-    #[error(
-        "unsupported sample rate: {0} Hz (supported: 8000, 11025, 16000, 22050, 44100, 48000)"
-    )]
+    #[error("unsupported sample rate: {0} Hz (supported: 8000, 11025, 16000, 22050, 44100, 48000)")]
     UnsupportedSampleRate(u32),
 
     /// The audio has a channel count `afp` cannot consume (must be mono).
@@ -98,7 +96,10 @@ mod tests {
 
     #[test]
     fn audio_too_short_displays_both_numbers() {
-        let e = AfpError::AudioTooShort { needed: 16_000, got: 8_000 };
+        let e = AfpError::AudioTooShort {
+            needed: 16_000,
+            got: 8_000,
+        };
         let s = e.to_string();
         assert!(s.contains("16000"), "got: {s}");
         assert!(s.contains("8000"), "got: {s}");

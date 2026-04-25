@@ -150,7 +150,15 @@ impl MelFilterBank {
             }
         }
 
-        Self { n_mels, n_fft, sr, fmin, fmax, scale, matrix }
+        Self {
+            n_mels,
+            n_fft,
+            sr,
+            fmin,
+            fmax,
+            scale,
+            matrix,
+        }
     }
 
     /// Number of FFT bins each filter spans (`n_fft / 2 + 1`).
@@ -175,7 +183,11 @@ impl MelFilterBank {
     ///
     /// Panics if `magnitude.len() != n_bins()` or `out.len() != n_mels`.
     pub fn log_mel(&self, magnitude: &[f32], out: &mut [f32]) {
-        assert_eq!(magnitude.len(), self.n_bins(), "magnitude length must equal n_bins");
+        assert_eq!(
+            magnitude.len(),
+            self.n_bins(),
+            "magnitude length must equal n_bins"
+        );
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
         let n_bins = self.n_bins();
@@ -205,7 +217,9 @@ mod tests {
 
     #[test]
     fn slaney_round_trip() {
-        for &hz in &[0.0_f32, 100.0, 440.0, 999.0, 1_000.0, 1_001.0, 5_000.0, 11_025.0] {
+        for &hz in &[
+            0.0_f32, 100.0, 440.0, 999.0, 1_000.0, 1_001.0, 5_000.0, 11_025.0,
+        ] {
             let m = MelScale::Slaney.hz_to_mel(hz);
             assert_relative_eq!(MelScale::Slaney.mel_to_hz(m), hz, max_relative = 1e-4);
         }

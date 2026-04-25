@@ -359,8 +359,7 @@ impl StreamingPanako {
         let mut emitted = Vec::with_capacity(result.hashes.len());
         for h in result.hashes {
             if h.t_anchor >= self.next_anchor_frame && h.t_anchor < cutoff {
-                let t_ms =
-                    (h.t_anchor as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
+                let t_ms = (h.t_anchor as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
                 emitted.push((TimestampMs(t_ms), h));
             }
         }
@@ -430,7 +429,10 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 16_000];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
         match fp.extract(buf) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
@@ -441,9 +443,15 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         match fp.extract(buf) {
-            Err(AfpError::AudioTooShort { needed: 16_000, got: 8_000 }) => {}
+            Err(AfpError::AudioTooShort {
+                needed: 16_000,
+                got: 8_000,
+            }) => {}
             other => panic!("expected AudioTooShort, got {other:?}"),
         }
     }
@@ -452,7 +460,10 @@ mod tests {
     fn silence_gives_empty_fingerprint() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000 * 3];
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let fpr = fp.extract(buf).unwrap();
         assert_eq!(fpr.frames_per_sec, 62.5);
         assert!(fpr.hashes.is_empty());
@@ -462,7 +473,10 @@ mod tests {
     fn synthetic_signal_produces_hashes() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xC0FFEE, 8_000 * 5);
-        let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
         let fpr = fp.extract(buf).unwrap();
         assert!(!fpr.hashes.is_empty(), "expected hashes from a 5s tone");
         for w in fpr.hashes.windows(2) {
@@ -476,12 +490,18 @@ mod tests {
 
         let mut fp1 = Panako::default();
         let f1 = fp1
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
 
         let mut fp2 = Panako::default();
         let f2 = fp2
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
 
         assert_eq!(f1.hashes, f2.hashes);
@@ -494,19 +514,40 @@ mod tests {
 
         let mut fp = Panako::default();
         let fa = fp
-            .extract(AudioBuffer { samples: &a, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &a,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
         let fb = fp
-            .extract(AudioBuffer { samples: &b, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &b,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
         assert_ne!(fa.hashes, fb.hashes);
     }
 
     #[test]
     fn pack_triplet_decodes_correctly() {
-        let a = Peak { t_frame: 100, f_bin: 50, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 110, f_bin: 70, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 130, f_bin: 60, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 100,
+            f_bin: 50,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 110,
+            f_bin: 70,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 130,
+            f_bin: 60,
+            _pad: 0,
+            mag: 0.0,
+        };
 
         let h = pack_triplet(&a, &b, &c);
 
@@ -531,15 +572,30 @@ mod tests {
 
     #[test]
     fn pack_triplet_clamps_large_freq_diffs() {
-        let a = Peak { t_frame: 0, f_bin: 0, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 5, f_bin: 400, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 10, f_bin: 0, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 0,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 400,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 0,
+            _pad: 0,
+            mag: 0.0,
+        };
 
         let h = pack_triplet(&a, &b, &c);
         let dab = ((h >> 15) & 0xFF) as u8 as i8;
         let dbc = ((h >> 7) & 0xFF) as u8 as i8;
-        assert_eq!(dab as i32, 127);   // clamped
-        assert_eq!(dbc as i32, -127);  // clamped
+        assert_eq!(dab as i32, 127); // clamped
+        assert_eq!(dbc as i32, -127); // clamped
     }
 
     #[test]
@@ -560,23 +616,68 @@ mod tests {
     #[test]
     fn mag_order_picks_largest_of_three() {
         // mag_order = 1 (b largest)
-        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 1.0 };
-        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 5.0 };
-        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 3.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 10,
+            _pad: 0,
+            mag: 1.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 20,
+            _pad: 0,
+            mag: 5.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 15,
+            _pad: 0,
+            mag: 3.0,
+        };
         let h = pack_triplet(&a, &b, &c);
         assert_eq!((h >> 28) & 0x3, 1);
 
         // mag_order = 2 (c largest)
-        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 1.0 };
-        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 2.0 };
-        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 9.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 10,
+            _pad: 0,
+            mag: 1.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 20,
+            _pad: 0,
+            mag: 2.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 15,
+            _pad: 0,
+            mag: 9.0,
+        };
         let h = pack_triplet(&a, &b, &c);
         assert_eq!((h >> 28) & 0x3, 2);
 
         // mag_order = 0 (anchor largest)
-        let a = Peak { t_frame: 0, f_bin: 10, _pad: 0, mag: 9.0 };
-        let b = Peak { t_frame: 5, f_bin: 20, _pad: 0, mag: 2.0 };
-        let c = Peak { t_frame: 10, f_bin: 15, _pad: 0, mag: 3.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 10,
+            _pad: 0,
+            mag: 9.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 20,
+            _pad: 0,
+            mag: 2.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 15,
+            _pad: 0,
+            mag: 3.0,
+        };
         let h = pack_triplet(&a, &b, &c);
         assert_eq!((h >> 28) & 0x3, 0);
     }
@@ -584,32 +685,92 @@ mod tests {
     #[test]
     fn sign_bit_combinations() {
         // Both descending: f_b < f_a, f_c < f_b → sign = 0b00
-        let a = Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 5, f_bin: 80, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 10, f_bin: 60, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 100,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 80,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 60,
+            _pad: 0,
+            mag: 0.0,
+        };
         assert_eq!((pack_triplet(&a, &b, &c) >> 30) & 0x3, 0b00);
 
         // Both ascending: f_b > f_a, f_c > f_b → sign = 0b11
-        let a = Peak { t_frame: 0, f_bin: 100, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 5, f_bin: 120, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 10, f_bin: 140, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 100,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 5,
+            f_bin: 120,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 10,
+            f_bin: 140,
+            _pad: 0,
+            mag: 0.0,
+        };
         assert_eq!((pack_triplet(&a, &b, &c) >> 30) & 0x3, 0b11);
     }
 
     #[test]
     fn beta_saturates_near_extremes() {
         // β ≈ 31 when t_b is right after t_a (ratio (t_c - t_b)/(t_c - t_a) → 1).
-        let a = Peak { t_frame: 0, f_bin: 0, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 1, f_bin: 5, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 95, f_bin: 8, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 0,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 1,
+            f_bin: 5,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 95,
+            f_bin: 8,
+            _pad: 0,
+            mag: 0.0,
+        };
         let h = pack_triplet(&a, &b, &c);
         let beta = (h >> 23) & 0x1F;
         assert!(beta >= 30, "beta should saturate near 31, got {beta}");
 
         // β ≈ 0 when t_b is just before t_c.
-        let a = Peak { t_frame: 0, f_bin: 0, _pad: 0, mag: 0.0 };
-        let b = Peak { t_frame: 90, f_bin: 5, _pad: 0, mag: 0.0 };
-        let c = Peak { t_frame: 91, f_bin: 8, _pad: 0, mag: 0.0 };
+        let a = Peak {
+            t_frame: 0,
+            f_bin: 0,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let b = Peak {
+            t_frame: 90,
+            f_bin: 5,
+            _pad: 0,
+            mag: 0.0,
+        };
+        let c = Peak {
+            t_frame: 91,
+            f_bin: 8,
+            _pad: 0,
+            mag: 0.0,
+        };
         let h = pack_triplet(&a, &b, &c);
         let beta = (h >> 23) & 0x1F;
         assert!(beta <= 1, "beta should saturate near 0, got {beta}");
@@ -621,7 +782,10 @@ mod tests {
 
         let mut offline = Panako::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
             .unwrap();
 
         let mut streaming = StreamingPanako::default();
@@ -629,7 +793,12 @@ mod tests {
         let mut cursor = 0;
         for n in chunk_sizes(0xCAFE, samples.len(), 4_000) {
             let end = cursor + n;
-            online.extend(streaming.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(
+                streaming
+                    .push(&samples[cursor..end])
+                    .into_iter()
+                    .map(|(_, h)| h),
+            );
             cursor = end;
         }
         online.extend(streaming.flush().into_iter().map(|(_, h)| h));
