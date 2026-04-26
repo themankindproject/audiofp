@@ -81,6 +81,22 @@ pub struct WatermarkDetector {
 
 impl WatermarkDetector {
     /// Validate `cfg` and load the ONNX file at `cfg.model_path`.
+    ///
+    /// The model is loaded in `InferenceModel` form with no fixed input
+    /// shape, so a single detector instance can handle audio buffers of
+    /// any length. Each [`detect`] call will concretise the model for
+    /// the call's input length.
+    ///
+    /// [`detect`]: WatermarkDetector::detect
+    ///
+    /// # Errors
+    ///
+    /// - [`AfpError::Config`] — `message_bits > 32`, `threshold` outside
+    ///   `[0, 1]`, or `sample_rate == 0`.
+    /// - [`AfpError::ModelNotFound`] — `model_path` is empty or points at
+    ///   a file that doesn't exist.
+    /// - [`AfpError::ModelLoad`] — the file exists but Tract couldn't
+    ///   parse it as an ONNX protobuf.
     pub fn new(cfg: WatermarkConfig) -> Result<Self> {
         if cfg.message_bits > 32 {
             return Err(AfpError::Config(format!(
@@ -121,9 +137,19 @@ impl WatermarkDetector {
 
     /// Run the watermark detector on `audio`.
     ///
-    /// Errors are returned (rather than panicking) for: a sample-rate
-    /// mismatch with the model, an empty input buffer, or any failure
-    /// inside `tract` while concretising / running the model.
+    /// Builds a `[1, 1, T] f32` input tensor from the buffer's samples,
+    /// concretises the loaded model for that input length, runs
+    /// inference, and decodes the model's two outputs into a
+    /// [`WatermarkResult`].
+    ///
+    /// # Errors
+    ///
+    /// - [`AfpError::UnsupportedSampleRate`] — `audio.rate` differs from
+    ///   `cfg.sample_rate`.
+    /// - [`AfpError::AudioTooShort`] — empty input buffer.
+    /// - [`AfpError::Inference`] — Tract failed at any of: shape inference,
+    ///   typing, building the runnable plan, running inference, or extracting
+    ///   the output tensors. The variant payload identifies which step.
     pub fn detect(&mut self, audio: AudioBuffer<'_>) -> Result<WatermarkResult> {
         if audio.rate.hz() != self.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));

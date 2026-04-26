@@ -20,9 +20,30 @@ use crate::{AfpError, Result};
 /// Multi-channel files are downmixed to mono by averaging channels per
 /// frame. The returned tuple is `(samples, sample_rate_hz)`.
 ///
-/// Supported formats: MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM
-/// (whatever Symphonia's default registries provide with the features
-/// enabled in `Cargo.toml`).
+/// # Supported formats
+///
+/// MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM — whatever Symphonia's
+/// default registries provide with the features enabled in
+/// `audiofp`'s `Cargo.toml`. The decoder probes magic bytes too, so
+/// extension-less files still work as long as they're a recognised format.
+///
+/// # Errors
+///
+/// - [`AfpError::Io`] if the file is missing, the format isn't recognised,
+///   or a stream-fatal decode error happens. Recoverable per-packet failures
+///   inside Symphonia are silently skipped so a single corrupt block
+///   doesn't kill the whole-file decode.
+///
+/// # Example
+///
+/// ```no_run
+/// use audiofp::io::decode_to_mono;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (samples, sr) = decode_to_mono("song.flac")?;
+/// println!("{} samples at {sr} Hz", samples.len());
+/// # Ok(()) }
+/// ```
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
     let path = path.as_ref();
     let file =
@@ -40,7 +61,25 @@ pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
 ///
 /// Pass-through (no resample) when the file already matches `target_sr`.
-/// Otherwise resamples via [`SincResampler`] at default quality.
+/// Otherwise resamples via [`SincResampler`] at default quality
+/// (32-tap Kaiser, β = 8.6). Equivalent to calling [`decode_to_mono`]
+/// then [`SincResampler::process`] yourself, but in one step.
+///
+/// # Errors
+///
+/// Surfaces every error [`decode_to_mono`] can return; resampling itself
+/// cannot fail with the built-in [`SincResampler`].
+///
+/// # Example
+///
+/// ```no_run
+/// use audiofp::io::decode_to_mono_at;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Get audio ready for Wang in one line:
+/// let samples = decode_to_mono_at("song.mp3", 8_000)?;
+/// # Ok(()) }
+/// ```
 pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<f32>> {
     let (samples, sr) = decode_to_mono(path)?;
     if sr == target_sr {
