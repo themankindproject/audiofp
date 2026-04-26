@@ -38,7 +38,7 @@ impl StftConfig {
     /// # Example
     ///
     /// ```
-    /// use afp::dsp::stft::StftConfig;
+    /// use audiofp::dsp::stft::StftConfig;
     /// let cfg = StftConfig::new(2048);
     /// assert_eq!(cfg.n_fft, 2048);
     /// assert_eq!(cfg.hop, 512);
@@ -68,7 +68,7 @@ impl StftConfig {
 /// # Example
 ///
 /// ```
-/// use afp::dsp::stft::{ShortTimeFFT, StftConfig};
+/// use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
 ///
 /// let mut stft = ShortTimeFFT::new(StftConfig::new(1024));
 /// let samples = vec![0.0_f32; 16_000];

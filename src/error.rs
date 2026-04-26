@@ -1,12 +1,12 @@
-//! Error type for the `afp` crate.
+//! Error type for the `audiofp` crate.
 //!
-//! Every fallible API in `afp` returns [`Result<T>`], a type alias for
+//! Every fallible API in `audiofp` returns [`Result<T>`], a type alias for
 //! `core::result::Result<T, AfpError>`.
 
 use alloc::string::String;
 use thiserror::Error;
 
-/// All errors surfaced by `afp`.
+/// All errors surfaced by `audiofp`.
 ///
 /// Marked `#[non_exhaustive]` so that adding a new variant in a future
 /// version is not a breaking change. Match exhaustively only inside the
@@ -15,7 +15,7 @@ use thiserror::Error;
 /// # Example
 ///
 /// ```
-/// use afp::AfpError;
+/// use audiofp::AfpError;
 ///
 /// let err = AfpError::AudioTooShort { needed: 16_000, got: 8_000 };
 /// assert_eq!(
@@ -40,7 +40,7 @@ pub enum AfpError {
     #[error("unsupported sample rate: {0} Hz (supported: 8000, 11025, 16000, 22050, 44100, 48000)")]
     UnsupportedSampleRate(u32),
 
-    /// The audio has a channel count `afp` cannot consume (must be mono).
+    /// The audio has a channel count `audiofp` cannot consume (must be mono).
     #[error("unsupported channel count: {0}")]
     UnsupportedChannels(u16),
 
@@ -67,7 +67,7 @@ pub enum AfpError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
-    /// An I/O failure surfaced through `afp`.
+    /// An I/O failure surfaced through `audiofp`.
     #[error("io: {0}")]
     Io(String),
 }
@@ -77,7 +77,7 @@ pub enum AfpError {
 /// # Example
 ///
 /// ```
-/// use afp::{AfpError, Result};
+/// use audiofp::{AfpError, Result};
 ///
 /// fn at_least_one_second(samples: &[f32]) -> Result<()> {
 ///     if samples.len() < 16_000 {

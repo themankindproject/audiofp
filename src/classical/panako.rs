@@ -90,8 +90,8 @@ const PANAKO_LOG_FLOOR: f32 = 1e-6;
 /// # Example
 ///
 /// ```
-/// use afp::{AudioBuffer, Fingerprinter, SampleRate};
-/// use afp::classical::Panako;
+/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::classical::Panako;
 ///
 /// let mut fp = Panako::default();
 /// let samples = vec![0.0_f32; 8_000 * 3];

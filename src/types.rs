@@ -1,16 +1,16 @@
-//! Shared value types used across the `afp` crate.
+//! Shared value types used across the `audiofp` crate.
 
 use core::num::NonZeroU32;
 
 /// A sample rate in hertz, guaranteed non-zero.
 ///
-/// Use one of the `HZ_*` constants for the rates `afp` supports out of the
+/// Use one of the `HZ_*` constants for the rates `audiofp` supports out of the
 /// box, or [`SampleRate::new`] to validate an arbitrary value.
 ///
 /// # Example
 ///
 /// ```
-/// use afp::SampleRate;
+/// use audiofp::SampleRate;
 ///
 /// assert_eq!(SampleRate::HZ_44100.hz(), 44_100);
 /// assert!(SampleRate::new(0).is_none());
@@ -19,7 +19,7 @@ use core::num::NonZeroU32;
 pub struct SampleRate(pub NonZeroU32);
 
 impl SampleRate {
-    /// 8 kHz — the rate `afp`'s classical fingerprinters consume.
+    /// 8 kHz — the rate `audiofp`'s classical fingerprinters consume.
     pub const HZ_8000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(8_000)) };
 
     /// 11.025 kHz.
@@ -44,7 +44,7 @@ impl SampleRate {
     /// # Example
     ///
     /// ```
-    /// use afp::SampleRate;
+    /// use audiofp::SampleRate;
     ///
     /// assert_eq!(SampleRate::new(32_000).unwrap().hz(), 32_000);
     /// assert!(SampleRate::new(0).is_none());
@@ -62,7 +62,7 @@ impl SampleRate {
     /// # Example
     ///
     /// ```
-    /// use afp::SampleRate;
+    /// use audiofp::SampleRate;
     ///
     /// assert_eq!(SampleRate::HZ_48000.hz(), 48_000);
     /// ```
@@ -74,14 +74,14 @@ impl SampleRate {
 
 /// A borrowed view of a mono PCM buffer in `[-1.0, 1.0]`.
 ///
-/// Channel mixing is the caller's job — every public `afp` API takes mono
+/// Channel mixing is the caller's job — every public `audiofp` API takes mono
 /// `f32`. Multi-channel inputs must be downmixed (helpers will live in the
 /// streaming module once it lands).
 ///
 /// # Example
 ///
 /// ```
-/// use afp::{AudioBuffer, SampleRate};
+/// use audiofp::{AudioBuffer, SampleRate};
 ///
 /// let samples = vec![0.0_f32; 16_000];
 /// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
@@ -105,7 +105,7 @@ pub struct AudioBuffer<'a> {
 /// # Example
 ///
 /// ```
-/// use afp::TimestampMs;
+/// use audiofp::TimestampMs;
 ///
 /// let t = TimestampMs(1_500);
 /// assert_eq!(t.0, 1_500);

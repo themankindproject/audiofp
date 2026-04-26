@@ -68,7 +68,7 @@ impl MelScale {
 /// # Example
 ///
 /// ```
-/// use afp::dsp::mel::{MelFilterBank, MelScale};
+/// use audiofp::dsp::mel::{MelFilterBank, MelScale};
 ///
 /// // 128 mels covering 0–11025 Hz at sr=22050, n_fft=2048.
 /// let fb = MelFilterBank::new(128, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);

@@ -69,8 +69,8 @@ const HAITSMA_N_BANDS: usize = 33;
 /// # Example
 ///
 /// ```
-/// use afp::{AudioBuffer, Fingerprinter, SampleRate};
-/// use afp::classical::Haitsma;
+/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::classical::Haitsma;
 ///
 /// let mut fp = Haitsma::default();
 /// let samples = vec![0.0_f32; 5_000 * 3];

@@ -1,6 +1,6 @@
 //! Fingerprinter traits.
 //!
-//! Two traits cover the two ways `afp` produces fingerprints:
+//! Two traits cover the two ways `audiofp` produces fingerprints:
 //!
 //! - [`Fingerprinter`] — feed a whole [`AudioBuffer`] and get its full
 //!   output. Suited to enrolment / batch jobs.
@@ -26,7 +26,7 @@ use crate::{AudioBuffer, Result, TimestampMs};
 /// # Example
 ///
 /// ```
-/// use afp::{AudioBuffer, Fingerprinter, Result, SampleRate};
+/// use audiofp::{AudioBuffer, Fingerprinter, Result, SampleRate};
 ///
 /// /// A toy fingerprinter that just sums absolute samples.
 /// struct Energy;
@@ -83,12 +83,12 @@ pub trait Fingerprinter {
 /// any buffers needed for sustained operation are allocated at construction,
 /// not inside [`StreamingFingerprinter::push`]. This makes them suitable
 /// for invocation from realtime audio callbacks (when invoked through
-/// `afp`'s streaming orchestrator).
+/// `audiofp`'s streaming orchestrator).
 ///
 /// # Example
 ///
 /// ```
-/// use afp::{StreamingFingerprinter, TimestampMs};
+/// use audiofp::{StreamingFingerprinter, TimestampMs};
 ///
 /// struct EveryThird { count: usize }
 ///

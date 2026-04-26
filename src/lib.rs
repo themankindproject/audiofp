@@ -1,4 +1,4 @@
-//! `afp` — audio fingerprinting SDK.
+//! `audiofp` — audio fingerprinting SDK.
 //!
 //! Compiles `no_std + alloc` by default (when the `std` feature is disabled),
 //! so the DSP primitives and classical fingerprinters can target embedded

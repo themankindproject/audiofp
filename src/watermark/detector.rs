@@ -133,11 +133,9 @@ impl WatermarkDetector {
             return Err(AfpError::AudioTooShort { needed: 1, got: 0 });
         }
 
-        // Build [1, 1, T] f32 input tensor.
-        let input_array =
-            ndarray::Array3::from_shape_vec((1, 1, n), audio.samples.to_vec())
-                .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
-        let input_tensor: Tensor = input_array.into();
+        // Build [1, 1, T] f32 input tensor without going through ndarray.
+        let input_tensor = Tensor::from_shape(&[1, 1, n], audio.samples)
+            .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
         // Concretise input shape and prepare a runnable plan.
         let runnable = self
@@ -209,7 +207,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "afp-watermark-test-{}-{}-{n}.bin",
+            "audiofp-watermark-test-{}-{}-{n}.bin",
             std::process::id(),
             stem,
         ))

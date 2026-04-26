@@ -147,7 +147,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "afp-decoder-test-{}-{}-{}-{}-{}.wav",
+            "audiofp-decoder-test-{}-{}-{}-{}-{}.wav",
             std::process::id(),
             channels,
             sr,
@@ -280,7 +280,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "afp-decoder-float-{}-{}-{}-{}.wav",
+            "audiofp-decoder-float-{}-{}-{}-{}.wav",
             std::process::id(),
             channels,
             sr,

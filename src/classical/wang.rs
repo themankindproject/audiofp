@@ -92,8 +92,8 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 /// # Example
 ///
 /// ```
-/// use afp::{AudioBuffer, Fingerprinter, SampleRate};
-/// use afp::classical::Wang;
+/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::classical::Wang;
 ///
 /// let mut fp = Wang::default();
 /// // 3 seconds of silence — produces an empty fingerprint, not an error.
@@ -272,8 +272,8 @@ fn quantise_freq(bin: u16) -> u32 {
 /// # Example
 ///
 /// ```
-/// use afp::{SampleRate, StreamingFingerprinter};
-/// use afp::classical::StreamingWang;
+/// use audiofp::{SampleRate, StreamingFingerprinter};
+/// use audiofp::classical::StreamingWang;
 ///
 /// let mut s = StreamingWang::default();
 /// // Feed 4 seconds of silence in two chunks; nothing should be emitted.

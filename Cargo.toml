@@ -1,11 +1,11 @@
 [package]
-name         = "afp"
+name         = "audiofp"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
 description  = "Audio fingerprinting SDK: Wang, Panako, Haitsma–Kalker, neural (ONNX), watermark, streaming."
-repository   = "https://github.com/themankindproject/afp"
+repository   = "https://github.com/themankindproject/audiofp"
 authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
 keywords     = ["audio", "fingerprint", "dsp", "shazam", "panako"]
 categories   = ["multimedia::audio", "algorithms", "no-std"]
@@ -23,7 +23,7 @@ std = ["dep:symphonia"]
 neural = ["std"]
 
 # AudioSeal-compatible watermark detector. Requires std.
-watermark = ["std", "dep:tract-onnx", "dep:ndarray"]
+watermark = ["std", "dep:tract-onnx"]
 
 # Install mimalloc as the process-wide #[global_allocator]. Requires std.
 # Off by default because libraries should not pick the allocator on behalf of
@@ -31,21 +31,20 @@ watermark = ["std", "dep:tract-onnx", "dep:ndarray"]
 mimalloc = ["std", "dep:mimalloc"]
 
 [dependencies]
-thiserror   = { version = "2", default-features = false }
-mimalloc    = { version = "0.1", default-features = false, optional = true }
-libm        = "0.2"
-num-traits  = { version = "0.2", default-features = false, features = ["libm"] }
-num-complex = { version = "0.4", default-features = false, features = ["libm"] }
-realfft     = { version = "3.4", default-features = false }
-bytemuck    = { version = "1.18", features = ["derive"] }
-symphonia   = { version = "0.5", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm"], optional = true }
-tract-onnx  = { version = "0.21", optional = true }
-ndarray     = { version = "0.16", default-features = false, optional = true }
+thiserror   = { version = "2.0.18", default-features = false }
+mimalloc    = { version = "0.1.50", default-features = false, optional = true }
+libm        = "0.2.16"
+num-traits  = { version = "0.2.19", default-features = false, features = ["libm"] }
+num-complex = { version = "0.4.6", default-features = false, features = ["libm"] }
+realfft     = { version = "3.5.0", default-features = false }
+bytemuck    = { version = "1.25.0", features = ["derive"] }
+symphonia   = { version = "0.5.5", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm"], optional = true }
+tract-onnx  = { version = "0.22.1", optional = true }
 
 [dev-dependencies]
-approx = "0.5"
-hound  = "3.5"
+approx = "0.5.1"
+hound  = "3.5.1"
 
 [lib]
-name = "afp"
+name = "audiofp"
 path = "src/lib.rs"

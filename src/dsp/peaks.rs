@@ -61,7 +61,7 @@ impl Default for PeakPickerConfig {
 /// # Example
 ///
 /// ```
-/// use afp::dsp::peaks::{PeakPicker, PeakPickerConfig};
+/// use audiofp::dsp::peaks::{PeakPicker, PeakPickerConfig};
 ///
 /// // 8 frames × 8 bins, single peak at (3, 4).
 /// let mut spec = vec![0.0_f32; 64];

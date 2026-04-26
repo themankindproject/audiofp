@@ -23,7 +23,7 @@ use libm::{sinf, sqrtf};
 /// # Example
 ///
 /// ```
-/// use afp::dsp::resample::linear;
+/// use audiofp::dsp::resample::linear;
 ///
 /// // Halve the rate: every other sample is kept.
 /// let x = vec![0.0_f32, 1.0, 0.0, 1.0, 0.0, 1.0];
@@ -89,7 +89,7 @@ impl Default for SincQuality {
 /// # Example
 ///
 /// ```
-/// use afp::dsp::resample::SincResampler;
+/// use audiofp::dsp::resample::SincResampler;
 ///
 /// // 1.0 s of 1 kHz tone at 16 kHz → resample to 8 kHz.
 /// let sr_in = 16_000u32;

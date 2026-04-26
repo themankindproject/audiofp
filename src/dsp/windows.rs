@@ -33,7 +33,7 @@ pub enum WindowKind {
 /// # Example
 ///
 /// ```
-/// use afp::dsp::windows::{make_window, WindowKind};
+/// use audiofp::dsp::windows::{make_window, WindowKind};
 ///
 /// let w = make_window(WindowKind::Hann, 1024);
 /// assert_eq!(w.len(), 1024);
