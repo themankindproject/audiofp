@@ -225,9 +225,8 @@ mod tests {
 
     #[test]
     fn missing_model_returns_model_not_found() {
-        let res = WatermarkDetector::new(WatermarkConfig::new(
-            "/nonexistent/path/to/audioseal.onnx",
-        ));
+        let res =
+            WatermarkDetector::new(WatermarkConfig::new("/nonexistent/path/to/audioseal.onnx"));
         match res {
             Err(AfpError::ModelNotFound(_)) => {}
             Ok(_) => panic!("expected ModelNotFound, got Ok"),
@@ -280,8 +279,7 @@ mod tests {
             let garbage = [0xAA_u8; 64];
             f.write_all(&garbage).unwrap();
         }
-        let res =
-            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()));
+        let res = WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()));
         std::fs::remove_file(&path).ok();
         match res {
             Err(AfpError::ModelLoad(_)) => {}
