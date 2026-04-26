@@ -48,3 +48,20 @@ hound  = "3.5.1"
 [lib]
 name = "audiofp"
 path = "src/lib.rs"
+
+# Examples that use the symphonia-backed `audiofp::io` decoder require the
+# `std` feature. Cargo silently skips them when their required features
+# aren't enabled, so `cargo clippy --no-default-features --all-targets`
+# stays clean.
+[[example]]
+name = "enroll_file"
+required-features = ["std"]
+
+[[example]]
+name = "match_two_files"
+required-features = ["std"]
+
+[[example]]
+name = "compare_algorithms"
+required-features = ["std"]
+
