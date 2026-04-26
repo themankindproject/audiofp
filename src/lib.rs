@@ -25,6 +25,8 @@ pub mod classical;
 pub mod dsp;
 #[cfg(feature = "std")]
 pub mod io;
+#[cfg(feature = "watermark")]
+pub mod watermark;
 
 mod error;
 mod fp;

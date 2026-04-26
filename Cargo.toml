@@ -23,7 +23,7 @@ std = ["dep:symphonia"]
 neural = ["std"]
 
 # AudioSeal-compatible watermark detector. Requires std.
-watermark = ["std"]
+watermark = ["std", "dep:tract-onnx", "dep:ndarray"]
 
 # Install mimalloc as the process-wide #[global_allocator]. Requires std.
 # Off by default because libraries should not pick the allocator on behalf of
@@ -39,6 +39,8 @@ num-complex = { version = "0.4", default-features = false, features = ["libm"] }
 realfft     = { version = "3.4", default-features = false }
 bytemuck    = { version = "1.18", features = ["derive"] }
 symphonia   = { version = "0.5", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm"], optional = true }
+tract-onnx  = { version = "0.21", optional = true }
+ndarray     = { version = "0.16", default-features = false, optional = true }
 
 [dev-dependencies]
 approx = "0.5"
