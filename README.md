@@ -192,7 +192,16 @@ F[n][b] = ((E[n][b] − E[n][b+1]) − (E[n−1][b] − E[n−1][b+1])) > 0
 
 ## Performance
 
-A criterion benchmark harness is on the roadmap. Design notes on the hot path:
+Measured on Intel i5-1135G7 (4 cores, 8 threads, 2.40 GHz) with `cargo
+bench --bench extract`:
+
+| Algorithm  | 2 s of audio | 5 s   | 30 s  | Realtime factor (30 s) |
+| ---------- | ------------ | ----- | ----- | ---------------------- |
+| `Wang`     | 5.6 ms       | 15.9 ms | 109 ms | 275×                |
+| `Panako`   | 5.8 ms       | 15.7 ms | 109 ms | 275×                |
+| `Haitsma`  | 3.1 ms       | 9.0 ms  | 65 ms  | 462×                |
+
+Hot-path design notes:
 
 - All three classical fingerprinters share the same Hann-windowed STFT and Lemire monotonic-deque peak picker (amortised O(N · M)), so cost is dominated by the FFT.
 - Streaming `push` reuses pre-allocated scratch; no allocation per frame after the initial ring is sized.
@@ -204,9 +213,10 @@ A criterion benchmark harness is on the roadmap. Design notes on the hot path:
 | `StreamingPanako`   | 2 784 ms       | Wider target zone (96 frames vs Wang's 63)             |
 | `StreamingHaitsma`  | 409 ms         | No peak picker → bounded by `n_fft / sr`               |
 
-Run benchmarks (once the harness lands):
+Run benchmarks for your own host:
 ```bash
-cargo bench
+cargo bench --bench extract
+cargo bench --bench extract -- --save-baseline main   # save for diffing later
 ```
 
 ### Memory Safety

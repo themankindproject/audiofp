@@ -19,3 +19,5 @@ cobertura.xml
 # Local env
 .env
 .env.local
+.recon/
+.mcp.json

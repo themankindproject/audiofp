@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-27
+
+### Added
+
+- **Criterion benchmark harness** (`benches/extract.rs`). Runs each
+  classical fingerprinter (`Wang`, `Panako`, `Haitsma`) over 2 s, 5 s,
+  and 30 s of deterministic synthetic input. Reproducible numbers via a
+  seeded xorshift32 generator (matching the regression-golden test's
+  input). Run with `cargo bench --bench extract`.
+
+### Changed
+
+- **README performance section** replaces the previous "design notes"
+  placeholder with measured numbers from the criterion harness on
+  Intel i5-1135G7 (2.40 GHz). Sample timings: Wang/Panako 30 s in
+  ≈ 109 ms (≈ 275× realtime), Haitsma 30 s in ≈ 65 ms (≈ 462× realtime).
+
 ## [0.1.0] - 2026-04-26
 
 Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
@@ -123,5 +140,6 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/themankindproject/audiofp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/themankindproject/audiofp/releases/tag/v0.1.0

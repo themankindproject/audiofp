@@ -1,6 +1,6 @@
 [package]
 name         = "audiofp"
-version      = "0.1.0"
+version      = "0.1.1"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
@@ -42,8 +42,13 @@ symphonia   = { version = "0.5.5", default-features = false, features = ["mp3", 
 tract-onnx  = { version = "0.22.1", optional = true }
 
 [dev-dependencies]
-approx = "0.5.1"
-hound  = "3.5.1"
+approx    = "0.5.1"
+hound     = "3.5.1"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name    = "extract"
+harness = false
 
 [lib]
 name = "audiofp"
