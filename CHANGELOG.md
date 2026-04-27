@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeded xorshift32 generator (matching the regression-golden test's
   input). Run with `cargo bench --bench extract`.
 
+- **Synthetic robustness tests** (`tests/robustness.rs`). Six tests
+  verifying each classical fingerprinter retains a calibrated minimum
+  hash overlap (Jaccard for Wang/Panako, bit similarity for Haitsma)
+  under two reproducible perturbations: SNR-based additive noise and
+  a 1-pole IIR lowpass. Synthetic only — real codec round-trips
+  (MP3/AAC/Opus through ffmpeg) are still on the roadmap.
+
 ### Changed
 
 - **README performance section** replaces the previous "design notes"
