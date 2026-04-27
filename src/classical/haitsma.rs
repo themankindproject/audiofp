@@ -26,9 +26,7 @@ use libm::powf;
 
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{
-    AfpError, AudioBuffer, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs,
-};
+use crate::{AfpError, AudioBuffer, Fingerprinter, Result, StreamingFingerprinter, TimestampMs};
 
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
 #[derive(Clone, Debug)]
@@ -165,21 +163,24 @@ impl Fingerprinter for Haitsma {
             });
         }
 
-        let spec = self.stft.magnitude(audio.samples);
-        if spec.len() < 2 {
+        // Pull power directly — band energy is `Σ |X|²`, so the previous
+        // path's `m * m` after a `sqrt(|X|²)` was redundant.
+        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
+        if n_frames < 2 {
             return Ok(HaitsmaFingerprint {
                 frames: Vec::new(),
                 frames_per_sec: HAITSMA_FRAMES_PER_SEC,
             });
         }
 
-        // Compute per-frame band energies (power, not magnitude).
-        let mut energies: Vec<[f32; HAITSMA_N_BANDS]> = Vec::with_capacity(spec.len());
-        for frame in &spec {
+        // Compute per-frame band energies.
+        let mut energies: Vec<[f32; HAITSMA_N_BANDS]> = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (bin, &m) in frame.iter().enumerate() {
+            for (bin, &p) in row.iter().enumerate() {
                 if let Some(b) = self.bin_to_band[bin] {
-                    e[b as usize] += m * m;
+                    e[b as usize] += p;
                 }
             }
             energies.push(e);
@@ -260,12 +261,36 @@ fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<Option<u8>> {
 /// reruns the offline pipeline on each push. Because Haitsma has no
 /// peak picker or per-second adaptive thresholding, an incremental
 /// implementation is straightforward and a future optimization.
+/// Streaming Haitsma–Kalker — fully incremental.
+///
+/// Trivially incremental: each output bit-frame depends only on the
+/// current and previous frames' band energies, so we just keep one
+/// previous-frame energy vector. No spectrogram window, no peak picker,
+/// no per-second adaptive threshold. Per-push CPU cost is proportional
+/// to the number of new samples, independent of total stream length.
+///
+/// Output is bit-exactly equivalent to [`Haitsma::extract`].
 pub struct StreamingHaitsma {
     cfg: HaitsmaConfig,
-    accumulated: Vec<f32>,
-    /// First frame index (1-based, since frame 0 has no hash) whose hash
-    /// has not yet been emitted.
+
+    stft: ShortTimeFFT,
+    sample_carry: Vec<f32>,
+    bin_to_band: Vec<Option<u8>>,
+
+    /// Per-bin scratch for one frame's power spectrum.
+    frame_power: Vec<f32>,
+
+    /// Whether we've seen any frame at all (frame 0 has no hash but we
+    /// still need its band energies as the "prev" for frame 1).
+    has_prev: bool,
+    prev_energy: [f32; HAITSMA_N_BANDS],
+
+    /// Next absolute frame index whose hash hasn't been emitted yet
+    /// (1-based — frame 0 has no hash).
     next_frame_idx: u32,
+
+    /// Output frames produced but not yet drained (incremental push).
+    pending: Vec<(TimestampMs, u32)>,
 }
 
 impl Default for StreamingHaitsma {
@@ -278,10 +303,24 @@ impl StreamingHaitsma {
     /// Build a streaming Haitsma extractor with the given config.
     #[must_use]
     pub fn new(cfg: HaitsmaConfig) -> Self {
+        let stft = ShortTimeFFT::new(StftConfig {
+            n_fft: HAITSMA_N_FFT,
+            hop: HAITSMA_HOP,
+            window: WindowKind::Hann,
+            center: false,
+        });
+        let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+        let n_bins = stft.n_bins();
         Self {
             cfg,
-            accumulated: Vec::new(),
-            next_frame_idx: 1, // hash index 0 is for frame 1 (first hashable frame)
+            stft,
+            sample_carry: Vec::new(),
+            bin_to_band,
+            frame_power: alloc::vec![0.0_f32; n_bins],
+            has_prev: false,
+            prev_energy: [0.0_f32; HAITSMA_N_BANDS],
+            next_frame_idx: 1,
+            pending: Vec::new(),
         }
     }
 
@@ -290,45 +329,48 @@ impl StreamingHaitsma {
     pub fn config(&self) -> &HaitsmaConfig {
         &self.cfg
     }
-
-    fn drain_all(&mut self) -> Vec<(TimestampMs, u32)> {
-        let mut h = Haitsma::new(self.cfg.clone());
-        let audio = AudioBuffer {
-            samples: &self.accumulated,
-            // SAFETY: 5000 is non-zero.
-            rate: SampleRate::new(HAITSMA_SR).unwrap(),
-        };
-        let result = match h.extract(audio) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut emitted = Vec::new();
-        for (i, &hash) in result.frames.iter().enumerate() {
-            // Frame index in spectrogram terms is i+1 (we skip frame 0).
-            let frame_idx = (i as u32) + 1;
-            if frame_idx >= self.next_frame_idx {
-                let t_ms = (frame_idx as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
-                emitted.push((TimestampMs(t_ms), hash));
-            }
-        }
-        if let Some((_, _)) = emitted.last() {
-            self.next_frame_idx = (result.frames.len() as u32) + 1;
-        }
-        emitted
-    }
 }
 
 impl StreamingFingerprinter for StreamingHaitsma {
     type Frame = u32;
 
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
-        self.accumulated.extend_from_slice(samples);
-        self.drain_all()
+        self.sample_carry.extend_from_slice(samples);
+
+        while self.sample_carry.len() >= HAITSMA_N_FFT {
+            // Compute power, then sum into bands.
+            self.stft
+                .process_frame_power(&self.sample_carry[0..HAITSMA_N_FFT], &mut self.frame_power);
+            let mut e = [0.0_f32; HAITSMA_N_BANDS];
+            for (bin, &p) in self.frame_power.iter().enumerate() {
+                if let Some(b) = self.bin_to_band[bin] {
+                    e[b as usize] += p;
+                }
+            }
+
+            if self.has_prev {
+                // Frame index is 1-based here. Frame N corresponds to
+                // hash index N-1 in the offline output, but absolute
+                // frame index is `next_frame_idx`.
+                let hash = pack_frame_bits(&e, &self.prev_energy);
+                let abs_frame = self.next_frame_idx;
+                let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
+                self.pending.push((TimestampMs(t_ms), hash));
+                self.next_frame_idx += 1;
+            } else {
+                self.has_prev = true;
+            }
+            self.prev_energy = e;
+            self.sample_carry.drain(0..HAITSMA_HOP);
+        }
+
+        core::mem::take(&mut self.pending)
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        self.drain_all()
+        // No buffered partial work — every complete frame has been
+        // emitted by `push`. `pending` holds anything not yet drained.
+        core::mem::take(&mut self.pending)
     }
 
     fn latency_ms(&self) -> u32 {
@@ -341,6 +383,7 @@ impl StreamingFingerprinter for StreamingHaitsma {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
 

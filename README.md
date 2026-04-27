@@ -30,7 +30,7 @@ Perfect for:
 ## Features
 
 - **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
-- **Streaming + Offline Variants** - Every fingerprinter has a `StreamingFingerprinter` impl with bit-exact parity to the offline `extract`
+- **Truly Incremental Streaming (0.2.0)** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` (verified by the test suite at every chunk size).
 - **Bit-Exact Determinism** - Same input always produces the same hashes; verified down to 1-sample-per-push streaming chunks
 - **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization
 - **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
@@ -46,7 +46,7 @@ Perfect for:
 
 ```toml
 [dependencies]
-audiofp = "0.1"
+audiofp = "0.2"
 ```
 
 ### Feature Flags
@@ -61,19 +61,19 @@ audiofp = "0.1"
 Minimal build (no_std + alloc, DSP and classical only):
 ```toml
 [dependencies]
-audiofp = { version = "0.1", default-features = false }
+audiofp = { version = "0.2", default-features = false }
 ```
 
 With watermark detection (pulls in Tract):
 ```toml
 [dependencies]
-audiofp = { version = "0.1", features = ["watermark"] }
+audiofp = { version = "0.2", features = ["watermark"] }
 ```
 
 With mimalloc for a faster global allocator:
 ```toml
 [dependencies]
-audiofp = { version = "0.1", features = ["mimalloc"] }
+audiofp = { version = "0.2", features = ["mimalloc"] }
 ```
 
 ## Quick Start
@@ -167,7 +167,7 @@ Haitsma offline
    - **Wang**: dB log-mag → 31×31 peak picker (capped at 30/s) → anchor-target landmark pairs in `Δt ∈ [1, 63], |Δf| ≤ 64`
    - **Panako**: same front-end → triplet enumeration in cone `Δt < 96, |Δf| < 96` → tempo-invariant β packing
    - **Haitsma**: 33 log-spaced bands (300–2000 Hz) → 32 sign bits per frame from band-difference deltas
-5. **Streaming variants** mirror offline pipelines and emit hashes once each anchor's full lookahead has elapsed, guaranteeing bit-exact equivalence under arbitrary chunking
+5. **Streaming variants** maintain a rolling `2·neighborhood_t + 1`-row spectrogram window and detect peaks frame-by-frame as each ripens; finalise per-second adaptive thresholding bucket-by-bucket; grow per-anchor target heaps incrementally; emit hashes when each anchor's target zone is fully observed. Bit-exact equivalence with offline `extract` is guaranteed under arbitrary chunking — including the 1-sample-per-push pathological case.
 
 ### Hash Layouts
 
@@ -195,11 +195,11 @@ F[n][b] = ((E[n][b] − E[n][b+1]) − (E[n−1][b] − E[n−1][b+1])) > 0
 Measured on Intel i5-1135G7 (4 cores, 8 threads, 2.40 GHz) with `cargo
 bench --bench extract`:
 
-| Algorithm  | 2 s of audio | 5 s   | 30 s  | Realtime factor (30 s) |
-| ---------- | ------------ | ----- | ----- | ---------------------- |
-| `Wang`     | 5.6 ms       | 15.9 ms | 109 ms | 275×                |
-| `Panako`   | 5.8 ms       | 15.7 ms | 109 ms | 275×                |
-| `Haitsma`  | 3.1 ms       | 9.0 ms  | 65 ms  | 462×                |
+| Algorithm  | 30 s of audio | Realtime factor |
+| ---------- | ------------- | --------------- |
+| `Wang`     |  99 ms        | 303×            |
+| `Panako`   | 104 ms        | 288×            |
+| `Haitsma`  |  47 ms        | 638×            |
 
 Hot-path design notes:
 

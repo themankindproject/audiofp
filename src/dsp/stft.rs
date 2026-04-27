@@ -9,6 +9,7 @@
 //! matching the behaviour of `librosa.stft(..., center=True)`.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use libm::sqrtf;
@@ -153,8 +154,45 @@ impl ShortTimeFFT {
     /// Returns an empty `Vec` for empty input.
     #[must_use]
     pub fn magnitude(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
-        if samples.is_empty() {
+        let (flat, n_frames, n_bins) = self.magnitude_flat(samples);
+        if n_frames == 0 {
             return Vec::new();
+        }
+        let mut out = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            out.push(flat[f * n_bins..(f + 1) * n_bins].to_vec());
+        }
+        out
+    }
+
+    /// Compute the **power** spectrogram of `samples` into a single
+    /// contiguous `Vec<f32>` of shape `(n_frames, n_bins)`. Each cell is
+    /// `re² + im²` — equivalent to `magnitude_flat`'s output squared,
+    /// but without the per-bin `sqrt`.
+    ///
+    /// Useful when the next stage applies `log10` (which combines
+    /// algebraically with the missing `sqrt`: `20·log10(sqrt(p)) ==
+    /// 10·log10(p)`) or any other operation that doesn't need the
+    /// magnitude itself. The classical fingerprinters all consume
+    /// `power_flat` for this reason.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
+    ///
+    /// let mut stft = ShortTimeFFT::new(StftConfig::new(1024));
+    /// let samples = vec![1.0_f32; 4096];
+    /// let (power, n_frames, n_bins) = stft.power_flat(&samples);
+    /// assert_eq!(power.len(), n_frames * n_bins);
+    /// // Centre frame's DC bin dominates by orders of magnitude.
+    /// let mid = (n_frames / 2) * n_bins;
+    /// assert!(power[mid] > power[mid + 2] * 1_000.0);
+    /// ```
+    #[must_use]
+    pub fn power_flat(&mut self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
+        if samples.is_empty() {
+            return (Vec::new(), 0, 0);
         }
 
         let n_fft = self.cfg.n_fft;
@@ -168,7 +206,7 @@ impl ShortTimeFFT {
             0
         };
 
-        let mut out = Vec::with_capacity(n_frames);
+        let mut out = vec![0.0_f32; n_frames * n_bins];
 
         for f in 0..n_frames {
             let start = (f * hop) as isize - center_off;
@@ -178,14 +216,112 @@ impl ShortTimeFFT {
                 .process(&mut self.scratch_in, &mut self.scratch_out)
                 .expect("FFT process: input/output length mismatch");
 
-            let mut mag = Vec::with_capacity(n_bins);
-            for c in &self.scratch_out {
-                mag.push(sqrtf(c.norm_sqr()));
+            let row = &mut out[f * n_bins..(f + 1) * n_bins];
+            for (i, c) in self.scratch_out.iter().enumerate() {
+                row[i] = c.norm_sqr();
             }
-            out.push(mag);
         }
 
-        out
+        (out, n_frames, n_bins)
+    }
+
+    /// Compute the magnitude spectrogram of `samples` into a single
+    /// contiguous `Vec<f32>` of shape `(n_frames, n_bins)` (row-major).
+    ///
+    /// Returns `(data, n_frames, n_bins)`. Far cheaper than [`magnitude`]
+    /// for large inputs because it does a single allocation instead of
+    /// one per frame, and it lets downstream consumers slice the
+    /// spectrogram directly without indirection.
+    ///
+    /// [`magnitude`]: ShortTimeFFT::magnitude
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
+    ///
+    /// let mut stft = ShortTimeFFT::new(StftConfig::new(1024));
+    /// let samples = vec![0.0_f32; 16_000];
+    /// let (mag, n_frames, n_bins) = stft.magnitude_flat(&samples);
+    /// assert_eq!(mag.len(), n_frames * n_bins);
+    /// assert_eq!(n_bins, 513);
+    /// ```
+    #[must_use]
+    pub fn magnitude_flat(&mut self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
+        if samples.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+
+        let n_fft = self.cfg.n_fft;
+        let hop = self.cfg.hop;
+        let n_frames = self.n_frames(samples.len());
+        let n_bins = self.n_bins();
+
+        let center_off = if self.cfg.center {
+            (n_fft / 2) as isize
+        } else {
+            0
+        };
+
+        let mut out = vec![0.0_f32; n_frames * n_bins];
+
+        for f in 0..n_frames {
+            let start = (f * hop) as isize - center_off;
+            self.fill_windowed(samples, start);
+
+            self.fft
+                .process(&mut self.scratch_in, &mut self.scratch_out)
+                .expect("FFT process: input/output length mismatch");
+
+            let row = &mut out[f * n_bins..(f + 1) * n_bins];
+            for (i, c) in self.scratch_out.iter().enumerate() {
+                row[i] = sqrtf(c.norm_sqr());
+            }
+        }
+
+        (out, n_frames, n_bins)
+    }
+
+    /// Streaming variant: window one `n_fft`-sized frame and emit its
+    /// **power** spectrum (`re² + im²`) into `out` (`n_bins` long).
+    ///
+    /// Same as [`process_frame`] but skips the per-bin `sqrt`. Useful in
+    /// the streaming fingerprinter front-ends, where every step downstream
+    /// applies `log10` (or band-summing) and absorbing the `sqrt` is a
+    /// simple constant adjustment.
+    ///
+    /// [`process_frame`]: ShortTimeFFT::process_frame
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frame.len() != n_fft` or `out.len() != n_bins`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
+    ///
+    /// let mut stft = ShortTimeFFT::new(StftConfig::new(256));
+    /// let frame = vec![0.0_f32; 256];
+    /// let mut out = vec![0.0_f32; 129]; // n_fft/2 + 1
+    /// stft.process_frame_power(&frame, &mut out);
+    /// assert!(out.iter().all(|&p| p == 0.0)); // silent input → zero power
+    /// ```
+    pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) {
+        assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
+        assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
+
+        for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {
+            self.scratch_in[i] = s * w;
+        }
+
+        self.fft
+            .process(&mut self.scratch_in, &mut self.scratch_out)
+            .expect("FFT process: input/output length mismatch");
+
+        for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
+            *o = c.norm_sqr();
+        }
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
@@ -214,10 +350,28 @@ impl ShortTimeFFT {
     /// Fill `scratch_in` with `samples[start..start+n_fft] * window`,
     /// reflecting indices that fall outside `samples` when the config
     /// uses centred framing.
+    ///
+    /// Hot-path optimised: when the window slot lives entirely inside
+    /// the input buffer (which is true for almost every frame in any
+    /// non-edge audio), we take a fast path with no per-sample bounds
+    /// or reflect check.
     fn fill_windowed(&mut self, samples: &[f32], start: isize) {
         let n_fft = self.cfg.n_fft;
         let len = samples.len();
 
+        // Fast inner path — window slot fully inside `samples`.
+        if start >= 0 && (start as usize).saturating_add(n_fft) <= len {
+            let s_off = start as usize;
+            let src = &samples[s_off..s_off + n_fft];
+            let win = &self.window[..n_fft];
+            let dst = &mut self.scratch_in[..n_fft];
+            for i in 0..n_fft {
+                dst[i] = src[i] * win[i];
+            }
+            return;
+        }
+
+        // Slow path — at the buffer edges, with bounds + reflect check.
         for k in 0..n_fft {
             let idx = start + k as isize;
             let s = if (0..len as isize).contains(&idx) {

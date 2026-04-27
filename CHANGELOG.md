@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-27
+
+A performance-focused minor release, driven by a hot-path audit using
+the recon code-intelligence MCP server.
+
+### Performance
+
+Measured on Intel i5-1135G7 (2.40 GHz) over a 30 s synthetic input:
+
+| Algorithm | 0.1.1   | 0.2.0   | Δ        |
+| --------- | ------- | ------- | -------- |
+| Wang      | 109 ms  |  99 ms  | **-9.6 %**  |
+| Panako    | 109 ms  | 104 ms  | **-4.7 %**  |
+| Haitsma   |  65 ms  |  47 ms  | **-27.4 %** |
+
+Wins compound across the 7 changes below; Haitsma sees the biggest lift
+because it's FFT-bound and benefits most from the new contiguous
+spectrogram and skip-sqrt path.
+
+### Added
+
+- `dsp::stft::ShortTimeFFT::magnitude_flat` — returns the magnitude
+  spectrogram as a single contiguous `Vec<f32>` of shape
+  `(n_frames, n_bins)` plus the dimensions, instead of the
+  per-frame-allocated `Vec<Vec<f32>>` that `magnitude` returns. One
+  allocation per call instead of one per frame, and downstream consumers
+  can slice it without indirection.
+- `dsp::stft::ShortTimeFFT::power_flat` — same shape but emits
+  `re² + im²` instead of `sqrt(re² + im²)`, useful when the next stage
+  is `log10` (since `20·log10(sqrt(p)) ≡ 10·log10(p)`) or any
+  power-domain operation. Saves a per-bin `sqrt` over the entire
+  spectrogram.
+
+### Changed
+
+- **Breaking:** `dsp::peaks::PeakPicker::pick` now takes `&mut self` so
+  it can re-use its internal scratch buffers across calls. If you
+  previously held a `PeakPicker` behind `&self`, store it as
+  `Mutex<PeakPicker>` or use one picker per producing thread. This
+  eliminates three `Vec::new() + resize()` allocations per `pick`
+  invocation.
+- **Hash output regenerated.** `Wang`, `Panako`, and `Haitsma` now
+  consume `power_flat` directly and apply the algebraically-equivalent
+  `10·log10(power)` instead of `20·log10(sqrt(power))`. The two forms
+  agree mathematically, but `f32` rounding through one less operation
+  produces last-bit differences in the resulting hashes. Goldens in
+  `tests/goldens/{wang_v1,panako_v2,haitsma_v1}.bin` were regenerated.
+- `dsp::stft::ShortTimeFFT::fill_windowed` takes a fast inner path with
+  no per-sample bounds or reflect check when the window slot lives
+  entirely inside the input buffer (≈ 99 % of frames in any non-edge
+  audio). Slow path retained for the boundary cases.
+- `Wang`, `Panako`, and `Haitsma` cache a `PeakPicker` (and pooled
+  log-magnitude `Vec<f32>`) as struct fields instead of constructing
+  them on every `extract` call.
+- `Wang::build_hashes` and `Panako::build_triplet_hashes` now use a
+  size-bounded `BinaryHeap` (`O(N log K)`) for the per-anchor top-K
+  selection instead of a full sort followed by `truncate`
+  (`O(N log N)`). Output is unchanged because the kept K elements are
+  re-sorted deterministically before emission.
+
+- **`StreamingWang`, `StreamingPanako`, and `StreamingHaitsma` are now
+  fully incremental.** The previous implementation re-ran the entire
+  offline pipeline on every push (`O(N²)` total CPU in stream length).
+  The new implementation:
+
+  - Wang / Panako: maintain a rolling log-power spectrogram window of
+    `2·neighborhood_t + 1` rows; detect peaks frame-by-frame as each
+    becomes ripe (full forward neighbourhood visible); accumulate
+    candidates per 1-second bucket and finalise them with the offline
+    adaptive threshold once the next bucket starts; grow per-anchor
+    target heaps incrementally; emit hashes when an anchor's target
+    zone is fully observed.
+  - Haitsma: trivially incremental — each output bit-frame depends only
+    on the current and previous frames' band energies, so we keep one
+    32-element `prev_energy` array and emit immediately per new frame.
+
+  Per-push CPU is now proportional to the number of new samples,
+  independent of total stream length. **Bit-exact equivalence with
+  `extract` is preserved — verified by the existing equivalence tests
+  including the 1-sample-per-push pathological case.**
+
 ## [0.1.1] - 2026-04-27
 
 ### Added
@@ -147,6 +228,7 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/themankindproject/audiofp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/themankindproject/audiofp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/themankindproject/audiofp/releases/tag/v0.1.0

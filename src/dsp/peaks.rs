@@ -9,6 +9,7 @@
 //! independent of the neighbourhood size.
 
 use alloc::collections::VecDeque;
+#[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -67,7 +68,7 @@ impl Default for PeakPickerConfig {
 /// let mut spec = vec![0.0_f32; 64];
 /// spec[3 * 8 + 4] = 1.0;
 ///
-/// let picker = PeakPicker::new(PeakPickerConfig {
+/// let mut picker = PeakPicker::new(PeakPickerConfig {
 ///     neighborhood_t: 1,
 ///     neighborhood_f: 1,
 ///     min_magnitude: 0.1,
@@ -79,13 +80,25 @@ impl Default for PeakPickerConfig {
 /// ```
 pub struct PeakPicker {
     cfg: PeakPickerConfig,
+    /// Pooled scratch — re-used across `pick` calls instead of allocating
+    /// fresh buffers every time.
+    max_buf: Vec<f32>,
+    temp_2d: Vec<f32>,
+    col_in: Vec<f32>,
+    col_out: Vec<f32>,
 }
 
 impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            max_buf: Vec::new(),
+            temp_2d: Vec::new(),
+            col_in: Vec::new(),
+            col_out: Vec::new(),
+        }
     }
 
     /// Borrow the configuration.
@@ -98,9 +111,13 @@ impl PeakPicker {
     ///
     /// `frames_per_sec` is used only for the per-second adaptive threshold.
     /// Output is sorted by `(t_frame, f_bin)`.
-    #[must_use]
+    ///
+    /// **Note (0.2.0):** this method now takes `&mut self` so it can re-use
+    /// scratch buffers across calls. If you previously held a `PeakPicker`
+    /// behind `&self`, store it as `Mutex<PeakPicker>` or use one picker
+    /// per producing thread.
     pub fn pick(
-        &self,
+        &mut self,
         spec: &[f32],
         n_frames: usize,
         n_bins: usize,
@@ -111,14 +128,26 @@ impl PeakPicker {
         }
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
 
-        let mut max_buf = vec![0.0_f32; spec.len()];
-        rolling_max_2d(
+        // Resize pooled scratch (no-op when capacity already covers it).
+        self.max_buf.clear();
+        self.max_buf.resize(spec.len(), 0.0);
+        self.temp_2d.clear();
+        self.temp_2d.resize(spec.len(), 0.0);
+        self.col_in.clear();
+        self.col_in.resize(n_frames, 0.0);
+        self.col_out.clear();
+        self.col_out.resize(n_frames, 0.0);
+
+        rolling_max_2d_pooled(
             spec,
             n_frames,
             n_bins,
             self.cfg.neighborhood_t,
             self.cfg.neighborhood_f,
-            &mut max_buf,
+            &mut self.max_buf,
+            &mut self.temp_2d,
+            &mut self.col_in,
+            &mut self.col_out,
         );
 
         let mut candidates: Vec<Peak> = Vec::new();
@@ -128,7 +157,7 @@ impl PeakPicker {
                 let v = spec[idx];
                 // A cell is a local maximum iff it equals the rolling max
                 // value at its own location (and is above the floor).
-                if v > self.cfg.min_magnitude && v >= max_buf[idx] {
+                if v > self.cfg.min_magnitude && v >= self.max_buf[idx] {
                     candidates.push(Peak {
                         t_frame: t as u32,
                         f_bin: f as u16,
@@ -178,10 +207,48 @@ fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize)
     kept
 }
 
-/// 2-D rolling max, computed separably (max-along-cols → max-along-rows).
+/// 2-D rolling max with caller-provided scratch buffers (no allocation).
 ///
-/// `output[r*n_cols + c] = max over the (2·kt+1) × (2·kf+1) box centred on (r, c)`,
-/// clipped at the array boundary.
+/// All scratch slices must already be sized: `temp` and `output` to
+/// `n_rows * n_cols`; `col_in` and `col_out` to `n_rows`.
+#[allow(clippy::too_many_arguments)] // private helper, bundling would obscure intent
+pub(crate) fn rolling_max_2d_pooled(
+    input: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+    kt: usize,
+    kf: usize,
+    output: &mut [f32],
+    temp: &mut [f32],
+    col_in: &mut [f32],
+    col_out: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), n_rows * n_cols);
+    debug_assert_eq!(output.len(), n_rows * n_cols);
+    debug_assert_eq!(temp.len(), n_rows * n_cols);
+    debug_assert_eq!(col_in.len(), n_rows);
+    debug_assert_eq!(col_out.len(), n_rows);
+
+    for r in 0..n_rows {
+        let row_in = &input[r * n_cols..(r + 1) * n_cols];
+        let row_out = &mut temp[r * n_cols..(r + 1) * n_cols];
+        rolling_max_1d(row_in, kf, row_out);
+    }
+
+    for c in 0..n_cols {
+        for r in 0..n_rows {
+            col_in[r] = temp[r * n_cols + c];
+        }
+        rolling_max_1d(col_in, kt, col_out);
+        for r in 0..n_rows {
+            output[r * n_cols + c] = col_out[r];
+        }
+    }
+}
+
+/// Allocating wrapper around [`rolling_max_2d_pooled`]; kept for the
+/// brute-force-comparison test.
+#[cfg(test)]
 fn rolling_max_2d(
     input: &[f32],
     n_rows: usize,
@@ -312,7 +379,7 @@ mod tests {
         let mut spec = vec![0.0_f32; n_frames * n_bins];
         spec[5 * n_bins + 7] = 0.9;
 
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 2,
             neighborhood_f: 2,
             min_magnitude: 0.1,
@@ -330,7 +397,7 @@ mod tests {
         let mut spec = vec![0.0_f32; 64];
         spec[10] = 0.05; // below floor
         spec[20] = 0.5; // above
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
             min_magnitude: 0.1,
@@ -351,7 +418,7 @@ mod tests {
         spec[20 * n_bins + 4] = 0.5;
         spec[5 * n_bins + 2] = 0.4;
 
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
             min_magnitude: 0.1,
@@ -376,7 +443,7 @@ mod tests {
             spec[t * n_bins + 4] = (i as f32) + 1.0;
         }
 
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 2,
             neighborhood_f: 2,
             min_magnitude: 0.1,
@@ -399,7 +466,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty() {
-        let picker = PeakPicker::new(PeakPickerConfig::default());
+        let mut picker = PeakPicker::new(PeakPickerConfig::default());
         assert!(picker.pick(&[], 0, 0, 62.5).is_empty());
     }
 
@@ -416,7 +483,7 @@ mod tests {
                 spec[t * n_bins + f] = 1.0;
             }
         }
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
             min_magnitude: 0.1,
@@ -430,7 +497,7 @@ mod tests {
     fn boundary_peak_at_corner_is_picked() {
         let mut spec = vec![0.0_f32; 16 * 16];
         spec[0] = 1.0;
-        let picker = PeakPicker::new(PeakPickerConfig {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 3,
             neighborhood_f: 3,
             min_magnitude: 0.1,

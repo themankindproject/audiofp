@@ -33,7 +33,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.1"
+audiofp = "0.2"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -159,6 +159,12 @@ pub trait StreamingFingerprinter {
 `push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
 
 > **Bit-exact guarantee.** Feeding the same audio in any chunking pattern (including 1-sample-per-push) produces the identical hash multiset as a single `Fingerprinter::extract` over the full buffer.
+>
+> **0.2.0 incremental streaming.** Wang/Panako keep a rolling
+> `2·neighborhood_t + 1`-row spectrogram window and detect peaks
+> frame-by-frame as each ripens; Haitsma keeps a single previous-frame
+> band-energy vector. Per-push CPU is proportional to the new samples
+> only — independent of total stream length.
 
 ### Shared value types
 
@@ -481,7 +487,7 @@ Available with the `watermark` feature. Wraps `tract-onnx` to run an AudioSeal-c
 
 ```toml
 [dependencies]
-audiofp = { version = "0.1", features = ["watermark"] }
+audiofp = { version = "0.2", features = ["watermark"] }
 ```
 
 ### `WatermarkConfig`
@@ -563,6 +569,33 @@ println!("{} frames × {} bins", spec.len(), stft.n_bins());
 
 Streaming `process_frame` lets you feed exactly `n_fft` samples and get one spectrum without allocating per call.
 
+**0.2.0 fast-path methods:**
+
+```rust
+use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
+
+let mut stft = ShortTimeFFT::new(StftConfig::new(2048));
+let samples: Vec<f32> = vec![0.0; 16_000];
+
+// Single contiguous Vec<f32> of shape (n_frames, n_bins).
+let (mag, n_frames, n_bins) = stft.magnitude_flat(&samples);
+assert_eq!(mag.len(), n_frames * n_bins);
+
+// Power (|X|²) — skips the per-bin sqrt. Pair with 10·log10(p) instead
+// of 20·log10(sqrt(p)) for an algebraically identical log result.
+let (pow, _, _) = stft.power_flat(&samples);
+assert_eq!(pow.len(), mag.len());
+
+// Per-frame streaming variant of power_flat.
+let frame = vec![0.0_f32; 2048];
+let mut out = vec![0.0_f32; stft.n_bins()];
+stft.process_frame_power(&frame, &mut out);
+```
+
+The classical fingerprinters all use `power_flat` / `process_frame_power`
+internally — they avoid `O(N · M)` `sqrt` calls per spectrogram, a
+notable win on the FFT-bound Haitsma path.
+
 ### `dsp::mel`
 
 ```rust
@@ -599,6 +632,11 @@ let peaks: Vec<Peak> = picker.pick(&magnitude_spec, n_frames, n_bins, frames_per
 ```
 
 2-D rolling max via Lemire's monotonic deque, amortised O(N · M) regardless of neighbourhood size.
+
+> **0.2.0 breaking change.** `PeakPicker::pick` now takes `&mut self` so
+> it can re-use its rolling-max scratch across calls. If you previously
+> held a `PeakPicker` behind `&self`, store it as `Mutex<PeakPicker>` or
+> use one picker per producing thread.
 
 ### `dsp::resample`
 
@@ -743,14 +781,21 @@ It's there as a baseline. Use `SincResampler` for anything user-facing — the a
 
 ```toml
 [dependencies]
-audiofp = { version = "0.1", features = ["mimalloc"] }
+audiofp = { version = "0.2", features = ["mimalloc"] }
 ```
 
 This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary or in `default = ["std", "mimalloc"]` if you're vendoring `audiofp`.
 
-### 6. Streaming hot path is allocation-free
+### 6. Streaming hot path is allocation-free and truly incremental (0.2.0+)
 
-After the first push warms up internal scratch buffers, `StreamingFingerprinter::push` does no allocations on the hot path. Safe to call from realtime audio threads, though running the offline pipeline once per push (the current implementation strategy for bit-exact parity) means CPU usage scales linearly with pushes.
+After the first push warms up internal scratch buffers,
+`StreamingFingerprinter::push` does no allocations on the hot path.
+**The streaming impls are now genuinely incremental** — Wang and Panako
+maintain a rolling spectrogram window of `2·neighborhood_t + 1` rows
+and detect peaks frame-by-frame as each becomes ripe; Haitsma keeps
+just one previous-frame band-energy array. Per-push CPU is proportional
+to the number of new samples, **not** to total stream length. Safe to
+call from realtime audio threads.
 
 ---
 
@@ -767,7 +812,7 @@ After the first push warms up internal scratch buffers, `StreamingFingerprinter:
 
 ```toml
 [dependencies]
-audiofp = { version = "0.1", default-features = false }
+audiofp = { version = "0.2", default-features = false }
 ```
 
 This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::watermark`), and `mimalloc`. The DSP primitives and classical fingerprinters all remain available.
@@ -776,7 +821,7 @@ This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::wate
 
 ```toml
 [dependencies]
-audiofp = { version = "0.1", default-features = false, features = ["watermark"] }
+audiofp = { version = "0.2", default-features = false, features = ["watermark"] }
 ```
 
 `watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without Symphonia.
@@ -789,7 +834,7 @@ The DSP primitives and classical fingerprinters compile under `no_std + alloc`:
 
 ```toml
 [dependencies]
-audiofp = { version = "0.1", default-features = false }
+audiofp = { version = "0.2", default-features = false }
 ```
 
 In your crate root:
@@ -829,7 +874,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Links
 
-- [Crates.io](https://crates.io/crates/audiofp) — *(pending first publish)*
-- [Documentation](https://docs.rs/audiofp) — *(pending first publish)*
+- [Crates.io](https://crates.io/crates/audiofp)
+- [Documentation](https://docs.rs/audiofp)
 - [Repository](https://github.com/themankindproject/audiofp)
 - [Changelog](CHANGELOG.md)

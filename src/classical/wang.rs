@@ -26,9 +26,7 @@ use libm::log10f;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{
-    AfpError, AudioBuffer, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs,
-};
+use crate::{AfpError, AudioBuffer, Fingerprinter, Result, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target landmark pair packed into a 32-bit hash.
 #[repr(C)]
@@ -86,6 +84,10 @@ const WANG_FRAMES_PER_SEC: f32 = WANG_SR as f32 / WANG_HOP as f32;
 const WANG_FREQ_BUCKETS: u32 = 512;
 const WANG_PEAK_NEIGHBOURHOOD: usize = 15;
 const WANG_LOG_FLOOR: f32 = 1e-6;
+/// Squared form of the magnitude floor — fed to `log10(power)` instead of
+/// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
+/// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
+const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
 
 /// Wang offline fingerprinter.
 ///
@@ -106,6 +108,11 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 pub struct Wang {
     cfg: WangConfig,
     stft: ShortTimeFFT,
+    /// Cached peak picker — pools its scratch buffers across calls so
+    /// repeated `extract` invocations don't re-allocate.
+    picker: PeakPicker,
+    /// Pooled log-magnitude buffer reused between calls.
+    log_spec: Vec<f32>,
 }
 
 impl Default for Wang {
@@ -126,7 +133,18 @@ impl Wang {
             // frame starts at sample 0 of the input buffer.
             center: false,
         });
-        Self { cfg, stft }
+        let picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: WANG_PEAK_NEIGHBOURHOOD,
+            neighborhood_f: WANG_PEAK_NEIGHBOURHOOD,
+            min_magnitude: cfg.min_anchor_mag_db,
+            target_per_sec: cfg.peaks_per_sec as usize,
+        });
+        Self {
+            cfg,
+            stft,
+            picker,
+            log_spec: Vec::new(),
+        }
     }
 }
 
@@ -161,33 +179,27 @@ impl Fingerprinter for Wang {
             });
         }
 
-        let spec = self.stft.magnitude(audio.samples);
-        let n_frames = spec.len();
+        // Compute power (|X|²) directly from the FFT — skips a per-bin
+        // sqrt that the dB conversion would immediately undo.
+        // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
+        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
         if n_frames == 0 {
             return Ok(WangFingerprint {
                 hashes: Vec::new(),
                 frames_per_sec: WANG_FRAMES_PER_SEC,
             });
         }
-        let n_bins = self.stft.n_bins();
 
-        // Flatten to a row-major dB log-magnitude grid for the peak picker.
-        let mut log_spec = Vec::with_capacity(n_frames * n_bins);
-        for frame in &spec {
-            for &m in frame {
-                log_spec.push(20.0 * log10f(m.max(WANG_LOG_FLOOR)));
-            }
+        // Convert power → dB log-magnitude in-place into the pooled buffer.
+        self.log_spec.clear();
+        self.log_spec.resize(power_flat.len(), 0.0);
+        for (i, &p) in power_flat.iter().enumerate() {
+            self.log_spec[i] = 10.0 * log10f(p.max(WANG_LOG_FLOOR_POWER));
         }
 
-        let picker = PeakPicker::new(PeakPickerConfig {
-            neighborhood_t: WANG_PEAK_NEIGHBOURHOOD,
-            neighborhood_f: WANG_PEAK_NEIGHBOURHOOD,
-            // The "magnitude" field of `Peak` is whatever we feed in here,
-            // so a dB floor goes through unchanged.
-            min_magnitude: self.cfg.min_anchor_mag_db,
-            target_per_sec: self.cfg.peaks_per_sec as usize,
-        });
-        let peaks = picker.pick(&log_spec, n_frames, n_bins, WANG_FRAMES_PER_SEC);
+        let peaks = self
+            .picker
+            .pick(&self.log_spec, n_frames, n_bins, WANG_FRAMES_PER_SEC);
 
         let mut hashes = build_hashes(&peaks, &self.cfg);
         // Stable, deterministic ordering for round-trip and golden tests.
@@ -200,6 +212,36 @@ impl Fingerprinter for Wang {
     }
 }
 
+/// Wrapper that orders `Peak`s such that the **smallest** magnitude (with
+/// the largest position as tiebreak) compares **greatest**. Used as the
+/// element of a max-heap to maintain the top-K largest candidates with
+/// `O(N log K)` work instead of an `O(N log N)` full sort.
+#[derive(Copy, Clone)]
+struct MinByMag<'a>(&'a Peak);
+
+impl PartialEq for MinByMag<'_> {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.mag == o.0.mag && self.0.t_frame == o.0.t_frame && self.0.f_bin == o.0.f_bin
+    }
+}
+impl Eq for MinByMag<'_> {}
+impl PartialOrd for MinByMag<'_> {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for MinByMag<'_> {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        // Reverse mag ordering (smallest first). Reverse position ordering
+        // (largest position first) so the final sort's deterministic
+        // (mag desc, pos asc) ordering still wins for kept elements.
+        o.0.mag
+            .partial_cmp(&self.0.mag)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| (o.0.t_frame, o.0.f_bin).cmp(&(self.0.t_frame, self.0.f_bin)))
+    }
+}
+
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit landmark hashes.
 fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let mut hashes = Vec::with_capacity(peaks.len() * cfg.fan_out as usize);
@@ -207,10 +249,12 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
 
-    let mut targets: Vec<&Peak> = Vec::with_capacity(64);
+    let mut heap: alloc::collections::BinaryHeap<MinByMag> =
+        alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
+    let mut targets: Vec<&Peak> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
-        targets.clear();
+        heap.clear();
         for target in &peaks[i + 1..] {
             let dt = target.t_frame as i32 - anchor.t_frame as i32;
             if dt < 1 {
@@ -225,17 +269,22 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             if df.abs() > target_zone_f {
                 continue;
             }
-            targets.push(target);
+            heap.push(MinByMag(target));
+            if heap.len() > fan_out {
+                // Drop the current smallest — the heap top, by our reversed Ord.
+                heap.pop();
+            }
         }
 
-        // Strongest first; tiebreak on (t, f) for determinism.
+        // Drain the heap and re-sort the kept K for deterministic emission.
+        targets.clear();
+        targets.extend(heap.drain().map(|w| w.0));
         targets.sort_unstable_by(|a, b| {
             b.mag
                 .partial_cmp(&a.mag)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
         });
-        targets.truncate(fan_out);
 
         for target in &targets {
             let f_a_q = quantise_freq(anchor.f_bin);
@@ -257,17 +306,50 @@ fn quantise_freq(bin: u16) -> u32 {
     (bin as u32 * WANG_FREQ_BUCKETS) / 513
 }
 
-/// Streaming Wang fingerprinter.
+/// Owned wrapper around `Peak` whose `Ord` reverses magnitude (and
+/// position tiebreak), so a `BinaryHeap<MinByMagOwned>` of size `K`
+/// behaves as a min-heap that retains the top-K largest peaks.
+#[derive(Copy, Clone)]
+struct MinByMagOwned(Peak);
+
+impl PartialEq for MinByMagOwned {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.mag == o.0.mag && self.0.t_frame == o.0.t_frame && self.0.f_bin == o.0.f_bin
+    }
+}
+impl Eq for MinByMagOwned {}
+impl PartialOrd for MinByMagOwned {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for MinByMagOwned {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        o.0.mag
+            .partial_cmp(&self.0.mag)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| (o.0.t_frame, o.0.f_bin).cmp(&(self.0.t_frame, self.0.f_bin)))
+    }
+}
+
+/// Anchor pending finalisation, with its top-K target heap.
+struct PendingAnchor {
+    peak: Peak,
+    targets: alloc::collections::BinaryHeap<MinByMagOwned>,
+}
+
+/// Streaming Wang fingerprinter — fully incremental.
 ///
-/// Buffers audio internally and emits each [`WangHash`] only once its
-/// anchor's full target zone has been observed. The output hash multiset
-/// matches what [`Wang::extract`] would produce for the same total input.
+/// Maintains a rolling spectrogram window (`2·neighborhood_t + 1` rows),
+/// detects peaks frame-by-frame as they ripen, accumulates per-second
+/// candidate buckets, finalises buckets via the per-second adaptive
+/// threshold, and grows per-anchor target heaps until each anchor's
+/// target zone is fully observed. Per-push CPU cost is proportional to
+/// the number of new frames (not the total stream length).
 ///
-/// **Implementation note:** the current version reruns the offline
-/// pipeline on each push to guarantee bit-exact offline parity. This is
-/// quadratic in stream length; an incremental implementation is on the
-/// roadmap. For now, prefer [`Wang`] for batch jobs and reserve this
-/// variant for short-running captures.
+/// The output hash multiset matches what [`Wang::extract`] would produce
+/// for the same total input — verified by the `streaming_offline_*`
+/// tests, including the 1-sample-per-push pathological case.
 ///
 /// # Example
 ///
@@ -284,9 +366,37 @@ fn quantise_freq(bin: u16) -> u32 {
 /// ```
 pub struct StreamingWang {
     cfg: WangConfig,
-    accumulated: Vec<f32>,
-    /// First frame index whose anchors have *not* yet been emitted.
-    next_anchor_frame: u32,
+
+    // Front-end.
+    stft: ShortTimeFFT,
+    sample_carry: alloc::vec::Vec<f32>,
+
+    // Rolling log-power spectrogram window (contiguous, row-major).
+    // Capacity = `2*nbht + 1` rows.
+    spec: alloc::vec::Vec<f32>,
+    spec_n_rows: usize,
+    spec_n_bins: usize,
+    spec_first_frame: u32,
+
+    // Frame counter and detection cursor.
+    n_frames_total: u32,
+    last_pd_frame: i32,
+
+    // Pooled peak-detection scratch.
+    pd_max: alloc::vec::Vec<f32>,
+    pd_temp: alloc::vec::Vec<f32>,
+    pd_col_in: alloc::vec::Vec<f32>,
+    pd_col_out: alloc::vec::Vec<f32>,
+
+    // Reusable scratch row for STFT output.
+    frame_scratch: alloc::vec::Vec<f32>,
+
+    // Per-second adaptive thresholding.
+    bucket_pending: alloc::collections::BTreeMap<u32, alloc::vec::Vec<Peak>>,
+    last_finalized_bucket: i32,
+
+    // Anchors awaiting finalisation, in t-order.
+    pending_anchors: alloc::collections::VecDeque<PendingAnchor>,
 }
 
 impl Default for StreamingWang {
@@ -299,10 +409,32 @@ impl StreamingWang {
     /// Build a streaming Wang extractor with the given config.
     #[must_use]
     pub fn new(cfg: WangConfig) -> Self {
+        let stft = ShortTimeFFT::new(StftConfig {
+            n_fft: WANG_N_FFT,
+            hop: WANG_HOP,
+            window: WindowKind::Hann,
+            center: false,
+        });
+        let n_bins = stft.n_bins();
+        let window_capacity = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
         Self {
             cfg,
-            accumulated: Vec::new(),
-            next_anchor_frame: 0,
+            stft,
+            sample_carry: alloc::vec::Vec::new(),
+            spec: alloc::vec![0.0_f32; window_capacity * n_bins],
+            spec_n_rows: 0,
+            spec_n_bins: n_bins,
+            spec_first_frame: 0,
+            n_frames_total: 0,
+            last_pd_frame: -1,
+            pd_max: alloc::vec::Vec::new(),
+            pd_temp: alloc::vec::Vec::new(),
+            pd_col_in: alloc::vec::Vec::new(),
+            pd_col_out: alloc::vec::Vec::new(),
+            frame_scratch: alloc::vec![0.0_f32; n_bins],
+            bucket_pending: alloc::collections::BTreeMap::new(),
+            last_finalized_bucket: -1,
+            pending_anchors: alloc::collections::VecDeque::new(),
         }
     }
 
@@ -312,74 +444,278 @@ impl StreamingWang {
         &self.cfg
     }
 
-    /// Number of complete STFT frames currently buffered.
-    fn frames_buffered(&self) -> u32 {
-        if self.accumulated.len() < WANG_N_FFT {
-            0
-        } else {
-            ((self.accumulated.len() - WANG_N_FFT) / WANG_HOP + 1) as u32
-        }
-    }
-
-    /// Frames an anchor must have *after* it before its hashes are stable:
+    /// Frames an anchor must have *after* it before all of its targets
+    /// are observed. Used only for [`latency_ms`] — emission timing in
+    /// the incremental implementation is driven by anchor finalisation.
     ///
-    /// - `target_zone_t` so all candidate targets are visible,
-    /// - `WANG_PEAK_NEIGHBOURHOOD` so the latest target is past the peak
-    ///   picker's confirmation latency,
-    /// - one full second so the per-second adaptive threshold has seen
-    ///   every peak that competes for the bucket. Without this, peaks at
-    ///   the tail briefly survive only to be culled when later peaks
-    ///   arrive in the same bucket.
+    /// [`latency_ms`]: StreamingWang::latency_ms
     fn lookahead_frames(&self) -> u32 {
         self.cfg.target_zone_t as u32
             + WANG_PEAK_NEIGHBOURHOOD as u32
             + WANG_FRAMES_PER_SEC.ceil() as u32
     }
 
-    /// Run the offline pipeline and return hashes whose anchor frame is
-    /// in `[next_anchor_frame, cutoff)`, advancing `next_anchor_frame`.
-    fn drain_up_to(&mut self, cutoff: u32) -> Vec<(TimestampMs, WangHash)> {
-        if cutoff <= self.next_anchor_frame {
-            return Vec::new();
+    /// Append one log-power row to the rolling spec buffer, dropping the
+    /// oldest if the buffer is at capacity.
+    fn append_row(&mut self, row: &[f32]) {
+        debug_assert_eq!(row.len(), self.spec_n_bins);
+        let cap = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
+        if self.spec_n_rows == cap {
+            // Slide everything one row up.
+            self.spec.copy_within(self.spec_n_bins.., 0);
+            self.spec_first_frame += 1;
+            self.spec_n_rows -= 1;
         }
+        let dst_start = self.spec_n_rows * self.spec_n_bins;
+        self.spec[dst_start..dst_start + self.spec_n_bins].copy_from_slice(row);
+        self.spec_n_rows += 1;
+    }
 
-        let mut wang = Wang::new(self.cfg.clone());
-        let audio = AudioBuffer {
-            samples: &self.accumulated,
-            rate: SampleRate::HZ_8000,
-        };
-        let result = match wang.extract(audio) {
-            Ok(r) => r,
-            // Not enough audio yet — wait for the next push.
-            Err(_) => return Vec::new(),
-        };
+    /// Run rolling-max on the current spec buffer and extract peaks at
+    /// rows `[from_row_inclusive, to_row_inclusive]` (in spec-buffer-relative
+    /// indices). Push survivors into [`bucket_pending`].
+    fn detect_rows(&mut self, from_row: usize, to_row: usize) {
+        if self.spec_n_rows == 0 || from_row > to_row {
+            return;
+        }
+        let n_rows = self.spec_n_rows;
+        let n_bins = self.spec_n_bins;
+        let used = n_rows * n_bins;
 
-        let mut emitted = Vec::with_capacity(result.hashes.len());
-        for h in result.hashes {
-            if h.t_anchor >= self.next_anchor_frame && h.t_anchor < cutoff {
-                let t_ms = (h.t_anchor as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
-                emitted.push((TimestampMs(t_ms), h));
+        self.pd_max.clear();
+        self.pd_max.resize(used, 0.0);
+        self.pd_temp.clear();
+        self.pd_temp.resize(used, 0.0);
+        self.pd_col_in.clear();
+        self.pd_col_in.resize(n_rows, 0.0);
+        self.pd_col_out.clear();
+        self.pd_col_out.resize(n_rows, 0.0);
+
+        crate::dsp::peaks::rolling_max_2d_pooled(
+            &self.spec[..used],
+            n_rows,
+            n_bins,
+            WANG_PEAK_NEIGHBOURHOOD,
+            WANG_PEAK_NEIGHBOURHOOD,
+            &mut self.pd_max,
+            &mut self.pd_temp,
+            &mut self.pd_col_in,
+            &mut self.pd_col_out,
+        );
+
+        for row in from_row..=to_row {
+            if row >= n_rows {
+                break;
+            }
+            let abs_f = self.spec_first_frame + row as u32;
+            let bucket = (abs_f as f32 / WANG_FRAMES_PER_SEC) as u32;
+            for bin in 0..n_bins {
+                let idx = row * n_bins + bin;
+                let v = self.spec[idx];
+                if v > self.cfg.min_anchor_mag_db && v >= self.pd_max[idx] {
+                    let peak = Peak {
+                        t_frame: abs_f,
+                        f_bin: bin as u16,
+                        _pad: 0,
+                        mag: v,
+                    };
+                    self.bucket_pending.entry(bucket).or_default().push(peak);
+                }
             }
         }
-        self.next_anchor_frame = cutoff;
+    }
+
+    /// Finalise one bucket: apply per-second adaptive threshold (top
+    /// `peaks_per_sec` by magnitude), then for each surviving peak in
+    /// `(t, f)` order, grow target heaps of older anchors and register
+    /// the peak as a new anchor.
+    fn finalize_bucket(&mut self, bucket: u32) {
+        let mut peaks = match self.bucket_pending.remove(&bucket) {
+            Some(p) => p,
+            None => return,
+        };
+        // Match the offline picker's `adaptive_per_second`: sort by mag
+        // desc only, no positional tiebreak.
+        peaks.sort_unstable_by(|a, b| {
+            b.mag
+                .partial_cmp(&a.mag)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        peaks.truncate(self.cfg.peaks_per_sec as usize);
+        // Re-sort by `(t, f)` so downstream iteration matches the offline
+        // hash builder's order.
+        peaks.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+
+        let target_zone_t = self.cfg.target_zone_t as i32;
+        let target_zone_f = self.cfg.target_zone_f as i32;
+        let fan_out = self.cfg.fan_out as usize;
+
+        for peak in peaks {
+            // Add this peak as a TARGET to every still-pending anchor whose
+            // zone covers it.
+            for anchor in self.pending_anchors.iter_mut() {
+                let dt = peak.t_frame as i32 - anchor.peak.t_frame as i32;
+                if dt < 1 || dt > target_zone_t {
+                    continue;
+                }
+                let df = peak.f_bin as i32 - anchor.peak.f_bin as i32;
+                if df.abs() > target_zone_f {
+                    continue;
+                }
+                anchor.targets.push(MinByMagOwned(peak));
+                if anchor.targets.len() > fan_out {
+                    anchor.targets.pop();
+                }
+            }
+            // Register this peak as a new ANCHOR.
+            self.pending_anchors.push_back(PendingAnchor {
+                peak,
+                targets: alloc::collections::BinaryHeap::with_capacity(fan_out + 1),
+            });
+        }
+        self.last_finalized_bucket = bucket as i32;
+    }
+
+    /// Finalise every bucket whose ALL frames have been peak-detected.
+    /// Conservative: bucket B is finalisable iff `bucket(last_pd_frame) > B`.
+    fn finalize_buckets(&mut self) {
+        if self.last_pd_frame < 0 {
+            return;
+        }
+        let current_bucket = (self.last_pd_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
+        let to_finalize: alloc::vec::Vec<u32> = self
+            .bucket_pending
+            .keys()
+            .filter(|&&b| (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket)
+            .cloned()
+            .collect();
+        for bucket in to_finalize {
+            self.finalize_bucket(bucket);
+        }
+    }
+
+    /// Pop anchors whose target zone is fully observed (i.e. the bucket
+    /// containing the last possible target frame has been finalised),
+    /// build hashes from their accumulated target heap, and return them.
+    fn emit_finalized_anchors(&mut self) -> alloc::vec::Vec<(TimestampMs, WangHash)> {
+        let mut emitted = alloc::vec::Vec::new();
+        while let Some(front) = self.pending_anchors.front() {
+            let last_target_frame = front.peak.t_frame + self.cfg.target_zone_t as u32;
+            let last_target_bucket = (last_target_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
+            if self.last_finalized_bucket < last_target_bucket {
+                break;
+            }
+            let anchor = self.pending_anchors.pop_front().unwrap();
+            self.build_hashes_for_anchor(anchor, &mut emitted);
+        }
         emitted
+    }
+
+    /// Drain an anchor's target heap, sort by `(mag desc, position asc)`
+    /// for deterministic emission, then emit the corresponding hashes.
+    fn build_hashes_for_anchor(
+        &self,
+        anchor: PendingAnchor,
+        out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
+    ) {
+        let mut targets: alloc::vec::Vec<Peak> = anchor.targets.into_iter().map(|w| w.0).collect();
+        targets.sort_unstable_by(|a, b| {
+            b.mag
+                .partial_cmp(&a.mag)
+                .unwrap_or(core::cmp::Ordering::Equal)
+                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
+        });
+        for target in &targets {
+            let f_a_q = quantise_freq(anchor.peak.f_bin);
+            let f_b_q = quantise_freq(target.f_bin);
+            let dt = ((target.t_frame - anchor.peak.t_frame) & 0x3FFF).max(1);
+            let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | (dt & 0x3FFF);
+            let t_ms = (anchor.peak.t_frame as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
+            out.push((
+                TimestampMs(t_ms),
+                WangHash {
+                    hash,
+                    t_anchor: anchor.peak.t_frame,
+                },
+            ));
+        }
     }
 }
 
 impl StreamingFingerprinter for StreamingWang {
     type Frame = WangHash;
 
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
-        self.accumulated.extend_from_slice(samples);
-        let frames = self.frames_buffered();
-        let cutoff = frames.saturating_sub(self.lookahead_frames());
-        self.drain_up_to(cutoff)
+    fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
+        self.sample_carry.extend_from_slice(samples);
+
+        let nbht = WANG_PEAK_NEIGHBOURHOOD as u32;
+
+        // 1. Compute new STFT frames one at a time, detecting peaks at
+        // each frame as soon as it becomes ripe (i.e. its full forward
+        // neighbourhood is in the buffer).
+        while self.sample_carry.len() >= WANG_N_FFT {
+            self.stft
+                .process_frame_power(&self.sample_carry[0..WANG_N_FFT], &mut self.frame_scratch);
+            for v in self.frame_scratch.iter_mut() {
+                *v = 10.0 * libm::log10f(v.max(WANG_LOG_FLOOR_POWER));
+            }
+            // Take ownership of the row data via copy (so we can borrow
+            // `self` mutably for `append_row`).
+            let row_copy: alloc::vec::Vec<f32> = self.frame_scratch.clone();
+            self.append_row(&row_copy);
+
+            let frame_idx = self.n_frames_total;
+            self.n_frames_total += 1;
+            self.sample_carry.drain(0..WANG_HOP);
+
+            // After adding frame `frame_idx`, frame `frame_idx - nbht`
+            // becomes ripe (its forward neighbourhood is now in the
+            // buffer; backward neighbourhood is offline-equivalent
+            // because the buffer's left edge matches the offline
+            // saturating clip when applicable).
+            if frame_idx >= nbht {
+                let abs_ripe = frame_idx - nbht;
+                let row_idx = (abs_ripe - self.spec_first_frame) as usize;
+                self.detect_rows(row_idx, row_idx);
+                self.last_pd_frame = abs_ripe as i32;
+            }
+        }
+
+        // 2. Finalise any buckets whose frames are all detected.
+        self.finalize_buckets();
+
+        // 3. Emit hashes for anchors whose target zone is fully observed.
+        self.emit_finalized_anchors()
     }
 
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        // Emit everything still pending. Using u32::MAX as the cutoff
-        // guarantees we drain to the end of the buffered audio.
-        self.drain_up_to(u32::MAX)
+    fn flush(&mut self) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
+        // Detect peaks at remaining frames (those whose forward context
+        // would otherwise extend past end-of-stream — same boundary the
+        // offline picker handles via `saturating_sub`).
+        if self.spec_n_rows > 0 && self.n_frames_total > 0 {
+            let detect_to_abs = self.n_frames_total as i32 - 1;
+            if detect_to_abs > self.last_pd_frame {
+                let from_abs = (self.last_pd_frame + 1).max(self.spec_first_frame as i32) as u32;
+                let to_abs = detect_to_abs as u32;
+                let from_row = (from_abs - self.spec_first_frame) as usize;
+                let to_row = (to_abs - self.spec_first_frame) as usize;
+                self.detect_rows(from_row, to_row);
+                self.last_pd_frame = detect_to_abs;
+            }
+        }
+
+        // Finalise every remaining bucket — no more peaks can arrive.
+        let buckets: alloc::vec::Vec<u32> = self.bucket_pending.keys().cloned().collect();
+        for bucket in buckets {
+            self.finalize_bucket(bucket);
+        }
+
+        // Emit every remaining anchor — no more targets can arrive.
+        let mut emitted = alloc::vec::Vec::new();
+        while let Some(anchor) = self.pending_anchors.pop_front() {
+            self.build_hashes_for_anchor(anchor, &mut emitted);
+        }
+        emitted
     }
 
     fn latency_ms(&self) -> u32 {
@@ -588,6 +924,34 @@ mod tests {
             remaining -= n;
         }
         out
+    }
+
+    /// Sanity check that the incremental impl emits the *same* hashes
+    /// across a sequence of fixed-size chunks regardless of the chunk
+    /// size — no spurious quadratic state, no per-push artefacts.
+    #[test]
+    fn streaming_chunk_size_invariant() {
+        let samples = synthetic_audio(0xFACE, 8_000 * 4);
+
+        let collect = |chunk_size: usize| -> Vec<WangHash> {
+            let mut s = StreamingWang::default();
+            let mut out = Vec::new();
+            for chunk in samples.chunks(chunk_size) {
+                out.extend(s.push(chunk).into_iter().map(|(_, h)| h));
+            }
+            out.extend(s.flush().into_iter().map(|(_, h)| h));
+            out.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+            out
+        };
+
+        let baseline = collect(8_000);  // 1-second chunks
+        for chunk_size in [128, 1024, 4321, 16_000] {
+            assert_eq!(
+                collect(chunk_size),
+                baseline,
+                "chunk_size = {chunk_size} produced different hashes than 8000",
+            );
+        }
     }
 
     #[test]
