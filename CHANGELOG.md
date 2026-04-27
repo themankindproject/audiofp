@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-27
+
+### Added
+
+- **`examples/hash_matcher.rs`** — runnable demo of the time-aligned
+  voting algorithm that turns Wang landmark hashes into actual
+  fingerprint matching. Multi-track enrollment, per-query Δt-histogram
+  scoring, top-5 results with offset and a confident-match heuristic:
+
+  ```bash
+  cargo run --example hash_matcher --release -- ref1.flac ref2.flac -- query.mp3
+  ```
+
+- **Property-based tests** (`tests/property.rs`) via `proptest`. Four
+  invariants checked under a randomly-generated mix of seed and chunk
+  patterns:
+
+  - `StreamingWang` ↔ `Wang::extract` hash multisets match.
+  - `StreamingPanako` ↔ `Panako::extract` hash multisets match.
+  - `StreamingHaitsma` ↔ `Haitsma::extract` frame sequences match.
+  - `Wang::extract` is deterministic (twice on same input → identical).
+
+  Default 16 cases per property; bump with
+  `PROPTEST_CASES=2000 cargo test --test property`.
+
 ## [0.2.0] - 2026-04-27
 
 A performance-focused minor release, driven by a hot-path audit using
@@ -228,7 +253,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/themankindproject/audiofp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/themankindproject/audiofp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/themankindproject/audiofp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/themankindproject/audiofp/releases/tag/v0.1.0

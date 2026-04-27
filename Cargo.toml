@@ -1,6 +1,6 @@
 [package]
 name         = "audiofp"
-version      = "0.2.0"
+version      = "0.2.1"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
@@ -45,6 +45,7 @@ tract-onnx  = { version = "0.22.1", optional = true }
 approx    = "0.5.1"
 hound     = "3.5.1"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+proptest  = { version = "1.5", default-features = false, features = ["std"] }
 
 [[bench]]
 name    = "extract"
@@ -68,5 +69,9 @@ required-features = ["std"]
 
 [[example]]
 name = "compare_algorithms"
+required-features = ["std"]
+
+[[example]]
+name = "hash_matcher"
 required-features = ["std"]
 
