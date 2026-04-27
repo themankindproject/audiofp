@@ -944,7 +944,7 @@ mod tests {
             out
         };
 
-        let baseline = collect(8_000);  // 1-second chunks
+        let baseline = collect(8_000); // 1-second chunks
         for chunk_size in [128, 1024, 4321, 16_000] {
             assert_eq!(
                 collect(chunk_size),
