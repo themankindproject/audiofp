@@ -21,3 +21,6 @@ cobertura.xml
 .env.local
 .recon/
 .mcp.json
+
+# Local Claude Code project instructions (not published)
+CLAUDE.md
