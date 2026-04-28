@@ -24,7 +24,7 @@ Perfect for:
 - Music identification ("what is this song?")
 - Audio deduplication at scale
 - Royalty / rights enforcement against re-encoded content
-- Cover and remix detection (with neural fingerprinting on the roadmap)
+- Embedding-based similarity search and cover/remix detection (BYO ONNX model via the `neural` feature)
 - Watermark verification on generative-AI audio
 
 ## Features
@@ -36,6 +36,7 @@ Perfect for:
 - **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
 - **High-Quality Resampling** - Built-in windowed-sinc Kaiser resampler with auto anti-aliasing cutoff
 - **Watermark Detection** - AudioSeal-compatible ONNX wrapper (Tract backend)
+- **Neural Embedder (0.3.0)** - Generic ONNX log-mel embedder with offline + streaming modes; build-once-runnable, zero-alloc `try_push_with` callback
 - **DSP Primitives Reusable** - Public `dsp::stft`, `dsp::mel`, `dsp::peaks`, `dsp::resample`, `dsp::windows`
 - **Allocation-Free Hot Path** - Streaming `push` reuses pre-allocated scratch after warmup
 - **`no_std + alloc` Capable** - DSP and classical fingerprinters compile without std (host-only today; bare-metal in roadmap)
@@ -46,7 +47,7 @@ Perfect for:
 
 ```toml
 [dependencies]
-audiofp = "0.2"
+audiofp = "0.3"
 ```
 
 ### Feature Flags
@@ -55,25 +56,31 @@ audiofp = "0.2"
 |---------|---------|-------------|
 | `std` | Yes | Enables `audiofp::io` (Symphonia file decoder) |
 | `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime |
-| `neural` | No | Reserved for the upcoming Phase 5 neural fingerprinter |
+| `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model) |
 | `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` |
 
 Minimal build (no_std + alloc, DSP and classical only):
 ```toml
 [dependencies]
-audiofp = { version = "0.2", default-features = false }
+audiofp = { version = "0.3", default-features = false }
 ```
 
 With watermark detection (pulls in Tract):
 ```toml
 [dependencies]
-audiofp = { version = "0.2", features = ["watermark"] }
+audiofp = { version = "0.3", features = ["watermark"] }
+```
+
+With the neural embedder (pulls in Tract):
+```toml
+[dependencies]
+audiofp = { version = "0.3", features = ["neural"] }
 ```
 
 With mimalloc for a faster global allocator:
 ```toml
 [dependencies]
-audiofp = { version = "0.2", features = ["mimalloc"] }
+audiofp = { version = "0.3", features = ["mimalloc"] }
 ```
 
 ## Quick Start

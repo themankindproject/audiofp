@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-28
+
+A feature release: ships the neural fingerprinting module the `neural`
+feature has been a placeholder for since 0.1, and a measured streaming
+hot-path perf fix in the classical fingerprinters.
+
+### Added
+
+- **`audiofp::neural`** (gated on the `neural` feature) — a generic
+  ONNX log-mel audio embedder. Bring your own model: any ONNX file
+  whose first input is `[1, n_mels, n_frames] f32` and whose first
+  output is a flat `f32` embedding vector works against the documented
+  contract. Two top-level types:
+
+  - `NeuralEmbedder` (impl `Fingerprinter`) for whole-buffer
+    extraction. Slides analysis windows across the input and emits
+    one `NeuralEmbedding { vector, t_start }` per window.
+  - `StreamingNeuralEmbedder` (impl `StreamingFingerprinter`) with
+    a bounded sample carry, `try_push` for error-propagating
+    inference, and **`try_push_with(samples, |t, &[f32]| ...)`** for
+    zero-allocation streaming where the embedding is handed to the
+    callback by reference.
+
+  Reasonable defaults (16 kHz, 1024 FFT, 320 hop, 128 mels, 1 s
+  non-overlapping windows, Slaney mel, Hann window, L2-normalised
+  output) via `NeuralEmbedderConfig::new(model_path)`.
+
+  All expensive work (model typing, optimisation, runnable plan
+  construction) happens **once** in `new()` with a fully-concrete
+  input shape — the watermark detector's per-call `clone +
+  optimize + runnable` pattern is explicitly avoided.
+
+- **`MelFilterBank::log_mel_from_power`** — log-mel from a power
+  spectrum (`re² + im²` per bin). Equivalent to `log_mel(sqrt(p))`
+  but skips the redundant per-bin square when the upstream is
+  `ShortTimeFFT::power_flat` / `process_frame_power`. Verified
+  bit-equivalent to the existing `log_mel` on squared input.
+
+- **Memory-bound regression tests** for all three classical streaming
+  fingerprinters (`streaming_state_stays_bounded_under_long_input` ×
+  3). Push 30 s of audio in 256-sample chunks and assert tight
+  ceilings on every internal buffer, including the rolling spectrogram
+  rows, bucket-pending map, and pending-anchors deque.
+
+- **`benches/streaming.rs`** — Criterion microbenches for the
+  classical streaming push throughput, two patterns each (small
+  256-sample chunks ≈ realtime mic; large 1 s chunks ≈ offline
+  batch). Captures the cost shape that's easy to regress and that
+  gates further perf work.
+
+- **`benches/neural_frontend.rs`** — Criterion microbenches for the
+  neural front-end (log-mel pipeline, strided tensor write, L2
+  normalise). Used to validate the ≥ 5 % bench-driven bar on perf
+  changes; documented the bench-driven decisions in `future.md`.
+
+### Performance
+
+- **`StreamingHaitsma::push` large-chunk: -25 %.** A 1 s push at
+  default config (HAITSMA_HOP = 64, HAITSMA_N_FFT = 2048) used to
+  call `sample_carry.drain(0..HOP)` *inside* the per-frame loop —
+  78 frames × ~5 KB shifted per drain = ~770 KB of cumulative
+  memmove per push. Replaced with an offset cursor and a single
+  drain at the end of the call. Bench: 10.44 ms → 7.78 ms.
+
+- **`StreamingWang::push` and `StreamingPanako::push`** received the
+  same drain-once-per-push refactor *and* lost a per-frame
+  `frame_scratch.clone()` (a fresh `Vec<f32>` allocated every frame
+  purely to satisfy a borrow conflict, replaced with a new
+  `append_frame_scratch_row` method that copies via disjoint field
+  borrow). Both changes are within bench noise at the default config
+  (peak picking dominates per-frame cost there) and were kept on
+  correctness grounds: drain is now O(N) instead of O(N²) per push,
+  and per-frame allocator traffic is gone.
+
+### Changed
+
+- **`neural` feature** now actually pulls in `tract-onnx` and exposes
+  `audiofp::neural`. Previously a no-op placeholder. Users with
+  `default-features = false, features = ["neural"]` will now see the
+  module.
+
+- **Streaming push internals**: `sample_carry` is drained exactly
+  once per `push()` call instead of per frame. No observable
+  semantic change — bit-exactness with `extract` preserved across
+  all chunk sizes (verified by `streaming_chunk_size_invariant` and
+  `streaming_with_one_sample_chunks_still_matches_offline`).
+
+### Documentation
+
+- Updated `future.md` with two new entries: §1.1 (neural fingerprinter)
+  marked done with three deferred follow-ups (batched offline
+  inference, SIMD log-mel matvec, and the bench-driven skip list);
+  §2.8 marked done with §2.8.1 documenting the streaming hot-path fix.
+
 ## [0.2.1] - 2026-04-27
 
 ### Added

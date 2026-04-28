@@ -19,6 +19,7 @@
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
+- [Neural Embedder](#neural-embedder)
 - [DSP Primitives](#dsp-primitives)
 - [Error Handling](#error-handling)
 - [Performance Tips](#performance-tips)
@@ -33,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.2"
+audiofp = "0.3"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -487,7 +488,7 @@ Available with the `watermark` feature. Wraps `tract-onnx` to run an AudioSeal-c
 
 ```toml
 [dependencies]
-audiofp = { version = "0.2", features = ["watermark"] }
+audiofp = { version = "0.3", features = ["watermark"] }
 ```
 
 ### `WatermarkConfig`
@@ -542,6 +543,132 @@ println!("localization length: {} samples", r.localization.len());
    - `[1]`: message bit logits tensor (any shape; first `message_bits` values are read).
 
 Bits are decoded as `logit ≥ 0`. If your AudioSeal export has a different layout, post-process accordingly before feeding it through this wrapper.
+
+---
+
+## Neural Embedder
+
+Available with the `neural` feature (added in 0.3.0). Wraps `tract-onnx` to run a generic ONNX log-mel audio embedder.
+
+```toml
+[dependencies]
+audiofp = { version = "0.3", features = ["neural"] }
+```
+
+### Model contract
+
+`audiofp::neural` works with **any** ONNX model that satisfies:
+
+1. **Input 0** — accepts `[1, n_mels, n_frames] f32`. `n_mels` is whatever you set in `NeuralEmbedderConfig::n_mels`; `n_frames` is fully determined by `(window_samples − n_fft) / hop + 1` (non-centred STFT framing).
+2. **Output 0** — any tensor whose flat length is the embedding dimension. The crate reads `output[0].iter().copied().collect()` and treats the result as the embedding vector. The dimension is discovered automatically by a probe inference at construction time.
+
+The shape is concretised **once at construction** and the model is optimised + made runnable then; per-call work is just the front-end (windowed FFT + log-mel) plus the inference itself. The watermark detector's per-call `clone + optimize + runnable` cycle is explicitly avoided.
+
+### `NeuralEmbedderConfig`
+
+```rust
+pub struct NeuralEmbedderConfig {
+    pub model_path: String,
+    pub sample_rate: u32,        // default 16_000
+    pub n_fft: usize,            // default 1024
+    pub hop: usize,              // default 320 (20 ms at 16 kHz)
+    pub n_mels: usize,           // default 128
+    pub fmin: f32,               // default 0.0
+    pub fmax: f32,               // default sample_rate / 2
+    pub mel_scale: MelScale,     // default Slaney (librosa default)
+    pub window_kind: WindowKind, // default Hann
+    pub window_secs: f32,        // default 1.0  (analysis-window length)
+    pub hop_secs: f32,           // default 1.0  (between successive windows; non-overlapping)
+    pub l2_normalize: bool,      // default true
+}
+```
+
+Constructor with reasonable defaults:
+
+```rust
+use audiofp::neural::NeuralEmbedderConfig;
+
+let cfg = NeuralEmbedderConfig::new("my_model.onnx");
+```
+
+### `NeuralEmbedder` (offline)
+
+```rust
+use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+
+let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
+let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+let fp = emb.extract(buf)?;
+
+println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
+for e in fp.embeddings.iter().take(3) {
+    println!("  t_start={} ms, dim={}", e.t_start.0, e.vector.len());
+}
+```
+
+`NeuralFingerprint` carries one entry per analysis window:
+
+```rust
+pub struct NeuralFingerprint {
+    pub embeddings: Vec<NeuralEmbedding>,
+    pub embedding_dim: usize,
+    pub frames_per_sec: f32,    // 1.0 / hop_secs
+}
+
+pub struct NeuralEmbedding {
+    pub vector: Vec<f32>,       // L2-normalised by default
+    pub t_start: TimestampMs,
+}
+```
+
+### `StreamingNeuralEmbedder` (incremental)
+
+```rust
+use audiofp::neural::{NeuralEmbedderConfig, StreamingNeuralEmbedder};
+use audiofp::StreamingFingerprinter;
+
+let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+
+// Feed 16 kHz mono PCM in arbitrary-sized chunks.
+for chunk in audio_capture_iter() {
+    for (t, vector) in s.push(&chunk) {
+        println!("t={} ms, dim={}", t.0, vector.len());
+    }
+}
+all.extend(s.flush());
+```
+
+`StreamingNeuralEmbedder` exposes three push variants:
+
+| Method                                             | Allocates per emit         | Errors          |
+| -------------------------------------------------- | -------------------------- | --------------- |
+| `push(samples) -> Vec<(TimestampMs, Vec<f32>)>`    | One `Vec<f32>` per emit    | Panics on infer |
+| `try_push(samples) -> Result<Vec<…>>`              | One `Vec<f32>` per emit    | `Result`        |
+| `try_push_with(samples, |t, &[f32]| …) -> Result<usize>` | **Zero** (callback gets `&[f32]`) | `Result`        |
+
+For realtime-friendly streaming, prefer `try_push_with` — the callback receives the embedding by reference, no `Vec` is created per emit, and the embedder reuses a single internal scratch buffer across all emits in one call.
+
+### Bit-exactness
+
+`StreamingNeuralEmbedder::push` is bit-exactly equivalent to `NeuralEmbedder::extract` over the same total input, regardless of how it's chunked. Verified end-to-end by the in-tree passthrough tract fixture across chunk sizes `[1, 7, 17, 256, 1024, 8 191]` and at `hop_secs < window_secs` (overlapping windows).
+
+### Errors
+
+| Failure                                            | Variant                       |
+| -------------------------------------------------- | ----------------------------- |
+| Empty `model_path`, file missing                   | `AfpError::ModelNotFound(_)`  |
+| File present but not parseable as ONNX             | `AfpError::ModelLoad(_)`      |
+| Invalid config (n_fft, hop, sample_rate, …)        | `AfpError::Config(_)`         |
+| `sample_rate` mismatch between buffer and config   | `AfpError::UnsupportedSampleRate(_)` |
+| Buffer shorter than `window_samples`               | `AfpError::AudioTooShort { … }` |
+| Tract typing / optimise / run failure              | `AfpError::Inference(_)`      |
+
+### Notes on model selection
+
+`audiofp::neural` is the runtime; the model is yours. Common public ONNX exports that fit the `[1, n_mels, n_frames]` contract (or fit it after a small reshape op): VGGish, YAMNet (with channel dim removed), OpenL3, audio MAE distillations. For other shapes, a tiny preprocessing op in your ONNX graph is usually enough to make the contract hold.
 
 ---
 
@@ -781,7 +908,7 @@ It's there as a baseline. Use `SincResampler` for anything user-facing — the a
 
 ```toml
 [dependencies]
-audiofp = { version = "0.2", features = ["mimalloc"] }
+audiofp = { version = "0.3", features = ["mimalloc"] }
 ```
 
 This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary or in `default = ["std", "mimalloc"]` if you're vendoring `audiofp`.
@@ -805,14 +932,14 @@ call from realtime audio threads.
 | ------------ | :-----: | ------------------------------------------------------------------------------- |
 | `std`        |   ✅    | Symphonia file decoding helpers (`audiofp::io`)                                     |
 | `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark`                              |
-| `neural`     |         | (Reserved for the upcoming Phase 5 ONNX neural fingerprinter)                   |
+| `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model)  |
 | `mimalloc`   |         | Installs `mimalloc` as the process-wide `#[global_allocator]`                   |
 
 ### Minimal build (no_std + alloc)
 
 ```toml
 [dependencies]
-audiofp = { version = "0.2", default-features = false }
+audiofp = { version = "0.3", default-features = false }
 ```
 
 This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::watermark`), and `mimalloc`. The DSP primitives and classical fingerprinters all remain available.
@@ -821,7 +948,7 @@ This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::wate
 
 ```toml
 [dependencies]
-audiofp = { version = "0.2", default-features = false, features = ["watermark"] }
+audiofp = { version = "0.3", default-features = false, features = ["watermark"] }
 ```
 
 `watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without Symphonia.
@@ -834,7 +961,7 @@ The DSP primitives and classical fingerprinters compile under `no_std + alloc`:
 
 ```toml
 [dependencies]
-audiofp = { version = "0.2", default-features = false }
+audiofp = { version = "0.3", default-features = false }
 ```
 
 In your crate root:
