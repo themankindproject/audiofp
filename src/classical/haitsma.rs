@@ -337,10 +337,17 @@ impl StreamingFingerprinter for StreamingHaitsma {
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.sample_carry.extend_from_slice(samples);
 
-        while self.sample_carry.len() >= HAITSMA_N_FFT {
+        // Walk frames with an offset cursor so we drain `sample_carry`
+        // exactly once at the end of the call, instead of shifting the
+        // whole tail by `HAITSMA_HOP` after every frame. The single-push
+        // frame loop becomes O(frames) instead of O(frames × buffer).
+        let mut off = 0usize;
+        while self.sample_carry.len() - off >= HAITSMA_N_FFT {
             // Compute power, then sum into bands.
-            self.stft
-                .process_frame_power(&self.sample_carry[0..HAITSMA_N_FFT], &mut self.frame_power);
+            self.stft.process_frame_power(
+                &self.sample_carry[off..off + HAITSMA_N_FFT],
+                &mut self.frame_power,
+            );
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
             for (bin, &p) in self.frame_power.iter().enumerate() {
                 if let Some(b) = self.bin_to_band[bin] {
@@ -361,7 +368,11 @@ impl StreamingFingerprinter for StreamingHaitsma {
                 self.has_prev = true;
             }
             self.prev_energy = e;
-            self.sample_carry.drain(0..HAITSMA_HOP);
+            off += HAITSMA_HOP;
+        }
+
+        if off > 0 {
+            self.sample_carry.drain(0..off);
         }
 
         core::mem::take(&mut self.pending)
@@ -656,5 +667,43 @@ mod tests {
         online.extend(streaming.flush().into_iter().map(|(_, h)| h));
 
         assert_eq!(off.frames, online, "streaming != offline frame sequence");
+    }
+
+    #[test]
+    fn streaming_state_stays_bounded_under_long_input() {
+        // 30 s of audio in 256-sample chunks. Haitsma's streaming
+        // state is just `sample_carry` (drained per push) and
+        // `prev_energy` (fixed array); `pending` is `mem::take`d on
+        // every return.
+        let secs = 30usize;
+        let samples = synthetic_audio(13, HAITSMA_SR as usize * secs);
+        let chunk = 256usize;
+
+        let mut s = StreamingHaitsma::default();
+        let mut peak_carry = 0usize;
+
+        let mut start = 0usize;
+        while start < samples.len() {
+            let end = (start + chunk).min(samples.len());
+            let _ = s.push(&samples[start..end]);
+            peak_carry = peak_carry.max(s.sample_carry.len());
+
+            assert!(s.sample_carry.len() < HAITSMA_N_FFT);
+            // `pending` is drained by `mem::take` at the end of every
+            // push, so it must be empty between calls.
+            assert_eq!(s.pending.len(), 0, "pending leaked between pushes");
+            start = end;
+        }
+
+        // sample_carry should reach close to (but never equal) N_FFT
+        // — that's the "almost-a-frame's-worth of leftover" steady state.
+        assert!(peak_carry < HAITSMA_N_FFT, "peak_carry {peak_carry}");
+        assert!(
+            peak_carry >= HAITSMA_N_FFT - HAITSMA_HOP,
+            "expected the carry to fill close to N_FFT under continuous input, got {peak_carry}",
+        );
+
+        let _ = s.flush();
+        assert_eq!(s.pending.len(), 0, "pending after flush");
     }
 }

@@ -428,8 +428,12 @@ impl StreamingPanako {
             + PANAKO_FRAMES_PER_SEC.ceil() as u32
     }
 
-    fn append_row(&mut self, row: &[f32]) {
-        debug_assert_eq!(row.len(), self.spec_n_bins);
+    /// Append the current contents of `self.frame_scratch` to the
+    /// rolling spec buffer, dropping the oldest row if at capacity.
+    /// Avoids the per-frame `Vec::clone` the borrow checker would
+    /// otherwise force on a `(&mut self, &[f32])` signature.
+    fn append_frame_scratch_row(&mut self) {
+        debug_assert_eq!(self.frame_scratch.len(), self.spec_n_bins);
         let cap = 2 * PANAKO_PEAK_NEIGHBOURHOOD + 1;
         if self.spec_n_rows == cap {
             self.spec.copy_within(self.spec_n_bins.., 0);
@@ -437,7 +441,10 @@ impl StreamingPanako {
             self.spec_n_rows -= 1;
         }
         let dst_start = self.spec_n_rows * self.spec_n_bins;
-        self.spec[dst_start..dst_start + self.spec_n_bins].copy_from_slice(row);
+        let n_bins = self.spec_n_bins;
+        // Disjoint borrow of `self.spec` (mut) and `self.frame_scratch`
+        // (shared) — different fields of `self`, so this is sound.
+        self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
         self.spec_n_rows += 1;
     }
 
@@ -614,18 +621,26 @@ impl StreamingFingerprinter for StreamingPanako {
         self.sample_carry.extend_from_slice(samples);
         let nbht = PANAKO_PEAK_NEIGHBOURHOOD as u32;
 
-        while self.sample_carry.len() >= PANAKO_N_FFT {
-            self.stft
-                .process_frame_power(&self.sample_carry[0..PANAKO_N_FFT], &mut self.frame_scratch);
+        // Walk frames with an offset cursor so we drain `sample_carry`
+        // exactly once at the end of the call instead of shifting the
+        // tail by `PANAKO_HOP` after every frame; the loop becomes
+        // O(frames) instead of O(frames × buffer).
+        let mut off = 0usize;
+        while self.sample_carry.len() - off >= PANAKO_N_FFT {
+            self.stft.process_frame_power(
+                &self.sample_carry[off..off + PANAKO_N_FFT],
+                &mut self.frame_scratch,
+            );
             for v in self.frame_scratch.iter_mut() {
                 *v = 10.0 * libm::log10f(v.max(PANAKO_LOG_FLOOR_POWER));
             }
-            let row_copy: Vec<f32> = self.frame_scratch.clone();
-            self.append_row(&row_copy);
+            // Append `self.frame_scratch` directly via disjoint field
+            // borrow, avoiding a per-frame `Vec::clone` of the row.
+            self.append_frame_scratch_row();
 
             let frame_idx = self.n_frames_total;
             self.n_frames_total += 1;
-            self.sample_carry.drain(0..PANAKO_HOP);
+            off += PANAKO_HOP;
 
             if frame_idx >= nbht {
                 let abs_ripe = frame_idx - nbht;
@@ -633,6 +648,10 @@ impl StreamingFingerprinter for StreamingPanako {
                 self.detect_rows(row_idx, row_idx);
                 self.last_pd_frame = abs_ripe as i32;
             }
+        }
+
+        if off > 0 {
+            self.sample_carry.drain(0..off);
         }
 
         self.finalize_buckets();
@@ -1090,5 +1109,53 @@ mod tests {
         b.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
         assert_eq!(a.len(), b.len(), "hash count mismatch");
         assert_eq!(a, b, "hash sequences differ");
+    }
+
+    #[test]
+    fn streaming_state_stays_bounded_under_long_input() {
+        // Same shape as the Wang invariant test: 30 s of audio in
+        // 256-sample chunks, peak-tracked ceilings on every buffer.
+        let secs = 30usize;
+        let samples = synthetic_audio(11, PANAKO_SR as usize * secs);
+        let chunk = 256usize;
+
+        let mut s = StreamingPanako::default();
+        let max_spec_rows = 2 * PANAKO_PEAK_NEIGHBOURHOOD + 1;
+
+        let mut peak_carry = 0usize;
+        let mut peak_spec_rows = 0usize;
+        let mut peak_bucket_pending = 0usize;
+        let mut peak_anchors = 0usize;
+
+        let mut start = 0usize;
+        while start < samples.len() {
+            let end = (start + chunk).min(samples.len());
+            let _ = s.push(&samples[start..end]);
+            peak_carry = peak_carry.max(s.sample_carry.len());
+            peak_spec_rows = peak_spec_rows.max(s.spec_n_rows);
+            peak_bucket_pending = peak_bucket_pending.max(s.bucket_pending.len());
+            peak_anchors = peak_anchors.max(s.pending_anchors.len());
+
+            assert!(s.sample_carry.len() < PANAKO_N_FFT);
+            assert!(s.spec_n_rows <= max_spec_rows);
+            start = end;
+        }
+
+        // target_zone_t=96 frames ≈ 1.54 s of bucket coverage at 62.5
+        // fps; peaks_per_sec=30 → ~46 anchors at peak.
+        assert_eq!(peak_spec_rows, max_spec_rows);
+        assert!(peak_carry < PANAKO_N_FFT, "peak_carry {peak_carry}");
+        assert!(
+            peak_bucket_pending <= 3,
+            "bucket_pending peaked at {peak_bucket_pending} (steady state should be ≤ 2)",
+        );
+        assert!(
+            peak_anchors <= 60,
+            "pending_anchors peaked at {peak_anchors} (expected ≤ 60)",
+        );
+
+        let _ = s.flush();
+        assert_eq!(s.bucket_pending.len(), 0);
+        assert_eq!(s.pending_anchors.len(), 0);
     }
 }

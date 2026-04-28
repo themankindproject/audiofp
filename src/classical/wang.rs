@@ -455,19 +455,23 @@ impl StreamingWang {
             + WANG_FRAMES_PER_SEC.ceil() as u32
     }
 
-    /// Append one log-power row to the rolling spec buffer, dropping the
-    /// oldest if the buffer is at capacity.
-    fn append_row(&mut self, row: &[f32]) {
-        debug_assert_eq!(row.len(), self.spec_n_bins);
+    /// Append the current contents of `self.frame_scratch` to the
+    /// rolling spec buffer, dropping the oldest row if at capacity.
+    /// Avoids the per-frame `Vec::clone` the borrow checker would
+    /// otherwise force on a `(&mut self, &[f32])` signature.
+    fn append_frame_scratch_row(&mut self) {
+        debug_assert_eq!(self.frame_scratch.len(), self.spec_n_bins);
         let cap = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
         if self.spec_n_rows == cap {
-            // Slide everything one row up.
             self.spec.copy_within(self.spec_n_bins.., 0);
             self.spec_first_frame += 1;
             self.spec_n_rows -= 1;
         }
         let dst_start = self.spec_n_rows * self.spec_n_bins;
-        self.spec[dst_start..dst_start + self.spec_n_bins].copy_from_slice(row);
+        let n_bins = self.spec_n_bins;
+        // Disjoint borrow: `self.spec` (mut) and `self.frame_scratch`
+        // (shared) are different fields of `self`, so this is sound.
+        self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
         self.spec_n_rows += 1;
     }
 
@@ -653,20 +657,27 @@ impl StreamingFingerprinter for StreamingWang {
         // 1. Compute new STFT frames one at a time, detecting peaks at
         // each frame as soon as it becomes ripe (i.e. its full forward
         // neighbourhood is in the buffer).
-        while self.sample_carry.len() >= WANG_N_FFT {
-            self.stft
-                .process_frame_power(&self.sample_carry[0..WANG_N_FFT], &mut self.frame_scratch);
+        //
+        // Walk frames with an offset cursor so we drain `sample_carry`
+        // exactly once at the end of the call instead of shifting the
+        // tail by `WANG_HOP` after every frame; the loop becomes
+        // O(frames) instead of O(frames × buffer).
+        let mut off = 0usize;
+        while self.sample_carry.len() - off >= WANG_N_FFT {
+            self.stft.process_frame_power(
+                &self.sample_carry[off..off + WANG_N_FFT],
+                &mut self.frame_scratch,
+            );
             for v in self.frame_scratch.iter_mut() {
                 *v = 10.0 * libm::log10f(v.max(WANG_LOG_FLOOR_POWER));
             }
-            // Take ownership of the row data via copy (so we can borrow
-            // `self` mutably for `append_row`).
-            let row_copy: alloc::vec::Vec<f32> = self.frame_scratch.clone();
-            self.append_row(&row_copy);
+            // Append `self.frame_scratch` directly via disjoint field
+            // borrow, avoiding a per-frame `Vec::clone` of the row.
+            self.append_frame_scratch_row();
 
             let frame_idx = self.n_frames_total;
             self.n_frames_total += 1;
-            self.sample_carry.drain(0..WANG_HOP);
+            off += WANG_HOP;
 
             // After adding frame `frame_idx`, frame `frame_idx - nbht`
             // becomes ripe (its forward neighbourhood is now in the
@@ -679,6 +690,10 @@ impl StreamingFingerprinter for StreamingWang {
                 self.detect_rows(row_idx, row_idx);
                 self.last_pd_frame = abs_ripe as i32;
             }
+        }
+
+        if off > 0 {
+            self.sample_carry.drain(0..off);
         }
 
         // 2. Finalise any buckets whose frames are all detected.
@@ -1062,6 +1077,64 @@ mod tests {
         a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
         b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn streaming_state_stays_bounded_under_long_input() {
+        // Push 30 s of audio in 256-sample chunks (~940 pushes) and
+        // track peak-observed sizes for each streaming buffer. Tight
+        // ceilings document the actual steady-state and catch future
+        // regressions that would inflate any of them.
+        let secs = 30usize;
+        let samples = synthetic_audio(7, WANG_SR as usize * secs);
+        let chunk = 256usize;
+
+        let mut s = StreamingWang::default();
+        let max_spec_rows = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
+
+        let mut peak_carry = 0usize;
+        let mut peak_spec_rows = 0usize;
+        let mut peak_bucket_pending = 0usize;
+        let mut peak_anchors = 0usize;
+
+        let mut start = 0usize;
+        while start < samples.len() {
+            let end = (start + chunk).min(samples.len());
+            let _ = s.push(&samples[start..end]);
+            peak_carry = peak_carry.max(s.sample_carry.len());
+            peak_spec_rows = peak_spec_rows.max(s.spec_n_rows);
+            peak_bucket_pending = peak_bucket_pending.max(s.bucket_pending.len());
+            peak_anchors = peak_anchors.max(s.pending_anchors.len());
+
+            // Hard structural invariants — must hold every push.
+            assert!(s.sample_carry.len() < WANG_N_FFT);
+            assert!(s.spec_n_rows <= max_spec_rows);
+            start = end;
+        }
+
+        // Tight ceilings on the peaks observed across the whole run at
+        // default config (peaks_per_sec=30, target_zone_t=63 frames ≈
+        // 1 s of bucket coverage, fan_out=5).
+        assert_eq!(
+            peak_spec_rows, max_spec_rows,
+            "spec window should fill once the stream is long enough",
+        );
+        assert!(peak_carry < WANG_N_FFT, "peak_carry {peak_carry}");
+        assert!(
+            peak_bucket_pending <= 3,
+            "bucket_pending peaked at {peak_bucket_pending} (steady state should be ≤ 2)",
+        );
+        // 1 s of finalised buckets × peaks_per_sec=30 = ~30 anchors;
+        // allow modest headroom for the boundary between adjacent buckets.
+        assert!(
+            peak_anchors <= 40,
+            "pending_anchors peaked at {peak_anchors} (expected ≤ 40)",
+        );
+
+        // Flush drains everything.
+        let _ = s.flush();
+        assert_eq!(s.bucket_pending.len(), 0);
+        assert_eq!(s.pending_anchors.len(), 0);
     }
 
     #[test]

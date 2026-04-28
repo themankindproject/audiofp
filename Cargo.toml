@@ -59,6 +59,10 @@ name              = "neural_frontend"
 harness           = false
 required-features = ["neural"]
 
+[[bench]]
+name    = "streaming"
+harness = false
+
 [lib]
 name = "audiofp"
 path = "src/lib.rs"
