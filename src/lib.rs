@@ -56,7 +56,7 @@
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
 //! | `std`        |   ✅    | Pulls in [`symphonia`](https://docs.rs/symphonia) → [`io`].       |
 //! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`]. |
-//! | `neural`     |         | Reserved for the upcoming neural fingerprinter.                   |
+//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`]. |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator.      |
 //!
 //! See [`USAGE.md`](https://github.com/themankindproject/audiofp/blob/main/USAGE.md)
@@ -74,6 +74,8 @@ pub mod classical;
 pub mod dsp;
 #[cfg(feature = "std")]
 pub mod io;
+#[cfg(feature = "neural")]
+pub mod neural;
 #[cfg(feature = "watermark")]
 pub mod watermark;
 

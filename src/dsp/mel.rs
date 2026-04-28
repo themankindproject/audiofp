@@ -200,6 +200,35 @@ impl MelFilterBank {
             *slot = log10f(acc + 1e-10);
         }
     }
+
+    /// Compute one log-mel frame from a **power** spectrum
+    /// (`re² + im²` per bin, e.g. one row of
+    /// [`ShortTimeFFT::power_flat`]).
+    ///
+    /// Equivalent to [`log_mel`] but skips the per-bin square — feed the
+    /// output of `power_flat` / `process_frame_power` directly to avoid
+    /// doing the work twice.
+    ///
+    /// [`log_mel`]: MelFilterBank::log_mel
+    /// [`ShortTimeFFT::power_flat`]: crate::dsp::stft::ShortTimeFFT::power_flat
+    ///
+    /// # Panics
+    ///
+    /// Panics if `power.len() != n_bins()` or `out.len() != n_mels`.
+    pub fn log_mel_from_power(&self, power: &[f32], out: &mut [f32]) {
+        assert_eq!(power.len(), self.n_bins(), "power length must equal n_bins");
+        assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
+
+        let n_bins = self.n_bins();
+        for (k, slot) in out.iter_mut().enumerate() {
+            let row = &self.matrix[k * n_bins..(k + 1) * n_bins];
+            let mut acc = 0.0_f32;
+            for (w, p) in row.iter().zip(power.iter()) {
+                acc += w * p;
+            }
+            *slot = log10f(acc + 1e-10);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +309,27 @@ mod tests {
         let fb = MelFilterBank::new(64, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
         for &w in fb.matrix() {
             assert!(w >= 0.0, "negative weight in mel matrix: {w}");
+        }
+    }
+
+    #[test]
+    fn log_mel_from_power_matches_log_mel_on_squared_input() {
+        let fb = MelFilterBank::new(32, 1024, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+        let n_bins = fb.n_bins();
+
+        // Synthetic spiky magnitude spectrum.
+        let mag: Vec<f32> = (0..n_bins)
+            .map(|b| ((b as f32 * 0.073).sin().abs() + 0.001) * (1 + b % 7) as f32)
+            .collect();
+        let pow: Vec<f32> = mag.iter().map(|m| m * m).collect();
+
+        let mut out_mag = vec![0.0_f32; fb.n_mels];
+        let mut out_pow = vec![0.0_f32; fb.n_mels];
+        fb.log_mel(&mag, &mut out_mag);
+        fb.log_mel_from_power(&pow, &mut out_pow);
+
+        for (a, b) in out_mag.iter().zip(out_pow.iter()) {
+            assert_relative_eq!(*a, *b, max_relative = 1e-6);
         }
     }
 

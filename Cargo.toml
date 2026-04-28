@@ -19,8 +19,11 @@ default = ["std"]
 # classical fingerprinters only.
 std = ["dep:symphonia"]
 
-# ONNX-based neural fingerprinter (Resona-FP). Requires std.
-neural = ["std"]
+# ONNX-based neural fingerprinter. The user supplies an ONNX model whose
+# input is a `[1, n_mels, n_frames]` log-mel spectrogram and whose first
+# output is a `[1, embedding_dim]` (or `[1, 1, embedding_dim]`) embedding.
+# Requires std (we read the model file and feed PCM at runtime).
+neural = ["std", "dep:tract-onnx"]
 
 # AudioSeal-compatible watermark detector. Requires std.
 watermark = ["std", "dep:tract-onnx"]
@@ -50,6 +53,11 @@ proptest  = { version = "1.5", default-features = false, features = ["std"] }
 [[bench]]
 name    = "extract"
 harness = false
+
+[[bench]]
+name              = "neural_frontend"
+harness           = false
+required-features = ["neural"]
 
 [lib]
 name = "audiofp"
