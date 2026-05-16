@@ -225,6 +225,44 @@ impl Ord for MinByScore<'_> {
     }
 }
 
+/// Owned variant of [`MinByScore`] for pooled heap use in the streaming
+/// builder where borrow lifetimes cannot be expressed on the struct.
+#[derive(Copy, Clone)]
+struct MinByScoreOwned {
+    b: Peak,
+    c: Peak,
+    score: f32,
+}
+
+impl MinByScoreOwned {
+    fn new(b: &Peak, c: &Peak, score: f32) -> Self {
+        Self { b: *b, c: *c, score }
+    }
+}
+
+impl PartialEq for MinByScoreOwned {
+    fn eq(&self, o: &Self) -> bool {
+        self.score == o.score
+            && (self.b.t_frame, self.b.f_bin) == (o.b.t_frame, o.b.f_bin)
+            && (self.c.t_frame, self.c.f_bin) == (o.c.t_frame, o.c.f_bin)
+    }
+}
+impl Eq for MinByScoreOwned {}
+impl PartialOrd for MinByScoreOwned {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for MinByScoreOwned {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        o.score
+            .partial_cmp(&self.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| (o.b.t_frame, o.b.f_bin).cmp(&(self.b.t_frame, self.b.f_bin)))
+            .then_with(|| (o.c.t_frame, o.c.f_bin).cmp(&(self.c.t_frame, self.c.f_bin)))
+    }
+}
+
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit triplet hashes.
 fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
     let target_zone_t = cfg.target_zone_t as i32;
@@ -373,6 +411,10 @@ pub struct StreamingPanako {
     last_finalized_bucket: i32,
 
     pending_anchors: alloc::collections::VecDeque<PendingAnchorPanako>,
+
+    /// Pooled scratch for the sorted (b, c, score) triplet list.
+    /// Stores owned Peak copies to avoid lifetime issues on the struct.
+    triplet_scratch: Vec<(Peak, Peak, f32)>,
 }
 
 impl Default for StreamingPanako {
@@ -411,6 +453,7 @@ impl StreamingPanako {
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
             pending_anchors: alloc::collections::VecDeque::new(),
+            triplet_scratch: Vec::new(),
         }
     }
 
@@ -570,33 +613,34 @@ impl StreamingPanako {
     }
 
     fn build_triplets_for_anchor(
-        &self,
+        &mut self,
         anchor: PendingAnchorPanako,
         out: &mut Vec<(TimestampMs, PanakoHash)>,
     ) {
-        // Use the same heap-based top-K logic the offline builder uses,
-        // but on this anchor's pre-collected target list.
         let fan_out = self.cfg.fan_out as usize;
-        let mut heap: alloc::collections::BinaryHeap<MinByScore> =
+        let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
             alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
         for (j, b) in anchor.targets.iter().enumerate() {
             for c in &anchor.targets[j + 1..] {
                 let score = b.mag + c.mag;
-                heap.push(MinByScore(b, c, score));
+                heap.push(MinByScoreOwned::new(b, c, score));
                 if heap.len() > fan_out {
                     heap.pop();
                 }
             }
         }
-        let mut triplets: Vec<(&Peak, &Peak, f32)> =
-            heap.into_iter().map(|w| (w.0, w.1, w.2)).collect();
-        triplets.sort_unstable_by(|x, y| {
+        self.triplet_scratch.clear();
+        self.triplet_scratch.extend(
+            heap.drain()
+                .map(|w| (w.b, w.c, w.score)),
+        );
+        self.triplet_scratch.sort_unstable_by(|x, y| {
             y.2.partial_cmp(&x.2)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then_with(|| (x.0.t_frame, x.0.f_bin).cmp(&(y.0.t_frame, y.0.f_bin)))
                 .then_with(|| (x.1.t_frame, x.1.f_bin).cmp(&(y.1.t_frame, y.1.f_bin)))
         });
-        for (b, c, _) in triplets {
+        for (b, c, _) in &self.triplet_scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
             let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
             out.push((
