@@ -87,3 +87,6 @@ required-features = ["std"]
 name = "hash_matcher"
 required-features = ["std"]
 
+[workspace]
+members = ["fuzz"]
+

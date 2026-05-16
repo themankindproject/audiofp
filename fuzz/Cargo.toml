@@ -1,0 +1,63 @@
+[package]
+name = "audiofp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+bytemuck = "1.25.0"
+audiofp = { path = "..", features = ["std"] }
+
+[[bin]]
+name = "wang_hash_roundtrip"
+path = "fuzz_targets/wang_hash_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "panako_hash_roundtrip"
+path = "fuzz_targets/panako_hash_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "haitsma_hash_roundtrip"
+path = "fuzz_targets/haitsma_hash_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "streaming_wang_equiv"
+path = "fuzz_targets/streaming_wang_equiv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sinc_resampler"
+path = "fuzz_targets/sinc_resampler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "streaming_haitsma_equiv"
+path = "fuzz_targets/streaming_haitsma_equiv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "streaming_panako_equiv"
+path = "fuzz_targets/streaming_panako_equiv.rs"
+test = false
+doc = false
+bench = false

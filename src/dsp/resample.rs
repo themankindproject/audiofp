@@ -11,6 +11,7 @@
 //! Both treat any out-of-range input as silence (zero-pad). Mono `f32` only;
 //! callers downmix multi-channel inputs upstream.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use libm::{sinf, sqrtf};

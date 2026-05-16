@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Three independent jobs run in parallel: rustfmt, clippy, test.
+# Jobs run in parallel unless they have explicit dependencies.
 jobs:
   fmt:
     name: rustfmt
@@ -50,3 +50,73 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  property-tests:
+    name: property tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: property-based tests (256 cases)
+        run: cargo test --test property --all-features
+        env:
+          PROPTEST_CASES: 256
+
+  msrv:
+    name: MSRV (1.85.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check (all features, MSRV)
+        run: cargo check --all-features
+      - name: test (MSRV)
+        run: cargo test --all-features
+
+  no-std:
+    name: no_std build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check no_std (default target)
+        run: cargo check --no-default-features
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit
+      - name: cargo audit
+        run: cargo audit --deny-warnings
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny
+        run: cargo install cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: fuzz smoke test (10 seconds)
+        run: cargo fuzz run streaming_wang_equiv -- -max_total_time=10 -runs=1000

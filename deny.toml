@@ -4,6 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked  = "deny"
+ignore  = []
 
 [licenses]
 version  = 2
@@ -31,8 +32,15 @@ exceptions = [
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
+deny = [
+    # Crates with known problematic licenses or security issues.
+    { name = "openssl", reason = "prefer rustls-based alternatives" },
+]
 
 [sources]
 unknown-registry = "deny"
 unknown-git      = "deny"
 allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+github = ["themankindproject"]
