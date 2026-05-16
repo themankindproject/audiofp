@@ -4,7 +4,12 @@ all-features = true
 [advisories]
 version = 2
 yanked  = "deny"
-ignore  = []
+ignore  = [
+    # RUSTSEC-2026-0009: time DoS via stack exhaustion.
+    # Transitive dep of tract-onnx (optional feature); no fix available
+    # until tract-onnx 0.22.2+ updates its liquid/tract-linalg deps.
+    "RUSTSEC-2026-0009",
+]
 
 [licenses]
 version  = 2
