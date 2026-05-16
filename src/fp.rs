@@ -131,4 +131,48 @@ pub trait StreamingFingerprinter {
     ///
     /// [`push`]: StreamingFingerprinter::push
     fn latency_ms(&self) -> u32;
+
+    /// Feed PCM samples and invoke `callback` for each fingerprint frame
+    /// that became available during this push.
+    ///
+    /// Zero-allocation variant: the callback receives `(TimestampMs, &Frame)`
+    /// by reference, avoiding the `Vec` allocation of [`push`]. Returns the
+    /// number of frames emitted.
+    ///
+    /// Default implementation delegates to [`push`] and iterates the result.
+    /// Implementors should override for true zero-allocation behaviour.
+    ///
+    /// [`push`]: StreamingFingerprinter::push
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        let frames = self.push(samples);
+        let n = frames.len();
+        for (t, frame) in frames {
+            callback(t, &frame);
+        }
+        n
+    }
+
+    /// Drain any pending fingerprint material at end-of-stream, invoking
+    /// `callback` for each frame.
+    ///
+    /// Zero-allocation variant of [`flush`]. Returns the number of frames
+    /// emitted.
+    ///
+    /// Default implementation delegates to [`flush`] and iterates the result.
+    ///
+    /// [`flush`]: StreamingFingerprinter::flush
+    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        let frames = self.flush();
+        let n = frames.len();
+        for (t, frame) in frames {
+            callback(t, &frame);
+        }
+        n
+    }
 }
