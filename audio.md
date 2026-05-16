@@ -29,7 +29,7 @@
 
 ## Project Overview
 
-**audiofp** is a Rust SDK (v0.3.0, edition 2024, MSRV 1.85) for extracting
+**audiofp** is a Rust SDK (v0.3.1, edition 2024, MSRV 1.85) for extracting
 deterministic fingerprints from mono PCM audio. It provides three classical
 fingerprinters, streaming variants with offline parity, reusable DSP
 primitives, optional ONNX log-mel embeddings, and optional AudioSeal-compatible

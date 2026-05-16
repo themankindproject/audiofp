@@ -34,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3"
+audiofp = "0.3.1"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang

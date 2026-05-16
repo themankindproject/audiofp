@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-16
+
+A performance-focused patch release with a new zero-allocation streaming
+API and a breaking change to `SincQuality` struct literals.
+
+### Added
+
+- **`StreamingFingerprinter::push_with` / `flush_with`** — zero-allocation
+  callback variants that invoke `FnMut(TimestampMs, &Frame)` per emitted
+  frame instead of allocating a `Vec`. Default implementations delegate
+  to `push`/`flush` so existing trait implementors are unaffected.
+
+- **`ShortTimeFFT::power_flat_into`** — writes the power spectrogram
+  directly into a caller-owned `&mut Vec<f32>`, avoiding the intermediate
+  allocation of `power_flat`.
+
+### Performance
+
+- **`WatermarkDetector` caches `TypedModel`** after the first `detect()`
+  call, skipping `with_input_fact + into_typed` on subsequent invocations.
+
+- **`Wang::extract` / `Panako::extract`** use `power_flat_into` with
+  in-place log-magnitude conversion, eliminating a `clear + resize +
+  copy` per call.
+
+- **`f_a_q` hoisted** out of per-target loops in `build_hashes` and
+  `build_hashes_for_anchor` (wang.rs) — computed once per anchor instead
+  of once per target pair.
+
+- **`StreamingPanako` pools** its triplet scratch `Vec` across
+  `build_triplets_for_anchor` calls, and uses `MinByScoreOwned` to avoid
+  lifetime-erased heap allocation.
+
+- **`SincResampler` precomputes** a polyphase kernel table at construction
+  time, replacing per-sample `sinc × Kaiser` evaluation with a table
+  lookup during `process()`.
+
+### Changed
+
+- **`SincQuality`** gains a required `polyphase_steps: u16` field
+  (default 256). This is a **breaking change** for explicit struct
+  literal constructions: `SincQuality { half_taps: 32, kaiser_beta: 8.6 }`
+  no longer compiles. `SincQuality::default()` continues to work.
+
+[0.3.1]: https://github.com/themankindproject/audiofp/compare/v0.3.0...v0.3.1
+
 ## [0.3.0] - 2026-04-28
 
 A feature release: ships the neural fingerprinting module the `neural`
@@ -347,7 +393,9 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/themankindproject/audiofp/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/themankindproject/audiofp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/themankindproject/audiofp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/themankindproject/audiofp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/themankindproject/audiofp/compare/v0.1.0...v0.1.1

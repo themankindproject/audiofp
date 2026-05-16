@@ -153,9 +153,9 @@ impl SincResampler {
         for s in 0..steps {
             let frac = s as f32 / steps as f32;
             let row = &mut kernel_table[s * taps..(s + 1) * taps];
-            for k in 0..taps {
+            for (k, cell) in row.iter_mut().enumerate() {
                 let x = (k as isize - half as isize) as f32 - frac;
-                row[k] = sinc(x * two_cutoff)
+                *cell = sinc(x * two_cutoff)
                     * kaiser_window_input(x, half_f, quality.kaiser_beta, inv_i0_beta)
                     * two_cutoff;
             }
@@ -216,12 +216,12 @@ impl SincResampler {
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let mut acc = 0.0_f32;
-            for k in 0..taps {
+            for (k, &coeff) in kernel.iter().enumerate() {
                 let idx = i_centre + k as isize - half as isize;
                 if idx < 0 || (idx as usize) >= n_in {
                     continue;
                 }
-                acc += input[idx as usize] * kernel[k];
+                acc += input[idx as usize] * coeff;
             }
             out.push(acc / self.dc_gain);
         }

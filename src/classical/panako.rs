@@ -236,7 +236,11 @@ struct MinByScoreOwned {
 
 impl MinByScoreOwned {
     fn new(b: &Peak, c: &Peak, score: f32) -> Self {
-        Self { b: *b, c: *c, score }
+        Self {
+            b: *b,
+            c: *c,
+            score,
+        }
     }
 }
 
@@ -630,10 +634,8 @@ impl StreamingPanako {
             }
         }
         self.triplet_scratch.clear();
-        self.triplet_scratch.extend(
-            heap.drain()
-                .map(|w| (w.b, w.c, w.score)),
-        );
+        self.triplet_scratch
+            .extend(heap.drain().map(|w| (w.b, w.c, w.score)));
         self.triplet_scratch.sort_unstable_by(|x, y| {
             y.2.partial_cmp(&x.2)
                 .unwrap_or(core::cmp::Ordering::Equal)
