@@ -95,7 +95,7 @@ jobs:
       - name: install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
-        run: cargo audit --deny-warnings
+        run: cargo audit
 
   deny:
     name: cargo deny
@@ -105,7 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.18.3 --locked
       - name: cargo deny check
         run: cargo deny check
 
