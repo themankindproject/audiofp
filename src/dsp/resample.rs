@@ -67,6 +67,10 @@ pub struct SincQuality {
     /// for stopband attenuation. Typical: 8.6 (≈ -80 dB stopband), 12.0
     /// (≈ -120 dB).
     pub kaiser_beta: f32,
+    /// Number of polyphase steps for the precomputed kernel table.
+    /// Each step stores `2 * half_taps + 1` kernel coefficients for a
+    /// different fractional offset. Default 256.
+    pub polyphase_steps: u16,
 }
 
 impl Default for SincQuality {
@@ -74,6 +78,7 @@ impl Default for SincQuality {
         Self {
             half_taps: 32,
             kaiser_beta: 8.6,
+            polyphase_steps: 256,
         }
     }
 }
@@ -108,15 +113,13 @@ pub struct SincResampler {
     from_sr: u32,
     to_sr: u32,
     quality: SincQuality,
-    /// `min(from_sr, to_sr) / from_sr / 2`: anti-aliasing cutoff,
-    /// normalised to the input's Nyquist.
-    cutoff: f32,
-    /// Reciprocal of `modified_bessel_i0(beta)`, precomputed for the
-    /// Kaiser window denominator.
-    inv_i0_beta: f32,
     /// DC gain of the kernel; applied as a divisor to keep constant
     /// signals constant.
     dc_gain: f32,
+    /// Precomputed polyphase kernel table: `[steps][2*half_taps+1]`.
+    /// Each row holds the sinc·Kaiser coefficients for one fractional
+    /// offset, avoiding per-sample kernel evaluation in `process`.
+    kernel_table: Vec<f32>,
 }
 
 impl SincResampler {
@@ -135,22 +138,33 @@ impl SincResampler {
     pub fn with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> Self {
         assert!(from_sr > 0 && to_sr > 0, "sample rates must be non-zero");
         assert!(quality.half_taps > 0, "half_taps must be > 0");
+        assert!(quality.polyphase_steps > 0, "polyphase_steps must be > 0");
 
         let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
         let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
+        let half = quality.half_taps;
+        let steps = quality.polyphase_steps as usize;
+        let taps = 2 * half + 1;
 
-        // Compute DC gain by summing a unit-DC kernel at the centre.
+        // Precompute the polyphase kernel table.
+        let mut kernel_table = vec![0.0_f32; steps * taps];
+        let two_cutoff = 2.0 * cutoff;
+        let half_f = half as f32;
+        for s in 0..steps {
+            let frac = s as f32 / steps as f32;
+            let row = &mut kernel_table[s * taps..(s + 1) * taps];
+            for k in 0..taps {
+                let x = (k as isize - half as isize) as f32 - frac;
+                row[k] = sinc(x * two_cutoff)
+                    * kaiser_window_input(x, half_f, quality.kaiser_beta, inv_i0_beta)
+                    * two_cutoff;
+            }
+        }
+
+        // Compute DC gain from the centre step (frac = 0).
         let mut dc_gain = 0.0_f32;
-        let half = quality.half_taps as isize;
-        for k in -half..=half {
-            let x = k as f32;
-            let w = kaiser_window_input(
-                x,
-                quality.half_taps as f32,
-                quality.kaiser_beta,
-                inv_i0_beta,
-            );
-            dc_gain += sinc(x * 2.0 * cutoff) * w * (2.0 * cutoff);
+        for &v in &kernel_table[..taps] {
+            dc_gain += v;
         }
         if dc_gain.abs() < 1e-10 {
             dc_gain = 1.0;
@@ -160,9 +174,8 @@ impl SincResampler {
             from_sr,
             to_sr,
             quality,
-            cutoff,
-            inv_i0_beta,
             dc_gain,
+            kernel_table,
         }
     }
 
@@ -188,9 +201,9 @@ impl SincResampler {
         let n_in = input.len();
         let n_out = ((n_in as u64 * self.to_sr as u64).div_ceil(self.from_sr as u64)) as usize;
         let ratio = self.from_sr as f64 / self.to_sr as f64;
-        let half = self.quality.half_taps as isize;
-        let half_f = self.quality.half_taps as f32;
-        let two_cutoff = 2.0 * self.cutoff;
+        let half = self.quality.half_taps;
+        let steps = self.quality.polyphase_steps as usize;
+        let taps = 2 * half + 1;
 
         let mut out = Vec::with_capacity(n_out);
         for n in 0..n_out {
@@ -198,16 +211,17 @@ impl SincResampler {
             let i_centre = pos.floor() as isize;
             let frac = (pos - pos.floor()) as f32;
 
+            // Look up the precomputed kernel row for this fractional offset.
+            let step = (frac * steps as f32) as usize % steps;
+            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
+
             let mut acc = 0.0_f32;
-            for k in -half..=half {
-                let idx = i_centre + k;
+            for k in 0..taps {
+                let idx = i_centre + k as isize - half as isize;
                 if idx < 0 || (idx as usize) >= n_in {
                     continue;
                 }
-                let x = k as f32 - frac;
-                let w = kaiser_window_input(x, half_f, self.quality.kaiser_beta, self.inv_i0_beta);
-                let s = sinc(x * two_cutoff);
-                acc += input[idx as usize] * s * w * two_cutoff;
+                acc += input[idx as usize] * kernel[k];
             }
             out.push(acc / self.dc_gain);
         }
@@ -403,6 +417,7 @@ mod tests {
             SincQuality {
                 half_taps: 8,
                 kaiser_beta: 4.0,
+                polyphase_steps: 256,
             },
         );
         let high_q = SincResampler::with_quality(
@@ -411,6 +426,7 @@ mod tests {
             SincQuality {
                 half_taps: 64,
                 kaiser_beta: 12.0,
+                polyphase_steps: 256,
             },
         );
 
