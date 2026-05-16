@@ -165,6 +165,51 @@ impl ShortTimeFFT {
         out
     }
 
+    /// Compute the **power** spectrogram of `samples` into a caller-owned
+    /// `out` buffer, returning `(n_frames, n_bins)`. Each cell is
+    /// `re² + im²`. The buffer is resized to `n_frames * n_bins` if
+    /// smaller; excess capacity is reused.
+    ///
+    /// Avoids the allocation of [`power_flat`] when the caller already
+    /// owns a suitably-sized buffer.
+    ///
+    /// [`power_flat`]: ShortTimeFFT::power_flat
+    pub fn power_flat_into(&mut self, samples: &[f32], out: &mut Vec<f32>) -> (usize, usize) {
+        if samples.is_empty() {
+            out.clear();
+            return (0, 0);
+        }
+
+        let n_fft = self.cfg.n_fft;
+        let hop = self.cfg.hop;
+        let n_frames = self.n_frames(samples.len());
+        let n_bins = self.n_bins();
+
+        let center_off = if self.cfg.center {
+            (n_fft / 2) as isize
+        } else {
+            0
+        };
+
+        out.resize(n_frames * n_bins, 0.0);
+
+        for f in 0..n_frames {
+            let start = (f * hop) as isize - center_off;
+            self.fill_windowed(samples, start);
+
+            self.fft
+                .process(&mut self.scratch_in, &mut self.scratch_out)
+                .expect("FFT process: input/output length mismatch");
+
+            let row = &mut out[f * n_bins..(f + 1) * n_bins];
+            for (i, c) in self.scratch_out.iter().enumerate() {
+                row[i] = c.norm_sqr();
+            }
+        }
+
+        (n_frames, n_bins)
+    }
+
     /// Compute the **power** spectrogram of `samples` into a single
     /// contiguous `Vec<f32>` of shape `(n_frames, n_bins)`. Each cell is
     /// `re² + im²` — equivalent to `magnitude_flat`'s output squared,

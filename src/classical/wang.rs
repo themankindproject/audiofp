@@ -182,7 +182,7 @@ impl Fingerprinter for Wang {
         // Compute power (|X|²) directly from the FFT — skips a per-bin
         // sqrt that the dB conversion would immediately undo.
         // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
-        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
+        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
         if n_frames == 0 {
             return Ok(WangFingerprint {
                 hashes: Vec::new(),
@@ -190,11 +190,9 @@ impl Fingerprinter for Wang {
             });
         }
 
-        // Convert power → dB log-magnitude in-place into the pooled buffer.
-        self.log_spec.clear();
-        self.log_spec.resize(power_flat.len(), 0.0);
-        for (i, &p) in power_flat.iter().enumerate() {
-            self.log_spec[i] = 10.0 * log10f(p.max(WANG_LOG_FLOOR_POWER));
+        // Convert power → dB log-magnitude in-place.
+        for v in self.log_spec.iter_mut() {
+            *v = 10.0 * log10f(v.max(WANG_LOG_FLOOR_POWER));
         }
 
         let peaks = self

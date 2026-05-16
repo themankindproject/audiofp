@@ -169,7 +169,7 @@ impl Fingerprinter for Panako {
             });
         }
 
-        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
+        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
         if n_frames == 0 {
             return Ok(PanakoFingerprint {
                 hashes: Vec::new(),
@@ -177,11 +177,9 @@ impl Fingerprinter for Panako {
             });
         }
 
-        // power → dB log-magnitude (20·log10(sqrt(p)) ≡ 10·log10(p)).
-        self.log_spec.clear();
-        self.log_spec.resize(power_flat.len(), 0.0);
-        for (i, &p) in power_flat.iter().enumerate() {
-            self.log_spec[i] = 10.0 * log10f(p.max(PANAKO_LOG_FLOOR_POWER));
+        // power → dB log-magnitude in-place (20·log10(sqrt(p)) ≡ 10·log10(p)).
+        for v in self.log_spec.iter_mut() {
+            *v = 10.0 * log10f(v.max(PANAKO_LOG_FLOOR_POWER));
         }
 
         let peaks = self
