@@ -286,8 +286,8 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
                 .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
         });
 
+        let f_a_q = quantise_freq(anchor.f_bin);
         for target in &targets {
-            let f_a_q = quantise_freq(anchor.f_bin);
             let f_b_q = quantise_freq(target.f_bin);
             let dt = ((target.t_frame - anchor.t_frame) & 0x3FFF).max(1);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | (dt & 0x3FFF);
@@ -629,8 +629,8 @@ impl StreamingWang {
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
         });
+        let f_a_q = quantise_freq(anchor.peak.f_bin);
         for target in &targets {
-            let f_a_q = quantise_freq(anchor.peak.f_bin);
             let f_b_q = quantise_freq(target.f_bin);
             let dt = ((target.t_frame - anchor.peak.t_frame) & 0x3FFF).max(1);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | (dt & 0x3FFF);
