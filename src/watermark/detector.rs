@@ -77,6 +77,11 @@ pub struct WatermarkResult {
 pub struct WatermarkDetector {
     cfg: WatermarkConfig,
     model: InferenceModel,
+    /// Cached typed model — populated after the first [`detect`] call so
+    /// subsequent calls skip `with_input_fact + into_typed`.
+    ///
+    /// [`detect`]: WatermarkDetector::detect
+    typed: Option<TypedModel>,
 }
 
 impl WatermarkDetector {
@@ -126,7 +131,11 @@ impl WatermarkDetector {
             .model_for_path(path)
             .map_err(|e| AfpError::ModelLoad(format!("load: {e}")))?;
 
-        Ok(Self { cfg, model })
+        Ok(Self {
+            cfg,
+            model,
+            typed: None,
+        })
     }
 
     /// Borrow the configuration this detector was built with.
@@ -164,18 +173,31 @@ impl WatermarkDetector {
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
         // Concretise input shape and prepare a runnable plan.
-        let runnable = self
-            .model
-            .clone()
-            .with_input_fact(
-                0,
-                InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
-            )
-            .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
-            .into_typed()
-            .map_err(|e| AfpError::Inference(format!("type: {e}")))?
-            .into_runnable()
-            .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
+        // Reuse the cached TypedModel after the first call to skip
+        // `with_input_fact + into_typed` on subsequent invocations.
+        let runnable = if let Some(typed) = &self.typed {
+            typed
+                .clone()
+                .into_runnable()
+                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?
+        } else {
+            let typed = self
+                .model
+                .clone()
+                .with_input_fact(
+                    0,
+                    InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
+                )
+                .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
+                .into_typed()
+                .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
+            let runnable = typed
+                .clone()
+                .into_runnable()
+                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
+            self.typed = Some(typed);
+            runnable
+        };
 
         let outputs = runnable
             .run(tvec!(input_tensor.into()))
