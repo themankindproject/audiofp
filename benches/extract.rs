@@ -79,7 +79,7 @@ fn bench_panako(c: &mut Criterion) {
 
 fn bench_haitsma(c: &mut Criterion) {
     let mut group = c.benchmark_group("haitsma");
-    let sr = SampleRate::new(5_000).unwrap();
+    let sr = SampleRate::HZ_5000;
     for &secs in &[2.0_f32, 5.0, 30.0] {
         let samples = synth(0xCAFE, 5_000, secs);
         group.throughput(Throughput::Elements(samples.len() as u64));

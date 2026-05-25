@@ -36,8 +36,11 @@ pub enum AfpError {
         got: usize,
     },
 
-    /// The audio's sample rate is not one of the supported rates.
-    #[error("unsupported sample rate: {0} Hz (supported: 8000, 11025, 16000, 22050, 44100, 48000)")]
+    /// The audio's sample rate does not match the rate the fingerprinter
+    /// expects. Each fingerprinter has a single required rate; consult
+    /// [`Fingerprinter::required_sample_rate`](crate::Fingerprinter::required_sample_rate)
+    /// (or the algorithm's documentation) to learn the value.
+    #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
 
     /// The audio has a channel count `audiofp` cannot consume (must be mono).
@@ -106,12 +109,24 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sample_rate_shows_value_and_supported_list() {
+    fn unsupported_sample_rate_displays_offending_value_only() {
+        // The message must NOT claim a global "supported" list — each
+        // fingerprinter has its own required rate, so any list we
+        // hardcode here would be wrong for at least one of them
+        // (Haitsma needs 5 kHz; the rest don't).
         let s = AfpError::UnsupportedSampleRate(7_000).to_string();
         assert!(s.contains("7000"));
-        // The supported list mentions all six canonical rates.
+        assert!(
+            !s.contains("(supported"),
+            "must not advertise a hardcoded supported list: {s}",
+        );
+        // None of the previously-hardcoded "supported" rate strings
+        // should appear in the error.
         for rate in ["8000", "11025", "16000", "22050", "44100", "48000"] {
-            assert!(s.contains(rate), "missing {rate} in: {s}");
+            assert!(
+                !s.contains(rate),
+                "found stale supported-rate {rate} in: {s}",
+            );
         }
     }
 

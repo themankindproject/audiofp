@@ -76,7 +76,7 @@ const HAITSMA_N_BANDS: usize = 33;
 /// // Wrong rate is rejected immediately.
 /// assert!(fp.extract(buf).is_err());
 ///
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::new(5_000).unwrap() };
+/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_5000 };
 /// let fpr = fp.extract(buf).unwrap();
 /// assert_eq!(fpr.frames_per_sec, 78.125);
 /// // Silence → all-zero hash frames (no band differences).
@@ -257,10 +257,6 @@ fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<Option<u8>> {
 /// length (`n_fft / sr ≈ 410 ms`) — much lower than the landmark
 /// extractors.
 ///
-/// **Implementation note:** like `StreamingWang`, the current version
-/// reruns the offline pipeline on each push. Because Haitsma has no
-/// peak picker or per-second adaptive thresholding, an incremental
-/// implementation is straightforward and a future optimization.
 /// Streaming Haitsma–Kalker — fully incremental.
 ///
 /// Trivially incremental: each output bit-frame depends only on the
@@ -431,10 +427,6 @@ mod tests {
         out
     }
 
-    fn sr_5khz() -> SampleRate {
-        SampleRate::new(5_000).unwrap()
-    }
-
     #[test]
     fn rejects_wrong_sample_rate() {
         let mut fp = Haitsma::default();
@@ -455,7 +447,7 @@ mod tests {
         let samples = vec![0.0_f32; 5_000];
         let buf = AudioBuffer {
             samples: &samples,
-            rate: sr_5khz(),
+            rate: SampleRate::HZ_5000,
         };
         match fp.extract(buf) {
             Err(AfpError::AudioTooShort {
@@ -472,7 +464,7 @@ mod tests {
         let samples = vec![0.0_f32; 5_000 * 3];
         let buf = AudioBuffer {
             samples: &samples,
-            rate: sr_5khz(),
+            rate: SampleRate::HZ_5000,
         };
         let fpr = fp.extract(buf).unwrap();
         assert_eq!(fpr.frames_per_sec, 78.125);
@@ -488,7 +480,7 @@ mod tests {
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 4);
         let buf = AudioBuffer {
             samples: &samples,
-            rate: sr_5khz(),
+            rate: SampleRate::HZ_5000,
         };
         let fpr = fp.extract(buf).unwrap();
         assert!(!fpr.frames.is_empty());
@@ -508,7 +500,7 @@ mod tests {
         let f1 = fp1
             .extract(AudioBuffer {
                 samples: &samples,
-                rate: sr_5khz(),
+                rate: SampleRate::HZ_5000,
             })
             .unwrap();
 
@@ -516,7 +508,7 @@ mod tests {
         let f2 = fp2
             .extract(AudioBuffer {
                 samples: &samples,
-                rate: sr_5khz(),
+                rate: SampleRate::HZ_5000,
             })
             .unwrap();
 
@@ -532,13 +524,13 @@ mod tests {
         let fa = fp
             .extract(AudioBuffer {
                 samples: &a,
-                rate: sr_5khz(),
+                rate: SampleRate::HZ_5000,
             })
             .unwrap();
         let fb = fp
             .extract(AudioBuffer {
                 samples: &b,
-                rate: sr_5khz(),
+                rate: SampleRate::HZ_5000,
             })
             .unwrap();
         assert_ne!(fa.frames, fb.frames);
@@ -614,7 +606,7 @@ mod tests {
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
         let buf = AudioBuffer {
             samples: &samples,
-            rate: sr_5khz(),
+            rate: SampleRate::HZ_5000,
         };
         let f = h.extract(buf).unwrap();
         // Should still produce frames; band edges differ but algorithm runs.
@@ -647,7 +639,7 @@ mod tests {
         let off = offline
             .extract(AudioBuffer {
                 samples: &samples,
-                rate: sr_5khz(),
+                rate: SampleRate::HZ_5000,
             })
             .unwrap();
 

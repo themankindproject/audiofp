@@ -126,7 +126,7 @@ fn haitsma_v1_golden() {
     let mut h = Haitsma::default();
     let buf = AudioBuffer {
         samples: &samples,
-        rate: SampleRate::new(5_000).unwrap(),
+        rate: SampleRate::HZ_5000,
     };
     let fp = h.extract(buf).unwrap();
 

@@ -125,7 +125,7 @@ fn haitsma_frames(samples: &[f32]) -> Vec<u32> {
     let mut h = Haitsma::default();
     let buf = AudioBuffer {
         samples,
-        rate: SampleRate::new(5_000).unwrap(),
+        rate: SampleRate::HZ_5000,
     };
     h.extract(buf).unwrap().frames
 }

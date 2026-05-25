@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut h = Haitsma::default();
         let buf = AudioBuffer {
             samples: &samples_5k,
-            rate: SampleRate::new(5_000).unwrap(),
+            rate: SampleRate::HZ_5000,
         };
         let t = Instant::now();
         let fp = h.extract(buf)?;

@@ -30,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
     let samples = &input.samples[..min_len];
     let buf = AudioBuffer {
         samples,
-        rate: SampleRate::new(5_000).unwrap(),
+        rate: SampleRate::HZ_5000,
     };
 
     let mut offline = Haitsma::new(cfg.clone());

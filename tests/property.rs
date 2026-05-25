@@ -134,7 +134,7 @@ proptest! {
 
         let mut offline = Haitsma::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::new(5_000).unwrap() })
+            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_5000 })
             .unwrap();
 
         let mut stream = StreamingHaitsma::default();

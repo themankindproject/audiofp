@@ -19,23 +19,27 @@ use core::num::NonZeroU32;
 pub struct SampleRate(pub NonZeroU32);
 
 impl SampleRate {
-    /// 8 kHz — the rate `audiofp`'s classical fingerprinters consume.
-    pub const HZ_8000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(8_000)) };
+    /// 5 kHz — the rate [`Haitsma`](crate::classical::Haitsma) consumes.
+    pub const HZ_5000: SampleRate = SampleRate(NonZeroU32::new(5_000).unwrap());
+
+    /// 8 kHz — the rate [`Wang`](crate::classical::Wang) and
+    /// [`Panako`](crate::classical::Panako) consume.
+    pub const HZ_8000: SampleRate = SampleRate(NonZeroU32::new(8_000).unwrap());
 
     /// 11.025 kHz.
-    pub const HZ_11025: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(11_025)) };
+    pub const HZ_11025: SampleRate = SampleRate(NonZeroU32::new(11_025).unwrap());
 
-    /// 16 kHz — typical speech rate.
-    pub const HZ_16000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(16_000)) };
+    /// 16 kHz — typical speech rate; AudioSeal watermark default.
+    pub const HZ_16000: SampleRate = SampleRate(NonZeroU32::new(16_000).unwrap());
 
     /// 22.05 kHz — common for music workflows.
-    pub const HZ_22050: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(22_050)) };
+    pub const HZ_22050: SampleRate = SampleRate(NonZeroU32::new(22_050).unwrap());
 
     /// 44.1 kHz — CD-quality audio.
-    pub const HZ_44100: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(44_100)) };
+    pub const HZ_44100: SampleRate = SampleRate(NonZeroU32::new(44_100).unwrap());
 
     /// 48 kHz — DAT / professional audio.
-    pub const HZ_48000: SampleRate = unsafe { SampleRate(NonZeroU32::new_unchecked(48_000)) };
+    pub const HZ_48000: SampleRate = SampleRate(NonZeroU32::new(48_000).unwrap());
 
     /// Build a [`SampleRate`] from any non-zero `u32`.
     ///
@@ -119,6 +123,7 @@ mod tests {
 
     #[test]
     fn sample_rate_constants_match_their_names() {
+        assert_eq!(SampleRate::HZ_5000.hz(), 5_000);
         assert_eq!(SampleRate::HZ_8000.hz(), 8_000);
         assert_eq!(SampleRate::HZ_11025.hz(), 11_025);
         assert_eq!(SampleRate::HZ_16000.hz(), 16_000);
