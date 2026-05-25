@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A correctness + clarity patch release driven by an end-to-end internal
+audit. Behaviour is bit-for-bit unchanged for any input that completed
+successfully on 0.3.1 — regression goldens are untouched. The visible
+changes are clearer error messages, an additional convenience constant,
+and tightened guarantees in places where 0.3.1's docs overstated.
+
+### Added
+
+- **`SampleRate::HZ_5000`** — convenience constant for the rate
+  [`Haitsma`] consumes. The previously verbose
+  `SampleRate::new(5_000).unwrap()` form is now obsolete; every
+  in-tree example, test, bench, and fuzz target has been migrated.
+
+### Changed
+
+- **`AfpError::UnsupportedSampleRate`** message dropped its
+  `(supported: 8000, 11025, 16000, 22050, 44100, 48000)` parenthetical.
+  The list was misleading: each fingerprinter has its own required
+  rate, and Haitsma's 5 kHz was conspicuously absent. Callers should
+  consult `Fingerprinter::required_sample_rate()` (now linked from the
+  variant's docstring) for the per-algorithm answer.
+
+- **`SampleRate` `HZ_*` constants** are now built from safe `const`
+  `Option::unwrap` instead of `unsafe { NonZeroU32::new_unchecked }`.
+  Same compile-time evaluation, no runtime cost, no `unsafe`.
+
+- **`SampleRate::HZ_8000` docstring** corrected from "the rate
+  audiofp's classical fingerprinters consume" (false — Haitsma uses
+  5 kHz) to "the rate Wang and Panako consume". `HZ_16000` doc clarifies
+  it is also the AudioSeal watermark default.
+
+- **`WatermarkDetector` typed-model cache** now stores
+  `Option<(usize, TypedModel)>` instead of `Option<TypedModel>`. If a
+  later `detect()` call passes a different-length buffer, the typed
+  plan is transparently rebuilt for the new length instead of letting
+  Tract emit a cryptic shape error. Equal-length repeat calls still
+  reuse the cached plan as before.
+
+### Fixed
+
+- **Wang `Δt` packing** truly clamps to `[1, 16383]` instead of
+  masking the low 14 bits. The module docstring already advertised
+  clamping as the contract; the code now matches. The fix is
+  bit-identical for all `Δt` values that arise under default
+  `target_zone_t` (≤ 63), so regression goldens are unaffected. A new
+  unit test `dt_field_clamps_to_14_bit_ceiling_not_wraparound` pins
+  the contract for any future change.
+
+- **`StreamingNeuralEmbedder::try_push_with` is now genuinely
+  zero-allocation per call.** The embedding scratch `Vec<f32>` is now
+  a struct field allocated once at construction with capacity
+  `embedding_dim`, instead of a fresh `Vec::with_capacity(...)` on
+  every call. The README claim of "zero-alloc try_push_with" is now
+  technically accurate. New regression test
+  `try_push_with_does_not_reallocate_embedding_scratch` proves the
+  buffer's capacity is preserved across 50 emits and 10 separate
+  pushes.
+
+- **`examples/hash_matcher.rs`** no longer hardcodes
+  `FRAMES_PER_SEC = 62.5`. The example now reads `frames_per_sec`
+  from the produced `WangFingerprint`, so it stays correct if Wang's
+  frame rate is ever changed in a future major version.
+
+### Documentation
+
+- **README** dropped stale `(0.2.0)` and `(0.3.0)` parenthetical
+  version markers from the feature bullets — they had become
+  misleading rather than informative. Watermark and neural bullets
+  now describe the cache + scratch behaviour the new code actually
+  delivers.
+
+[`Haitsma`]: https://docs.rs/audiofp/latest/audiofp/classical/struct.Haitsma.html
+
 ## [0.3.1] - 2026-05-16
 
 A performance-focused patch release with a new zero-allocation streaming

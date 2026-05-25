@@ -1,6 +1,6 @@
 [package]
 name         = "audiofp"
-version      = "0.3.1"
+version      = "0.3.2"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
@@ -15,8 +15,9 @@ readme       = "README.md"
 default = ["std"]
 
 # Pulls symphonia file decoding helpers (and, in a later phase, cpal mic
-# capture). Without it the crate compiles `no_std + alloc` — DSP and
-# classical fingerprinters only.
+# capture). Without it the crate is `no_std + alloc` in API shape for DSP
+# and classical fingerprinters, but the current FFT dependency chain keeps
+# the no_std path host-only today.
 std = ["dep:symphonia"]
 
 # ONNX-based neural fingerprinter. The user supplies an ONNX model whose
@@ -89,4 +90,3 @@ required-features = ["std"]
 
 [workspace]
 members = ["fuzz"]
-
