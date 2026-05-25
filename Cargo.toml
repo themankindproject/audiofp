@@ -10,6 +10,14 @@ authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
 keywords     = ["audio", "fingerprint", "dsp", "shazam", "panako"]
 categories   = ["multimedia::audio", "algorithms", "no-std"]
 readme       = "README.md"
+exclude      = [
+    # Personal prep / scratch files — useful in the repo, not on crates.io.
+    "prep.md",
+    "tests/goldens/.gitignore",
+    ".github/",
+    ".codex/",
+    ".agents/",
+]
 
 [features]
 default = ["std"]

@@ -34,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.1"
+audiofp = "0.3.2"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -183,6 +183,7 @@ assert!(SampleRate::new(0).is_none());
 
 | Constant            | Hz     |
 | ------------------- | ------ |
+| `HZ_5000`           | 5 000  |
 | `HZ_8000`           | 8 000  |
 | `HZ_11025`          | 11 025 |
 | `HZ_16000`          | 16 000 |
@@ -516,7 +517,7 @@ let cfg = WatermarkConfig::new("audioseal_v0.2.onnx");
 ```rust
 let mut det = WatermarkDetector::new(cfg)?;
 
-let buf = AudioBuffer { samples: &audio, rate: SampleRate::new(16_000).unwrap() };
+let buf = AudioBuffer { samples: &audio, rate: SampleRate::HZ_16000 };
 let r = det.detect(buf)?;
 
 println!("detected={} confidence={:.3} message={:#018b}",
@@ -524,8 +525,12 @@ println!("detected={} confidence={:.3} message={:#018b}",
 println!("localization length: {} samples", r.localization.len());
 ```
 
-The detector caches the typed model after the first call, so repeated use is
-most efficient when buffers share a length.
+The detector caches the typed model after the first call, keyed by input
+length: subsequent calls with the same buffer length skip
+`with_input_fact + into_typed`. If a later call passes a different-length
+buffer, the typed plan is transparently rebuilt for the new length — no
+cryptic Tract shape error reaches the caller. For best performance,
+prefer batching at a fixed length.
 
 ### `WatermarkResult`
 
@@ -652,7 +657,7 @@ all.extend(s.flush());
 | `try_push(samples) -> Result<Vec<…>>`              | One `Vec<f32>` per emit    | `Result`        |
 | `try_push_with(samples, |t, &[f32]| …) -> Result<usize>` | **Zero** (callback gets `&[f32]`) | `Result`        |
 
-For realtime-friendly streaming, prefer `try_push_with` — the callback receives the embedding by reference, no `Vec` is created per emit, and the embedder reuses a single internal scratch buffer across all emits in one call.
+For realtime-friendly streaming, prefer `try_push_with` — the callback receives the embedding by reference, no `Vec` is created per emit, and the embedder reuses a single internal scratch buffer that is allocated **once at construction** (sized to `embedding_dim`) and reused across every emit *and* every push for the lifetime of the embedder. Per-push allocation is genuinely zero.
 
 ### Bit-exactness
 
@@ -814,7 +819,7 @@ pub enum AfpError {
     #[error("audio too short: needed at least {needed} samples, got {got}")]
     AudioTooShort { needed: usize, got: usize },
 
-    #[error("unsupported sample rate: {0} Hz (supported: 8000, 11025, 16000, 22050, 44100, 48000)")]
+    #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
 
     #[error("unsupported channel count: {0}")]
