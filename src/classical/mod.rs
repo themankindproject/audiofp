@@ -1,8 +1,9 @@
 //! Classical (DSP-only) fingerprinters.
 //!
-//! Three independent extractors, all `no_std + alloc`. Each makes a
-//! different storage / robustness tradeoff; pick the one that matches
-//! your workload:
+//! Three independent extractors, all `no_std + alloc` in API shape.
+//! Each makes a different storage / robustness tradeoff; pick the one
+//! that matches your workload. The current FFT dependency chain still
+//! keeps the no_std path host-only today:
 //!
 //! | Algorithm   | Output                  | Sample rate | Frame rate | Storage / sec       | Best for                                |
 //! | ----------- | ----------------------- | ----------- | ---------- | ------------------- | --------------------------------------- |

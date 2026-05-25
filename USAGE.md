@@ -524,6 +524,9 @@ println!("detected={} confidence={:.3} message={:#018b}",
 println!("localization length: {} samples", r.localization.len());
 ```
 
+The detector caches the typed model after the first call, so repeated use is
+most efficient when buffers share a length.
+
 ### `WatermarkResult`
 
 | Field          | Type        | Meaning                                                                 |
@@ -781,7 +784,7 @@ let y = r.process(&x);
 let r = SincResampler::with_quality(
     44_100,
     8_000,
-    SincQuality { half_taps: 64, kaiser_beta: 12.0 },
+    SincQuality { half_taps: 64, kaiser_beta: 12.0, polyphase_steps: 256 },
 );
 let y = r.process(&x);
 ```

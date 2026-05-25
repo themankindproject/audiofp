@@ -27,11 +27,9 @@
 
 use std::collections::HashMap;
 
-use audiofp::classical::{Wang, WangHash};
+use audiofp::classical::{Wang, WangFingerprint, WangHash};
 use audiofp::io::decode_to_mono_at;
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
-
-const FRAMES_PER_SEC: f32 = 62.5;
 
 /// In-memory inverted index from hash → list of `(track_id, t_anchor)` hits.
 struct HashDatabase {
@@ -107,13 +105,13 @@ struct MatchResult {
     total_collisions: u32,
 }
 
-fn fingerprint(wang: &mut Wang, path: &str) -> Result<Vec<WangHash>, Box<dyn std::error::Error>> {
+fn fingerprint(wang: &mut Wang, path: &str) -> Result<WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
     let buf = AudioBuffer {
         samples: &samples,
         rate: SampleRate::HZ_8000,
     };
-    Ok(wang.extract(buf)?.hashes)
+    Ok(wang.extract(buf)?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -133,17 +131,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Enrolling {} reference track(s)...", refs.len());
     for path in refs {
-        let hashes = fingerprint(&mut wang, path)?;
-        let id = db.enroll(path.clone(), &hashes);
-        println!("  [{:>2}] {}  ({} hashes)", id, path, hashes.len());
+        let fp = fingerprint(&mut wang, path)?;
+        let id = db.enroll(path.clone(), &fp.hashes);
+        println!("  [{:>2}] {}  ({} hashes)", id, path, fp.hashes.len());
     }
 
     for query_path in queries {
         println!("\n--- Querying: {} ---", query_path);
-        let qh = fingerprint(&mut wang, query_path)?;
-        println!("  {} query hashes", qh.len());
+        let qfp = fingerprint(&mut wang, query_path)?;
+        let frames_per_sec = qfp.frames_per_sec;
+        println!(
+            "  {} query hashes at {:.1} fps",
+            qfp.hashes.len(),
+            frames_per_sec
+        );
 
-        let results = db.query(&qh);
+        let results = db.query(&qfp.hashes);
         if results.is_empty() {
             println!("  no matches found in any reference");
             continue;
@@ -153,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Score   Hits  Offset    Track");
         println!("  -----  -----  --------  -----");
         for r in results.iter().take(5) {
-            let offset_secs = r.offset_frames as f32 / FRAMES_PER_SEC;
+            let offset_secs = r.offset_frames as f32 / frames_per_sec;
             println!(
                 "  {:>5}  {:>5}  {:>+7.2}s  {}",
                 r.score, r.total_collisions, offset_secs, r.track_name,

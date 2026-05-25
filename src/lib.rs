@@ -5,11 +5,11 @@
 //! noise, and (for some algorithms) tempo or pitch changes — the
 //! fundamental primitive behind systems like Shazam or AcoustID.
 //!
-//! The crate compiles **`no_std + alloc`** by default (when the `std`
-//! feature is disabled), so the DSP primitives and classical
-//! fingerprinters can target embedded systems such as
-//! `thumbv7em-none-eabihf`. The file decoder ([`io`]) and watermark
-//! detector ([`watermark`]) live behind feature flags and require `std`.
+//! The crate is **`no_std + alloc`** in API shape when the `std`
+//! feature is disabled, but the current FFT dependency chain still
+//! keeps the no_std path host-only today. The file decoder ([`io`]) and
+//! watermark detector ([`watermark`]) live behind feature flags and
+//! require `std`.
 //!
 //! # Quick tour
 //!

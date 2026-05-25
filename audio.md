@@ -52,7 +52,7 @@ It serves:
 | **Stable hash bytes** | `WangHash`, `PanakoHash`, and `Peak` are `repr(C)` and `bytemuck::Pod`. |
 | **Streaming parity** | Streaming output matches offline extraction under arbitrary chunking. |
 | **DSP reuse** | STFT, peak picking, mel filters, windows, and resampling are public primitives. |
-| **Feature isolation** | Classical DSP works in `no_std + alloc`; file I/O, neural, and watermark are feature-gated. |
+| **Feature isolation** | Classical DSP is designed for `no_std + alloc`; file I/O, neural, and watermark are feature-gated, and the current FFT dependency still makes the no_std path host-only. |
 | **Hot-path reuse** | FFT plans, peak-picker scratch, and streaming buffers are held on the extractor. |
 
 ---
@@ -124,6 +124,22 @@ flowchart TD
     H2 --> H3["33 log-spaced bands, 300-2000 Hz"]
     H3 --> H4["32 band-difference delta bits/frame"]
     H4 --> H5["u32 frame hashes"]
+
+    classDef input fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a,stroke-width:1px;
+    classDef router fill:#f3f4f6,stroke:#9ca3af,color:#111827,stroke-width:1px;
+    classDef wang fill:#fef3c7,stroke:#f59e0b,color:#92400e,stroke-width:1px;
+    classDef panako fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6,stroke-width:1px;
+    classDef haitsma fill:#ccfbf1,stroke:#14b8a6,color:#115e59,stroke-width:1px;
+    classDef output fill:#e5e7eb,stroke:#6b7280,color:#111827,stroke-width:1px;
+
+    class A,B,C,D input;
+    class E router;
+    class W1,W2,W3,W4,W5 wang;
+    class W6 output;
+    class P1,P2,P3,P4,P5 panako;
+    class P6 output;
+    class H1,H2,H3,H4 haitsma;
+    class H5 output;
 ```
 
 ### Runtime Sequence (Wang offline path)
@@ -158,8 +174,9 @@ sequenceDiagram
 | `watermark` | No | AudioSeal-style detector via Tract |
 | `mimalloc` | No | `mimalloc::MiMalloc` global allocator |
 
-With default features disabled, the crate is `no_std + alloc` for DSP and
-classical fingerprinters.
+With default features disabled, the crate is `no_std + alloc` in API shape for
+DSP and classical fingerprinters, but the current FFT dependency chain keeps
+the no_std path host-only today.
 
 ---
 
@@ -263,6 +280,14 @@ flowchart TD
     F --> G["for each anchor, keep top fan_out targets"]
     G --> H["pack f_a_q | f_b_q | dt"]
     H --> I["WangFingerprint"]
+
+    classDef input fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a,stroke-width:1px;
+    classDef wang fill:#fef3c7,stroke:#f59e0b,color:#92400e,stroke-width:1px;
+    classDef output fill:#e5e7eb,stroke:#6b7280,color:#111827,stroke-width:1px;
+
+    class A input;
+    class B,C,D,E,F,G,H wang;
+    class I output;
 ```
 
 #### Key Properties
@@ -373,6 +398,14 @@ flowchart TD
     E --> F["top fan_out by b.mag + c.mag"]
     F --> G["pack sign | mag_order | beta | df_ab | df_bc"]
     G --> H["PanakoFingerprint"]
+
+    classDef input fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a,stroke-width:1px;
+    classDef panako fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6,stroke-width:1px;
+    classDef output fill:#e5e7eb,stroke:#6b7280,color:#111827,stroke-width:1px;
+
+    class A input;
+    class B,C,D,E,F,G panako;
+    class H output;
 ```
 
 #### Key Properties
@@ -455,6 +488,14 @@ flowchart TD
     D --> E["compare adjacent-band differences across adjacent frames"]
     E --> F["pack 32 sign bits MSB-first"]
     F --> G["HaitsmaFingerprint"]
+
+    classDef input fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a,stroke-width:1px;
+    classDef haitsma fill:#ccfbf1,stroke:#14b8a6,color:#115e59,stroke-width:1px;
+    classDef output fill:#e5e7eb,stroke:#6b7280,color:#111827,stroke-width:1px;
+
+    class A input;
+    class B,C,D,E,F haitsma;
+    class G output;
 ```
 
 #### Key Properties
@@ -462,7 +503,7 @@ flowchart TD
 - **Dense**: roughly one 32-bit word per STFT frame from frame 1 onward.
 - **Fast**: no 2-D peak picker, no target search.
 - **Compact**: about 312 bytes/s at 78.125 fps.
-- **Silence invariant**: all-zero input produces all-zero frame hashes.
+- **Silence invariant**: all-zero input produces all-zero frame hashes; Haitsma still emits one zero-valued hash per frame from frame 1 onward.
 
 ---
 
@@ -646,6 +687,8 @@ NeuralFingerprint
 The `watermark` feature wraps AudioSeal-style ONNX detectors. It expects a model
 that accepts `[1, 1, T]` waveform input and returns at least two outputs:
 detection scores and message logits.
+The current implementation caches the typed model after the first `detect`
+call, so repeated calls are best when buffer lengths stay consistent.
 
 #### Config
 
@@ -665,9 +708,9 @@ Step 1 - Build input:
   Tensor shape [1, 1, samples.len()]
 
 Step 2 - Concretize model:
-  set input fact for this exact T
-  type model
-  build runnable
+  on first call, set input fact for this exact T
+  type model, cache typed plan, build runnable
+  subsequent calls reuse the cached typed model
 
 Step 3 - Run inference:
   outputs[0] = detection scores
@@ -791,6 +834,7 @@ SincResampler
   Kaiser window
   default half_taps = 32
   default beta = 8.6
+  default polyphase_steps = 256
   cutoff = min(from_sr, to_sr) / from_sr / 2
 ```
 
@@ -1122,4 +1166,3 @@ neural-onnx-v0
 ```
 
 The version suffix is the semantic compatibility boundary for hash bytes.
-
