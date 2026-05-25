@@ -66,31 +66,31 @@ pub struct WatermarkResult {
 /// AudioSeal-style watermark detector.
 ///
 /// The loaded ONNX model is held in `InferenceModel` form with no fixed
-/// input shape; each [`detect`] call concretises the input length, runs
-/// the optimisation pipeline, and emits a result. That's not the cheapest
-/// possible path — for a hot-loop use case where buffers are always the
-/// same length, prefer batching multiple calls under a single
-/// [`WatermarkDetector`] instance, where `tract` will cache the optimised
-/// plan after the first call.
+/// input shape. The first [`detect`] call concretises the input length
+/// and caches a typed model; subsequent calls of the **same input
+/// length** reuse that typed plan. If the input length changes, the
+/// detector transparently rebuilds the typed plan for the new length —
+/// no cryptic Tract shape error reaches the caller. For best
+/// performance, prefer batching at a fixed length.
 ///
 /// [`detect`]: WatermarkDetector::detect
 pub struct WatermarkDetector {
     cfg: WatermarkConfig,
     model: InferenceModel,
-    /// Cached typed model — populated after the first [`detect`] call so
-    /// subsequent calls skip `with_input_fact + into_typed`.
+    /// Cached typed model paired with the input length it was built
+    /// for. On a length mismatch the cache is rebuilt; equal-length
+    /// repeat calls reuse it directly.
     ///
     /// [`detect`]: WatermarkDetector::detect
-    typed: Option<TypedModel>,
+    typed: Option<(usize, TypedModel)>,
 }
 
 impl WatermarkDetector {
     /// Validate `cfg` and load the ONNX file at `cfg.model_path`.
     ///
     /// The model is loaded in `InferenceModel` form with no fixed input
-    /// shape, so a single detector instance can handle audio buffers of
-    /// any length. Each [`detect`] call will concretise the model for
-    /// the call's input length.
+    /// shape. The first [`detect`] call concretises the model for that
+    /// input length and caches the typed plan; later calls reuse it.
     ///
     /// [`detect`]: WatermarkDetector::detect
     ///
@@ -173,30 +173,33 @@ impl WatermarkDetector {
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
         // Concretise input shape and prepare a runnable plan.
-        // Reuse the cached TypedModel after the first call to skip
-        // `with_input_fact + into_typed` on subsequent invocations.
-        let runnable = if let Some(typed) = &self.typed {
-            typed
+        // Reuse the cached TypedModel when the input length matches
+        // what the model was concretised for; otherwise rebuild for the
+        // new length so the caller never sees a cryptic Tract shape
+        // error from a length-mismatched cache.
+        let runnable = match &self.typed {
+            Some((cached_n, typed)) if *cached_n == n => typed
                 .clone()
                 .into_runnable()
-                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?
-        } else {
-            let typed = self
-                .model
-                .clone()
-                .with_input_fact(
-                    0,
-                    InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
-                )
-                .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
-                .into_typed()
-                .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
-            let runnable = typed
-                .clone()
-                .into_runnable()
-                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
-            self.typed = Some(typed);
-            runnable
+                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?,
+            _ => {
+                let typed = self
+                    .model
+                    .clone()
+                    .with_input_fact(
+                        0,
+                        InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
+                    )
+                    .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
+                    .into_typed()
+                    .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
+                let runnable = typed
+                    .clone()
+                    .into_runnable()
+                    .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
+                self.typed = Some((n, typed));
+                runnable
+            }
         };
 
         let outputs = runnable

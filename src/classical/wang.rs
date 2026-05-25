@@ -287,8 +287,12 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
         let f_a_q = quantise_freq(anchor.f_bin);
         for target in &targets {
             let f_b_q = quantise_freq(target.f_bin);
-            let dt = ((target.t_frame - anchor.t_frame) & 0x3FFF).max(1);
-            let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | (dt & 0x3FFF);
+            // Δt is encoded in 14 bits (max 16383). target_zone_t can never
+            // realistically saturate this with default config, but clamp
+            // defensively so an out-of-range Δt becomes the zone ceiling
+            // rather than silently aliasing through a bitmask wraparound.
+            let dt = (target.t_frame - anchor.t_frame).clamp(1, 0x3FFF);
+            let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
             hashes.push(WangHash {
                 hash,
                 t_anchor: anchor.t_frame,
@@ -630,8 +634,8 @@ impl StreamingWang {
         let f_a_q = quantise_freq(anchor.peak.f_bin);
         for target in &targets {
             let f_b_q = quantise_freq(target.f_bin);
-            let dt = ((target.t_frame - anchor.peak.t_frame) & 0x3FFF).max(1);
-            let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | (dt & 0x3FFF);
+            let dt = (target.t_frame - anchor.peak.t_frame).clamp(1, 0x3FFF);
+            let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
             let t_ms = (anchor.peak.t_frame as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
             out.push((
                 TimestampMs(t_ms),
@@ -899,6 +903,37 @@ mod tests {
         assert_eq!(f_b_q, quantise_freq(70));
         assert_eq!(dt, 10);
         assert_eq!(hashes[0].t_anchor, 100);
+    }
+
+    #[test]
+    fn dt_field_clamps_to_14_bit_ceiling_not_wraparound() {
+        // Anchor at t=0, target at t=20_000 — well past the 14-bit ceiling
+        // of 16383. Use a config with a large target_zone_t so the zone
+        // check itself doesn't cull the target before clamping kicks in.
+        let peaks = alloc::vec![
+            Peak {
+                t_frame: 0,
+                f_bin: 50,
+                _pad: 0,
+                mag: -10.0
+            },
+            Peak {
+                t_frame: 20_000,
+                f_bin: 70,
+                _pad: 0,
+                mag: -12.0
+            },
+        ];
+        let cfg = WangConfig {
+            target_zone_t: u16::MAX,
+            target_zone_f: u16::MAX,
+            ..WangConfig::default()
+        };
+        let hashes = build_hashes(&peaks, &cfg);
+        assert_eq!(hashes.len(), 1);
+        // Δt field must saturate at 16383 — NOT wrap around to 20000 % 16384 = 3616.
+        let dt = hashes[0].hash & 0x3FFF;
+        assert_eq!(dt, 0x3FFF, "Δt must clamp to 14-bit max, got {dt}");
     }
 
     #[test]

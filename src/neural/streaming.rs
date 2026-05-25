@@ -49,6 +49,14 @@ pub struct StreamingNeuralEmbedder {
     /// construction. Drives output timestamps so they match the offline
     /// embedder.
     samples_consumed: u64,
+    /// Embedding scratch reused across every emit in every
+    /// [`try_push_with`] call. Allocated **once** at construction with
+    /// capacity = `embedding_dim`, so the streaming hot path performs
+    /// zero allocations per push or per emit (the callback receives a
+    /// borrow of this buffer).
+    ///
+    /// [`try_push_with`]: StreamingNeuralEmbedder::try_push_with
+    embedding_scratch: Vec<f32>,
 }
 
 impl StreamingNeuralEmbedder {
@@ -59,10 +67,12 @@ impl StreamingNeuralEmbedder {
     /// and a probe inference — and shares the same error contract.
     pub fn new(cfg: NeuralEmbedderConfig) -> Result<Self> {
         let inner = super::embedder::NeuralEmbedder::new(cfg)?;
+        let embedding_dim = inner.core.embedding_dim;
         Ok(Self {
             core: inner.core,
             sample_carry: Vec::new(),
             samples_consumed: 0,
+            embedding_scratch: Vec::with_capacity(embedding_dim),
         })
     }
 
@@ -107,9 +117,9 @@ impl StreamingNeuralEmbedder {
     /// buffer and is overwritten on the next emit — copy out before
     /// the next iteration if you need to keep it.
     ///
-    /// Allocates exactly one `Vec<f32>` for the embedding scratch on
-    /// the first emit per call, reused across every emit in the same
-    /// `try_push_with`. Returns the number of embeddings emitted.
+    /// Performs **zero allocations per call**: the embedding scratch is
+    /// allocated once at construction (with capacity = `embedding_dim`)
+    /// and reused across every emit in every push.
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -129,19 +139,19 @@ impl StreamingNeuralEmbedder {
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let sr = self.core.cfg.sample_rate as u64;
-        let mut buf = Vec::with_capacity(self.core.embedding_dim);
         let mut emitted = 0usize;
 
         while self.sample_carry.len() >= window_samples {
-            // Disjoint borrow: `sample_carry` (immutable) and `core`
-            // (mutable) are different fields of `self`, so this is sound
-            // under Rust 2024's borrow rules.
+            // Disjoint borrow: `sample_carry` (immutable), `core` (mutable),
+            // and `embedding_scratch` (mutable) are different fields of
+            // `self`, so this is sound under Rust 2024's borrow rules.
             {
                 let window = &self.sample_carry[..window_samples];
-                self.core.embed_window_into(window, &mut buf)?;
+                self.core
+                    .embed_window_into(window, &mut self.embedding_scratch)?;
             }
             let t_start = TimestampMs(self.samples_consumed * 1000 / sr);
-            callback(t_start, &buf);
+            callback(t_start, &self.embedding_scratch);
             emitted += 1;
 
             // Drop the hop_samples we've now committed to; the remainder
@@ -178,14 +188,24 @@ impl StreamingNeuralEmbedder {
         self.samples_consumed
     }
 
+    /// Test-only: capacity of the embedding scratch buffer. Constant
+    /// across the lifetime of the embedder (set once at construction);
+    /// used to assert that `try_push_with` never reallocates.
+    #[cfg(test)]
+    pub(crate) fn embedding_scratch_capacity(&self) -> usize {
+        self.embedding_scratch.capacity()
+    }
+
     /// Test-only constructor: wrap a pre-built `EmbedderCore`. Used by
     /// the in-process passthrough fixture in `test_support`.
     #[cfg(test)]
     pub(crate) fn __from_core_for_test(core: EmbedderCore) -> Self {
+        let embedding_dim = core.embedding_dim;
         Self {
             core,
             sample_carry: Vec::new(),
             samples_consumed: 0,
+            embedding_scratch: Vec::with_capacity(embedding_dim),
         }
     }
 }
@@ -508,5 +528,43 @@ mod tests {
             (norm - 1.0).abs() > 0.5,
             "unexpected near-unit norm without L2: {norm}",
         );
+    }
+
+    #[test]
+    fn try_push_with_does_not_reallocate_embedding_scratch() {
+        // Pin the zero-allocation contract: the embedding scratch buffer
+        // is sized once at construction (capacity = embedding_dim) and
+        // must never grow — even across many emits in a single push,
+        // and across many pushes.
+        let mut s = fixture();
+        let initial_cap = s.embedding_scratch_capacity();
+        assert_eq!(
+            initial_cap,
+            s.embedding_dim(),
+            "scratch must start sized for one embedding",
+        );
+
+        // Push enough audio to emit ~50 embeddings.
+        let chunk = synth_audio(31, 50 * s.window_samples(), 16_000);
+        let mut emitted = 0usize;
+        s.try_push_with(&chunk, |_, _| emitted += 1).unwrap();
+        assert_eq!(emitted, 50);
+        assert_eq!(
+            s.embedding_scratch_capacity(),
+            initial_cap,
+            "scratch reallocated during a multi-emit push",
+        );
+
+        // Now push again across multiple smaller calls — capacity must
+        // still be unchanged.
+        for _ in 0..10 {
+            let small = synth_audio(43, s.window_samples(), 16_000);
+            s.try_push_with(&small, |_, _| {}).unwrap();
+            assert_eq!(
+                s.embedding_scratch_capacity(),
+                initial_cap,
+                "scratch reallocated across pushes",
+            );
+        }
     }
 }
