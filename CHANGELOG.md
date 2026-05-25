@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-26
+
 A correctness + clarity patch release driven by an end-to-end internal
 audit. Behaviour is bit-for-bit unchanged for any input that completed
 successfully on 0.3.1 — regression goldens are untouched. The visible
@@ -78,7 +80,8 @@ and tightened guarantees in places where 0.3.1's docs overstated.
   now describe the cache + scratch behaviour the new code actually
   delivers.
 
-[`Haitsma`]: https://docs.rs/audiofp/latest/audiofp/classical/struct.Haitsma.html
+[`Haitsma`]: https://docs.rs/audiofp/0.3.2/audiofp/classical/struct.Haitsma.html
+[0.3.2]: https://github.com/themankindproject/audiofp/compare/v0.3.1...v0.3.2
 
 ## [0.3.1] - 2026-05-16
 
@@ -466,7 +469,7 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.2...HEAD
 [0.3.1]: https://github.com/themankindproject/audiofp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/themankindproject/audiofp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/themankindproject/audiofp/compare/v0.2.0...v0.2.1
