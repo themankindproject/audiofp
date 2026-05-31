@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Streaming `push` is now genuinely allocation-free after warmup.**
+  `dsp::peaks::rolling_max_1d` allocated a fresh `VecDeque` on every
+  call, and `rolling_max_2d_pooled` invokes it `(n_rows + n_cols)` times
+  — so each streaming `detect_rows` performed hundreds of small heap
+  allocations per frame, contradicting the README's "allocation-free hot
+  path after warmup" claim. A single pooled `VecDeque<usize>` is now
+  owned by each caller (`PeakPicker`, `StreamingWang`, `StreamingPanako`)
+  and threaded through `rolling_max_2d_pooled` into `rolling_max_1d`,
+  where it is `clear()`ed (capacity retained) instead of reallocated.
+  Bit-exact streaming/offline parity is preserved — verified by the
+  existing `streaming_offline_equivalence` and 1-sample-per-push tests.
+
+### Fixed
+
+- **File decoder reallocates its conversion buffer when a packet grows.**
+  `io::decode_to_mono` sized the `f32` conversion buffer from the first
+  decoded packet only. A later packet that decodes to more frames than
+  the first (legal for some containers) would have decoded into an
+  undersized buffer. The buffer is now rebuilt whenever a packet's
+  capacity exceeds the current buffer.
+
 ## [0.3.2] - 2026-05-26
 
 A correctness + clarity patch release driven by an end-to-end internal

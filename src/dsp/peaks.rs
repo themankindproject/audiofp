@@ -86,6 +86,8 @@ pub struct PeakPicker {
     temp_2d: Vec<f32>,
     col_in: Vec<f32>,
     col_out: Vec<f32>,
+    /// Pooled monotonic deque for the 1-D rolling max passes.
+    dq: VecDeque<usize>,
 }
 
 impl PeakPicker {
@@ -98,6 +100,7 @@ impl PeakPicker {
             temp_2d: Vec::new(),
             col_in: Vec::new(),
             col_out: Vec::new(),
+            dq: VecDeque::new(),
         }
     }
 
@@ -148,6 +151,7 @@ impl PeakPicker {
             &mut self.temp_2d,
             &mut self.col_in,
             &mut self.col_out,
+            &mut self.dq,
         );
 
         let mut candidates: Vec<Peak> = Vec::new();
@@ -222,6 +226,7 @@ pub(crate) fn rolling_max_2d_pooled(
     temp: &mut [f32],
     col_in: &mut [f32],
     col_out: &mut [f32],
+    dq: &mut VecDeque<usize>,
 ) {
     debug_assert_eq!(input.len(), n_rows * n_cols);
     debug_assert_eq!(output.len(), n_rows * n_cols);
@@ -232,14 +237,14 @@ pub(crate) fn rolling_max_2d_pooled(
     for r in 0..n_rows {
         let row_in = &input[r * n_cols..(r + 1) * n_cols];
         let row_out = &mut temp[r * n_cols..(r + 1) * n_cols];
-        rolling_max_1d(row_in, kf, row_out);
+        rolling_max_1d(row_in, kf, row_out, dq);
     }
 
     for c in 0..n_cols {
         for r in 0..n_rows {
             col_in[r] = temp[r * n_cols + c];
         }
-        rolling_max_1d(col_in, kt, col_out);
+        rolling_max_1d(col_in, kt, col_out, dq);
         for r in 0..n_rows {
             output[r * n_cols + c] = col_out[r];
         }
@@ -261,10 +266,11 @@ fn rolling_max_2d(
     debug_assert_eq!(output.len(), n_rows * n_cols);
 
     let mut temp = vec![0.0_f32; n_rows * n_cols];
+    let mut dq: VecDeque<usize> = VecDeque::new();
     for r in 0..n_rows {
         let row_in = &input[r * n_cols..(r + 1) * n_cols];
         let row_out = &mut temp[r * n_cols..(r + 1) * n_cols];
-        rolling_max_1d(row_in, kf, row_out);
+        rolling_max_1d(row_in, kf, row_out, &mut dq);
     }
 
     let mut col_in = vec![0.0_f32; n_rows];
@@ -273,7 +279,7 @@ fn rolling_max_2d(
         for r in 0..n_rows {
             col_in[r] = temp[r * n_cols + c];
         }
-        rolling_max_1d(&col_in, kt, &mut col_out);
+        rolling_max_1d(&col_in, kt, &mut col_out, &mut dq);
         for r in 0..n_rows {
             output[r * n_cols + c] = col_out[r];
         }
@@ -285,14 +291,16 @@ fn rolling_max_2d(
 /// `output[i] = max(input[max(0, i-k) ..= min(n-1, i+k)])` for each `i`.
 /// Total work is amortised O(n) — every index is pushed and popped at
 /// most once.
-fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32]) {
+fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque<usize>) {
     let n = input.len();
     debug_assert_eq!(output.len(), n);
     if n == 0 {
         return;
     }
 
-    let mut dq: VecDeque<usize> = VecDeque::with_capacity(n.min(2 * k + 1));
+    // Pooled scratch: cleared (capacity retained) so the hot path does
+    // not allocate after warmup.
+    dq.clear();
 
     // Forward pass: as we add input[j], settle output[j - k] when j >= k.
     for j in 0..n {
@@ -362,10 +370,11 @@ mod tests {
             &[1.0],
             &[],
         ];
+        let mut dq: VecDeque<usize> = VecDeque::new();
         for &input in inputs {
             for k in 0..=4 {
                 let mut got = vec![0.0; input.len()];
-                rolling_max_1d(input, k, &mut got);
+                rolling_max_1d(input, k, &mut got, &mut dq);
                 let want = naive_max_1d(input, k);
                 assert_eq!(got, want, "input={input:?}, k={k}");
             }

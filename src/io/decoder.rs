@@ -143,8 +143,14 @@ fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> 
         };
 
         // Lazily allocate the f32 conversion buffer once the first packet
-        // tells us the channel layout / capacity.
-        if convert_buf.is_none() {
+        // tells us the channel layout / capacity. Reallocate if a later
+        // packet decodes to more frames than the current buffer can hold
+        // (the first packet's capacity is not guaranteed to bound the rest).
+        let needs_buf = match &convert_buf {
+            None => true,
+            Some(buf) => decoded.capacity() > buf.capacity(),
+        };
+        if needs_buf {
             let spec = *decoded.spec();
             let cap = decoded.capacity() as u64;
             convert_buf = Some(AudioBuffer::<f32>::new(cap, spec));

@@ -389,6 +389,7 @@ pub struct StreamingWang {
     pd_temp: alloc::vec::Vec<f32>,
     pd_col_in: alloc::vec::Vec<f32>,
     pd_col_out: alloc::vec::Vec<f32>,
+    pd_dq: alloc::collections::VecDeque<usize>,
 
     // Reusable scratch row for STFT output.
     frame_scratch: alloc::vec::Vec<f32>,
@@ -433,6 +434,7 @@ impl StreamingWang {
             pd_temp: alloc::vec::Vec::new(),
             pd_col_in: alloc::vec::Vec::new(),
             pd_col_out: alloc::vec::Vec::new(),
+            pd_dq: alloc::collections::VecDeque::new(),
             frame_scratch: alloc::vec![0.0_f32; n_bins],
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
@@ -507,6 +509,7 @@ impl StreamingWang {
             &mut self.pd_temp,
             &mut self.pd_col_in,
             &mut self.pd_col_out,
+            &mut self.pd_dq,
         );
 
         for row in from_row..=to_row {

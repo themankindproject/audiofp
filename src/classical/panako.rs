@@ -409,6 +409,7 @@ pub struct StreamingPanako {
     pd_temp: Vec<f32>,
     pd_col_in: Vec<f32>,
     pd_col_out: Vec<f32>,
+    pd_dq: alloc::collections::VecDeque<usize>,
     frame_scratch: Vec<f32>,
 
     bucket_pending: alloc::collections::BTreeMap<u32, Vec<Peak>>,
@@ -453,6 +454,7 @@ impl StreamingPanako {
             pd_temp: Vec::new(),
             pd_col_in: Vec::new(),
             pd_col_out: Vec::new(),
+            pd_dq: alloc::collections::VecDeque::new(),
             frame_scratch: alloc::vec![0.0_f32; n_bins],
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
@@ -520,6 +522,7 @@ impl StreamingPanako {
             &mut self.pd_temp,
             &mut self.pd_col_in,
             &mut self.pd_col_out,
+            &mut self.pd_dq,
         );
 
         for row in from_row..=to_row {
