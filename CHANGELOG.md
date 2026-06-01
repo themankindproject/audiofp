@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undersized buffer. The buffer is now rebuilt whenever a packet's
   capacity exceeds the current buffer.
 
+### Changed
+
+- **Internal: collapsed duplicated top-K heap wrappers.** Wang's
+  borrowed `MinByMag` and Panako's borrowed `MinByScore` were
+  byte-identical in `Ord` logic to their owned
+  `MinByMagOwned` / `MinByScoreOwned` siblings, differing only in
+  borrowed-vs-owned storage. Since `Peak` is `Copy`, the offline
+  builders now use the owned variants too, removing the borrowed structs
+  and their hand-written `PartialEq`/`Eq`/`Ord` impls (~55 lines). Also
+  hoisted Slaney's `min_log_mel` (a pure compile-time division) to a
+  `const` instead of recomputing it per `hz_to_mel` / `mel_to_hz` call.
+  No public API or output change — goldens unaffected.
+
 ## [0.3.2] - 2026-05-26
 
 A correctness + clarity patch release driven by an end-to-end internal
