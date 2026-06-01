@@ -199,34 +199,8 @@ impl Fingerprinter for Panako {
 /// Wrapper that orders triplets so the **smallest** combined magnitude
 /// (with the largest position as tiebreak) compares **greatest** —
 /// suitable as the element of a max-heap that maintains the top-K
-/// largest triplets in `O(N log K)` work.
-#[derive(Copy, Clone)]
-struct MinByScore<'a>(&'a Peak, &'a Peak, f32);
-
-impl PartialEq for MinByScore<'_> {
-    fn eq(&self, o: &Self) -> bool {
-        self.2 == o.2
-            && (self.0.t_frame, self.0.f_bin) == (o.0.t_frame, o.0.f_bin)
-            && (self.1.t_frame, self.1.f_bin) == (o.1.t_frame, o.1.f_bin)
-    }
-}
-impl Eq for MinByScore<'_> {}
-impl PartialOrd for MinByScore<'_> {
-    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for MinByScore<'_> {
-    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
-        o.2.partial_cmp(&self.2)
-            .unwrap_or(core::cmp::Ordering::Equal)
-            .then_with(|| (o.0.t_frame, o.0.f_bin).cmp(&(self.0.t_frame, self.0.f_bin)))
-            .then_with(|| (o.1.t_frame, o.1.f_bin).cmp(&(self.1.t_frame, self.1.f_bin)))
-    }
-}
-
-/// Owned variant of [`MinByScore`] for pooled heap use in the streaming
-/// builder where borrow lifetimes cannot be expressed on the struct.
+/// largest triplets in `O(N log K)` work. Owned `Peak` copies so the
+/// same type serves both the offline and pooled streaming builders.
 #[derive(Copy, Clone)]
 struct MinByScoreOwned {
     b: Peak,
@@ -276,9 +250,9 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
     let mut hashes = Vec::with_capacity(peaks.len() * fan_out);
 
     let mut targets: Vec<&Peak> = Vec::with_capacity(64);
-    let mut heap: alloc::collections::BinaryHeap<MinByScore> =
+    let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
         alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
-    let mut triplets: Vec<(&Peak, &Peak, f32)> = Vec::with_capacity(fan_out);
+    let mut triplets: Vec<(Peak, Peak, f32)> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
         // Collect all peaks in the cone.
@@ -303,7 +277,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         for (j, b) in targets.iter().enumerate() {
             for c in &targets[j + 1..] {
                 let score = b.mag + c.mag;
-                heap.push(MinByScore(b, c, score));
+                heap.push(MinByScoreOwned::new(b, c, score));
                 if heap.len() > fan_out {
                     heap.pop();
                 }
@@ -312,7 +286,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
 
         // Drain and re-sort the kept K for deterministic emission.
         triplets.clear();
-        triplets.extend(heap.drain().map(|w| (w.0, w.1, w.2)));
+        triplets.extend(heap.drain().map(|w| (w.b, w.c, w.score)));
         triplets.sort_unstable_by(|x, y| {
             y.2.partial_cmp(&x.2)
                 .unwrap_or(core::cmp::Ordering::Equal)

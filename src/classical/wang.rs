@@ -210,36 +210,6 @@ impl Fingerprinter for Wang {
     }
 }
 
-/// Wrapper that orders `Peak`s such that the **smallest** magnitude (with
-/// the largest position as tiebreak) compares **greatest**. Used as the
-/// element of a max-heap to maintain the top-K largest candidates with
-/// `O(N log K)` work instead of an `O(N log N)` full sort.
-#[derive(Copy, Clone)]
-struct MinByMag<'a>(&'a Peak);
-
-impl PartialEq for MinByMag<'_> {
-    fn eq(&self, o: &Self) -> bool {
-        self.0.mag == o.0.mag && self.0.t_frame == o.0.t_frame && self.0.f_bin == o.0.f_bin
-    }
-}
-impl Eq for MinByMag<'_> {}
-impl PartialOrd for MinByMag<'_> {
-    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for MinByMag<'_> {
-    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
-        // Reverse mag ordering (smallest first). Reverse position ordering
-        // (largest position first) so the final sort's deterministic
-        // (mag desc, pos asc) ordering still wins for kept elements.
-        o.0.mag
-            .partial_cmp(&self.0.mag)
-            .unwrap_or(core::cmp::Ordering::Equal)
-            .then_with(|| (o.0.t_frame, o.0.f_bin).cmp(&(self.0.t_frame, self.0.f_bin)))
-    }
-}
-
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit landmark hashes.
 fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let mut hashes = Vec::with_capacity(peaks.len() * cfg.fan_out as usize);
@@ -247,9 +217,9 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
 
-    let mut heap: alloc::collections::BinaryHeap<MinByMag> =
+    let mut heap: alloc::collections::BinaryHeap<MinByMagOwned> =
         alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
-    let mut targets: Vec<&Peak> = Vec::with_capacity(fan_out);
+    let mut targets: Vec<Peak> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
         heap.clear();
@@ -267,7 +237,7 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             if df.abs() > target_zone_f {
                 continue;
             }
-            heap.push(MinByMag(target));
+            heap.push(MinByMagOwned(*target));
             if heap.len() > fan_out {
                 // Drop the current smallest — the heap top, by our reversed Ord.
                 heap.pop();

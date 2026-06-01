@@ -30,18 +30,20 @@ pub enum MelScale {
 const SLANEY_F_SP: f32 = 200.0 / 3.0;
 const SLANEY_MIN_LOG_HZ: f32 = 1000.0;
 const SLANEY_LOGSTEP_DENOM: f32 = 27.0;
+/// Mel value where Slaney's mapping switches from linear to logarithmic.
+/// Pure compile-time division, hoisted out of `hz_to_mel` / `mel_to_hz`.
+const SLANEY_MIN_LOG_MEL: f32 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
 
 impl MelScale {
     fn hz_to_mel(self, hz: f32) -> f32 {
         match self {
             MelScale::Htk => 2595.0 * log10f(1.0 + hz / 700.0),
             MelScale::Slaney => {
-                let min_log_mel = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
                 let logstep = logf(6.4) / SLANEY_LOGSTEP_DENOM;
                 if hz < SLANEY_MIN_LOG_HZ {
                     hz / SLANEY_F_SP
                 } else {
-                    min_log_mel + logf(hz / SLANEY_MIN_LOG_HZ) / logstep
+                    SLANEY_MIN_LOG_MEL + logf(hz / SLANEY_MIN_LOG_HZ) / logstep
                 }
             }
         }
@@ -51,12 +53,11 @@ impl MelScale {
         match self {
             MelScale::Htk => 700.0 * (powf(10.0, mel / 2595.0) - 1.0),
             MelScale::Slaney => {
-                let min_log_mel = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
                 let logstep = logf(6.4) / SLANEY_LOGSTEP_DENOM;
-                if mel < min_log_mel {
+                if mel < SLANEY_MIN_LOG_MEL {
                     SLANEY_F_SP * mel
                 } else {
-                    SLANEY_MIN_LOG_HZ * expf(logstep * (mel - min_log_mel))
+                    SLANEY_MIN_LOG_HZ * expf(logstep * (mel - SLANEY_MIN_LOG_MEL))
                 }
             }
         }
