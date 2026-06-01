@@ -183,15 +183,20 @@ impl PeakPicker {
 
 /// Keep the top `target` peaks per one-second bucket (by magnitude).
 fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize) -> Vec<Peak> {
-    // Sort by (bucket asc, mag desc) so we can stream-select per bucket.
+    // Sort by (bucket asc, mag desc, position asc) so we can stream-select
+    // per bucket. The `(t_frame, f_bin)` tiebreak is unique per peak, making
+    // this a total order: equal-magnitude peaks resolve identically here and
+    // in the streaming `finalize_bucket`, so both keep the same top-K.
     peaks.sort_unstable_by(|a, b| {
         let ba = (a.t_frame as f32 / frames_per_sec) as u32;
         let bb = (b.t_frame as f32 / frames_per_sec) as u32;
-        ba.cmp(&bb).then_with(|| {
-            b.mag
-                .partial_cmp(&a.mag)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        })
+        ba.cmp(&bb)
+            .then_with(|| {
+                b.mag
+                    .partial_cmp(&a.mag)
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            })
+            .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
     });
 
     let mut kept = Vec::with_capacity(peaks.len());
@@ -471,6 +476,29 @@ mod tests {
         let mut mags: Vec<f32> = peaks_tight.iter().map(|p| p.mag).collect();
         mags.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(mags, vec![8.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn adaptive_per_second_breaks_exact_mag_ties_by_position() {
+        // All peaks share one bucket and the SAME magnitude, exceeding the
+        // cap. The `(t_frame, f_bin)` tiebreak must make selection a total
+        // order so the kept set is deterministic — and identical to what
+        // the streaming `finalize_bucket` keeps. Without the tiebreak,
+        // `sort_unstable` could retain a different subset.
+        let peaks: Vec<Peak> = (0..6)
+            .map(|f| Peak {
+                t_frame: 1,
+                f_bin: f,
+                _pad: 0,
+                mag: 5.0, // exact tie
+            })
+            .collect();
+
+        let kept = adaptive_per_second(peaks, 100.0, 3);
+        let mut got: Vec<u16> = kept.iter().map(|p| p.f_bin).collect();
+        got.sort_unstable();
+        // Lowest-position peaks win the tie (mag desc, then (t, f) asc).
+        assert_eq!(got, vec![0, 1, 2]);
     }
 
     #[test]

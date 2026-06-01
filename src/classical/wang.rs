@@ -514,11 +514,14 @@ impl StreamingWang {
             None => return,
         };
         // Match the offline picker's `adaptive_per_second`: sort by mag
-        // desc only, no positional tiebreak.
+        // desc, then `(t, f)` ascending. The positional tiebreak is unique
+        // per peak, so equal-magnitude peaks at the truncation boundary
+        // resolve identically to the offline path.
         peaks.sort_unstable_by(|a, b| {
             b.mag
                 .partial_cmp(&a.mag)
                 .unwrap_or(core::cmp::Ordering::Equal)
+                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
         });
         peaks.truncate(self.cfg.peaks_per_sec as usize);
         // Re-sort by `(t, f)` so downstream iteration matches the offline

@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Adaptive per-second peak selection is now a total order.** Both the
+  offline `adaptive_per_second` and the streaming `finalize_bucket`
+  truncate to `peaks_per_sec` by magnitude; neither had a positional
+  tiebreak, so two peaks of *exactly* equal `f32` magnitude straddling
+  the cap could be resolved differently by `sort_unstable` in the two
+  paths — a latent gap in the "bit-exact under arbitrary chunking"
+  guarantee. All three truncation sorts now break ties on
+  `(t_frame, f_bin)` (unique per peak), making selection deterministic
+  and identical across offline/streaming. No golden change (synthetic
+  inputs produce no exact ties); new unit test
+  `adaptive_per_second_breaks_exact_mag_ties_by_position` pins the
+  contract.
+
 - **File decoder reallocates its conversion buffer when a packet grows.**
   `io::decode_to_mono` sized the `f32` conversion buffer from the first
   decoded packet only. A later packet that decodes to more frames than
