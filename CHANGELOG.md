@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where it is `clear()`ed (capacity retained) instead of reallocated.
   Bit-exact streaming/offline parity is preserved — verified by the
   existing `streaming_offline_equivalence` and 1-sample-per-push tests.
+  This removes per-frame allocator traffic (a realtime-jitter win for
+  audio-callback use); steady-state throughput is unchanged at default
+  config, where peak-picking dominates per-frame cost —
+  `cargo bench --bench streaming` shows all deltas within the ~3–4 %
+  run-to-run noise floor. The larger streaming cost is the redundant
+  full-window rolling-max recompute tracked in #1.
 
 ### Fixed
 
