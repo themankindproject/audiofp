@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-04
+
+A correctness and realtime-allocation patch release for the classical
+streaming paths. Public API and fingerprint outputs are unchanged for
+normal inputs; the release tightens deterministic selection, decoder
+buffer handling, and the allocation guarantees documented for streaming
+push.
+
 ### Performance
 
 - **Streaming `push` is now genuinely allocation-free after warmup.**
@@ -61,6 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hoisted Slaney's `min_log_mel` (a pure compile-time division) to a
   `const` instead of recomputing it per `hz_to_mel` / `mel_to_hz` call.
   No public API or output change — goldens unaffected.
+
+[0.3.3]: https://github.com/themankindproject/audiofp/compare/v0.3.2...v0.3.3
 
 ## [0.3.2] - 2026-05-26
 
@@ -524,7 +534,7 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.3...HEAD
 [0.3.1]: https://github.com/themankindproject/audiofp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/themankindproject/audiofp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/themankindproject/audiofp/compare/v0.2.0...v0.2.1
