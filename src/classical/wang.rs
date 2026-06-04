@@ -354,12 +354,9 @@ pub struct StreamingWang {
     n_frames_total: u32,
     last_pd_frame: i32,
 
-    // Pooled peak-detection scratch.
-    pd_max: alloc::vec::Vec<f32>,
-    pd_temp: alloc::vec::Vec<f32>,
-    pd_col_in: alloc::vec::Vec<f32>,
-    pd_col_out: alloc::vec::Vec<f32>,
-    pd_dq: alloc::collections::VecDeque<usize>,
+    // Incremental peak detection (replaces full-window rolling_max_2d).
+    peak_det: crate::dsp::peaks::IncrementalPeakDetector,
+    peak_row_max: alloc::vec::Vec<f32>,
 
     // Reusable scratch row for STFT output.
     frame_scratch: alloc::vec::Vec<f32>,
@@ -400,11 +397,12 @@ impl StreamingWang {
             spec_first_frame: 0,
             n_frames_total: 0,
             last_pd_frame: -1,
-            pd_max: alloc::vec::Vec::new(),
-            pd_temp: alloc::vec::Vec::new(),
-            pd_col_in: alloc::vec::Vec::new(),
-            pd_col_out: alloc::vec::Vec::new(),
-            pd_dq: alloc::collections::VecDeque::new(),
+            peak_det: crate::dsp::peaks::IncrementalPeakDetector::new(
+                WANG_PEAK_NEIGHBOURHOOD,
+                WANG_PEAK_NEIGHBOURHOOD,
+                n_bins,
+            ),
+            peak_row_max: alloc::vec![0.0_f32; n_bins],
             frame_scratch: alloc::vec![0.0_f32; n_bins],
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
@@ -452,38 +450,14 @@ impl StreamingWang {
     /// Run rolling-max on the current spec buffer and extract peaks at
     /// rows `[from_row_inclusive, to_row_inclusive]` (in spec-buffer-relative
     /// indices). Push survivors into [`bucket_pending`].
-    fn detect_rows(&mut self, from_row: usize, to_row: usize) {
+    fn detect_rows_range(&mut self, from_row: usize, to_row: usize) {
         if self.spec_n_rows == 0 || from_row > to_row {
             return;
         }
-        let n_rows = self.spec_n_rows;
         let n_bins = self.spec_n_bins;
-        let used = n_rows * n_bins;
-
-        self.pd_max.clear();
-        self.pd_max.resize(used, 0.0);
-        self.pd_temp.clear();
-        self.pd_temp.resize(used, 0.0);
-        self.pd_col_in.clear();
-        self.pd_col_in.resize(n_rows, 0.0);
-        self.pd_col_out.clear();
-        self.pd_col_out.resize(n_rows, 0.0);
-
-        crate::dsp::peaks::rolling_max_2d_pooled(
-            &self.spec[..used],
-            n_rows,
-            n_bins,
-            WANG_PEAK_NEIGHBOURHOOD,
-            WANG_PEAK_NEIGHBOURHOOD,
-            &mut self.pd_max,
-            &mut self.pd_temp,
-            &mut self.pd_col_in,
-            &mut self.pd_col_out,
-            &mut self.pd_dq,
-        );
 
         for row in from_row..=to_row {
-            if row >= n_rows {
+            if row >= self.spec_n_rows {
                 break;
             }
             let abs_f = self.spec_first_frame + row as u32;
@@ -491,7 +465,7 @@ impl StreamingWang {
             for bin in 0..n_bins {
                 let idx = row * n_bins + bin;
                 let v = self.spec[idx];
-                if v > self.cfg.min_anchor_mag_db && v >= self.pd_max[idx] {
+                if v > self.cfg.min_anchor_mag_db && v >= self.peak_row_max[bin] {
                     let peak = Peak {
                         t_frame: abs_f,
                         f_bin: bin as u16,
@@ -630,8 +604,6 @@ impl StreamingFingerprinter for StreamingWang {
     fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
         self.sample_carry.extend_from_slice(samples);
 
-        let nbht = WANG_PEAK_NEIGHBOURHOOD as u32;
-
         // 1. Compute new STFT frames one at a time, detecting peaks at
         // each frame as soon as it becomes ripe (i.e. its full forward
         // neighbourhood is in the buffer).
@@ -653,20 +625,16 @@ impl StreamingFingerprinter for StreamingWang {
             // borrow, avoiding a per-frame `Vec::clone` of the row.
             self.append_frame_scratch_row();
 
-            let frame_idx = self.n_frames_total;
             self.n_frames_total += 1;
             off += WANG_HOP;
 
-            // After adding frame `frame_idx`, frame `frame_idx - nbht`
-            // becomes ripe (its forward neighbourhood is now in the
-            // buffer; backward neighbourhood is offline-equivalent
-            // because the buffer's left edge matches the offline
-            // saturating clip when applicable).
-            if frame_idx >= nbht {
-                let abs_ripe = frame_idx - nbht;
-                let row_idx = (abs_ripe - self.spec_first_frame) as usize;
-                self.detect_rows(row_idx, row_idx);
-                self.last_pd_frame = abs_ripe as i32;
+            // Feed the new row to the incremental peak detector. When the
+            // center of the vertical window becomes ripe, it returns the
+            // 2-D rolling-max for that row so we can compare peaks.
+            if let Some(ripe_abs) = self.peak_det.push_row(&self.frame_scratch, &mut self.peak_row_max) {
+                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
+                self.detect_rows_range(row_idx, row_idx);
+                self.last_pd_frame = ripe_abs as i32;
             }
         }
 
@@ -682,20 +650,33 @@ impl StreamingFingerprinter for StreamingWang {
     }
 
     fn flush(&mut self) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
-        // Detect peaks at remaining frames (those whose forward context
-        // would otherwise extend past end-of-stream — same boundary the
-        // offline picker handles via `saturating_sub`).
-        if self.spec_n_rows > 0 && self.n_frames_total > 0 {
-            let detect_to_abs = self.n_frames_total as i32 - 1;
-            if detect_to_abs > self.last_pd_frame {
-                let from_abs = (self.last_pd_frame + 1).max(self.spec_first_frame as i32) as u32;
-                let to_abs = detect_to_abs as u32;
-                let from_row = (from_abs - self.spec_first_frame) as usize;
-                let to_row = (to_abs - self.spec_first_frame) as usize;
-                self.detect_rows(from_row, to_row);
-                self.last_pd_frame = detect_to_abs;
+        // Flush remaining frames from the incremental peak detector.
+        // These are frames whose forward context extends past end-of-stream.
+        let n_bins = self.spec_n_bins;
+        let min_mag = self.cfg.min_anchor_mag_db;
+        let spec = &self.spec;
+        let spec_first_frame = self.spec_first_frame;
+        let bucket_pending = &mut self.bucket_pending;
+        let last_pd = &mut self.last_pd_frame;
+
+        self.peak_det.flush(&mut self.peak_row_max, |ripe_abs, max_row| {
+            let row_idx = (ripe_abs - spec_first_frame) as usize;
+            let bucket = (ripe_abs as f32 / WANG_FRAMES_PER_SEC) as u32;
+            for bin in 0..n_bins {
+                let idx = row_idx * n_bins + bin;
+                let v = spec[idx];
+                if v > min_mag && v >= max_row[bin] {
+                    let peak = Peak {
+                        t_frame: ripe_abs,
+                        f_bin: bin as u16,
+                        _pad: 0,
+                        mag: v,
+                    };
+                    bucket_pending.entry(bucket).or_default().push(peak);
+                }
             }
-        }
+            *last_pd = ripe_abs as i32;
+        });
 
         // Finalise every remaining bucket — no more peaks can arrive.
         let buckets: alloc::vec::Vec<u32> = self.bucket_pending.keys().cloned().collect();

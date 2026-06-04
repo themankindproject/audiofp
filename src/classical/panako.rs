@@ -379,11 +379,8 @@ pub struct StreamingPanako {
     n_frames_total: u32,
     last_pd_frame: i32,
 
-    pd_max: Vec<f32>,
-    pd_temp: Vec<f32>,
-    pd_col_in: Vec<f32>,
-    pd_col_out: Vec<f32>,
-    pd_dq: alloc::collections::VecDeque<usize>,
+    peak_det: crate::dsp::peaks::IncrementalPeakDetector,
+    peak_row_max: Vec<f32>,
     frame_scratch: Vec<f32>,
 
     bucket_pending: alloc::collections::BTreeMap<u32, Vec<Peak>>,
@@ -424,11 +421,12 @@ impl StreamingPanako {
             spec_first_frame: 0,
             n_frames_total: 0,
             last_pd_frame: -1,
-            pd_max: Vec::new(),
-            pd_temp: Vec::new(),
-            pd_col_in: Vec::new(),
-            pd_col_out: Vec::new(),
-            pd_dq: alloc::collections::VecDeque::new(),
+            peak_det: crate::dsp::peaks::IncrementalPeakDetector::new(
+                PANAKO_PEAK_NEIGHBOURHOOD,
+                PANAKO_PEAK_NEIGHBOURHOOD,
+                n_bins,
+            ),
+            peak_row_max: alloc::vec![0.0_f32; n_bins],
             frame_scratch: alloc::vec![0.0_f32; n_bins],
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
@@ -473,34 +471,10 @@ impl StreamingPanako {
         if self.spec_n_rows == 0 || from_row > to_row {
             return;
         }
-        let n_rows = self.spec_n_rows;
         let n_bins = self.spec_n_bins;
-        let used = n_rows * n_bins;
-
-        self.pd_max.clear();
-        self.pd_max.resize(used, 0.0);
-        self.pd_temp.clear();
-        self.pd_temp.resize(used, 0.0);
-        self.pd_col_in.clear();
-        self.pd_col_in.resize(n_rows, 0.0);
-        self.pd_col_out.clear();
-        self.pd_col_out.resize(n_rows, 0.0);
-
-        crate::dsp::peaks::rolling_max_2d_pooled(
-            &self.spec[..used],
-            n_rows,
-            n_bins,
-            PANAKO_PEAK_NEIGHBOURHOOD,
-            PANAKO_PEAK_NEIGHBOURHOOD,
-            &mut self.pd_max,
-            &mut self.pd_temp,
-            &mut self.pd_col_in,
-            &mut self.pd_col_out,
-            &mut self.pd_dq,
-        );
 
         for row in from_row..=to_row {
-            if row >= n_rows {
+            if row >= self.spec_n_rows {
                 break;
             }
             let abs_f = self.spec_first_frame + row as u32;
@@ -508,7 +482,7 @@ impl StreamingPanako {
             for bin in 0..n_bins {
                 let idx = row * n_bins + bin;
                 let v = self.spec[idx];
-                if v > self.cfg.min_anchor_mag_db && v >= self.pd_max[idx] {
+                if v > self.cfg.min_anchor_mag_db && v >= self.peak_row_max[bin] {
                     let peak = Peak {
                         t_frame: abs_f,
                         f_bin: bin as u16,
@@ -645,12 +619,7 @@ impl StreamingFingerprinter for StreamingPanako {
 
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.sample_carry.extend_from_slice(samples);
-        let nbht = PANAKO_PEAK_NEIGHBOURHOOD as u32;
 
-        // Walk frames with an offset cursor so we drain `sample_carry`
-        // exactly once at the end of the call instead of shifting the
-        // tail by `PANAKO_HOP` after every frame; the loop becomes
-        // O(frames) instead of O(frames × buffer).
         let mut off = 0usize;
         while self.sample_carry.len() - off >= PANAKO_N_FFT {
             self.stft.process_frame_power(
@@ -660,19 +629,15 @@ impl StreamingFingerprinter for StreamingPanako {
             for v in self.frame_scratch.iter_mut() {
                 *v = 10.0 * libm::log10f(v.max(PANAKO_LOG_FLOOR_POWER));
             }
-            // Append `self.frame_scratch` directly via disjoint field
-            // borrow, avoiding a per-frame `Vec::clone` of the row.
             self.append_frame_scratch_row();
 
-            let frame_idx = self.n_frames_total;
             self.n_frames_total += 1;
             off += PANAKO_HOP;
 
-            if frame_idx >= nbht {
-                let abs_ripe = frame_idx - nbht;
-                let row_idx = (abs_ripe - self.spec_first_frame) as usize;
+            if let Some(ripe_abs) = self.peak_det.push_row(&self.frame_scratch, &mut self.peak_row_max) {
+                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
                 self.detect_rows(row_idx, row_idx);
-                self.last_pd_frame = abs_ripe as i32;
+                self.last_pd_frame = ripe_abs as i32;
             }
         }
 
@@ -685,17 +650,32 @@ impl StreamingFingerprinter for StreamingPanako {
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        if self.spec_n_rows > 0 && self.n_frames_total > 0 {
-            let detect_to_abs = self.n_frames_total as i32 - 1;
-            if detect_to_abs > self.last_pd_frame {
-                let from_abs = (self.last_pd_frame + 1).max(self.spec_first_frame as i32) as u32;
-                let to_abs = detect_to_abs as u32;
-                let from_row = (from_abs - self.spec_first_frame) as usize;
-                let to_row = (to_abs - self.spec_first_frame) as usize;
-                self.detect_rows(from_row, to_row);
-                self.last_pd_frame = detect_to_abs;
+        let n_bins = self.spec_n_bins;
+        let min_mag = self.cfg.min_anchor_mag_db;
+        let spec = &self.spec;
+        let spec_first_frame = self.spec_first_frame;
+        let bucket_pending = &mut self.bucket_pending;
+        let last_pd = &mut self.last_pd_frame;
+
+        self.peak_det.flush(&mut self.peak_row_max, |ripe_abs, max_row| {
+            let row_idx = (ripe_abs - spec_first_frame) as usize;
+            let bucket = (ripe_abs as f32 / PANAKO_FRAMES_PER_SEC) as u32;
+            for bin in 0..n_bins {
+                let idx = row_idx * n_bins + bin;
+                let v = spec[idx];
+                if v > min_mag && v >= max_row[bin] {
+                    let peak = Peak {
+                        t_frame: ripe_abs,
+                        f_bin: bin as u16,
+                        _pad: 0,
+                        mag: v,
+                    };
+                    bucket_pending.entry(bucket).or_default().push(peak);
+                }
             }
-        }
+            *last_pd = ripe_abs as i32;
+        });
+
         let buckets: Vec<u32> = self.bucket_pending.keys().cloned().collect();
         for bucket in buckets {
             self.finalize_bucket(bucket);

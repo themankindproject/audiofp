@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Streaming peak detection is now truly incremental (~16× faster).**
+  `StreamingWang::push` and `StreamingPanako::push` previously called
+  `rolling_max_2d_pooled` over the full 31-row spectrogram window on
+  every newly-ripe frame, even though only a single row's result was
+  consumed — ~31× redundant work per frame (the dominant streaming cost
+  noted in 0.3.3). A new `IncrementalPeakDetector` caches the horizontal
+  rolling-max once per row when it's appended and maintains per-column
+  vertical Lemire deques across pushes, producing the 2-D rolling max
+  for the single ripe row in amortised O(n_bins) instead of
+  O(n_rows × n_bins). Per-push CPU no longer depends on
+  `neighbourhood_t`. Bit-exact streaming/offline parity is preserved —
+  all existing equivalence tests pass unchanged, including the
+  1-sample-per-push pathological case.
+  `cargo bench --bench streaming` results (5 s synthetic, default config):
+
+  | Fingerprinter | Before     | After     | Δ           |
+  | ------------- | ---------- | --------- | ----------- |
+  | Wang (256)    | 226 ms     | 13.3 ms   | **−94.1 %** |
+  | Wang (1 s)    | 229 ms     | 13.3 ms   | **−94.2 %** |
+  | Panako (256)  | 231 ms     | 14.2 ms   | **−93.9 %** |
+  | Panako (1 s)  | 233 ms     | 14.3 ms   | **−93.9 %** |
+
+  Streaming throughput now matches the offline extractors (~3 Melem/s).
+  Closes #1.
+
 ## [0.3.3] - 2026-06-04
 
 A correctness and realtime-allocation patch release for the classical

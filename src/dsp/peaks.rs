@@ -348,6 +348,178 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
     }
 }
 
+/// Incremental 2-D rolling-max for streaming peak detection.
+///
+/// Caches the horizontal rolling-max once per row and maintains per-column
+/// vertical Lemire deques so the 2-D max for a single ripe row is produced
+/// in amortised O(n_bins) instead of recomputing the full window.
+pub(crate) struct IncrementalPeakDetector {
+    kt: usize,
+    kf: usize,
+    n_bins: usize,
+    window_cap: usize,
+    // Ring of horizontally-maxed rows (flat, row-major).
+    horiz_ring: Vec<f32>,
+    ring_len: usize,
+    ring_write: usize,
+    // Absolute row index of the most recently pushed row.
+    abs_pushed: u32,
+    // Number of rows pushed so far (saturates at u32::MAX in practice).
+    n_pushed: u32,
+    // Per-column vertical Lemire deques: (abs_row_index, value).
+    vert_deques: Vec<VecDeque<(u32, f32)>>,
+    // Scratch for horizontal rolling-max.
+    horiz_scratch: Vec<f32>,
+    dq: VecDeque<usize>,
+}
+
+impl IncrementalPeakDetector {
+    pub(crate) fn new(kt: usize, kf: usize, n_bins: usize) -> Self {
+        let window_cap = 2 * kt + 1;
+        let vert_deques = (0..n_bins)
+            .map(|_| VecDeque::with_capacity(window_cap))
+            .collect();
+        Self {
+            kt,
+            kf,
+            n_bins,
+            window_cap,
+            horiz_ring: alloc::vec![0.0_f32; window_cap * n_bins],
+            ring_len: 0,
+            ring_write: 0,
+            abs_pushed: 0,
+            n_pushed: 0,
+            vert_deques,
+            horiz_scratch: alloc::vec![0.0_f32; n_bins],
+            dq: VecDeque::new(),
+        }
+    }
+
+    /// Push a new spectrogram row. Returns `Some(abs_ripe_frame)` when the
+    /// center row of the vertical window becomes ripe, writing its 2-D
+    /// rolling-max into `out_max`. Returns `None` while filling the initial
+    /// window.
+    pub(crate) fn push_row(&mut self, row: &[f32], out_max: &mut [f32]) -> Option<u32> {
+        debug_assert_eq!(row.len(), self.n_bins);
+        debug_assert_eq!(out_max.len(), self.n_bins);
+
+        let abs = self.n_pushed;
+        self.abs_pushed = abs;
+        self.n_pushed += 1;
+
+        // 1. Horizontal rolling-max of the new row → store in ring.
+        rolling_max_1d(row, self.kf, &mut self.horiz_scratch, &mut self.dq);
+        let dst_start = self.ring_write * self.n_bins;
+        self.horiz_ring[dst_start..dst_start + self.n_bins]
+            .copy_from_slice(&self.horiz_scratch);
+        self.ring_write = (self.ring_write + 1) % self.window_cap;
+        if self.ring_len < self.window_cap {
+            self.ring_len += 1;
+        }
+
+        // 2. Update vertical deques with the new horizontal-maxed values.
+        for col in 0..self.n_bins {
+            let val = self.horiz_scratch[col];
+            let dq = &mut self.vert_deques[col];
+            // Maintain decreasing monotonicity.
+            while let Some(&(_, back_val)) = dq.back() {
+                if back_val <= val {
+                    dq.pop_back();
+                } else {
+                    break;
+                }
+            }
+            dq.push_back((abs, val));
+            // Expire entries outside the window.
+            let window_start = abs.saturating_sub(self.kt as u32);
+            // For the ripe row (center), the window extends kt on each side.
+            // But we need to consider what the ripe row is: it's abs - kt.
+            // The vertical window for the ripe row is [ripe - kt, ripe + kt].
+            // Since ripe = abs - kt, the window is [abs - 2*kt, abs].
+            // We expire anything < abs - 2*kt.
+            let _ = window_start; // not used directly; see below
+        }
+
+        // 3. Check if a ripe row exists (need at least kt+1 rows pushed).
+        if abs < self.kt as u32 {
+            return None;
+        }
+
+        let ripe_abs = abs - self.kt as u32;
+        // The vertical window for the ripe row: [ripe_abs - kt, ripe_abs + kt]
+        // = [abs - 2*kt, abs]. Expire entries before that.
+        let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
+
+        for col in 0..self.n_bins {
+            let dq = &mut self.vert_deques[col];
+            while let Some(&(idx, _)) = dq.front() {
+                if idx < vert_window_start {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            out_max[col] = dq.front().unwrap().1;
+        }
+
+        Some(ripe_abs)
+    }
+
+    /// Flush remaining rows that haven't become ripe during normal push.
+    /// These are the tail rows whose forward context extends past end-of-stream.
+    /// Calls `emit_fn(abs_frame, max_slice)` for each.
+    pub(crate) fn flush(&mut self, out_max: &mut [f32], mut emit_fn: impl FnMut(u32, &[f32])) {
+        if self.n_pushed == 0 {
+            return;
+        }
+        // The last ripe frame emitted by push was at abs = n_pushed - 1 - kt
+        // (if n_pushed > kt). The remaining un-emitted frames are
+        // [last_ripe + 1, n_pushed - 1], i.e. the last `min(kt, n_pushed-1)` frames.
+        // But if n_pushed <= kt, then NO frames were emitted by push at all,
+        // so we need to emit all of [0, n_pushed-1].
+        let first_flush = if self.n_pushed > self.kt as u32 {
+            self.n_pushed - self.kt as u32
+        } else {
+            0
+        };
+        let last_flush = self.n_pushed - 1;
+
+        // For flush frames, we can't push new rows — the deques already
+        // contain all the data. The vertical window shrinks on the right.
+        // For ripe_abs in [first_flush, last_flush]:
+        //   window = [ripe_abs.saturating_sub(kt), min(ripe_abs + kt, n_pushed - 1)]
+        //   = [ripe_abs.saturating_sub(kt), n_pushed - 1]  (since ripe_abs + kt >= n_pushed - 1 for flush frames)
+        // The deques contain all entries up to abs = n_pushed - 1.
+        // We just need to expire entries below the window start.
+        for ripe_abs in first_flush..=last_flush {
+            let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
+            for col in 0..self.n_bins {
+                let dq = &mut self.vert_deques[col];
+                while let Some(&(idx, _)) = dq.front() {
+                    if idx < vert_window_start {
+                        dq.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                out_max[col] = dq.front().unwrap().1;
+            }
+            emit_fn(ripe_abs, out_max);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reset(&mut self) {
+        self.ring_len = 0;
+        self.ring_write = 0;
+        self.abs_pushed = 0;
+        self.n_pushed = 0;
+        for dq in &mut self.vert_deques {
+            dq.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +749,58 @@ mod tests {
                     }
                 }
                 assert_eq!(got[r * n_cols + c], want, "cell ({r}, {c})");
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_matches_rolling_max_2d() {
+        let n_rows = 12;
+        let n_cols = 10;
+        let mut input = vec![0.0_f32; n_rows * n_cols];
+        let mut x: u32 = 42;
+        for v in input.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *v = (x % 200) as f32;
+        }
+
+        for kt in [1, 2, 3, 5] {
+            for kf in [1, 2, 3] {
+                let mut reference = vec![0.0_f32; n_rows * n_cols];
+                rolling_max_2d(&input, n_rows, n_cols, kt, kf, &mut reference);
+
+                let mut det = IncrementalPeakDetector::new(kt, kf, n_cols);
+                let mut out_max = vec![0.0_f32; n_cols];
+                let mut got_rows: Vec<(u32, Vec<f32>)> = Vec::new();
+
+                for r in 0..n_rows {
+                    let row = &input[r * n_cols..(r + 1) * n_cols];
+                    if let Some(ripe_abs) = det.push_row(row, &mut out_max) {
+                        got_rows.push((ripe_abs, out_max.clone()));
+                    }
+                }
+                det.flush(&mut out_max, |abs, max_row| {
+                    got_rows.push((abs, max_row.to_vec()));
+                });
+
+                assert_eq!(
+                    got_rows.len(),
+                    n_rows,
+                    "kt={kt}, kf={kf}: expected {n_rows} output rows, got {}",
+                    got_rows.len()
+                );
+
+                for (abs, row_max) in &got_rows {
+                    let r = *abs as usize;
+                    let ref_row = &reference[r * n_cols..(r + 1) * n_cols];
+                    assert_eq!(
+                        row_max.as_slice(),
+                        ref_row,
+                        "kt={kt}, kf={kf}, row={r} mismatch"
+                    );
+                }
             }
         }
     }
