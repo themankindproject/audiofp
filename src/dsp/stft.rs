@@ -546,4 +546,86 @@ mod tests {
             assert_relative_eq!(a, b, max_relative = 1e-5);
         }
     }
+
+    // -----------------------------------------------------------------
+    // `power_flat` / `power_flat_into` direct coverage.
+    //
+    // These two functions are the inputs to the Wang/Panako/Haitsma
+    // hash builders and are exercised transitively by every classical
+    // test, but had no direct unit test. They also encode the
+    // identity `power = |magnitude|²` (modulo float-rounding), which
+    // is the contract that lets the hash builders skip the redundant
+    // `sqrt`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn power_flat_matches_magnitude_squared() {
+        // 1 kHz tone at 16 kHz — same input as `pure_sine_peaks_at_expected_bin`.
+        let n_fft = 1024;
+        let sr = 16_000.0_f32;
+        let freq = 1_000.0_f32;
+        let mut s = ShortTimeFFT::new(StftConfig::new(n_fft));
+
+        let samples: alloc::vec::Vec<f32> = (0..4_096)
+            .map(|n| libm::sinf(2.0 * core::f32::consts::PI * freq * n as f32 / sr))
+            .collect();
+
+        let (power, n_frames, n_bins) = s.power_flat(&samples);
+        let magnitude = s.magnitude(&samples);
+
+        assert_eq!(n_frames, magnitude.len());
+        assert_eq!(n_bins, magnitude[0].len());
+        assert_eq!(power.len(), n_frames * n_bins);
+        for (f, mag_row) in magnitude.iter().enumerate() {
+            for (b, &m) in mag_row.iter().enumerate() {
+                let p = power[f * n_bins + b];
+                // power == |magnitude|². Use a relative epsilon for
+                // large magnitudes, absolute for small ones.
+                let want = m * m;
+                if want.abs() > 1e-3 {
+                    assert_relative_eq!(p, want, max_relative = 1e-5);
+                } else {
+                    assert!((p - want).abs() < 1e-6, "frame={f} bin={b}: {p} vs {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn power_flat_into_writes_into_caller_vec_without_realloc() {
+        // Reuse a `Vec` across calls; `power_flat_into` must `resize`
+        // to the right size without throwing away the existing
+        // capacity (this is what makes it zero-alloc on the hot path).
+        let n_fft = 1024;
+        let sr = 16_000.0_f32;
+        let freq = 1_000.0_f32;
+        let mut s = ShortTimeFFT::new(StftConfig::new(n_fft));
+
+        let samples: alloc::vec::Vec<f32> = (0..4_096)
+            .map(|n| libm::sinf(2.0 * core::f32::consts::PI * freq * n as f32 / sr))
+            .collect();
+
+        let mut buf: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
+        let initial_cap = buf.capacity();
+        let (n_frames, n_bins) = s.power_flat_into(&samples, &mut buf);
+        let after_first = buf.capacity();
+
+        assert_eq!(n_frames * n_bins, buf.len());
+        // Capacity should be ≥ len, and on the second call should
+        // not grow (the Vec already has room for this size).
+        assert!(after_first >= n_frames * n_bins);
+
+        let (n_frames2, _) = s.power_flat_into(&samples, &mut buf);
+        assert_eq!(n_frames2, n_frames);
+        // Capacity must be preserved (no realloc, no shrink).
+        assert_eq!(buf.capacity(), after_first);
+
+        // And: empty input clears without growing.
+        let mut empty_buf: alloc::vec::Vec<f32> = alloc::vec![1.0; 64];
+        let (nf, nb) = s.power_flat_into(&[], &mut empty_buf);
+        assert_eq!((nf, nb), (0, 0));
+        assert!(empty_buf.is_empty());
+        // (Don't assert capacity here — clear() is allowed to shrink.)
+        let _ = initial_cap;
+    }
 }

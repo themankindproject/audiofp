@@ -1275,4 +1275,20 @@ mod tests {
         assert!(second.is_empty());
         assert!(s.pending_anchors.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Public API contract pins. See wang.rs for motivation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn public_api_name_and_config_match_documented_values() {
+        let fp = Panako::default();
+        assert_eq!(fp.name(), "panako-v2");
+        assert_eq!(fp.required_sample_rate(), 8_000);
+        assert_eq!(fp.min_samples(), 16_000);
+
+        let s = StreamingPanako::default();
+        // 2 784 ms at the documented defaults.
+        assert_eq!(s.latency_ms(), 2_784);
+    }
 }

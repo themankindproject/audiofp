@@ -602,4 +602,72 @@ mod tests {
         assert_eq!(cfg.hop_secs, 1.0);
         assert!(cfg.l2_normalize);
     }
+
+    // -----------------------------------------------------------------
+    // Public API contract pin.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn public_api_name_matches_documented_value() {
+        // Use the in-process passthrough fixture so we don't need a
+        // real ONNX file (no fixture ships with the crate).
+        let cfg = NeuralEmbedderConfig::new("test-fixture");
+        let fp = crate::neural::test_support::passthrough_embedder(cfg).unwrap();
+        assert_eq!(fp.name(), "neural-onnx-v0");
+        assert_eq!(fp.required_sample_rate(), 16_000);
+        // 1.0 s window at 16 kHz = 16 000 samples.
+        assert_eq!(fp.min_samples(), 16_000);
+    }
+
+    // -----------------------------------------------------------------
+    // Happy-path coverage of the offline `extract` method.
+    //
+    // The existing in-module tests only hit error paths (no model,
+    // corrupt model, bad config). The streaming path is well-exercised
+    // by `src/neural/streaming.rs::tests`, but the offline `extract`
+    // end-to-end (front-end → strided tensor write → runnable →
+    // embedding collection → L2 normalisation) was not directly
+    // tested with a real (tract-built) runnable. This test uses the
+    // in-process passthrough fixture, which models a real
+    // input-pass-through model so the strided write + L2 path is
+    // actually exercised.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn offline_extract_produces_normalised_embeddings_of_expected_shape() {
+        use crate::SampleRate;
+        use crate::neural::test_support::{passthrough_embedder, small_cfg, synth_audio};
+
+        let cfg = small_cfg();
+        let mut fp = passthrough_embedder(cfg.clone()).expect("passthrough embedder");
+
+        // 2 s of synthetic audio — 8 windows of cfg.window_secs (= 0.25 s)
+        // each. Each window emits one embedding of length `n_mels * n_frames`.
+        let samples = synth_audio(42, 2 * cfg.sample_rate as usize, cfg.sample_rate);
+        let audio = crate::AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
+
+        let fp_out = fp.extract(audio).expect("extract");
+        let expected_dim = fp.embedding_dim();
+        let window_samples = fp.window_samples();
+        let hop_samples = fp.hop_samples();
+        let n_windows = (samples.len().saturating_sub(window_samples)) / hop_samples + 1;
+
+        assert_eq!(fp_out.embedding_dim, expected_dim);
+        assert_eq!(fp_out.embeddings.len(), n_windows);
+        for (i, e) in fp_out.embeddings.iter().enumerate() {
+            assert_eq!(e.vector.len(), expected_dim, "window {i}");
+            // L2-normalised when l2_normalize is on (small_cfg's default).
+            let sumsq: f32 = e.vector.iter().map(|x| x * x).sum();
+            assert!(
+                (sumsq - 1.0).abs() < 1e-3,
+                "window {i} not L2-normalised: sumsq={sumsq}"
+            );
+            // t_start is the window's start in ms, growing by hop.
+            let expected_t = (i * hop_samples * 1000) as u64 / cfg.sample_rate as u64;
+            assert_eq!(e.t_start.0, expected_t, "window {i} t_start");
+        }
+    }
 }

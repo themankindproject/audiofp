@@ -24,6 +24,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Public API and signatures unchanged; behaviour bit-identical
   (`streaming_offline_equivalence` and 1-sample-per-push tests still pass).
 
+- **Internal: added regression tests for the refactor above plus broader
+  coverage gaps.** 28 new unit tests across the affected paths:
+  - 8 in `dsp::peaks` + `classical/{wang,panako}` pin the
+    `IncrementalPeakDetector` per-row output and the
+    `emit_finalized_anchors` re-queue / emit-all / idempotent
+    invariants directly. A forgotten `push_front` (or any other
+    re-queue mistake) is now caught at the site of the change, not
+    indirectly via `streaming_offline_equivalence`.
+  - 4 in `classical/{wang,panako,haitsma}` + `neural/embedder` pin
+    `Fingerprinter::name()` and the streaming `latency_ms()` against
+    documented values. A silent rename of any fingerprinter would
+    now break a unit test rather than only the regression goldens.
+  - 11 constructor panic tests in `dsp::mel` (5), `classical/haitsma`
+    (2), and `dsp::resample` (4). Every documented panic on
+    `MelFilterBank::new`, `Haitsma::new`, `linear()`, and
+    `SincResampler::with_quality` is now `#[should_panic]`-pinned.
+  - 5 in `dsp::stft` and `error`: direct tests for
+    `ShortTimeFFT::power_flat` (`power == |magnitude|²`) and
+    `power_flat_into` (zero-alloc on the hot path), plus
+    `Display` text for the two previously-untested `AfpError`
+    variants (`UnsupportedChannels`, `Io`).
+  - 1 in `neural/embedder`: end-to-end `NeuralEmbedder::extract`
+    happy path using the in-process passthrough tract model —
+    verifies window count, `embedding_dim`, L2 normalisation, and
+    `t_start` arithmetic. Replaces the prior gap where the offline
+    `extract` was only smoke-tested via the streaming passthrough
+    fixture.
+
+  Only production change: `SincQuality` now derives `PartialEq` so
+  its getter test can assert equality. Library test count: 112 → 183
+  (`--features neural`), 112 → 139 (default features).
+
 ### Performance
 
 - **Streaming peak detection is now truly incremental (~16× faster).**

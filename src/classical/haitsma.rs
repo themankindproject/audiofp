@@ -698,4 +698,49 @@ mod tests {
         let _ = s.flush();
         assert_eq!(s.pending.len(), 0, "pending after flush");
     }
+
+    // -----------------------------------------------------------------
+    // Public API contract pins. See wang.rs for motivation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn public_api_name_and_config_match_documented_values() {
+        let fp = Haitsma::default();
+        assert_eq!(fp.name(), "haitsma-v1");
+        assert_eq!(fp.required_sample_rate(), 5_000);
+        assert_eq!(fp.min_samples(), 10_000);
+
+        let s = StreamingHaitsma::default();
+        // 409 ms at the documented defaults (n_fft=2048, sr=5 000).
+        assert_eq!(s.latency_ms(), 409);
+    }
+
+    // -----------------------------------------------------------------
+    // Constructor panic coverage.
+    //
+    // `Haitsma::new` (used by the `Haitsma` extractor) asserts
+    // `fmin > 0`, `fmax > fmin`, and `fmax < Nyquist`. The latter two
+    // are already covered by `invalid_band_range_panics` and
+    // `fmax_above_nyquist_panics`. The fmin>0 case is the gap.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "fmin must be positive")]
+    fn haitsma_new_panics_on_zero_fmin() {
+        let cfg = HaitsmaConfig {
+            fmin: 0.0,
+            ..HaitsmaConfig::default()
+        };
+        let _ = Haitsma::new(cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "fmin must be positive")]
+    fn haitsma_new_panics_on_negative_fmin() {
+        let cfg = HaitsmaConfig {
+            fmin: -10.0,
+            ..HaitsmaConfig::default()
+        };
+        let _ = Haitsma::new(cfg);
+    }
 }

@@ -347,4 +347,43 @@ mod tests {
         let max = out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         assert!(max > -9.0, "no band responded: max={max}");
     }
+
+    // -----------------------------------------------------------------
+    // Constructor panic coverage.
+    //
+    // Pin the panic-asserts documented on `MelFilterBank::new`.
+    // A refactor that loosens or removes any of these assertions would
+    // silently change the filter bank's behaviour on bad input. Each
+    // `should_panic` test below pins exactly one assertion.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "n_mels must be > 0")]
+    fn mel_filter_bank_panics_on_zero_n_mels() {
+        let _ = MelFilterBank::new(0, 1024, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_fft must be even and >= 2")]
+    fn mel_filter_bank_panics_on_odd_n_fft() {
+        let _ = MelFilterBank::new(64, 1023, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_fft must be even and >= 2")]
+    fn mel_filter_bank_panics_on_n_fft_below_two() {
+        let _ = MelFilterBank::new(64, 1, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    #[should_panic(expected = "fmin must be strictly less than fmax")]
+    fn mel_filter_bank_panics_when_fmin_equals_fmax() {
+        let _ = MelFilterBank::new(64, 1024, 16_000, 1_000.0, 1_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    #[should_panic(expected = "fmin must be strictly less than fmax")]
+    fn mel_filter_bank_panics_when_fmin_above_fmax() {
+        let _ = MelFilterBank::new(64, 1024, 16_000, 4_000.0, 1_000.0, MelScale::Slaney);
+    }
 }

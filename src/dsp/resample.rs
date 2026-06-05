@@ -58,7 +58,7 @@ pub fn linear(input: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
 }
 
 /// Quality knobs for [`SincResampler`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SincQuality {
     /// Half the filter width in *input* samples. The filter spans
     /// `2 * half_taps` input samples around each output position.
@@ -475,5 +475,58 @@ mod tests {
         assert_relative_eq!(modified_bessel_i0(0.0), 1.0, max_relative = 1e-6);
         assert_relative_eq!(modified_bessel_i0(1.0), 1.266_065_8, max_relative = 1e-5);
         assert_relative_eq!(modified_bessel_i0(5.0), 27.239_872, max_relative = 1e-5);
+    }
+
+    #[test]
+    fn quality_getter_returns_the_quality_passed_in() {
+        let q = SincQuality {
+            half_taps: 32,
+            kaiser_beta: 8.6,
+            polyphase_steps: 128,
+        };
+        let r = SincResampler::with_quality(8_000, 16_000, q);
+        assert_eq!(*r.quality(), q);
+    }
+
+    // -----------------------------------------------------------------
+    // Constructor panic coverage.
+    //
+    // `linear` and `SincResampler::with_quality` each have documented
+    // panics on invalid input. Pin them with `should_panic` tests so
+    // a refactor that loosens any assertion is caught.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "sample rates must be non-zero")]
+    fn linear_panics_on_zero_from_sr() {
+        let _ = linear(&[0.0; 16], 0, 8_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample rates must be non-zero")]
+    fn linear_panics_on_zero_to_sr() {
+        let _ = linear(&[0.0; 16], 8_000, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "half_taps must be > 0")]
+    fn sinc_resampler_panics_on_zero_half_taps() {
+        let q = SincQuality {
+            half_taps: 0,
+            kaiser_beta: 8.6,
+            polyphase_steps: 128,
+        };
+        let _ = SincResampler::with_quality(8_000, 16_000, q);
+    }
+
+    #[test]
+    #[should_panic(expected = "polyphase_steps must be > 0")]
+    fn sinc_resampler_panics_on_zero_polyphase_steps() {
+        let q = SincQuality {
+            half_taps: 32,
+            kaiser_beta: 8.6,
+            polyphase_steps: 0,
+        };
+        let _ = SincResampler::with_quality(8_000, 16_000, q);
     }
 }

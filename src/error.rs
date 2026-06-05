@@ -141,4 +141,24 @@ mod tests {
         let f = |x: u32| -> Result<u32> { Ok(x * 2) };
         assert_eq!(f(21).unwrap(), 42);
     }
+
+    // -----------------------------------------------------------------
+    // Display formatting for variants that were previously untested.
+    //
+    // Each `assert_eq!` pins the exact `Display` text so a future
+    // `thiserror` annotation change is caught. The `to_string` of
+    // every public error variant is part of the contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unsupported_channels_displays_the_count() {
+        let err = AfpError::UnsupportedChannels(7);
+        assert_eq!(err.to_string(), "unsupported channel count: 7");
+    }
+
+    #[test]
+    fn io_displays_the_inner_message() {
+        let err = AfpError::Io("disk full".to_string());
+        assert_eq!(err.to_string(), "io: disk full");
+    }
 }

@@ -1294,4 +1294,31 @@ mod tests {
         assert!(second.is_empty());
         assert!(s.pending_anchors.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Public API contract pins.
+    //
+    // These pin the return values of the `Fingerprinter` and
+    // `StreamingFingerprinter` trait methods. A silent change to any
+    // of these (a rename of `name`, a change in `required_sample_rate`
+    // or `min_samples`, a shift in the latency window) would break
+    // downstream consumers that hardcode these values (e.g. the
+    // `tests/goldens/*.bin` regression headers include the algorithm
+    // name). The pins below catch the change at the unit-test level.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn public_api_name_and_config_match_documented_values() {
+        let fp = Wang::default();
+        assert_eq!(fp.name(), "wang-v1");
+        assert_eq!(fp.required_sample_rate(), 8_000);
+        assert_eq!(fp.min_samples(), 16_000);
+
+        // The streaming trait does not carry a `name`; we just pin
+        // `latency_ms` (computed at the call site from the same
+        // constants the public docs quote).
+        let s = StreamingWang::default();
+        // 2 256 ms at the documented defaults.
+        assert_eq!(s.latency_ms(), 2_256);
+    }
 }
