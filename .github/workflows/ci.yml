@@ -93,7 +93,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit
       - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0009
         continue-on-error: true
