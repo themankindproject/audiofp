@@ -328,7 +328,9 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
                     break;
                 }
             }
-            output[i] = input[*dq.front().unwrap()];
+            if let Some(&front) = dq.front() {
+                output[i] = input[front];
+            }
         }
     }
 
@@ -344,7 +346,9 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
                 break;
             }
         }
-        *slot = input[*dq.front().unwrap()];
+        if let Some(&front) = dq.front() {
+            *slot = input[front];
+        }
     }
 }
 
@@ -410,8 +414,7 @@ impl IncrementalPeakDetector {
         // 1. Horizontal rolling-max of the new row → store in ring.
         rolling_max_1d(row, self.kf, &mut self.horiz_scratch, &mut self.dq);
         let dst_start = self.ring_write * self.n_bins;
-        self.horiz_ring[dst_start..dst_start + self.n_bins]
-            .copy_from_slice(&self.horiz_scratch);
+        self.horiz_ring[dst_start..dst_start + self.n_bins].copy_from_slice(&self.horiz_scratch);
         self.ring_write = (self.ring_write + 1) % self.window_cap;
         if self.ring_len < self.window_cap {
             self.ring_len += 1;
@@ -450,7 +453,7 @@ impl IncrementalPeakDetector {
         // = [abs - 2*kt, abs]. Expire entries before that.
         let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
 
-        for col in 0..self.n_bins {
+        for (col, out) in out_max.iter_mut().enumerate().take(self.n_bins) {
             let dq = &mut self.vert_deques[col];
             while let Some(&(idx, _)) = dq.front() {
                 if idx < vert_window_start {
@@ -459,7 +462,9 @@ impl IncrementalPeakDetector {
                     break;
                 }
             }
-            out_max[col] = dq.front().unwrap().1;
+            if let Some(&(_, v)) = dq.front() {
+                *out = v;
+            }
         }
 
         Some(ripe_abs)
@@ -493,7 +498,7 @@ impl IncrementalPeakDetector {
         // We just need to expire entries below the window start.
         for ripe_abs in first_flush..=last_flush {
             let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
-            for col in 0..self.n_bins {
+            for (col, out) in out_max.iter_mut().enumerate().take(self.n_bins) {
                 let dq = &mut self.vert_deques[col];
                 while let Some(&(idx, _)) = dq.front() {
                     if idx < vert_window_start {
@@ -502,7 +507,9 @@ impl IncrementalPeakDetector {
                         break;
                     }
                 }
-                out_max[col] = dq.front().unwrap().1;
+                if let Some(&(_, v)) = dq.front() {
+                    *out = v;
+                }
             }
             emit_fn(ripe_abs, out_max);
         }

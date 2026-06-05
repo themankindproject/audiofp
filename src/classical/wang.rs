@@ -555,13 +555,17 @@ impl StreamingWang {
     /// build hashes from their accumulated target heap, and return them.
     fn emit_finalized_anchors(&mut self) -> alloc::vec::Vec<(TimestampMs, WangHash)> {
         let mut emitted = alloc::vec::Vec::new();
-        while let Some(front) = self.pending_anchors.front() {
-            let last_target_frame = front.peak.t_frame + self.cfg.target_zone_t as u32;
+        // Pop-and-push pattern: take the front anchor, decide whether its
+        // target zone is fully observed, and if not put it back. This avoids
+        // an `unwrap` after a separate `front()` peek and stays a clean
+        // `while let` over the pop result.
+        while let Some(anchor) = self.pending_anchors.pop_front() {
+            let last_target_frame = anchor.peak.t_frame + self.cfg.target_zone_t as u32;
             let last_target_bucket = (last_target_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
             if self.last_finalized_bucket < last_target_bucket {
+                self.pending_anchors.push_front(anchor);
                 break;
             }
-            let anchor = self.pending_anchors.pop_front().unwrap();
             self.build_hashes_for_anchor(anchor, &mut emitted);
         }
         emitted
@@ -631,7 +635,10 @@ impl StreamingFingerprinter for StreamingWang {
             // Feed the new row to the incremental peak detector. When the
             // center of the vertical window becomes ripe, it returns the
             // 2-D rolling-max for that row so we can compare peaks.
-            if let Some(ripe_abs) = self.peak_det.push_row(&self.frame_scratch, &mut self.peak_row_max) {
+            if let Some(ripe_abs) = self
+                .peak_det
+                .push_row(&self.frame_scratch, &mut self.peak_row_max)
+            {
                 let row_idx = (ripe_abs - self.spec_first_frame) as usize;
                 self.detect_rows_range(row_idx, row_idx);
                 self.last_pd_frame = ripe_abs as i32;
@@ -659,24 +666,25 @@ impl StreamingFingerprinter for StreamingWang {
         let bucket_pending = &mut self.bucket_pending;
         let last_pd = &mut self.last_pd_frame;
 
-        self.peak_det.flush(&mut self.peak_row_max, |ripe_abs, max_row| {
-            let row_idx = (ripe_abs - spec_first_frame) as usize;
-            let bucket = (ripe_abs as f32 / WANG_FRAMES_PER_SEC) as u32;
-            for bin in 0..n_bins {
-                let idx = row_idx * n_bins + bin;
-                let v = spec[idx];
-                if v > min_mag && v >= max_row[bin] {
-                    let peak = Peak {
-                        t_frame: ripe_abs,
-                        f_bin: bin as u16,
-                        _pad: 0,
-                        mag: v,
-                    };
-                    bucket_pending.entry(bucket).or_default().push(peak);
+        self.peak_det
+            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
+                let row_idx = (ripe_abs - spec_first_frame) as usize;
+                let bucket = (ripe_abs as f32 / WANG_FRAMES_PER_SEC) as u32;
+                for (bin, &row_max) in max_row.iter().enumerate().take(n_bins) {
+                    let idx = row_idx * n_bins + bin;
+                    let v = spec[idx];
+                    if v > min_mag && v >= row_max {
+                        let peak = Peak {
+                            t_frame: ripe_abs,
+                            f_bin: bin as u16,
+                            _pad: 0,
+                            mag: v,
+                        };
+                        bucket_pending.entry(bucket).or_default().push(peak);
+                    }
                 }
-            }
-            *last_pd = ripe_abs as i32;
-        });
+                *last_pd = ripe_abs as i32;
+            });
 
         // Finalise every remaining bucket — no more peaks can arrive.
         let buckets: alloc::vec::Vec<u32> = self.bucket_pending.keys().cloned().collect();

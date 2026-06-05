@@ -560,13 +560,17 @@ impl StreamingPanako {
         // Anchor's last possible target frame is `t + (target_zone_t - 1)`
         // because Panako uses strict `dt < target_zone_t`.
         let last_dt = self.cfg.target_zone_t as u32 - 1;
-        while let Some(front) = self.pending_anchors.front() {
-            let last_target_frame = front.peak.t_frame + last_dt;
+        // Pop-and-push pattern: take the front anchor, decide whether its
+        // target zone is fully observed, and if not put it back. This avoids
+        // an `unwrap` after a separate `front()` peek and stays a clean
+        // `while let` over the pop result.
+        while let Some(anchor) = self.pending_anchors.pop_front() {
+            let last_target_frame = anchor.peak.t_frame + last_dt;
             let last_target_bucket = (last_target_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32;
             if self.last_finalized_bucket < last_target_bucket {
+                self.pending_anchors.push_front(anchor);
                 break;
             }
-            let anchor = self.pending_anchors.pop_front().unwrap();
             self.build_triplets_for_anchor(anchor, &mut emitted);
         }
         emitted
@@ -634,7 +638,10 @@ impl StreamingFingerprinter for StreamingPanako {
             self.n_frames_total += 1;
             off += PANAKO_HOP;
 
-            if let Some(ripe_abs) = self.peak_det.push_row(&self.frame_scratch, &mut self.peak_row_max) {
+            if let Some(ripe_abs) = self
+                .peak_det
+                .push_row(&self.frame_scratch, &mut self.peak_row_max)
+            {
                 let row_idx = (ripe_abs - self.spec_first_frame) as usize;
                 self.detect_rows(row_idx, row_idx);
                 self.last_pd_frame = ripe_abs as i32;
@@ -657,24 +664,25 @@ impl StreamingFingerprinter for StreamingPanako {
         let bucket_pending = &mut self.bucket_pending;
         let last_pd = &mut self.last_pd_frame;
 
-        self.peak_det.flush(&mut self.peak_row_max, |ripe_abs, max_row| {
-            let row_idx = (ripe_abs - spec_first_frame) as usize;
-            let bucket = (ripe_abs as f32 / PANAKO_FRAMES_PER_SEC) as u32;
-            for bin in 0..n_bins {
-                let idx = row_idx * n_bins + bin;
-                let v = spec[idx];
-                if v > min_mag && v >= max_row[bin] {
-                    let peak = Peak {
-                        t_frame: ripe_abs,
-                        f_bin: bin as u16,
-                        _pad: 0,
-                        mag: v,
-                    };
-                    bucket_pending.entry(bucket).or_default().push(peak);
+        self.peak_det
+            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
+                let row_idx = (ripe_abs - spec_first_frame) as usize;
+                let bucket = (ripe_abs as f32 / PANAKO_FRAMES_PER_SEC) as u32;
+                for (bin, &row_max) in max_row.iter().enumerate().take(n_bins) {
+                    let idx = row_idx * n_bins + bin;
+                    let v = spec[idx];
+                    if v > min_mag && v >= row_max {
+                        let peak = Peak {
+                            t_frame: ripe_abs,
+                            f_bin: bin as u16,
+                            _pad: 0,
+                            mag: v,
+                        };
+                        bucket_pending.entry(bucket).or_default().push(peak);
+                    }
                 }
-            }
-            *last_pd = ripe_abs as i32;
-        });
+                *last_pd = ripe_abs as i32;
+            });
 
         let buckets: Vec<u32> = self.bucket_pending.keys().cloned().collect();
         for bucket in buckets {
