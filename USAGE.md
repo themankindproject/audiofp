@@ -34,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.2"
+audiofp = "0.3.3"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -154,10 +154,18 @@ pub trait StreamingFingerprinter {
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)>;
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)>;
     fn latency_ms(&self) -> u32;
+
+    // Provided methods — zero-allocation callback variants:
+    fn push_with<F>(&mut self, samples: &[f32], callback: F) -> usize
+    where F: FnMut(TimestampMs, &Self::Frame);
+    fn flush_with<F>(&mut self, callback: F) -> usize
+    where F: FnMut(TimestampMs, &Self::Frame);
 }
 ```
 
 `push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
+
+`push_with` and `flush_with` are **provided** zero-allocation callback variants: instead of returning a `Vec`, they invoke `callback(timestamp, &frame)` for each emitted frame and return the count. Use these when you want to avoid per-push heap allocation — the caller processes each frame inline without intermediate collection.
 
 > **Bit-exact guarantee.** Feeding the same audio in any chunking pattern (including 1-sample-per-push) produces the identical hash multiset as a single `Fingerprinter::extract` over the full buffer.
 >
@@ -209,6 +217,14 @@ pub struct TimestampMs(pub u64);
 ```
 
 Milliseconds since stream start. `u64` gives ≈ 584 million years of headroom.
+
+#### `VERSION`
+
+```rust
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+```
+
+Crate version string, e.g. `"0.3.3"`. Useful for runtime sanity checks when the SDK is vendored.
 
 ---
 
@@ -374,6 +390,8 @@ Each classical fingerprinter has a streaming sibling:
 | `StreamingPanako`        | `PanakoHash`   | 2 784          |
 | `StreamingHaitsma`       | `u32`          | 409            |
 
+Each streaming variant also exposes `fn config(&self) -> &XConfig` for inspecting the configuration it was built with.
+
 ### Microphone-style usage
 
 ```rust
@@ -532,6 +550,8 @@ buffer, the typed plan is transparently rebuilt for the new length — no
 cryptic Tract shape error reaches the caller. For best performance,
 prefer batching at a fixed length.
 
+The detector also exposes `fn config(&self) -> &WatermarkConfig` for inspecting the configuration it was built with.
+
 ### `WatermarkResult`
 
 | Field          | Type        | Meaning                                                                 |
@@ -607,6 +627,11 @@ use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
 let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 
+// Query model properties:
+println!("embedding_dim={}", emb.embedding_dim());
+println!("window_samples={}", emb.window_samples());
+println!("hop_samples={}", emb.hop_samples());
+
 let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
 let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
 let fp = emb.extract(buf)?;
@@ -658,6 +683,16 @@ all.extend(s.flush());
 | `try_push_with(samples, |t, &[f32]| …) -> Result<usize>` | **Zero** (callback gets `&[f32]`) | `Result`        |
 
 For realtime-friendly streaming, prefer `try_push_with` — the callback receives the embedding by reference, no `Vec` is created per emit, and the embedder reuses a single internal scratch buffer that is allocated **once at construction** (sized to `embedding_dim`) and reused across every emit *and* every push for the lifetime of the embedder. Per-push allocation is genuinely zero.
+
+Additional accessor methods:
+
+| Method                        | Returns                             |
+| ----------------------------- | ----------------------------------- |
+| `config()`                    | `&NeuralEmbedderConfig`             |
+| `embedding_dim()`             | `usize` — dimension of each vector  |
+| `window_samples()`            | `usize` — analysis window length    |
+| `hop_samples()`               | `usize` — hop between windows       |
+| `reset()`                     | Clears internal carry buffer and zero the consumed-sample counter; call this to restart a stream from a clean state |
 
 ### Bit-exactness
 
@@ -731,6 +766,21 @@ The classical fingerprinters all use `power_flat` / `process_frame_power`
 internally — they avoid `O(N · M)` `sqrt` calls per spectrogram, a
 notable win on the FFT-bound Haitsma path.
 
+Additional methods:
+
+```rust
+// Inspect the config the STFT was built with:
+let cfg = stft.config();
+
+// Write power spectrogram into a caller-provided Vec (avoids allocation):
+let mut buf = Vec::new();
+let (n_frames, n_bins) = stft.power_flat_into(&samples, &mut buf);
+
+// Streaming per-frame magnitude (with sqrt — use process_frame_power for power):
+let mut out = vec![0.0_f32; stft.n_bins()];
+stft.process_frame(&frame, &mut out);
+```
+
 ### `dsp::mel`
 
 ```rust
@@ -751,6 +801,19 @@ fb.log_mel(&magnitude_spectrum, &mut log_mel);
 
 Slaney-normalised triangular filters; matches librosa's `feature.melspectrogram` defaults.
 
+Additional methods:
+
+```rust
+// Number of FFT bins (n_fft / 2 + 1):
+let n = fb.n_bins();
+
+// Apply log-mel to a power spectrum directly (skips the per-bin sqrt):
+fb.log_mel_from_power(&power_spectrum, &mut log_mel);
+
+// Borrow the row-major weight matrix (n_mels × n_bins):
+let weights: &[f32] = fb.matrix();
+```
+
 ### `dsp::peaks`
 
 ```rust
@@ -765,6 +828,19 @@ let picker = PeakPicker::new(PeakPickerConfig {
 
 let peaks: Vec<Peak> = picker.pick(&magnitude_spec, n_frames, n_bins, frames_per_sec);
 ```
+
+#### `Peak` fields
+
+```rust
+pub struct Peak {
+    pub t_frame: u32,  // STFT frame index of the peak
+    pub f_bin: u16,    // FFT bin index of the peak
+    pub _pad: u16,     // explicit padding (required by bytemuck::Pod)
+    pub mag: f32,      // magnitude at the peak
+}
+```
+
+The picker also exposes `fn config(&self) -> &PeakPickerConfig` for inspecting the configuration it was built with.
 
 2-D rolling max via Lemire's monotonic deque, amortised O(N · M) regardless of neighbourhood size.
 
@@ -795,6 +871,8 @@ let y = r.process(&x);
 ```
 
 Cutoff is automatically `min(from, to) / 2` to suppress aliasing on downsamples.
+
+The resampler also exposes `fn quality(&self) -> &SincQuality` for inspecting the quality parameters it was built with.
 
 ### `dsp::windows`
 
