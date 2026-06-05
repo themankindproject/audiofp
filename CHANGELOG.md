@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal: removed all production `.unwrap()` calls.** Six `unwrap()`
+  sites in the streaming hot path are replaced with explicit `Option`
+  handling:
+  - `dsp::peaks::rolling_max_1d` — `dq.front().unwrap()` reads are guarded
+    by `if let Some(&front) = dq.front()`. Callers pre-zero the output
+    slice, so a missing deque entry leaves the value at 0.0 (the Lemire
+    invariant guarantees the deque is non-empty at these sites).
+  - `IncrementalPeakDetector::push_row` / `flush` — same `if let` pattern
+    for the per-column vertical deques.
+  - `StreamingPanako` / `StreamingWang` `emit_finalized_anchors` — switched
+    from peek-then-`pop_front().unwrap()` to a pop-and-push-front pattern
+    that re-queues the anchor when its target zone is not yet finalised.
+  Public API and signatures unchanged; behaviour bit-identical
+  (`streaming_offline_equivalence` and 1-sample-per-push tests still pass).
+
 ### Performance
 
 - **Streaming peak detection is now truly incremental (~16× faster).**
