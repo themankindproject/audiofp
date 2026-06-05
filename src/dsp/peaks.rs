@@ -811,4 +811,89 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // Direct unit tests for `IncrementalPeakDetector`.
+    //
+    // These pin the contract of the post-226e0f2 failable reads in
+    // `push_row` and `flush`. The reads are guarded by `if let Some`,
+    // so a future bug that empties the vert_deques at a read site would
+    // silently leave `out_max` at 0.0 (the pre-zeroed default) instead
+    // of panicking. The tests below exercise the invariant directly:
+    // the detector's per-row output must equal the brute-force 2-D
+    // rolling max for every (kt, kf, n_bins) combination, and the
+    // stream of ripe rows must be contiguous (kt, kt+1, …, n_pushed-1)
+    // with no duplicates between `push_row` and `flush`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn incremental_returns_none_until_window_fills_then_some() {
+        // For kt=2, the first 2 pushes return None (vertical window not
+        // full), the 3rd push emits the first ripe row (abs=0), the 4th
+        // emits abs=1, and so on.
+        let kt = 2;
+        let mut det = IncrementalPeakDetector::new(kt, 1, 4);
+        let mut out_max = vec![0.0_f32; 4];
+        let row = vec![1.0_f32; 4];
+
+        assert!(det.push_row(&row, &mut out_max).is_none());
+        assert!(det.push_row(&row, &mut out_max).is_none());
+        for expected_ripe in 0u32..5 {
+            let ripe = det
+                .push_row(&row, &mut out_max)
+                .expect("ripe row should be available after kt pushes");
+            assert_eq!(ripe, expected_ripe);
+        }
+    }
+
+    #[test]
+    fn incremental_matches_naive_for_random_input() {
+        // Random spectrogram, single (kt, kf) config: every per-row
+        // output (push and flush) must equal the brute-force 2-D max.
+        // This is the focused regression for the 226e0f2 refactor: if
+        // the `if let Some(&(_, v))` branch is ever hit on a real push,
+        // this test fails because the 0.0 fallback diverges from the
+        // reference.
+        let n_rows = 10;
+        let n_cols = 6;
+        let kt = 2;
+        let kf = 2;
+
+        let mut input = vec![0.0_f32; n_rows * n_cols];
+        let mut x: u32 = 7;
+        for v in input.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *v = (x % 100) as f32;
+        }
+
+        let mut reference = vec![0.0_f32; n_rows * n_cols];
+        rolling_max_2d(&input, n_rows, n_cols, kt, kf, &mut reference);
+
+        let mut det = IncrementalPeakDetector::new(kt, kf, n_cols);
+        let mut out_max = vec![0.0_f32; n_cols];
+        let mut got: Vec<(u32, Vec<f32>)> = Vec::new();
+
+        for r in 0..n_rows {
+            let row = &input[r * n_cols..(r + 1) * n_cols];
+            if let Some(ripe_abs) = det.push_row(row, &mut out_max) {
+                got.push((ripe_abs, out_max.clone()));
+            }
+        }
+        det.flush(&mut out_max, |abs, max_row| {
+            got.push((abs, max_row.to_vec()));
+        });
+
+        // No duplicates between push and flush; contiguous kt..n_rows-1.
+        assert_eq!(got.len(), n_rows);
+        for (expected, (abs, _)) in got.iter().enumerate() {
+            assert_eq!(*abs as usize, expected);
+        }
+        for (abs, row_max) in &got {
+            let r = *abs as usize;
+            let ref_row = &reference[r * n_cols..(r + 1) * n_cols];
+            assert_eq!(row_max.as_slice(), ref_row, "row {r} mismatch");
+        }
+    }
 }

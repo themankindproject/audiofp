@@ -1187,4 +1187,111 @@ mod tests {
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0].t_anchor, 0);
     }
+
+    // -----------------------------------------------------------------
+    // Direct unit tests for `emit_finalized_anchors`.
+    //
+    // These pin the re-queue invariant of the 226e0f2 refactor: when
+    // the front anchor's target zone is not yet finalised, the pop-
+    // and-push-front pattern must return it to the front of the queue
+    // intact. A forgotten `push_front` (or any other deviation) would
+    // silently drop the anchor and lose its hashes forever — the
+    // existing `streaming_offline_equivalence` test would catch the
+    // symptom at a high level, but these tests catch the cause at the
+    // site of the refactor.
+    //
+    // We populate `pending_anchors` and `last_finalized_bucket`
+    // directly (both are private; the test module sits inside the
+    // same file with `use super::*`, so it has access).
+    // -----------------------------------------------------------------
+
+    fn anchor_with_target(
+        t_frame: u32,
+        f_bin: u16,
+        target_t: u32,
+        target_f: u16,
+        target_mag: f32,
+    ) -> PendingAnchor {
+        let target = MinByMagOwned(Peak {
+            t_frame: target_t,
+            f_bin: target_f,
+            _pad: 0,
+            mag: target_mag,
+        });
+        let mut targets = alloc::collections::BinaryHeap::with_capacity(4);
+        targets.push(target);
+        PendingAnchor {
+            peak: Peak {
+                t_frame,
+                f_bin,
+                _pad: 0,
+                mag: 1.0,
+            },
+            targets,
+        }
+    }
+
+    /// Bucket index for a frame at the Wang default rate
+    /// (`WANG_FRAMES_PER_SEC = 62.5`).
+    fn wang_bucket_of(t_frame: u32) -> i32 {
+        (t_frame as f32 / WANG_FRAMES_PER_SEC) as i32
+    }
+
+    #[test]
+    fn wang_emit_finalized_anchors_emits_all_when_zones_covered() {
+        // Three anchors, all of whose target zones are covered by
+        // `last_finalized_bucket`. All three should emit.
+        let mut s = StreamingWang::default();
+        // Anchor at frame 0: zone covers frames [1, 63], last target frame = 63
+        // → bucket 1.
+        s.pending_anchors
+            .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
+        // Anchor at frame 5: zone covers [6, 68], bucket 1.
+        s.pending_anchors
+            .push_back(anchor_with_target(5, 20, 15, 22, 0.8));
+        // Anchor at frame 100: zone covers [101, 163], bucket 2.
+        s.pending_anchors
+            .push_back(anchor_with_target(100, 30, 110, 32, 0.7));
+        s.last_finalized_bucket = wang_bucket_of(163);
+
+        let emitted = s.emit_finalized_anchors();
+        assert_eq!(emitted.len(), 3);
+        assert!(s.pending_anchors.is_empty());
+    }
+
+    #[test]
+    fn wang_emit_finalized_anchors_re_queues_unfinalised() {
+        // Two anchors; only the first is covered. The second must
+        // remain in `pending_anchors` after the emit.
+        let mut s = StreamingWang::default();
+        s.pending_anchors
+            .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
+        // Zone covers [1, 63], bucket 1.
+        s.pending_anchors
+            .push_back(anchor_with_target(100, 30, 110, 32, 0.7));
+        // Only cover bucket 1, not bucket 2.
+        s.last_finalized_bucket = 1;
+
+        let emitted = s.emit_finalized_anchors();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(s.pending_anchors.len(), 1);
+        // The re-queued anchor must be the unfinalised one (frame 100).
+        assert_eq!(s.pending_anchors.front().unwrap().peak.t_frame, 100);
+    }
+
+    #[test]
+    fn wang_emit_finalized_anchors_idempotent_under_repeated_calls() {
+        // With one anchor covered, two consecutive calls must emit
+        // the same hashes (no double-emit, no lost anchor).
+        let mut s = StreamingWang::default();
+        s.pending_anchors
+            .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
+        s.last_finalized_bucket = wang_bucket_of(63);
+
+        let first = s.emit_finalized_anchors();
+        let second = s.emit_finalized_anchors();
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert!(s.pending_anchors.is_empty());
+    }
 }

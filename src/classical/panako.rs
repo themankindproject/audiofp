@@ -1172,4 +1172,107 @@ mod tests {
         assert_eq!(s.bucket_pending.len(), 0);
         assert_eq!(s.pending_anchors.len(), 0);
     }
+
+    // -----------------------------------------------------------------
+    // Direct unit tests for `emit_finalized_anchors`.
+    //
+    // Same re-queue invariant as the wang.rs counterpart. See the
+    // comment block there for motivation; this is the Panako
+    // mirror. Panako's `last_target_frame = t + (target_zone_t - 1)`
+    // (strict `dt < target_zone_t`).
+    // -----------------------------------------------------------------
+
+    fn panako_anchor_with_target(
+        t_frame: u32,
+        f_bin: u16,
+        target_t: u32,
+        target_f: u16,
+    ) -> PendingAnchorPanako {
+        // Two targets so that `build_triplets_for_anchor` (which
+        // iterates over `(b, c)` pairs) produces at least one hash.
+        PendingAnchorPanako {
+            peak: Peak {
+                t_frame,
+                f_bin,
+                _pad: 0,
+                mag: 1.0,
+            },
+            targets: vec![
+                Peak {
+                    t_frame: target_t,
+                    f_bin: target_f,
+                    _pad: 0,
+                    mag: 0.9,
+                },
+                Peak {
+                    t_frame: target_t + 1,
+                    f_bin: target_f + 1,
+                    _pad: 0,
+                    mag: 0.8,
+                },
+            ],
+        }
+    }
+
+    /// Bucket index for a frame at the Panako default rate
+    /// (`PANAKO_FRAMES_PER_SEC = 62.5`).
+    fn panako_bucket_of(t_frame: u32) -> i32 {
+        (t_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32
+    }
+
+    #[test]
+    fn panako_emit_finalized_anchors_emits_all_when_zones_covered() {
+        // Three anchors, all of whose target zones are covered.
+        // Panako default `target_zone_t = 96` → last_target_frame
+        // = t_frame + 95.
+        let mut s = StreamingPanako::default();
+        // t=0 → last target frame 95 → bucket 1
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(0, 10, 10, 12));
+        // t=5 → last target frame 100 → bucket 1
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(5, 20, 15, 22));
+        // t=100 → last target frame 195 → bucket 3
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(100, 30, 110, 32));
+        s.last_finalized_bucket = panako_bucket_of(195);
+
+        let emitted = s.emit_finalized_anchors();
+        assert_eq!(emitted.len(), 3);
+        assert!(s.pending_anchors.is_empty());
+    }
+
+    #[test]
+    fn panako_emit_finalized_anchors_re_queues_unfinalised() {
+        // Two anchors; only the first is covered. The second must
+        // remain in `pending_anchors` after the emit.
+        let mut s = StreamingPanako::default();
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(0, 10, 10, 12));
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(100, 30, 110, 32));
+        // Only cover bucket 1 (last target frame ≤ 95).
+        s.last_finalized_bucket = 1;
+
+        let emitted = s.emit_finalized_anchors();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(s.pending_anchors.len(), 1);
+        assert_eq!(s.pending_anchors.front().unwrap().peak.t_frame, 100);
+    }
+
+    #[test]
+    fn panako_emit_finalized_anchors_idempotent_under_repeated_calls() {
+        // With one anchor covered, two consecutive calls must emit
+        // the same hashes (no double-emit, no lost anchor).
+        let mut s = StreamingPanako::default();
+        s.pending_anchors
+            .push_back(panako_anchor_with_target(0, 10, 10, 12));
+        s.last_finalized_bucket = panako_bucket_of(95);
+
+        let first = s.emit_finalized_anchors();
+        let second = s.emit_finalized_anchors();
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert!(s.pending_anchors.is_empty());
+    }
 }
