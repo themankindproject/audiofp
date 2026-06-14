@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.3.4] - 2026-06-14
+
 ### Changed
 
 - **Internal: removed all production `.unwrap()` calls.** Six `unwrap()`
@@ -610,7 +614,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/themankindproject/audiofp/compare/v0.3.3...v0.3.4
 [0.3.1]: https://github.com/themankindproject/audiofp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/themankindproject/audiofp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/themankindproject/audiofp/compare/v0.2.0...v0.2.1

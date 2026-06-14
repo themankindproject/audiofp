@@ -34,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.3"
+audiofp = "0.3.4"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -224,7 +224,7 @@ Milliseconds since stream start. `u64` gives ≈ 584 million years of headroom.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ```
 
-Crate version string, e.g. `"0.3.3"`. Useful for runtime sanity checks when the SDK is vendored.
+Crate version string, e.g. `"0.3.4"`. Useful for runtime sanity checks when the SDK is vendored.
 
 ---
 
