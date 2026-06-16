@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No changes yet._
+### Changed
+
+- **`classical::panako` module docstring.** The hash layout block was
+  misattributed to "Six 2021 §3.2" but is `afp`'s own `panako-v2`.
+  Re-attributed and added a "Relationship to Panako" section that cites
+  Six 2014 and Six 2021 and lists the four deliberate divergences from
+  the original Panako (STFT vs CQT, 5-bit `β` vs 8-bit time ratio,
+  signed `Δf` clamped to ±127, `sign`+`mag_order` packed where Six uses
+  coarse band indices). Notes that `panako-v2` hashes are not
+  drop-in compatible with a Six-format Panako database and that
+  speed/pitch robustness claims are matcher-side properties.
 
 ## [0.3.4] - 2026-06-14
 
