@@ -5,7 +5,7 @@
 //! over *triplets* `(a, b, c)` rather than pairs. The third peak gives a
 //! tempo-invariant ratio `β` that is robust to ±5 % time stretch.
 //!
-//! Hash layout (Six 2021 §3.2), high to low bit:
+//! Hash layout (this crate's `panako-v2`), high to low bit:
 //! ```text
 //! [31..30]  sign       (2 bits, sign of Δf_ab and Δf_bc)
 //! [29..28]  mag_order  (2 bits, which of {a, b, c} has the largest magnitude)
@@ -14,6 +14,44 @@
 //! [14.. 7]  Δf_bc      (8 bits, signed, clamped to ±127)
 //! [ 6.. 0]  reserved   (7 bits, zero)
 //! ```
+//!
+//! ## Relationship to Panako (Six 2014, Six 2021)
+//!
+//! The hash layout, peak-zone constraints, and `fan_out` cap are the
+//! authors' own and are documented inline in [`PanakoConfig`]. The
+//! fingerprinting idea — encoding a tempo-invariant ratio and
+//! pitch-invariant frequency differences from a peak triplet — comes
+//! from Panako:
+//!
+//! - Six, J., Leman, M. (2014). *Panako — A Scalable Acoustic
+//!   Fingerprinting System Handling Time-Scale and Pitch Modifications.*
+//!   proceedings of ISMIR.
+//! - Six, J. (2021). *Panako 2.0 — Updates for an Acoustic
+//!   Fingerprinting System.* Late-Breaking ISMIR.
+//!
+//! Deliberate divergences from the original Panako:
+//!
+//! 1. **Front-end.** Six uses a Constant-Q transform; this crate uses a
+//!    Hann-windowed STFT (same front-end as [`super::Wang`]) to share
+//!    the DSP stack. A CQT front-end is tracked under `future.md` §1.3.
+//! 2. **Time-ratio resolution.** Six 2021 quantises the ratio
+//!    `(t2 − t1) / (t3 − t1)` to 8 bits; this crate stores `β =
+//!    (t_c − t_b) / (t_c − t_a)` to 5 bits and leaves the remaining
+//!    bits reserved. As a result, this crate's hashes are *not*
+//!    drop-in compatible with a Six-format Panako database — they share
+//!    the invariance *principle* but not the bit layout.
+//! 3. **Frequency differences.** Six quantises unsigned `|Δf|`; this
+//!    crate uses signed `Δf` clamped to ±127 to fit the 8-bit slot and
+//!    signs are packed into the top 2 bits.
+//! 4. **No coarse band indices.** Six's 32-bit layout also stores
+//!    4-bit coarse band indices for the anchor and second target; this
+//!    crate uses the 4 bits for `sign` and `mag_order` instead.
+//!
+//! Robustness claims (e.g. "±10 % speed / ±200 cents pitch") are
+//! matcher-side properties in the Panako papers and depend on the
+//! downstream alignment procedure. This crate only guarantees
+//! deterministic, codec-tolerant hashes; callers are responsible for
+//! the matching logic.
 
 use alloc::vec::Vec;
 
