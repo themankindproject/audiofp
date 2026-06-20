@@ -8,7 +8,7 @@ description  = "Audio fingerprinting SDK: Wang, Panako, Haitsma–Kalker, neural
 repository   = "https://github.com/themankindproject/audiofp"
 authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
 keywords     = ["audio", "fingerprint", "dsp", "shazam", "panako"]
-categories   = ["multimedia::audio", "algorithms", "no-std"]
+categories   = ["multimedia::audio", "algorithms"]
 readme       = "README.md"
 exclude      = [
     # Personal prep / scratch files — useful in the repo, not on crates.io.
