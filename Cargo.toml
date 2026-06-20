@@ -14,7 +14,6 @@ exclude      = [
     # Personal prep / scratch files — useful in the repo, not on crates.io.
     "prep.md",
     "dsp.md",
-    "tests/goldens/.gitignore",
     ".github/",
     ".codex/",
     ".agents/",
