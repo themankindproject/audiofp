@@ -68,6 +68,19 @@ Before opening a PR, make sure:
   trait, and audio-callback hot paths where bounds checks have been profiled.
   Every `unsafe` block carries a `// SAFETY:` comment.
 
+## no_std status
+
+`audiofp` is **host-only** today, despite the `no_std + alloc` API shape.
+The `rustfft -> num-traits/std` dependency chain pulls in `std` unconditionally,
+so `cargo check --no-default-features --target thumbv7em-none-eabihf` will
+fail. `rust-toolchain.toml` therefore no longer lists a bare-metal target
+(it was aspirational — nothing exercised the `rust-std` component for it).
+
+True embedded support is tracked in `future.md` §2.1 (swap `rustfft` for
+`microfft` behind a feature flag). Until that lands, please don't add code
+that assumes bare-metal builds; assume `--no-default-features` runs on a
+host target only.
+
 ## Versioning
 
 The project follows [Semantic Versioning](https://semver.org/) once it ships
