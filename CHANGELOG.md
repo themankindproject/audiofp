@@ -19,6 +19,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drop-in compatible with a Six-format Panako database and that
   speed/pitch robustness claims are matcher-side properties.
 
+### Documentation
+
+- **Repo metadata and docs cleanup.** No user-visible behaviour change.
+  - `Cargo.toml` — removed the dead `tests/goldens/.gitignore` exclude
+  (the file doesn't exist; the directory only holds the `*.bin`
+  golden fixtures) and dropped `"no-std"` from the `categories`
+  list. The crates.io `no-std` category is reserved for crates
+  that actually build on bare-metal, which `audiofp` does not
+  today.
+  - `audio.md` — replaced a hardcoded `v0.3.1` in the project
+  overview with a non-version-bound phrasing ("current version
+  pinned in `Cargo.toml`") so the architecture doc no longer
+  goes stale on each release.
+  - `CHANGELOG.md` — added the missing `[0.3.2]` and `[0.3.3]` link
+  refs to the bottom-of-file footer, and moved `[0.3.1]` into its
+  semver-ascending slot between them.
+  - `rust-toolchain.toml` — removed the
+   `targets = ["thumbv7em-none-eabihf"]` entry that pulled
+  `rust-std` for Cortex-M4 but was never exercised (the
+  `rustfft -> num-traits/std` chain prevents embedded builds).
+  - `CONTRIBUTING.md` — added a "no_std status" section that
+  documents audiofp is host-only today and points at `future.md`
+  §2.1 (the planned `rustfft` → `microfft` swap) as the path to
+  real bare-metal support.
+
 ## [0.3.4] - 2026-06-14
 
 ### Changed
