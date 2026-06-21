@@ -38,6 +38,53 @@ pub struct HaitsmaFingerprint {
     pub frames_per_sec: f32,
 }
 
+impl HaitsmaFingerprint {
+    /// Return the frames as a [`Vec`] of [`HaitsmaHash`] pairs, pairing
+    /// each `u32` frame with its STFT-frame index so the result can be
+    /// fed to the generic [`Matcher`](crate::matcher::Matcher).
+    ///
+    /// The frame index starts at `1` (Haitsma's first hash frame is
+    /// `n=1`, because the bit-difference formula needs the previous
+    /// frame).
+    #[must_use]
+    pub fn hash_pairs(&self) -> Vec<HaitsmaHash> {
+        self.frames
+            .iter()
+            .enumerate()
+            .map(|(i, &hash)| HaitsmaHash {
+                hash,
+                t_anchor: (i + 1) as u32,
+            })
+            .collect()
+    }
+}
+
+/// One Haitsma 32-bit sign-bit frame paired with its frame index.
+///
+/// This is the [`Hash32`](crate::hash::Hash32)-compatible view of a
+/// Haitsma fingerprint frame. Use
+/// [`HaitsmaFingerprint::hash_pairs`] to obtain a `Vec<HaitsmaHash>`
+/// from a fingerprint.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HaitsmaHash {
+    /// The 32 sign-bits packed into a `u32` (band 0 in the MSB).
+    pub hash: u32,
+    /// STFT frame index (starts at 1).
+    pub t_anchor: u32,
+}
+
+impl crate::hash::Hash32 for HaitsmaHash {
+    #[inline]
+    fn hash(&self) -> u32 {
+        self.hash
+    }
+    #[inline]
+    fn t_anchor(&self) -> u32 {
+        self.t_anchor
+    }
+}
+
 /// Tunable parameters for [`Haitsma`].
 #[derive(Clone, Debug)]
 pub struct HaitsmaConfig {

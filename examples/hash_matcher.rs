@@ -9,7 +9,7 @@
 //! after is queried against it. For each query the program prints the top
 //! reference matches with a vote count and the best-matching time offset.
 
-use audiofp::classical::{Wang, WangFingerprint};
+use audiofp::classical::{Wang, WangFingerprint, WangHash};
 use audiofp::io::decode_to_mono_at;
 use audiofp::matcher::Matcher;
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
@@ -36,13 +36,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut wang = Wang::default();
-    let mut m = Matcher::new();
+    let mut m: Matcher<WangHash> = Matcher::new();
 
     println!("Enrolling {} reference track(s)...", refs.len());
     for path in refs {
         let fp = fingerprint(&mut wang, path)?;
         let id = m.enroll(path.clone(), &fp.hashes);
-        println!("  [{:>2}] {}  ({} hashes)", id, path, fp.hashes.len());
+        println!(
+            "  [{:>2}] {}  ({} hashes, index {} hashes)",
+            id,
+            path,
+            fp.hashes.len(),
+            m.hash_count()
+        );
     }
 
     for query_path in queries {

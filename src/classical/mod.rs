@@ -25,6 +25,6 @@ pub mod haitsma;
 pub mod panako;
 pub mod wang;
 
-pub use haitsma::{Haitsma, HaitsmaConfig, HaitsmaFingerprint, StreamingHaitsma};
+pub use haitsma::{Haitsma, HaitsmaConfig, HaitsmaFingerprint, HaitsmaHash, StreamingHaitsma};
 pub use panako::{Panako, PanakoConfig, PanakoFingerprint, PanakoHash, StreamingPanako};
 pub use wang::{StreamingWang, Wang, WangConfig, WangFingerprint, WangHash};
