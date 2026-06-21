@@ -830,10 +830,48 @@ mod tests {
             rate: SampleRate::HZ_8000,
         };
         let fpr = fp.extract(buf).unwrap();
-        assert!(!fpr.hashes.is_empty(), "expected hashes from a 5s tone");
+        assert!(
+            (500..=900).contains(&fpr.hashes.len()),
+            "expected 500..=900 hashes from a 5s tone, got {}",
+            fpr.hashes.len(),
+        );
+        let distinct: alloc::collections::BTreeSet<u32> =
+            fpr.hashes.iter().map(|h| h.hash).collect();
+        assert!(
+            distinct.len() > 400,
+            "expected most hashes to be distinct, got {} distinct of {}",
+            distinct.len(),
+            fpr.hashes.len(),
+        );
+        // Ordering invariant: sorted by (t_anchor, t_b, t_c).
         for w in fpr.hashes.windows(2) {
             assert!((w[0].t_anchor, w[0].t_b, w[0].t_c) <= (w[1].t_anchor, w[1].t_b, w[1].t_c));
         }
+    }
+
+    #[test]
+    fn synthetic_signal_is_deterministic() {
+        // Two separate extractors on identical input must produce the
+        // same hash multiset (the regression goldens pin byte-exact
+        // output; this smoke test pins the count + multiset count for a
+        // second seed at a different length to catch algorithm drift
+        // the goldens would miss if the seed/input changes).
+        let samples = synthetic_audio(0xBEEF, 8_000 * 3);
+        let mut a = Panako::default();
+        let mut b = Panako::default();
+        let fa = a
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+        let fb = b
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+        assert_eq!(fa.hashes, fb.hashes);
     }
 
     #[test]

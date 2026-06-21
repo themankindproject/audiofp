@@ -111,6 +111,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of The Mankind Project`), matching the `Cargo.toml`
     `authors` field.
 
+### Added
+
+- **`audiofp::matcher` module.** The Shazam-style time-aligned hash
+  voter previously lived only in `examples/hash_matcher.rs` (186
+  lines, untested).  Promoted to a first-class public module
+  `src/matcher.rs` with full test coverage (`Matcher::new`,
+  `enroll`, `query`, self-query perfect-match, two-track selection,
+  empty-db and silence-query edge cases).  The example is now a
+  thin `main` wrapper around `audiofp::matcher::Matcher`.  Related:
+  issue #17 (`Hash32` trait) remains open; when landed the matcher
+  can be generalised from `WangHash` to `impl Hash32`.
+
+### Tests
+
+- **`ShortTimeFFT::new` panic coverage.** Four new `#[should_panic]`
+  tests in `src/dsp/stft.rs` pin the three documented panic
+  conditions: zero `n_fft`, non-power-of-two `n_fft`, zero `hop`,
+  and `hop > n_fft`.  (Issue #33.)
+
+- **Strengthened synthetic-signal smoke tests.** `synthetic_signal_
+  produces_hashes` in `src/classical/{wang,panako,haitsma}.rs` now
+  asserts hash count is in a tight expected range, asserts most
+  hashes are distinct, and is accompanied by a new
+  `synthetic_signal_is_deterministic` test that runs two extractors
+  on the same input and asserts identical output.  (Issue #36.)
+
+- **`StreamingFingerprinter::push_with` / `flush_with` default-impl
+  tests.** Three new tests in `src/fp.rs` pin the default
+  delegation contract: `push_with` emits the same frames as `push`
+  in the same order and returns the correct count; `flush_with`
+  mirrors `flush`.  (Issue #37.)
+
+- **NaN/inf robustness.** Two fixed tests (`nan_audio_does_not_panic`,
+  `infinity_audio_does_not_panic`) plus three proptest strategies
+  (`wang/panako/haitsma_tolerates_nan_inf_spikes`) in
+  `tests/property.rs` verify that NaN and infinity in audio data
+  never cause panics — graceful degradation is the documented
+  contract.  (Issue #34.)
+
+- **Golden-file magic header.** `tests/regression.rs` now writes
+  `<8-byte per-algorithm magic> <bytemuck-cast hash bytes>` to
+  each golden file (`AFPWANG\0`, `AFPPANK\0`, `AFPHAIT\0`).  On
+  read the magic is validated; a silent `#[repr(C)]` field
+  reordering that changes the byte layout now fails with a clear
+  message instead of silently accepting a byte-for-byte match of
+  garbage.  Existing `tests/goldens/*.bin` regenerated.  (Issue #48.)
+
+- **Neural embedder test rename.** `tests/neural.rs` test
+  `extract_on_short_audio_returns_audio_too_short_via_trait`
+  renamed to `neural_fingerprinter_is_object_safe` — the old name
+  claimed to test extraction but only checked trait object safety.
+  (Issue #47.)
+
+- **`fuzz/.gitignore`.** Added `.gitignore` covering `corpus/` and
+  `artifacts/` so `cargo fuzz` runtime output doesn't show up as
+  untracked.  (Issue #47.)
+
 ## [0.3.4] - 2026-06-14
 
 ### Changed

@@ -5,6 +5,14 @@
 //!   2. Runs the corresponding fingerprinter.
 //!   3. Compares its byte representation against `tests/goldens/<algo>.bin`.
 //!
+//! Each golden file is `<8-byte magic> <bytemuck-cast hash bytes>`. The
+//! magic prefix catches `#[repr(C)]` field reordering regressions: a
+//! silent swap of `hash` and `t_anchor` in `WangHash` (or analogous
+//! fields in `PanakoHash` / the Haitsma `u32` frame) would still
+//! produce 4-byte-aligned output but the magic would no longer match
+//! the algorithm, so the test fails with a clear message rather than
+//! silently accepting a byte-for-byte "match" of garbage.
+//!
 //! To regenerate the goldens after an *intentional* output change:
 //!
 //! ```bash
@@ -23,6 +31,10 @@ const TONE_LO: f32 = 880.0;
 const TONE_HI: f32 = 1320.0;
 const SECS: f32 = 6.0;
 const GOLDEN_DIR: &str = "tests/goldens";
+
+const MAGIC_WANG: &[u8; 8] = b"AFPWANG\0";
+const MAGIC_PANAKO: &[u8; 8] = b"AFPPANK\0";
+const MAGIC_HAITSMA: &[u8; 8] = b"AFPHAIT\0";
 
 /// Deterministic xorshift32-driven two-tone-with-noise synthesiser.
 fn synth(seed: u32, sr: u32) -> Vec<f32> {
@@ -43,27 +55,52 @@ fn synth(seed: u32, sr: u32) -> Vec<f32> {
     out
 }
 
-/// Read a golden file (panicking with a helpful message if it's missing
-/// and we're not in update mode).
-fn load_or_update(path: &Path, current: &[u8]) -> Vec<u8> {
-    if std::env::var_os("UPDATE_GOLDENS").is_some() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        std::fs::write(path, current).unwrap();
-        eprintln!(
-            "[goldens] wrote {} ({} bytes)",
-            path.display(),
-            current.len()
-        );
+/// Build a `<magic> <bytes>` golden file payload.
+fn with_magic(magic: &[u8; 8], bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(magic.len() + bytes.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Write a golden file (panicking with a helpful message if we're not
+/// in update mode and the file is missing).
+fn write_golden(path: &Path, payload: &[u8]) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap();
     }
-    std::fs::read(path).unwrap_or_else(|e| {
+    std::fs::write(path, payload).unwrap();
+    eprintln!(
+        "[goldens] wrote {} ({} bytes)",
+        path.display(),
+        payload.len()
+    );
+}
+
+/// Read a golden file, validating the per-algorithm magic header.
+fn read_golden(path: &Path, magic: &[u8; 8], label: &str) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
         panic!(
             "golden file {} missing or unreadable: {e}\n\
              Run with UPDATE_GOLDENS=1 cargo test --test regression to (re)generate.",
             path.display(),
         )
-    })
+    });
+    if bytes.len() < magic.len() || &bytes[..magic.len()] != magic {
+        panic!(
+            "{label} golden {} is missing the {} magic header\n  \
+             got: {:?}\n  \
+             want: {:?}\n\
+             This usually means the file was generated against an older\n\
+             version of this test. Re-run with\n  \
+             UPDATE_GOLDENS=1 cargo test --test regression",
+            path.display(),
+            label,
+            &bytes[..bytes.len().min(magic.len())],
+            magic.as_slice(),
+        );
+    }
+    bytes[magic.len()..].to_vec()
 }
 
 /// Friendly error message helper that doesn't dump tens of KB on failure.
@@ -100,7 +137,11 @@ fn wang_v1_golden() {
 
     let bytes = bytemuck::cast_slice::<WangHash, u8>(&fp.hashes);
     let path = Path::new(GOLDEN_DIR).join("wang_v1.bin");
-    let expected = load_or_update(&path, bytes);
+
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        write_golden(&path, &with_magic(MAGIC_WANG, bytes));
+    }
+    let expected = read_golden(&path, MAGIC_WANG, "Wang");
     assert_bytes_equal(bytes, &expected, "Wang");
 }
 
@@ -116,7 +157,11 @@ fn panako_v2_golden() {
 
     let bytes = bytemuck::cast_slice::<PanakoHash, u8>(&fp.hashes);
     let path = Path::new(GOLDEN_DIR).join("panako_v2.bin");
-    let expected = load_or_update(&path, bytes);
+
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        write_golden(&path, &with_magic(MAGIC_PANAKO, bytes));
+    }
+    let expected = read_golden(&path, MAGIC_PANAKO, "Panako");
     assert_bytes_equal(bytes, &expected, "Panako");
 }
 
@@ -132,6 +177,10 @@ fn haitsma_v1_golden() {
 
     let bytes = bytemuck::cast_slice::<u32, u8>(&fp.frames);
     let path = Path::new(GOLDEN_DIR).join("haitsma_v1.bin");
-    let expected = load_or_update(&path, bytes);
+
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        write_golden(&path, &with_magic(MAGIC_HAITSMA, bytes));
+    }
+    let expected = read_golden(&path, MAGIC_HAITSMA, "Haitsma");
     assert_bytes_equal(bytes, &expected, "Haitsma");
 }

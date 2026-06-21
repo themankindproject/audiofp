@@ -483,13 +483,44 @@ mod tests {
             rate: SampleRate::HZ_5000,
         };
         let fpr = fp.extract(buf).unwrap();
-        assert!(!fpr.frames.is_empty());
+        assert!(
+            (200..=400).contains(&fpr.frames.len()),
+            "expected 200..=400 frames from a 4s tone @ 5 kHz, got {}",
+            fpr.frames.len(),
+        );
         let nonzero = fpr.frames.iter().filter(|&&h| h != 0).count();
         assert!(
-            nonzero > fpr.frames.len() / 4,
-            "expected most frames to have at least one bit set, got {nonzero}/{}",
+            nonzero > fpr.frames.len() * 3 / 4,
+            "expected > 75% of frames to have at least one bit set, got {nonzero}/{}",
             fpr.frames.len()
         );
+        let distinct: alloc::collections::BTreeSet<u32> = fpr.frames.iter().copied().collect();
+        assert!(
+            distinct.len() > 200,
+            "expected most frames to be distinct, got {} distinct of {}",
+            distinct.len(),
+            fpr.frames.len(),
+        );
+    }
+
+    #[test]
+    fn synthetic_signal_is_deterministic() {
+        let samples = synthetic_audio(0xBEEF, 5_000 * 3);
+        let mut a = Haitsma::default();
+        let mut b = Haitsma::default();
+        let fa = a
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_5000,
+            })
+            .unwrap();
+        let fb = b
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_5000,
+            })
+            .unwrap();
+        assert_eq!(fa.frames, fb.frames);
     }
 
     #[test]

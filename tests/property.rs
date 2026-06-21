@@ -167,3 +167,125 @@ proptest! {
         prop_assert_eq!(f1.hashes, f2.hashes);
     }
 }
+
+// ---------------------------------------------------------------------------
+// NaN / inf robustness: none of these may panic; behaviour is contractually
+// "graceful degradation" — NaN/inf propagates through the DSP chain, so
+// no valid peaks are detected and the fingerprint is empty or sparse.
+// A future version may return an error for NaN inputs; for now, the
+// contract is "never panic, always produce some output".
+// ---------------------------------------------------------------------------
+
+/// Inject `n_spikes` NaN or infinity values at random positions in a
+/// clean synthetic signal of `n_samples` total samples.
+fn inject_spikes(clean: &mut [f32], n_spikes: usize, seed: u32) {
+    let mut rng: u64 = seed as u64 | 1;
+    for _ in 0..n_spikes {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let idx = (rng as usize) % clean.len();
+        // Alternate between NaN and infinity.
+        clean[idx] = if (rng >> 62) & 1 == 0 {
+            f32::NAN
+        } else {
+            f32::INFINITY
+        };
+    }
+}
+
+#[test]
+fn nan_audio_does_not_panic() {
+    // All-NaN input.
+    let samples = vec![f32::NAN; 8_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_8000,
+    };
+    let mut wang = Wang::default();
+    let _ = wang.extract(buf);
+
+    let samples = vec![f32::NAN; 8_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_8000,
+    };
+    let mut panako = Panako::default();
+    let _ = panako.extract(buf);
+
+    let samples = vec![f32::NAN; 5_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_5000,
+    };
+    let mut h = Haitsma::default();
+    let _ = h.extract(buf);
+}
+
+#[test]
+fn infinity_audio_does_not_panic() {
+    // All-inf input.
+    let samples = vec![f32::INFINITY; 8_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_8000,
+    };
+    let mut wang = Wang::default();
+    let _ = wang.extract(buf);
+
+    let samples = vec![f32::INFINITY; 8_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_8000,
+    };
+    let mut panako = Panako::default();
+    let _ = panako.extract(buf);
+
+    let samples = vec![f32::INFINITY; 5_000 * 3];
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_5000,
+    };
+    let mut h = Haitsma::default();
+    let _ = h.extract(buf);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Sprinkling a few NaN/inf values into otherwise normal audio must
+    /// never cause `extract` to panic.  The fingerprints may be empty or
+    /// sparse — that's the documented contract — but a panic would be a
+    /// hard bug (stack unwind + potential data loss in a streaming
+    /// callback).
+    #[test]
+    fn wang_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
+        let mut samples = synth(seed, 8_000, 8_000 * 3);
+        inject_spikes(&mut samples, n_spikes, seed);
+        let mut wang = Wang::default();
+        let _ = wang.extract(AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        });
+    }
+
+    #[test]
+    fn panako_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
+        let mut samples = synth(seed, 8_000, 8_000 * 3);
+        inject_spikes(&mut samples, n_spikes, seed);
+        let mut panako = Panako::default();
+        let _ = panako.extract(AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        });
+    }
+
+    #[test]
+    fn haitsma_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
+        let mut samples = synth(seed, 5_000, 5_000 * 3);
+        inject_spikes(&mut samples, n_spikes, seed);
+        let mut h = Haitsma::default();
+        let _ = h.extract(AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        });
+    }
+}

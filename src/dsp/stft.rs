@@ -470,6 +470,50 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "n_fft must be a non-zero power of two")]
+    fn new_panics_on_zero_n_fft() {
+        let _ = ShortTimeFFT::new(StftConfig {
+            n_fft: 0,
+            hop: 256,
+            window: WindowKind::Hann,
+            center: true,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "n_fft must be a non-zero power of two")]
+    fn new_panics_on_non_power_of_two_n_fft() {
+        let _ = ShortTimeFFT::new(StftConfig {
+            n_fft: 1000,
+            hop: 250,
+            window: WindowKind::Hann,
+            center: true,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "hop must be in (0, n_fft]")]
+    fn new_panics_on_zero_hop() {
+        let _ = ShortTimeFFT::new(StftConfig {
+            n_fft: 1024,
+            hop: 0,
+            window: WindowKind::Hann,
+            center: true,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "hop must be in (0, n_fft]")]
+    fn new_panics_on_hop_greater_than_n_fft() {
+        let _ = ShortTimeFFT::new(StftConfig {
+            n_fft: 1024,
+            hop: 2048,
+            window: WindowKind::Hann,
+            center: true,
+        });
+    }
+
+    #[test]
     fn empty_input_produces_no_frames() {
         let mut s = ShortTimeFFT::new(StftConfig::new(1024));
         assert!(s.magnitude(&[]).is_empty());

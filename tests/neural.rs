@@ -57,10 +57,11 @@ fn invalid_config_is_rejected_before_model_load() {
 }
 
 #[test]
-fn extract_on_short_audio_returns_audio_too_short_via_trait() {
-    // We can't construct an embedder here without a model — but we can
-    // still demonstrate the public Fingerprinter trait carries through
-    // the AudioBuffer contract by type-checking the trait surface.
+fn neural_fingerprinter_is_object_safe() {
+    // The neural fingerprinter's public `Fingerprinter` impl must be
+    // object-safe so downstream crates can hold it as `Box<dyn
+    // Fingerprinter<...>>`. This is a compile-time contract; the body
+    // just exercises the trait object surface and the public types.
     fn _assert_trait_object_compatible<F: Fingerprinter>(_: &F) {}
     let _ = _assert_trait_object_compatible::<audiofp::neural::NeuralEmbedder>;
     // Construct a buffer just to exercise the public types; we never

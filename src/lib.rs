@@ -74,6 +74,7 @@ pub mod classical;
 pub mod dsp;
 #[cfg(feature = "std")]
 pub mod io;
+pub mod matcher;
 #[cfg(feature = "neural")]
 pub mod neural;
 #[cfg(feature = "watermark")]

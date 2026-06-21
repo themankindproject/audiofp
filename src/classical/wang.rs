@@ -785,11 +785,43 @@ mod tests {
             rate: SampleRate::HZ_8000,
         };
         let fpr = fp.extract(buf).unwrap();
-        assert!(!fpr.hashes.is_empty(), "expected hashes from a 5s tone");
-        // Ordering invariant.
+        assert!(
+            (650..=1100).contains(&fpr.hashes.len()),
+            "expected 650..=1100 hashes from a 5s tone, got {}",
+            fpr.hashes.len(),
+        );
+        let distinct: alloc::collections::BTreeSet<u32> =
+            fpr.hashes.iter().map(|h| h.hash).collect();
+        assert!(
+            distinct.len() > 500,
+            "expected most hashes to be distinct, got {} distinct of {}",
+            distinct.len(),
+            fpr.hashes.len(),
+        );
+        // Ordering invariant: sorted by (t_anchor, hash).
         for w in fpr.hashes.windows(2) {
             assert!((w[0].t_anchor, w[0].hash) <= (w[1].t_anchor, w[1].hash));
         }
+    }
+
+    #[test]
+    fn synthetic_signal_is_deterministic() {
+        let samples = synthetic_audio(0xBEEF, 8_000 * 3);
+        let mut a = Wang::default();
+        let mut b = Wang::default();
+        let fa = a
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+        let fb = b
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+        assert_eq!(fa.hashes, fb.hashes);
     }
 
     #[test]
