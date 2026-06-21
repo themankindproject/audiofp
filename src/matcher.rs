@@ -142,6 +142,8 @@ impl Matcher {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::classical::Wang;
     use crate::{AudioBuffer, Fingerprinter, SampleRate};

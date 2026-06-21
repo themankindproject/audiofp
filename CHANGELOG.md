@@ -101,6 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `wang-v2`, etc.) in the same release. The contract was
     already in README §"Determinism" but was missing from the
     API doc (the only thing docs.rs shows).
+  - `src/lib.rs` — the crate-level example doctest used
+    `std::collections::HashSet` and `audiofp::io::decode_to_mono_at`,
+    both of which are unavailable under `no_std + alloc`.  Replaced
+    with `alloc::collections::BTreeSet` and a synthetic buffer so the
+    doctest compiles and passes under `--no-default-features`
+    (unblocks the new `no-std-test` CI job).  (Issue #3.)
+  - `src/fp.rs`, `src/matcher.rs` — test modules that use `vec![]`
+    now import `use alloc::vec;` so the macro is available under
+    `--no-default-features` in the clippy-no-std CI job.
   - `README.md` — replaced the stale "Examples will be added in
     a future release" paragraph with a list of the five existing
     programs in `examples/` and the canonical

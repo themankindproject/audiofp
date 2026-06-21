@@ -187,6 +187,8 @@ pub trait StreamingFingerprinter {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// A toy streaming fingerprinter that emits one `u32` frame per

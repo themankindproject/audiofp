@@ -33,21 +33,19 @@
 //!
 //! Identify a song by counting Wang hash collisions between two files:
 //!
-//! ```no_run
+//! ```
+//! extern crate alloc;
 //! use audiofp::classical::Wang;
-//! use audiofp::io::decode_to_mono_at;
 //! use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
-//! use std::collections::HashSet;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let samples = decode_to_mono_at("song.flac", 8_000)?;
+//! let samples: alloc::vec::Vec<f32> = alloc::vec![0.0_f32; 8_000 * 4];
 //! let mut wang = Wang::default();
 //! let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-//! let fp = wang.extract(buf)?;
+//! let fp = wang.extract(buf).unwrap();
 //!
-//! let unique: HashSet<u32> = fp.hashes.into_iter().map(|h| h.hash).collect();
+//! let unique: alloc::collections::BTreeSet<u32> =
+//!     fp.hashes.into_iter().map(|h| h.hash).collect();
 //! println!("{} unique landmark hashes", unique.len());
-//! # Ok(()) }
 //! ```
 //!
 //! # Cargo features
