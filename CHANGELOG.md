@@ -122,43 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`audiofp::hash::Hash32` trait.** A common interface for 32-bit
-  fingerprint hashes across all three classical fingerprinters.
-  `Hash32` requires `Copy + Clone + Debug + Send + Sync + 'static` and
-  exposes two accessors: `hash(&self) -> u32` (the 32-bit inverted-index
-  key) and `t_anchor(&self) -> u32` (the STFT-frame anchor time).
-  Implemented for `WangHash`, `PanakoHash`, and the new `HaitsmaHash`.
-  (Closes #17.)
-
-- **`HaitsmaHash` type + `HaitsmaFingerprint::hash_pairs()`.**  Haitsma
-  stores its output as `Vec<u32>` (raw frames without anchor indices).
-  `HaitsmaHash` is a new `#[repr(C)]` `Pod` newtype that pairs each
-  `u32` frame with its STFT-frame index, making Haitsma usable with the
-  generic `Matcher` and any other `Hash32`-generic code.
-  `HaitsmaFingerprint::hash_pairs()` builds the `Vec<HaitsmaHash>` in
-  one pass.
-
-- **`audiofp::matcher` module — rewritten for performance and generic
-  use.**  The Shazam-style time-aligned hash voter is now:
-  - **Generic over `impl Hash32`** — `Matcher<WangHash>`,
-    `Matcher<PanakoHash>`, `Matcher<HaitsmaHash>` all work from one
-    codebase.  (Closes #35.)
-  - **`HashMap` index on `std`, `BTreeMap` on `no_std`** — `O(1)`
-    lookup on hosted targets, `O(log n)` on bare-metal, behind a
-    single `IndexMap` type alias.
-  - **Flat-vote query** — the previous design allocated a nested
-    `BTreeMap<u32, BTreeMap<i64, u32>>` per query (one `BTreeMap` per
-    track, one per `Δt` bucket).  The new design collects all
-    `(track_id, Δt)` votes into a single `Vec`, sorts once, and counts
-    runs — **zero per-track map allocations during query**.
-  - **`Arc<str>` track names** — `enroll` stores names as `Arc<str>`;
-    `MatchResult::track_name` is an `Arc<str>` clone (refcount bump,
-    not a heap copy).
-  - **DB management API** — `track_count()`, `hash_count()`, `clear()`,
-    `remove_track(track_id)` added for index lifecycle control.
-  - **10 unit tests** covering Wang/Panako/Haitsma self-query,
-    two-track selection, empty-db, silence-query, DB management, and
-    `MatchResult` `Clone+Eq` contracts.
+- **`audiofp::matcher` module.** The Shazam-style time-aligned hash
+  voter previously lived only in `examples/hash_matcher.rs` (186
+  lines, untested).  Promoted to a first-class public module
+  `src/matcher.rs` with full test coverage (`Matcher::new`,
+  `enroll`, `query`, self-query perfect-match, two-track selection,
+  empty-db and silence-query edge cases).  The example is now a
+  thin `main` wrapper around `audiofp::matcher::Matcher`.  Related:
+  issue #17 (`Hash32` trait) remains open; when landed the matcher
+  can be generalised from `WangHash` to `impl Hash32`.
 
 ### Tests
 

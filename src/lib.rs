@@ -70,7 +70,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod classical;
 pub mod dsp;
-pub mod hash;
 #[cfg(feature = "std")]
 pub mod io;
 pub mod matcher;
