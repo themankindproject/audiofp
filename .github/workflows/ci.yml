@@ -85,6 +85,16 @@ jobs:
       - name: check no_std (default target)
         run: cargo check --no-default-features
 
+  no-std-test:
+    name: test (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (no default features)
+        run: cargo test --no-default-features
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
@@ -96,7 +106,6 @@ jobs:
         run: cargo install cargo-audit --version 0.22.1
       - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0009
-        continue-on-error: true
 
   deny:
     name: cargo deny

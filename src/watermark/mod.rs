@@ -14,7 +14,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! audiofp = { version = "0.1", features = ["watermark"] }
+//! audiofp = { version = "0.3", features = ["watermark"] }
 //! ```
 //!
 //! # Example

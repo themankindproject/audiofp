@@ -265,7 +265,15 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 
 ## Examples
 
-The `examples/` directory will house complete working programs in a future release; for now, the snippets in [USAGE.md](USAGE.md) and the doctests across the public API are the recommended starting point.
+The `examples/` directory contains complete working programs that can be run with `cargo run --example <name>`:
+
+- `enroll_file` — fingerprint a single audio file and print the unique Wang landmark count.
+- `match_two_files` — print the number of Wang hash collisions between two files (the canonical "is this the same recording?" check).
+- `compare_algorithms` — run Wang, Panako, and Haitsma–Kalker over the same file and report per-algorithm timing and hash counts.
+- `hash_matcher` — Shazam-style time-aligned matcher over a directory of fingerprints.
+- `stream_buffer` — feed Wang's streaming fingerprinter from an `io::Read` chunk-by-chunk.
+
+The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.
 
 ## Contributing
 

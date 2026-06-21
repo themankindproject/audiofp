@@ -4,10 +4,10 @@ version      = "0.3.4"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
-description  = "Audio fingerprinting SDK: Wang, Panako, Haitsma–Kalker, neural (ONNX), watermark, streaming."
+description  = "Pure-Rust audio fingerprinting and identification: Wang, Panako, Haitsma–Kalker, ONNX neural embedder, AudioSeal watermark, and streaming variants. no_std + alloc capable, bytemuck-friendly hash types."
 repository   = "https://github.com/themankindproject/audiofp"
 authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
-keywords     = ["audio", "fingerprint", "dsp", "shazam", "panako"]
+keywords     = ["audio", "fingerprint", "no-std", "shazam", "acoustid"]
 categories   = ["multimedia::audio", "algorithms"]
 readme       = "README.md"
 exclude      = [
@@ -46,17 +46,17 @@ mimalloc = ["std", "dep:mimalloc"]
 thiserror   = { version = "2.0.18", default-features = false }
 mimalloc    = { version = "0.1.50", default-features = false, optional = true }
 libm        = "0.2.16"
-num-traits  = { version = "0.2.19", default-features = false, features = ["libm"] }
-num-complex = { version = "0.4.6", default-features = false, features = ["libm"] }
+num-traits  = { version = "0.2.19", default-features = false }
+num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive"] }
 symphonia   = { version = "0.5.5", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm"], optional = true }
-tract-onnx  = { version = "0.22.1", optional = true }
+tract-onnx  = { version = "0.22.1", default-features = false, optional = true }
 
 [dev-dependencies]
 approx    = "0.5.1"
 hound     = "3.5.1"
-criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 proptest  = { version = "1.5", default-features = false, features = ["std"] }
 
 [[bench]]
@@ -95,6 +95,9 @@ required-features = ["std"]
 [[example]]
 name = "hash_matcher"
 required-features = ["std"]
+
+[[example]]
+name = "stream_buffer"
 
 [workspace]
 members = ["fuzz"]

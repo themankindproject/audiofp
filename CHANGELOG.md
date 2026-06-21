@@ -44,6 +44,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §2.1 (the planned `rustfft` → `microfft` swap) as the path to
   real bare-metal support.
 
+### Changed
+
+- **CI / Cargo hygiene.** No user-visible runtime behaviour change.
+  - `Cargo.toml` — dropped the `"plotters"` feature from the dev-dep
+    on `criterion` (HTML benchmark reports only; pulled in ~30
+    transitive deps including the `pest` chain on every `cargo
+    test` for no benefit). `cargo test` is now materially faster
+    on cold builds.
+  - `Cargo.toml` — dropped `features = ["libm"]` from `num-traits`
+    and `num-complex` (the crate already calls `libm::sinf` /
+    `logf` / `log10f` directly via the `libm` direct dep, so the
+    libm fallback on these wrappers was redundant).
+  - `Cargo.toml` — added `default-features = false` to `tract-onnx`
+    so the `neural` / `watermark` feature path no longer pulls in
+    BLAS bindings, `blas`, `lazy_static`, `ndarray`, etc. on host
+    platforms.
+  - `Cargo.toml` — added an explicit `[[example]] name =
+    "stream_buffer"` block so the streaming example is declared
+    alongside the other four (consistent, and lets us pin a
+    `required-features` if a future example needs one).
+  - `Cargo.toml` — rewrote the `description` to lead with value
+    ("Pure-Rust audio fingerprinting and identification") and
+    swapped `keywords` to `["audio", "fingerprint", "no-std",
+    "shazam", "acoustid"]` for better crates.io discoverability
+    under the `no_std` search term.
+  - `.github/workflows/ci.yml` — added a `no-std-test` job that
+    runs `cargo test --no-default-features`, so a regression that
+    accidentally uses `std::` in DSP code is caught by CI rather
+    than discovered on first embedded attempt.
+  - `.github/workflows/ci.yml` — removed `continue-on-error: true`
+    from the `cargo audit` step. The durable allow-list lives in
+    `deny.toml`; a new advisory that isn't on that list should
+    fail PRs, not silently turn red.
+  - `deny.toml` — clarified the `RUSTSEC-2026-0009` comment to
+    reflect both transitive pull paths (`liquid` via `tract-onnx`
+    on `neural`/`watermark`, and `chrono` in test paths).
+
+### Documentation
+
+- **Module docstrings, README, and `LICENSE` cleanup.** No
+  user-visible behaviour change.
+  - `src/watermark/mod.rs`, `src/neural/mod.rs` — bumped the
+    pinned `audiofp = "0.1"` / `"0.2"` in the feature-gated
+    install snippets to `"0.3"` to match the current crate
+    version and the `USAGE.md` pattern. Users on the latest
+    release no longer hit resolver errors; users on older
+    versions can no longer silently get a no-op placeholder.
+  - `src/lib.rs` — pinned the `VERSION` doc test to
+    `env!("CARGO_PKG_VERSION")` so a hand-edited bump of the
+    `VERSION` constant that goes out of sync with `Cargo.toml`
+    fails the test, not docs.rs.
+  - `src/fp.rs` — expanded the `Fingerprinter::name()` docstring
+    with the version-suffix-bump contract: a change that alters
+    hash bytes must bump the version suffix (`wang-v1` →
+    `wang-v2`, etc.) in the same release. The contract was
+    already in README §"Determinism" but was missing from the
+    API doc (the only thing docs.rs shows).
+  - `README.md` — replaced the stale "Examples will be added in
+    a future release" paragraph with a list of the five existing
+    programs in `examples/` and the canonical
+    `cargo run --example <name>` invocation for each.
+  - `LICENSE` — copyright line updated to name the individual
+    author and the project together
+    (`Ashutosh Kumar <kumarashutosh34169@gmail.com> on behalf
+    of The Mankind Project`), matching the `Cargo.toml`
+    `authors` field.
+
 ## [0.3.4] - 2026-06-14
 
 ### Changed

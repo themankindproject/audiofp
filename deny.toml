@@ -6,8 +6,10 @@ version = 2
 yanked  = "deny"
 ignore  = [
     # RUSTSEC-2026-0009: time DoS via stack exhaustion.
-    # Transitive dep of tract-onnx (optional feature); no fix available
-    # until tract-onnx 0.22.2+ updates its liquid/tract-linalg deps.
+    # Pulled in transitively by liquid v0.26.8 (via tract-onnx, when
+    # `neural`/`watermark` is enabled) and by chrono in test paths.
+    # No fix available until tract-onnx 0.22.2+ updates its
+    # liquid/tract-linalg deps.
     "RUSTSEC-2026-0009",
 ]
 

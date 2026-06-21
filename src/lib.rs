@@ -95,6 +95,6 @@ pub use types::{AudioBuffer, SampleRate, TimestampMs};
 /// # Example
 ///
 /// ```
-/// assert!(!audiofp::VERSION.is_empty());
+/// assert_eq!(audiofp::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

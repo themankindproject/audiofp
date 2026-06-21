@@ -24,7 +24,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! audiofp = { version = "0.2", features = ["neural"] }
+//! audiofp = { version = "0.3", features = ["neural"] }
 //! ```
 //!
 //! # Example

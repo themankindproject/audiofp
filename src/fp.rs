@@ -58,6 +58,14 @@ pub trait Fingerprinter {
 
     /// Stable identifier for the algorithm and version, e.g. `"wang-v1"`.
     /// Useful when persisting fingerprints alongside the producer name.
+    ///
+    /// **Versioning contract:** the returned string is guaranteed to be
+    /// stable as long as the bytes of the produced hashes are stable.
+    /// A change that alters hash bytes (algorithm tweak, parameter bump,
+    /// representation change) **must** bump the version suffix
+    /// (`wang-v1` → `wang-v2`, etc.) in the same release. Persisted
+    /// fingerprints can then be invalidated, migrated, or rejected
+    /// based on the producer name without ambiguity.
     fn name(&self) -> &'static str;
 
     /// Borrow the configuration this instance was built with.
