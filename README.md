@@ -315,4 +315,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 - Avery Wang, *An Industrial-Strength Audio Search Algorithm* (ISMIR 2003) — Wang landmarks
 - Joren Six & Marc Leman, *Panako: A Scalable Acoustic Fingerprinting System* (ISMIR 2014); 2021 update — triplet β hash
 - Jaap Haitsma & Ton Kalker, *A Highly Robust Audio Fingerprinting System* (ISMIR 2002) — band-power sign bits
-- Robin San Roman et al., *Proactive Detection of Voice Cloning with Localized Watermarking* (AudioSeal, 2024) — watermark model
+- San Roman, R., Fernandez, P., Elsahar, H., Défossez, A., Furon, T. & Tran, T. *Proactive Detection of Voice Cloning with Localized Watermarking.* arXiv:2401.17264, 2024 (AudioSeal) — watermark model. <https://arxiv.org/abs/2401.17264>

@@ -1,4 +1,4 @@
-/target
+target/
 *.swp
 *.swo
 .DS_Store
@@ -6,10 +6,6 @@
 # IDE
 .idea/
 .vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
 
 # Coverage / profiling
 *.profraw
@@ -19,8 +15,3 @@ cobertura.xml
 # Local env
 .env
 .env.local
-.recon/
-.mcp.json
-
-# Local Claude Code project instructions (not published)
-CLAUDE.md

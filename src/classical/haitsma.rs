@@ -1,7 +1,9 @@
 //! Haitsma–Kalker / Philips robust hash.
 //!
-//! Reference: Jaap Haitsma & Ton Kalker, "A Highly Robust Audio
-//! Fingerprinting System" (ISMIR 2002).
+//! Reference: Haitsma, J. & Kalker, T. "A Highly Robust Audio
+//! Fingerprinting System." Proceedings of the 3rd International
+//! Conference on Music Information Retrieval (ISMIR), Paris, France,
+//! 2002. <https://www.ismir.net/resources/ismir-conferences/>
 //!
 //! Algorithm:
 //!
@@ -19,6 +21,18 @@
 //! 5. Pack the 32 bits per frame into a `u32` with band 0 in the most
 //!    significant bit (the spec's "MSB-zero" ordering) and band 31 in
 //!    the least significant.
+//!
+//! ## Divergence from the paper
+//!
+//! The bit-packing order in this implementation (band 0 → bit 31,
+//! "MSB-zero") is **not** the natural band-index order described in
+//! the Haitsma & Kalker 2002 paper. The paper packs bands in their
+//! natural index order. This is a deliberate, stable divergence — the
+//! `haitsma-v1` hash layout in [`Haitsma::name`] is part of the crate's
+//! versioned contract, and changing it would invalidate every
+//! persisted `haitsma-v1` fingerprint. Callers porting an existing
+//! Haitsma database must XOR or byte-reverse each 32-bit frame before
+//! comparison.
 
 use alloc::vec::Vec;
 

@@ -5,174 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.5] - 2026-06-22
 
-### Changed
+A correctness, ergonomics, and doc-completeness patch release. Public
+API surface gains one constructor (`AudioBuffer::new`), two promoted
+DSP primitives (`IncrementalPeakDetector`, `rolling_max_2d_pooled`),
+and `#[must_use]` on the two extraction trait methods. No hash output,
+no error contract, and no audio-format support changes.
 
-- **`classical::panako` module docstring.** The hash layout block was
-  misattributed to "Six 2021 §3.2" but is `afp`'s own `panako-v2`.
-  Re-attributed and added a "Relationship to Panako" section that cites
-  Six 2014 and Six 2021 and lists the four deliberate divergences from
-  the original Panako (STFT vs CQT, 5-bit `β` vs 8-bit time ratio,
-  signed `Δf` clamped to ±127, `sign`+`mag_order` packed where Six uses
-  coarse band indices). Notes that `panako-v2` hashes are not
-  drop-in compatible with a Six-format Panako database and that
-  speed/pitch robustness claims are matcher-side properties.
+### Performance
+
+- **`StreamingWang` and `StreamingPanako` no longer allocate a
+  `Vec<u32>` on every `push` for bucket finalisation.**
+  `finalize_buckets` previously called `self.bucket_pending.keys()
+  .filter(…).cloned().collect()` — a fresh heap allocation on every
+  `push` (called every ~256 samples in the streaming benchmark). Both
+  structs now own a pooled `to_finalize: Vec<u32>` field, `clear()`ed
+  and reused per call. The `flush` path uses the same pooled buffer.
+  The `bucket_pending` map is bounded to ≤ 3 entries in steady state
+  (pinned by `streaming_state_stays_bounded_under_long_input`), so
+  the pooled buffer never grows after warmup. An index-based loop
+  (rather than `drain(..)`) sidesteps the borrow conflict where
+  `drain` would hold `&mut self.to_finalize` across the
+  `self.finalize_bucket` call. Matches the 0.3.3 pooled-`VecDeque`
+  and 0.3.2 pooled-embedding-scratch patterns. (Issue #26.)
+
+  `cargo bench --bench streaming` A/B (50 samples, 5 s measurement,
+  5 s synthetic input, default config):
+
+  | Benchmark              | Before    | After     | Δ          |
+  | ---------------------- | --------- | --------- | ---------- |
+  | Wang (256-chunk)       | 12.808 ms | 12.694 ms | **−0.89%** |
+  | Wang (1 s-chunk)       | 12.684 ms | 12.661 ms | noise      |
+  | Panako (256-chunk)     | 13.452 ms | 13.363 ms | **−0.66%** |
+  | Panako (1 s-chunk)     | 13.459 ms | 13.347 ms | **−0.83%** |
+  | Haitsma (256-chunk)    | 7.259 ms  | 7.280 ms  | noise      |
+  | Haitsma (1 s-chunk)    | 7.222 ms  | 7.252 ms  | noise      |
+
+  The improvement is modest (~1 % on the small-chunk streaming path
+  where `finalize_buckets` is called most often) — the allocation
+  was real (one `Vec<u32>` per push) but small. For realtime audio
+  callbacks where allocator jitter matters more than steady-state
+  throughput, eliminating a per-push alloc is the right call
+  regardless of the bench delta. Haitsma is unaffected (it doesn't
+  use `bucket_pending` / `finalize_buckets`).
+
+### Fixed
+
+- **`StreamingNeuralEmbedder::push` panic is now documented at the
+  crate level.** The `StreamingFingerprinter` trait declares
+  `push` as infallible, but the neural streaming implementation
+  panics on ONNX inference errors. Added a `Panics in streaming
+  APIs` section to the crate-level docs (`src/lib.rs`) pointing
+  at [`neural::StreamingNeuralEmbedder::try_push`] for callers
+  that need to surface inference failures (audio callbacks,
+  `tokio::spawn` workers, etc.). Classical streaming fingerprinters
+  (Wang / Panako / Haitsma) never panic on valid input. (Issue #6.)
+
+  **Note on issue #7 (hot-path Tensor allocation per window):**
+  investigated but **not fixed** in this release. tract 0.22.1's
+  `Tensor::clone()` is a deep copy (`self.deep_clone()`), not a
+  refcount bump, so the "cache + clone" approach proposed in the
+  issue would not save the allocation. Every `Tensor` construction
+  path in tract 0.22.1 (`uninitialized`, `from_shape`, `from_raw`,
+  `from_slice_align`) allocates a fresh backing buffer. A genuine
+  zero-alloc fix requires either a tract API change (e.g.
+  `from_raw_vec`) or unsafe interior mutability — deferred until
+  tract 0.23 (tracked in issue #49). The misleading comment in
+  `embed_window_into` has been corrected to document this
+  limitation honestly. (Issue #7.)
+
+### Added
+
+- **`AudioBuffer::new(samples, rate)`.** Constructor that matches
+  the field layout by name; equivalent to the existing struct
+  literal. Recommended in new code; the literal form is kept for
+  backward compatibility. (Issue #16.)
+
+- **Public `IncrementalPeakDetector` and `rolling_max_2d_pooled`.**
+  Both were `pub(crate)` but battle-tested, unit-tested, and useful
+  as building blocks for any streaming spectrogram pipeline (tempo,
+  onset, beat tracking). `IncrementalPeakDetector` was the engine
+  behind the 0.3.4 streaming-perf fix; exposing it lets external
+  pipelines reuse the amortised O(n_bins) per-row rolling max
+  without copy-pasting ~130 lines. (Issue #19.)
+
+- **`#[must_use]` on `Fingerprinter` and `StreamingFingerprinter`.**
+  Both `extract` and `push`/`flush` return values that are often
+  silently discarded (`fp.extract(buf);`, `s.push(chunk);`) — a
+  real bug pattern. The trait-level attribute flags this at
+  compile time. (Issue #16.)
 
 ### Documentation
 
-- **Repo metadata and docs cleanup.** No user-visible behaviour change.
-  - `Cargo.toml` — removed the dead `tests/goldens/.gitignore` exclude
-  (the file doesn't exist; the directory only holds the `*.bin`
-  golden fixtures) and dropped `"no-std"` from the `categories`
-  list. The crates.io `no-std` category is reserved for crates
-  that actually build on bare-metal, which `audiofp` does not
-  today.
-  - `audio.md` — replaced a hardcoded `v0.3.1` in the project
-  overview with a non-version-bound phrasing ("current version
-  pinned in `Cargo.toml`") so the architecture doc no longer
-  goes stale on each release.
-  - `CHANGELOG.md` — added the missing `[0.3.2]` and `[0.3.3]` link
-  refs to the bottom-of-file footer, and moved `[0.3.1]` into its
-  semver-ascending slot between them.
-  - `rust-toolchain.toml` — removed the
-   `targets = ["thumbv7em-none-eabihf"]` entry that pulled
-  `rust-std` for Cortex-M4 but was never exercised (the
-  `rustfft -> num-traits/std` chain prevents embedded builds).
-  - `CONTRIBUTING.md` — added a "no_std status" section that
-  documents audiofp is host-only today and points at `future.md`
-  §2.1 (the planned `rustfft` → `microfft` swap) as the path to
-  real bare-metal support.
+- **`Peak::mag` units now documented.** The previous "Magnitude at
+  the peak." left callers guessing whether the value was linear
+  power, dB, or something else. Now spells out: Wang/Panako feed
+  dB (`10·log10(power)`), and `audiofp`'s `PeakPicker` has no
+  opinion on units otherwise. (Issue #40.)
 
-### Changed
+- **`MelFilterBank::new` `fmin` precondition documented.** The
+  docstring now clarifies that `fmin = 0` is accepted (both Slaney
+  and HTK mel scales handle 0 Hz without hitting `log(0)` — Slaney's
+  linear branch covers `hz < 1000`, HTK evaluates `log10(1 + 0) = 0`),
+  and explains why [`HaitsmaConfig`](crate::classical::HaitsmaConfig)
+  independently requires `fmin > 0` (its log-spaced band edges use
+  `powf(fmax / fmin, …)`, which is a different code path). An
+  `assert!(fmin >= 0)` was added to guard against negative inputs.
+  (Issue #40.)
 
-- **CI / Cargo hygiene.** No user-visible runtime behaviour change.
-  - `Cargo.toml` — dropped the `"plotters"` feature from the dev-dep
-    on `criterion` (HTML benchmark reports only; pulled in ~30
-    transitive deps including the `pest` chain on every `cargo
-    test` for no benefit). `cargo test` is now materially faster
-    on cold builds.
-  - `Cargo.toml` — dropped `features = ["libm"]` from `num-traits`
-    and `num-complex` (the crate already calls `libm::sinf` /
-    `logf` / `log10f` directly via the `libm` direct dep, so the
-    libm fallback on these wrappers was redundant).
-  - `Cargo.toml` — added `default-features = false` to `tract-onnx`
-    so the `neural` / `watermark` feature path no longer pulls in
-    BLAS bindings, `blas`, `lazy_static`, `ndarray`, etc. on host
-    platforms.
-  - `Cargo.toml` — added an explicit `[[example]] name =
-    "stream_buffer"` block so the streaming example is declared
-    alongside the other four (consistent, and lets us pin a
-    `required-features` if a future example needs one).
-  - `Cargo.toml` — rewrote the `description` to lead with value
-    ("Pure-Rust audio fingerprinting and identification") and
-    swapped `keywords` to `["audio", "fingerprint", "no-std",
-    "shazam", "acoustid"]` for better crates.io discoverability
-    under the `no_std` search term.
-  - `.github/workflows/ci.yml` — added a `no-std-test` job that
-    runs `cargo test --no-default-features`, so a regression that
-    accidentally uses `std::` in DSP code is caught by CI rather
-    than discovered on first embedded attempt.
-  - `.github/workflows/ci.yml` — removed `continue-on-error: true`
-    from the `cargo audit` step. The durable allow-list lives in
-    `deny.toml`; a new advisory that isn't on that list should
-    fail PRs, not silently turn red.
-  - `deny.toml` — clarified the `RUSTSEC-2026-0009` comment to
-    reflect both transitive pull paths (`liquid` via `tract-onnx`
-    on `neural`/`watermark`, and `chrono` in test paths).
+- **`Haitsma` MSB-zero bit-packing divergence from paper is now
+  called out in the module docstring.** The paper packs bands in
+  natural index order; this implementation uses band 0 → bit 31
+  ("MSB-zero"). Stable for `haitsma-v1` hashes, but worth
+  documenting explicitly — same shape as the recent
+  `panako-v2` docstring fix. (Issue #41.)
 
-### Documentation
+- **Wang, Haitsma, and AudioSeal citations now include stable
+  identifiers.** Wang (2003) is cited with the canonical
+  Columbia PDF URL; Haitsma (2002) is cited with full
+  author/title/venue; AudioSeal (San Roman et al., 2024) is
+  cited with the arXiv preprint ID. Matches the post-0.3.4
+  Panako citation style. (Issue #42.)
 
-- **Module docstrings, README, and `LICENSE` cleanup.** No
-  user-visible behaviour change.
-  - `src/watermark/mod.rs`, `src/neural/mod.rs` — bumped the
-    pinned `audiofp = "0.1"` / `"0.2"` in the feature-gated
-    install snippets to `"0.3"` to match the current crate
-    version and the `USAGE.md` pattern. Users on the latest
-    release no longer hit resolver errors; users on older
-    versions can no longer silently get a no-op placeholder.
-  - `src/lib.rs` — pinned the `VERSION` doc test to
-    `env!("CARGO_PKG_VERSION")` so a hand-edited bump of the
-    `VERSION` constant that goes out of sync with `Cargo.toml`
-    fails the test, not docs.rs.
-  - `src/fp.rs` — expanded the `Fingerprinter::name()` docstring
-    with the version-suffix-bump contract: a change that alters
-    hash bytes must bump the version suffix (`wang-v1` →
-    `wang-v2`, etc.) in the same release. The contract was
-    already in README §"Determinism" but was missing from the
-    API doc (the only thing docs.rs shows).
-  - `src/lib.rs` — the crate-level example doctest used
-    `std::collections::HashSet` and `audiofp::io::decode_to_mono_at`,
-    both of which are unavailable under `no_std + alloc`.  Replaced
-    with `alloc::collections::BTreeSet` and a synthetic buffer so the
-    doctest compiles and passes under `--no-default-features`
-    (unblocks the new `no-std-test` CI job).  (Issue #3.)
-  - `src/fp.rs` — test modules that use `vec![]`
-    now import `use alloc::vec;` so the macro is available under
-    `--no-default-features` in the clippy-no-std CI job.
-  - `README.md` — replaced the stale "Examples will be added in
-    a future release" paragraph with a list of the five existing
-    programs in `examples/` and the canonical
-    `cargo run --example <name>` invocation for each.
-  - `LICENSE` — copyright line updated to name the individual
-    author and the project together
-    (`Ashutosh Kumar <kumarashutosh34169@gmail.com> on behalf
-    of The Mankind Project`), matching the `Cargo.toml`
-    `authors` field.
-
-### Changed
-
-- **Reverted `audiofp::matcher` module.** The matcher promoted from
-  `examples/hash_matcher.rs` to a public module in the previous commit
-  was removed — it requires a major version bump (generic `Matcher<T>`,
-  `HaitsmaHash` newtype, `Arc<str>` track names). The matching algorithm
-  remains available as a standalone example in `examples/hash_matcher.rs`.
-  Issue #17 (`Hash32` trait) remains open for future landing.
-
-### Tests
-
-- **`ShortTimeFFT::new` panic coverage.** Four new `#[should_panic]`
-  tests in `src/dsp/stft.rs` pin the three documented panic
-  conditions: zero `n_fft`, non-power-of-two `n_fft`, zero `hop`,
-  and `hop > n_fft`.  (Issue #33.)
-
-- **Strengthened synthetic-signal smoke tests.** `synthetic_signal_
-  produces_hashes` in `src/classical/{wang,panako,haitsma}.rs` now
-  asserts hash count is in a tight expected range, asserts most
-  hashes are distinct, and is accompanied by a new
-  `synthetic_signal_is_deterministic` test that runs two extractors
-  on the same input and asserts identical output.  (Issue #36.)
-
-- **`StreamingFingerprinter::push_with` / `flush_with` default-impl
-  tests.** Three new tests in `src/fp.rs` pin the default
-  delegation contract: `push_with` emits the same frames as `push`
-  in the same order and returns the correct count; `flush_with`
-  mirrors `flush`.  (Issue #37.)
-
-- **NaN/inf robustness.** Two fixed tests (`nan_audio_does_not_panic`,
-  `infinity_audio_does_not_panic`) plus three proptest strategies
-  (`wang/panako/haitsma_tolerates_nan_inf_spikes`) in
-  `tests/property.rs` verify that NaN and infinity in audio data
-  never cause panics — graceful degradation is the documented
-  contract.  (Issue #34.)
-
-- **Golden-file magic header.** `tests/regression.rs` now writes
-  `<8-byte per-algorithm magic> <bytemuck-cast hash bytes>` to
-  each golden file (`AFPWANG\0`, `AFPPANK\0`, `AFPHAIT\0`).  On
-  read the magic is validated; a silent `#[repr(C)]` field
-  reordering that changes the byte layout now fails with a clear
-  message instead of silently accepting a byte-for-byte match of
-  garbage.  Existing `tests/goldens/*.bin` regenerated.  (Issue #48.)
-
-- **Neural embedder test rename.** `tests/neural.rs` test
-  `extract_on_short_audio_returns_audio_too_short_via_trait`
-  renamed to `neural_fingerprinter_is_object_safe` — the old name
-  claimed to test extraction but only checked trait object safety.
-  (Issue #47.)
-
-- **`fuzz/.gitignore`.** Added `.gitignore` covering `corpus/` and
-  `artifacts/` so `cargo fuzz` runtime output doesn't show up as
-  untracked.  (Issue #47.)
+- **`push_with` / `flush_with` default-impl allocation behaviour
+  is now explicit in the docstring.** The previous wording
+  claimed the methods are "zero-allocation"; the default impl
+  delegates to `push`/`flush` (which allocate a `Vec`) and is
+  not zero-alloc unless the implementor overrides. The
+  docstring now says so plainly. (Issue #53.)
 
 ## [0.3.4] - 2026-06-14
 
@@ -779,7 +740,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/themankindproject/audiofp/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/themankindproject/audiofp/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/themankindproject/audiofp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/themankindproject/audiofp/compare/v0.3.1...v0.3.2

@@ -359,7 +359,7 @@ mod tests {
     fn flush_clears_carry_and_emits_nothing() {
         let mut s = fixture();
         let chunk = vec![0.0_f32; s.window_samples() / 2];
-        s.push(&chunk);
+        let _ = s.push(&chunk);
         assert!(s.carry_len() > 0);
         let f = s.flush();
         assert!(f.is_empty());

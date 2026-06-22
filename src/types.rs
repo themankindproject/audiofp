@@ -88,7 +88,7 @@ impl SampleRate {
 /// use audiofp::{AudioBuffer, SampleRate};
 ///
 /// let samples = vec![0.0_f32; 16_000];
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+/// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
 /// assert_eq!(buf.samples.len(), 16_000);
 /// assert_eq!(buf.rate.hz(), 16_000);
 /// ```
@@ -100,6 +100,30 @@ pub struct AudioBuffer<'a> {
 
     /// Sample rate the samples were captured at.
     pub rate: SampleRate,
+}
+
+impl<'a> AudioBuffer<'a> {
+    /// Build an [`AudioBuffer`] from a borrowed sample slice and a rate.
+    ///
+    /// Equivalent to the struct literal form, but the field names are not
+    /// memorised on every call site. Prefer this constructor in new code;
+    /// the literal form is kept for backward compatibility.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use audiofp::{AudioBuffer, SampleRate};
+    ///
+    /// let samples = vec![0.0_f32; 16_000];
+    /// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
+    /// assert_eq!(buf.samples.len(), 16_000);
+    /// assert_eq!(buf.rate.hz(), 16_000);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn new(samples: &'a [f32], rate: SampleRate) -> Self {
+        Self { samples, rate }
+    }
 }
 
 /// A timestamp in milliseconds since the start of a stream.

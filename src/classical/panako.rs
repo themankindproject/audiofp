@@ -426,6 +426,13 @@ pub struct StreamingPanako {
 
     pending_anchors: alloc::collections::VecDeque<PendingAnchorPanako>,
 
+    /// Pooled scratch for `finalize_buckets` / `flush`: the list of
+    /// bucket keys to finalise on this call. Previously a fresh
+    /// `Vec::collect()` on every `push`; pooled here and `clear()`ed
+    /// per call so the streaming hot path performs zero allocations
+    /// for bucket finalisation. Same pattern as `StreamingWang`.
+    to_finalize: Vec<u32>,
+
     /// Pooled scratch for the sorted (b, c, score) triplet list.
     /// Stores owned Peak copies to avoid lifetime issues on the struct.
     triplet_scratch: Vec<(Peak, Peak, f32)>,
@@ -469,6 +476,7 @@ impl StreamingPanako {
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
             pending_anchors: alloc::collections::VecDeque::new(),
+            to_finalize: Vec::new(),
             triplet_scratch: Vec::new(),
         }
     }
@@ -582,15 +590,28 @@ impl StreamingPanako {
             return;
         }
         let current_bucket = (self.last_pd_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32;
-        let to_finalize: Vec<u32> = self
-            .bucket_pending
-            .keys()
-            .filter(|&&b| (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket)
-            .cloned()
-            .collect();
-        for bucket in to_finalize {
+        // Collect into the pooled buffer instead of allocating a fresh
+        // `Vec` on every `push`. `bucket_pending` is bounded (≤ 3 in
+        // steady state), so the buffer never grows after warmup.
+        //
+        // The index-based loop (rather than `drain(..)`) sidesteps the
+        // borrow conflict: `drain` would hold `&mut self.to_finalize`
+        // across the loop body where `self.finalize_bucket` needs
+        // `&mut self`. Indexing a `Copy` element produces a `u32` by
+        // value, so the immutable borrow of `to_finalize` ends before
+        // the mutable call begins.
+        self.to_finalize.clear();
+        self.to_finalize.extend(
+            self.bucket_pending.keys().copied().filter(|&b| {
+                (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket
+            }),
+        );
+        let n = self.to_finalize.len();
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
             self.finalize_bucket(bucket);
         }
+        self.to_finalize.clear();
     }
 
     fn emit_finalized_anchors(&mut self) -> Vec<(TimestampMs, PanakoHash)> {
@@ -722,10 +743,18 @@ impl StreamingFingerprinter for StreamingPanako {
                 *last_pd = ripe_abs as i32;
             });
 
-        let buckets: Vec<u32> = self.bucket_pending.keys().cloned().collect();
-        for bucket in buckets {
+        // Finalise every remaining bucket — no more peaks can arrive.
+        // Reuse the pooled buffer (`to_finalize`) rather than a fresh
+        // `Vec::collect()`, matching `finalize_buckets`. Index-based
+        // loop to avoid the `drain` borrow conflict.
+        self.to_finalize.clear();
+        self.to_finalize.extend(self.bucket_pending.keys().copied());
+        let n = self.to_finalize.len();
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
             self.finalize_bucket(bucket);
         }
+        self.to_finalize.clear();
         let mut emitted = Vec::new();
         while let Some(anchor) = self.pending_anchors.pop_front() {
             self.build_triplets_for_anchor(anchor, &mut emitted);

@@ -102,6 +102,15 @@ impl MelFilterBank {
     ///
     /// Panics if `n_mels == 0`, `n_fft < 2`, `n_fft` is not even, or
     /// `fmin >= fmax`.
+    ///
+    /// `fmin = 0` is accepted — both the Slaney and HTK mel scales
+    /// handle 0 Hz without hitting `log(0)` (Slaney's linear branch
+    /// covers `hz < 1000`, HTK's formula evaluates `log10(1 + 0) = 0`).
+    /// The first filter simply starts at 0 Hz. Note that
+    /// [`HaitsmaConfig`](crate::classical::HaitsmaConfig) independently
+    /// requires `fmin > 0` because its log-spaced band edges use
+    /// `powf(fmax / fmin, …)`, which is undefined for `fmin = 0`; that
+    /// restriction is Haitsma-specific and does not apply here.
     #[must_use]
     pub fn new(
         n_mels: usize,
@@ -113,6 +122,7 @@ impl MelFilterBank {
     ) -> Self {
         assert!(n_mels > 0, "n_mels must be > 0");
         assert!(n_fft >= 2 && n_fft % 2 == 0, "n_fft must be even and >= 2");
+        assert!(fmin >= 0.0, "fmin must be >= 0");
         assert!(fmin < fmax, "fmin must be strictly less than fmax");
 
         let n_bins = n_fft / 2 + 1;
@@ -385,5 +395,11 @@ mod tests {
     #[should_panic(expected = "fmin must be strictly less than fmax")]
     fn mel_filter_bank_panics_when_fmin_above_fmax() {
         let _ = MelFilterBank::new(64, 1024, 16_000, 4_000.0, 1_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    #[should_panic(expected = "fmin must be >= 0")]
+    fn mel_filter_bank_panics_on_negative_fmin() {
+        let _ = MelFilterBank::new(64, 1024, 16_000, -10.0, 8_000.0, MelScale::Slaney);
     }
 }

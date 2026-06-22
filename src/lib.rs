@@ -29,6 +29,20 @@
 //!   picker, resampler, and tapered windows for users building their
 //!   own pipelines on top of `audiofp`.
 //!
+//! # Panics in streaming APIs
+//!
+//! All `StreamingFingerprinter::push` implementations are infallible
+//! **except** [`neural::StreamingNeuralEmbedder::push`], which panics
+//! if the underlying ONNX model reports an inference error. The
+//! non-panicking counterpart [`neural::StreamingNeuralEmbedder::try_push`]
+//! returns `Result` for any code that needs to surface those failures
+//! (audio callbacks, `tokio::spawn` workers, etc.). Classical
+//! streaming fingerprinters (Wang / Panako / Haitsma) never panic on
+//! valid input.
+//!
+//! [`neural::StreamingNeuralEmbedder::push`]: crate::neural::StreamingNeuralEmbedder::push
+//! [`neural::StreamingNeuralEmbedder::try_push`]: crate::neural::StreamingNeuralEmbedder::try_push
+//!
 //! # Example
 //!
 //! Identify a song by counting Wang hash collisions between two files:

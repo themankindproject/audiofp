@@ -141,9 +141,15 @@ impl EmbedderCore {
         let n_mels = self.frontend.n_mels();
         let n_frames = self.n_frames;
 
-        // Allocate the model input tensor once and write log-mel
-        // straight into its `[1, n_mels, n_frames]` row-major buffer
-        // with strided writes — no intermediate `Vec` and no transpose.
+        // Allocate the model input tensor and write log-mel straight
+        // into its `[1, n_mels, n_frames]` row-major buffer with strided
+        // writes — no intermediate `Vec` and no transpose.
+        //
+        // NOTE: tract 0.22.1's `Tensor::clone()` is a deep copy
+        // (`self.deep_clone()`), not a refcount bump, so caching the
+        // tensor and cloning per call would not save the allocation.
+        // A genuine zero-alloc path requires a tract API change
+        // (`from_raw_vec` or similar); tracked in issue #7.
         //
         // SAFETY: `Tensor::uninitialized` returns a tensor whose backing
         // buffer is uninitialised; we must overwrite every element before

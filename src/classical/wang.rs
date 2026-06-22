@@ -1,7 +1,9 @@
 //! Wang-style landmark fingerprinter.
 //!
-//! The algorithm (Avery Wang, "An Industrial-Strength Audio Search
-//! Algorithm", 2003 — the "Shazam paper"):
+//! The algorithm: Wang, A. "An Industrial-Strength Audio Search
+//! Algorithm." Proceedings of the 4th International Conference on Music
+//! Information Retrieval (ISMIR), Baltimore, MD, USA, 2003.
+//! <https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf>
 //!
 //! 1. Resample the input to 8 kHz mono *(caller's responsibility)*.
 //! 2. Take a Hann-windowed STFT with `n_fft = 1024`, `hop = 128` →
@@ -367,6 +369,16 @@ pub struct StreamingWang {
 
     // Anchors awaiting finalisation, in t-order.
     pending_anchors: alloc::collections::VecDeque<PendingAnchor>,
+
+    /// Pooled scratch for `finalize_buckets` / `flush`: the list of
+    /// bucket keys to finalise on this call. `bucket_pending` is
+    /// bounded by `≤ 3` entries in steady state (verified by
+    /// `streaming_state_stays_bounded_under_long_input`), so this Vec
+    /// is tiny — but it was previously a fresh `Vec::collect()` on
+    /// every `push`, i.e. one heap allocation per ~256 samples.
+    /// Pooled here and `clear()`ed per call so the streaming hot path
+    /// performs zero allocations for bucket finalisation.
+    to_finalize: alloc::vec::Vec<u32>,
 }
 
 impl Default for StreamingWang {
@@ -407,6 +419,7 @@ impl StreamingWang {
             bucket_pending: alloc::collections::BTreeMap::new(),
             last_finalized_bucket: -1,
             pending_anchors: alloc::collections::VecDeque::new(),
+            to_finalize: alloc::vec::Vec::new(),
         }
     }
 
@@ -539,15 +552,28 @@ impl StreamingWang {
             return;
         }
         let current_bucket = (self.last_pd_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
-        let to_finalize: alloc::vec::Vec<u32> = self
-            .bucket_pending
-            .keys()
-            .filter(|&&b| (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket)
-            .cloned()
-            .collect();
-        for bucket in to_finalize {
+        // Collect into the pooled buffer instead of allocating a fresh
+        // `Vec` on every `push`. `bucket_pending` is bounded (≤ 3 in
+        // steady state), so the buffer never grows after warmup.
+        //
+        // The index-based loop (rather than `drain(..)`) sidesteps the
+        // borrow conflict: `drain` would hold `&mut self.to_finalize`
+        // across the loop body where `self.finalize_bucket` needs
+        // `&mut self`. Indexing a `Copy` element produces a `u32` by
+        // value, so the immutable borrow of `to_finalize` ends before
+        // the mutable call begins.
+        self.to_finalize.clear();
+        self.to_finalize.extend(
+            self.bucket_pending.keys().copied().filter(|&b| {
+                (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket
+            }),
+        );
+        let n = self.to_finalize.len();
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
             self.finalize_bucket(bucket);
         }
+        self.to_finalize.clear();
     }
 
     /// Pop anchors whose target zone is fully observed (i.e. the bucket
@@ -687,10 +713,17 @@ impl StreamingFingerprinter for StreamingWang {
             });
 
         // Finalise every remaining bucket — no more peaks can arrive.
-        let buckets: alloc::vec::Vec<u32> = self.bucket_pending.keys().cloned().collect();
-        for bucket in buckets {
+        // Reuse the pooled buffer (`to_finalize`) rather than a fresh
+        // `Vec::collect()`, matching `finalize_buckets`. Index-based
+        // loop to avoid the `drain` borrow conflict.
+        self.to_finalize.clear();
+        self.to_finalize.extend(self.bucket_pending.keys().copied());
+        let n = self.to_finalize.len();
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
             self.finalize_bucket(bucket);
         }
+        self.to_finalize.clear();
 
         // Emit every remaining anchor — no more targets can arrive.
         let mut emitted = alloc::vec::Vec::new();

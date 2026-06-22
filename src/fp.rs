@@ -46,9 +46,10 @@ use crate::{AudioBuffer, Result, TimestampMs};
 ///
 /// let mut fp = Energy;
 /// let samples = vec![0.0_f32; 16_000];
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
+/// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
 /// assert_eq!(fp.extract(buf).unwrap(), 0.0);
 /// ```
+#[must_use]
 pub trait Fingerprinter {
     /// The fingerprint produced by this extractor (e.g. `Vec<WangHash>`).
     type Output;
@@ -119,6 +120,7 @@ pub trait Fingerprinter {
 /// let mut fp = EveryThird { count: 0 };
 /// assert_eq!(fp.push(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).len(), 2);
 /// ```
+#[must_use]
 pub trait StreamingFingerprinter {
     /// One unit of fingerprint material the stream emits.
     type Frame;
@@ -147,8 +149,10 @@ pub trait StreamingFingerprinter {
     /// by reference, avoiding the `Vec` allocation of [`push`]. Returns the
     /// number of frames emitted.
     ///
-    /// Default implementation delegates to [`push`] and iterates the result.
-    /// Implementors should override for true zero-allocation behaviour.
+    /// **The default implementation is *not* zero-allocation.** It calls
+    /// [`push`] (which builds a `Vec`) and iterates the result, so it
+    /// inherits the same per-call allocation. Implementors wanting a
+    /// genuine zero-allocation hot path must override this method.
     ///
     /// [`push`]: StreamingFingerprinter::push
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
@@ -169,7 +173,10 @@ pub trait StreamingFingerprinter {
     /// Zero-allocation variant of [`flush`]. Returns the number of frames
     /// emitted.
     ///
-    /// Default implementation delegates to [`flush`] and iterates the result.
+    /// **The default implementation is *not* zero-allocation.** It calls
+    /// [`flush`] and iterates the result, so it inherits the same per-call
+    /// allocation. Implementors wanting a genuine zero-allocation hot
+    /// path must override this method.
     ///
     /// [`flush`]: StreamingFingerprinter::flush
     fn flush_with<F>(&mut self, mut callback: F) -> usize

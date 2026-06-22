@@ -18,6 +18,21 @@ use alloc::vec::Vec;
 /// `repr(C)` plus an explicit `_pad` field keeps the layout deterministic
 /// (12 bytes, no implicit padding) so the struct is `bytemuck::Pod` and can
 /// be stored directly in mmap'd files or shipped over a C ABI.
+///
+/// **Units of [`Peak::mag`]** depend entirely on what the upstream STFT
+/// feeds into the picker — `PeakPicker` is a pure algorithm with no
+/// opinion on units. Concretely, `audiofp`'s built-in extractors pass:
+///
+/// - **dB** (`10·log10(power)`): [`Wang`](crate::classical::Wang) and
+///   [`Panako`](crate::classical::Panako) — their pickers threshold
+///   against `min_anchor_mag_db`.
+/// - **Raw band-difference sign bits** packed as a `u32`: not stored
+///   here. [`Haitsma`](crate::classical::Haitsma) emits frames
+///   directly, not `Peak`s.
+///
+/// Callers wiring up a custom front-end should document the units
+/// alongside the picker config and apply any conversion (e.g. dB →
+/// linear) before thresholding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Peak {
@@ -28,7 +43,8 @@ pub struct Peak {
     /// Explicit padding so the struct has no implicit gaps (required for
     /// `bytemuck::Pod`).
     pub _pad: u16,
-    /// Magnitude at the peak.
+    /// Magnitude at the peak. See the [struct docs](Peak) for unit
+    /// conventions used by the in-tree extractors.
     pub mag: f32,
 }
 
@@ -220,8 +236,14 @@ fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize)
 ///
 /// All scratch slices must already be sized: `temp` and `output` to
 /// `n_rows * n_cols`; `col_in` and `col_out` to `n_rows`.
-#[allow(clippy::too_many_arguments)] // private helper, bundling would obscure intent
-pub(crate) fn rolling_max_2d_pooled(
+///
+/// This is the static (non-incremental) variant of [`IncrementalPeakDetector`].
+/// It recomputes the full 2-D max on every call, so its cost is
+/// `O(n_rows · n_cols)` regardless of `kt` / `kf` — useful for one-shot
+/// offline peak picking where incremental maintenance isn't worth the
+/// state. The scratch buffers let callers reuse allocations across calls.
+#[allow(clippy::too_many_arguments)] // public helper, bundling would obscure intent
+pub fn rolling_max_2d_pooled(
     input: &[f32],
     n_rows: usize,
     n_cols: usize,
@@ -357,7 +379,13 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
 /// Caches the horizontal rolling-max once per row and maintains per-column
 /// vertical Lemire deques so the 2-D max for a single ripe row is produced
 /// in amortised O(n_bins) instead of recomputing the full window.
-pub(crate) struct IncrementalPeakDetector {
+///
+/// Useful as a building block for any pipeline that needs to pick peaks
+/// from a streaming spectrogram (tempo, onset, beat tracking, etc.).
+/// Construct with [`IncrementalPeakDetector::new`], feed each new
+/// spectrogram row into [`push_row`](IncrementalPeakDetector::push_row),
+/// and consume the per-ripe-row 2-D max from `out_max`.
+pub struct IncrementalPeakDetector {
     kt: usize,
     kf: usize,
     n_bins: usize,
@@ -378,7 +406,12 @@ pub(crate) struct IncrementalPeakDetector {
 }
 
 impl IncrementalPeakDetector {
-    pub(crate) fn new(kt: usize, kf: usize, n_bins: usize) -> Self {
+    /// Build a detector for a spectrogram of width `n_bins` and a
+    /// `(2·kt+1) × (2·kf+1)` neighbourhood. Allocates all internal
+    /// state up front so `push_row` performs zero allocations on the
+    /// hot path.
+    #[must_use]
+    pub fn new(kt: usize, kf: usize, n_bins: usize) -> Self {
         let window_cap = 2 * kt + 1;
         let vert_deques = (0..n_bins)
             .map(|_| VecDeque::with_capacity(window_cap))
@@ -403,7 +436,7 @@ impl IncrementalPeakDetector {
     /// center row of the vertical window becomes ripe, writing its 2-D
     /// rolling-max into `out_max`. Returns `None` while filling the initial
     /// window.
-    pub(crate) fn push_row(&mut self, row: &[f32], out_max: &mut [f32]) -> Option<u32> {
+    pub fn push_row(&mut self, row: &[f32], out_max: &mut [f32]) -> Option<u32> {
         debug_assert_eq!(row.len(), self.n_bins);
         debug_assert_eq!(out_max.len(), self.n_bins);
 
@@ -473,7 +506,7 @@ impl IncrementalPeakDetector {
     /// Flush remaining rows that haven't become ripe during normal push.
     /// These are the tail rows whose forward context extends past end-of-stream.
     /// Calls `emit_fn(abs_frame, max_slice)` for each.
-    pub(crate) fn flush(&mut self, out_max: &mut [f32], mut emit_fn: impl FnMut(u32, &[f32])) {
+    pub fn flush(&mut self, out_max: &mut [f32], mut emit_fn: impl FnMut(u32, &[f32])) {
         if self.n_pushed == 0 {
             return;
         }
@@ -515,8 +548,13 @@ impl IncrementalPeakDetector {
         }
     }
 
+    /// Reset all internal state. The detector behaves as if freshly
+    /// constructed: no rows pushed, no ripe frames emitted. Call between
+    /// independent input streams sharing one detector instance so stale
+    /// data from a previous stream doesn't bleed into the first emitted
+    /// row.
     #[allow(dead_code)]
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.ring_len = 0;
         self.ring_write = 0;
         self.abs_pushed = 0;
