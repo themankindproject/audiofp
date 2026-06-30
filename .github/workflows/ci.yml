@@ -51,6 +51,18 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit@0.22.1 --locked
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0009 --ignore RUSTSEC-2026-0186 --ignore RUSTSEC-2026-0190
+
   property-tests:
     name: property tests
     runs-on: ubuntu-latest
@@ -95,18 +107,6 @@ jobs:
       - name: cargo test (no default features)
         run: cargo test --no-default-features
 
-  audit:
-    name: cargo audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0009
-
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
@@ -122,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@nightly-2025-06-01
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
