@@ -11,6 +11,12 @@ ignore  = [
     # No fix available until tract-onnx 0.22.2+ updates its
     # liquid/tract-linalg deps.
     "RUSTSEC-2026-0009",
+    # RUSTSEC-2026-0186: memmap2 unchecked pointer offset.
+    # RUSTSEC-2026-0190: anyhow downcast_mut unsoundness.
+    # Both pulled in transitively by tract-onnx 0.22.1.
+    # No fix available until tract-onnx 0.22.2+.
+    "RUSTSEC-2026-0186",
+    "RUSTSEC-2026-0190",
 ]
 
 [licenses]
