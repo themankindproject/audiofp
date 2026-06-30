@@ -103,7 +103,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-audit
-        run: cargo install cargo-audit --version 0.22.1
+        run: cargo install cargo-audit --locked
       - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0009
 
@@ -123,6 +123,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
