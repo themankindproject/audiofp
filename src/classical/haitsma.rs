@@ -76,6 +76,9 @@ const HAITSMA_SR: u32 = 5_000;
 const HAITSMA_FRAMES_PER_SEC: f32 = HAITSMA_SR as f32 / HAITSMA_HOP as f32;
 const HAITSMA_N_BANDS: usize = 33;
 
+/// Sentinel value meaning "this FFT bin falls outside the band range".
+const NO_BAND: u8 = u8::MAX;
+
 /// Haitsma–Kalker offline fingerprinter.
 ///
 /// # Example
@@ -101,9 +104,11 @@ const HAITSMA_N_BANDS: usize = 33;
 pub struct Haitsma {
     cfg: HaitsmaConfig,
     stft: ShortTimeFFT,
-    /// `bin_to_band[i]` = `Some(b)` if FFT bin `i` falls inside band `b`,
-    /// `None` if it lies outside `[fmin, fmax]`.
-    bin_to_band: Vec<Option<u8>>,
+    /// `bin_to_band[i]` = band index (0..32) if FFT bin `i` falls inside
+    /// a band, or `NO_BAND` (255) if it lies outside `[fmin, fmax]`.
+    /// Using a plain `u8` sentinel instead of `Option<u8>` eliminates
+    /// the branch in the hot inner loop, enabling auto-vectorization.
+    bin_to_band: Vec<u8>,
 }
 
 impl Default for Haitsma {
@@ -193,7 +198,8 @@ impl Fingerprinter for Haitsma {
             let row = &power_flat[f * n_bins..(f + 1) * n_bins];
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
             for (bin, &p) in row.iter().enumerate() {
-                if let Some(b) = self.bin_to_band[bin] {
+                let b = self.bin_to_band[bin];
+                if b != NO_BAND {
                     e[b as usize] += p;
                 }
             }
@@ -215,6 +221,7 @@ impl Fingerprinter for Haitsma {
 
 /// Pack 32 sign bits comparing band-difference deltas between frame `n`
 /// and frame `n−1`.
+#[inline]
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
     let mut hash = 0_u32;
     for b in 0..32 {
@@ -232,8 +239,9 @@ fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS])
 ///
 /// 33 bands defined by 34 logarithmically-spaced edges from `fmin` to
 /// `fmax`. Bin `i`'s frequency is `i · sr / n_fft`. A bin in
-/// `[edge_b, edge_{b+1})` is mapped to band `b`.
-fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<Option<u8>> {
+/// `[edge_b, edge_{b+1})` is mapped to band `b`. Bins outside the range
+/// are mapped to `NO_BAND` (255).
+fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<u8> {
     let n_edges = HAITSMA_N_BANDS + 1;
     let mut edges = [0.0_f32; HAITSMA_N_BANDS + 1];
     let ratio = cfg.fmax / cfg.fmin;
@@ -248,14 +256,14 @@ fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<Option<u8>> {
     for i in 0..n_bins {
         let f = i as f32 * bin_hz;
         if f < edges[0] || f >= edges[n_edges - 1] {
-            out.push(None);
+            out.push(NO_BAND);
             continue;
         }
         // Linear scan is fine — only 33 edges.
-        let mut found = None;
+        let mut found = NO_BAND;
         for b in 0..HAITSMA_N_BANDS {
             if f >= edges[b] && f < edges[b + 1] {
-                found = Some(b as u8);
+                found = b as u8;
                 break;
             }
         }
@@ -285,7 +293,7 @@ pub struct StreamingHaitsma {
 
     stft: ShortTimeFFT,
     sample_carry: Vec<f32>,
-    bin_to_band: Vec<Option<u8>>,
+    bin_to_band: Vec<u8>,
 
     /// Per-bin scratch for one frame's power spectrum.
     frame_power: Vec<f32>,
@@ -360,7 +368,8 @@ impl StreamingFingerprinter for StreamingHaitsma {
             );
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
             for (bin, &p) in self.frame_power.iter().enumerate() {
-                if let Some(b) = self.bin_to_band[bin] {
+                let b = self.bin_to_band[bin];
+                if b != NO_BAND {
                     e[b as usize] += p;
                 }
             }
@@ -625,7 +634,7 @@ mod tests {
         // At least one bin in each band should be tagged.
         let mut hit_per_band = [false; HAITSMA_N_BANDS];
         for &b in &lookup {
-            if let Some(b) = b {
+            if b != NO_BAND {
                 hit_per_band[b as usize] = true;
             }
         }
@@ -633,10 +642,10 @@ mod tests {
             assert!(h, "band {i} has no FFT bins");
         }
 
-        // Bins outside [fmin, fmax) are None.
+        // Bins outside [fmin, fmax) are NO_BAND.
         let bin_at_100hz = (100.0 / bin_hz) as usize;
-        assert!(
-            lookup[bin_at_100hz].is_none(),
+        assert_eq!(
+            lookup[bin_at_100hz], NO_BAND,
             "100 Hz should be below fmin=300"
         );
     }

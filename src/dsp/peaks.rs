@@ -318,6 +318,7 @@ fn rolling_max_2d(
 /// `output[i] = max(input[max(0, i-k) ..= min(n-1, i+k)])` for each `i`.
 /// Total work is amortised O(n) — every index is pushed and popped at
 /// most once.
+#[inline]
 fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque<usize>) {
     let n = input.len();
     debug_assert_eq!(output.len(), n);

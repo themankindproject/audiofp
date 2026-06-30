@@ -1,6 +1,6 @@
 [package]
 name         = "audiofp"
-version      = "0.3.5"
+version      = "0.3.6"
 edition      = "2024"
 rust-version = "1.85.0"
 license      = "MIT"
@@ -98,6 +98,15 @@ required-features = ["std"]
 
 [[example]]
 name = "stream_buffer"
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+
+[profile.bench]
+lto           = "fat"
+codegen-units = 1
 
 [workspace]
 members = ["fuzz"]

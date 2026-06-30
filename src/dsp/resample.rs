@@ -206,13 +206,23 @@ impl SincResampler {
         let steps = self.quality.polyphase_steps as usize;
         let taps = 2 * half + 1;
 
+        // Determine the output-sample range where the kernel is fully
+        // inside the input buffer (no bounds check needed).
+        // i_centre = floor(n * ratio), kernel covers [i_centre - half, i_centre + half].
+        // Fully inside when i_centre >= half AND i_centre + half < n_in.
+        // n * ratio >= half  →  n >= ceil(half / ratio)
+        // n * ratio < n_in - 1 - half  →  n < (n_in - 1 - half) / ratio
+        let n_safe_start = ((half as f64) / ratio).ceil() as usize;
+        let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
+        let n_safe_end = n_safe_end.min(n_out);
+
         let mut out = Vec::with_capacity(n_out);
-        for n in 0..n_out {
+
+        // Left boundary: kernel may extend past the start of input.
+        for n in 0..n_safe_start.min(n_out) {
             let pos = n as f64 * ratio;
             let i_centre = pos.floor() as isize;
             let frac = (pos - pos.floor()) as f32;
-
-            // Look up the precomputed kernel row for this fractional offset.
             let step = (frac * steps as f32) as usize % steps;
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
@@ -226,6 +236,42 @@ impl SincResampler {
             }
             out.push(acc / self.dc_gain);
         }
+
+        // Middle: kernel is fully inside input — no bounds check.
+        for n in n_safe_start..n_safe_end {
+            let pos = n as f64 * ratio;
+            let i_centre = pos.floor() as usize;
+            let frac = (pos - pos.floor()) as f32;
+            let step = (frac * steps as f32) as usize % steps;
+            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
+
+            let base = i_centre.wrapping_sub(half);
+            let mut acc = 0.0_f32;
+            for (k, &coeff) in kernel.iter().enumerate() {
+                acc += input[base + k] * coeff;
+            }
+            out.push(acc / self.dc_gain);
+        }
+
+        // Right boundary: kernel may extend past the end of input.
+        for n in n_safe_end..n_out {
+            let pos = n as f64 * ratio;
+            let i_centre = pos.floor() as isize;
+            let frac = (pos - pos.floor()) as f32;
+            let step = (frac * steps as f32) as usize % steps;
+            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
+
+            let mut acc = 0.0_f32;
+            for (k, &coeff) in kernel.iter().enumerate() {
+                let idx = i_centre + k as isize - half as isize;
+                if idx < 0 || (idx as usize) >= n_in {
+                    continue;
+                }
+                acc += input[idx as usize] * coeff;
+            }
+            out.push(acc / self.dc_gain);
+        }
+
         out
     }
 }

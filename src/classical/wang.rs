@@ -215,7 +215,7 @@ impl Fingerprinter for Wang {
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit landmark hashes.
 fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let mut hashes = Vec::with_capacity(peaks.len() * cfg.fan_out as usize);
-    let target_zone_t = cfg.target_zone_t as i32;
+    let target_zone_t = cfg.target_zone_t as u32;
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
 
@@ -224,16 +224,18 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let mut targets: Vec<Peak> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
+        // Binary search for the upper bound of the target zone:
+        // the first peak whose t_frame > anchor.t_frame + target_zone_t.
+        // Since peaks are sorted by (t_frame, f_bin), all valid targets
+        // for this anchor lie in `peaks[i+1..zone_end]`.
+        let zone_limit = anchor.t_frame.saturating_add(target_zone_t);
+        let zone_end = peaks[i + 1..].partition_point(|p| p.t_frame <= zone_limit);
+
         heap.clear();
-        for target in &peaks[i + 1..] {
-            let dt = target.t_frame as i32 - anchor.t_frame as i32;
+        for target in &peaks[i + 1..i + 1 + zone_end] {
+            let dt = target.t_frame - anchor.t_frame;
             if dt < 1 {
                 continue;
-            }
-            if dt > target_zone_t {
-                // Peaks are sorted by t_frame, so once we exceed the zone
-                // for this anchor, no later peak can fit either.
-                break;
             }
             let df = target.f_bin as i32 - anchor.f_bin as i32;
             if df.abs() > target_zone_f {

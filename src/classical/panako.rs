@@ -293,15 +293,18 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
     let mut triplets: Vec<(Peak, Peak, f32)> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
-        // Collect all peaks in the cone.
+        // Binary search for the upper bound: first peak with
+        // t_frame >= anchor.t_frame + target_zone_t.
+        // Panako uses STRICT inequality (dt < target_zone_t).
+        let zone_limit = anchor.t_frame.saturating_add(target_zone_t as u32 - 1);
+        let zone_end = peaks[i + 1..].partition_point(|p| p.t_frame <= zone_limit);
+
+        // Collect peaks in the cone (within freq zone too).
         targets.clear();
-        for target in &peaks[i + 1..] {
+        for target in &peaks[i + 1..i + 1 + zone_end] {
             let dt = target.t_frame as i32 - anchor.t_frame as i32;
             if dt < 1 {
                 continue;
-            }
-            if dt >= target_zone_t {
-                break;
             }
             let df = target.f_bin as i32 - anchor.f_bin as i32;
             if df.abs() >= target_zone_f {
@@ -347,6 +350,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
 }
 
 /// Pack one anchor-b-c triplet into a 32-bit hash.
+#[inline]
 fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
     let f_a = a.f_bin as i32;
     let f_b = b.f_bin as i32;

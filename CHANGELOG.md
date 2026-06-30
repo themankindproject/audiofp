@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-06-30
+
+A performance patch release. Seven optimisations across the DSP, classical,
+and resampling paths, verified deterministic (bit-exact with 0.3.5 output)
+under all existing tests. No public API changes, no hash output changes.
+
+### Performance
+
+- **`[profile.release]` with LTO and `codegen-units = 1`.** No release
+  profile existed at all — the crate shipped with Cargo's defaults
+  (`codegen-units = 256`, no LTO). Adding `lto = "fat"` and
+  `codegen-units = 1` enables cross-crate inlining of hot-path functions
+  (`log10f`, `norm_sqr`, DSP inner loops). `[profile.bench]` inherits the
+  same settings so benchmark numbers reflect the production build.
+  Measured improvement: **3–16 % throughput gain across all algorithms**
+  (see per-algorithm breakdowns below). This is the single highest-leverage
+  change in this release.
+
+- **Sparse (CSR) mel filterbank for `log_mel_from_power`.** `MelFilterBank`
+  now stores a compressed sparse row representation alongside the existing
+  dense matrix. Each triangular filter is non-zero in only ~20–40 bins out
+  of 513+; `log_mel` and `log_mel_from_power` iterate only those bins
+  instead of all `n_bins`. The dense `matrix()` getter is preserved for
+  backward compatibility. Affects the neural frontend hot path where
+  `log_mel_from_power` is called once per STFT frame per analysis window.
+
+- **Wang `build_hashes` uses binary search for target-zone bounds.**
+  Previously iterated all remaining peaks per anchor, relying on a
+  `break` when `dt > target_zone_t`. Now uses `partition_point()` on the
+  sorted peak list to pre-slice to `peaks[i+1..zone_end]`, eliminating
+  the linear scan over peaks that are beyond the zone. Inner loop goes
+  from O(total_peaks) to O(peaks_in_zone). Measured: Wang extract 5 s
+  13.3 ms → 12.2 ms (**−8.2 %**), 30 s 93.2 ms → 89.9 ms (**−3.5 %**).
+
+- **Panako `build_triplet_hashes` uses binary search for zone bounds.**
+  Same `partition_point()` optimisation as Wang, combined with
+  pre-sliced target lists that reduce the O(|targets|²) pair-enumeration
+  scope. Measured: Panako extract 5 s 14.2 ms → 12.1 ms (**−14.8 %**),
+  30 s 97.3 ms → 87.9 ms (**−9.7 %**). The larger relative gain vs Wang
+  reflects the quadratic pair enumeration that benefits most from a
+  tighter target slice.
+
+- **Haitsma `bin_to_band` replaces `Option<u8>` with `u8::MAX` sentinel.**
+  Every FFT bin (1025 per frame) was tested with `if let Some(b)`,
+  preventing auto-vectorisation of the band-energy accumulation loop.
+  Now uses `u8::MAX` as a sentinel ("no band") with a simple `!=`
+  comparison — branch-free and auto-vectorisable. Affects both
+  `Haitsma::extract` and `StreamingHaitsma::push`.
+
+- **`SincResampler::process` splits boundary and middle regions.**
+  Previously checked `if idx < 0 || idx >= n_in` on every output sample.
+  Now precomputes the safe middle range where the kernel is fully inside
+  the input and iterates it without bounds checks. The boundary regions
+  (first and last ~`half_taps / ratio` samples) retain the check.
+  Middle region covers >95 % of output samples for typical resampling
+  ratios.
+
+- **`#[inline]` on hot-path functions.** Added to `pack_frame_bits`
+  (Haitsma), `pack_triplet` (Panako), and `rolling_max_1d` (peaks).
+  These are called in tight loops across module boundaries; `#[inline]`
+  ensures cross-module inlining even without LTO (e.g. when a downstream
+  crate depends on `audiofp` without its own LTO setting).
+
+### Fixed
+
+- **Streaming Wang and Panako benchmark improvements now measurable.**
+  The 0.3.5 streaming benchmarks showed ~1 % gains from pooled
+  `to_finalize` buffers — within the noise floor. With LTO enabled,
+  the same code now shows **8–16 % streaming throughput improvement**
+  (Wang 1 s-chunk: 13.7 ms → 11.5 ms, −16 %; Panako small-chunk:
+  14.4 ms → 12.6 ms, −12.5 %), confirming the allocation elimination
+  was worthwhile once the compiler can inline the surrounding code.
+
 ## [0.3.5] - 2026-06-22
 
 A correctness, ergonomics, and doc-completeness patch release. Public
@@ -740,7 +813,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/themankindproject/audiofp/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/themankindproject/audiofp/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/themankindproject/audiofp/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/themankindproject/audiofp/compare/v0.3.2...v0.3.3

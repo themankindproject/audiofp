@@ -64,6 +64,15 @@ impl MelScale {
     }
 }
 
+/// One mel band in CSR (Compressed Sparse Row) form: the triangle
+/// weights for bins `[start_bin .. start_bin + weights.len()]`.
+/// All other bins have weight 0 and are skipped in the hot path.
+#[derive(Clone, Debug)]
+struct MelBand {
+    start_bin: usize,
+    weights: Vec<f32>,
+}
+
 /// A precomputed triangular mel filterbank.
 ///
 /// # Example
@@ -93,6 +102,12 @@ pub struct MelFilterBank {
 
     /// Row-major `(n_mels, n_fft/2 + 1)` weight matrix.
     matrix: Vec<f32>,
+
+    /// Sparse (CSR) representation of each mel band. Only stores the
+    /// non-zero weight range per band so `log_mel_from_power` iterates
+    /// ~20-40 bins instead of all `n_bins` (513+). This is the hot-path
+    /// representation; `matrix` is kept for the `matrix()` getter.
+    sparse: Vec<MelBand>,
 }
 
 impl MelFilterBank {
@@ -161,6 +176,29 @@ impl MelFilterBank {
             }
         }
 
+        // Build CSR (sparse) representation: for each band, find the
+        // contiguous range of non-zero bins and store only those weights.
+        // Each triangular filter is non-zero only in (left_hz, right_hz),
+        // so the sparse representation skips all zero-tail bins.
+        let mut sparse = Vec::with_capacity(n_mels);
+        for k in 0..n_mels {
+            let row = &matrix[k * n_bins..(k + 1) * n_bins];
+            // Find first and last non-zero bin.
+            let first = row.iter().position(|&w| w != 0.0).unwrap_or(n_bins);
+            let last = row.iter().rposition(|&w| w != 0.0).unwrap_or(0);
+            if first <= last {
+                sparse.push(MelBand {
+                    start_bin: first,
+                    weights: row[first..=last].to_vec(),
+                });
+            } else {
+                sparse.push(MelBand {
+                    start_bin: 0,
+                    weights: Vec::new(),
+                });
+            }
+        }
+
         Self {
             n_mels,
             n_fft,
@@ -169,6 +207,7 @@ impl MelFilterBank {
             fmax,
             scale,
             matrix,
+            sparse,
         }
     }
 
@@ -201,11 +240,11 @@ impl MelFilterBank {
         );
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
-        let n_bins = self.n_bins();
+        // Use the sparse representation: only iterate non-zero bins per band.
         for (k, slot) in out.iter_mut().enumerate() {
-            let row = &self.matrix[k * n_bins..(k + 1) * n_bins];
+            let band = &self.sparse[k];
             let mut acc = 0.0_f32;
-            for (w, m) in row.iter().zip(magnitude.iter()) {
+            for (w, m) in band.weights.iter().zip(magnitude[band.start_bin..].iter()) {
                 acc += w * (m * m);
             }
             *slot = log10f(acc + 1e-10);
@@ -230,11 +269,12 @@ impl MelFilterBank {
         assert_eq!(power.len(), self.n_bins(), "power length must equal n_bins");
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
-        let n_bins = self.n_bins();
+        // Use the sparse representation: only iterate non-zero bins per band.
+        // Each triangular filter spans ~20-40 bins instead of all n_bins.
         for (k, slot) in out.iter_mut().enumerate() {
-            let row = &self.matrix[k * n_bins..(k + 1) * n_bins];
+            let band = &self.sparse[k];
             let mut acc = 0.0_f32;
-            for (w, p) in row.iter().zip(power.iter()) {
+            for (w, p) in band.weights.iter().zip(power[band.start_bin..].iter()) {
                 acc += w * p;
             }
             *slot = log10f(acc + 1e-10);
