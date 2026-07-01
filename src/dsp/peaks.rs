@@ -12,6 +12,7 @@ use alloc::collections::VecDeque;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
+use bytemuck::Zeroable;
 
 /// One peak emitted by [`PeakPicker`].
 ///
@@ -170,26 +171,33 @@ impl PeakPicker {
             &mut self.dq,
         );
 
-        let mut candidates: Vec<Peak> = Vec::new();
+        let min_mag = self.cfg.min_magnitude;
+        let target_per_sec = self.cfg.target_per_sec;
+
+        let upper = (frames_per_sec.ceil() as usize * target_per_sec)
+            .max(1)
+            .saturating_mul(2)
+            .max(64);
+        let mut candidates: Vec<Peak> = Vec::with_capacity(upper);
         for t in 0..n_frames {
             for f in 0..n_bins {
                 let idx = t * n_bins + f;
                 let v = spec[idx];
                 // A cell is a local maximum iff it equals the rolling max
                 // value at its own location (and is above the floor).
-                if v > self.cfg.min_magnitude && v >= self.max_buf[idx] {
+                if v > min_mag && v >= self.max_buf[idx] {
                     candidates.push(Peak {
                         t_frame: t as u32,
                         f_bin: f as u16,
-                        _pad: 0,
                         mag: v,
+                        ..Peak::zeroed()
                     });
                 }
             }
         }
 
-        if self.cfg.target_per_sec > 0 && frames_per_sec > 0.0 && !candidates.is_empty() {
-            candidates = adaptive_per_second(candidates, frames_per_sec, self.cfg.target_per_sec);
+        if target_per_sec > 0 && frames_per_sec > 0.0 && !candidates.is_empty() {
+            candidates = adaptive_per_second(candidates, frames_per_sec, target_per_sec);
         }
 
         candidates.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
@@ -267,13 +275,21 @@ pub fn rolling_max_2d_pooled(
         rolling_max_1d(row_in, kf, row_out, dq);
     }
 
-    for c in 0..n_cols {
-        for r in 0..n_rows {
-            col_in[r] = temp[r * n_cols + c];
-        }
-        rolling_max_1d(col_in, kt, col_out, dq);
-        for r in 0..n_rows {
-            output[r * n_cols + c] = col_out[r];
+    // Block-tile column pass to keep `temp` L1-resident. Each column
+    // read strides `n_cols` apart (a separate cache line per row);
+    // processing by TILE-wide blocks ensures recently-touched rows
+    // stay hot across columns in each block.
+    const TILE: usize = 64;
+    for c_block in (0..n_cols).step_by(TILE) {
+        let c_end = (c_block + TILE).min(n_cols);
+        for c in c_block..c_end {
+            for r in 0..n_rows {
+                col_in[r] = temp[r * n_cols + c];
+            }
+            rolling_max_1d(col_in, kt, col_out, dq);
+            for r in 0..n_rows {
+                output[r * n_cols + c] = col_out[r];
+            }
         }
     }
 }

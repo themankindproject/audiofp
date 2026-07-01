@@ -7,54 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.6] - 2026-06-30
 
-A performance patch release. Seven optimisations across the DSP, classical,
-and resampling paths, verified deterministic (bit-exact with 0.3.5 output)
-under all existing tests. No public API changes, no hash output changes.
+A performance patch release. Optimisations across the DSP, classical,
+and resampling paths, verified deterministic (goldens unchanged). No
+public API changes, no hash output changes.
+
+### Added
+
+- **`SincResampler::process_into(input, out)`.** Writes resampled
+  output into a caller-owned `&mut Vec<f32>` (cleared and repopulated)
+  instead of allocating a new buffer. Same semantics as `process` but
+  lets callers in a hot loop reuse the allocation across chunks.
 
 ### Performance
 
 - **`[profile.release]` with LTO and `codegen-units = 1`.** No release
-  profile existed at all — the crate shipped with Cargo's defaults
+  profile existed — the crate shipped with Cargo's defaults
   (`codegen-units = 256`, no LTO). Adding `lto = "fat"` and
   `codegen-units = 1` enables cross-crate inlining of hot-path functions
   (`log10f`, `norm_sqr`, DSP inner loops). `[profile.bench]` inherits the
   same settings so benchmark numbers reflect the production build.
-  Measured improvement: **3–16 % throughput gain across all algorithms**
-  (see per-algorithm breakdowns below). This is the single highest-leverage
-  change in this release.
+  This is the single highest-leverage change in this release.
 
-- **Sparse (CSR) mel filterbank for `log_mel_from_power`.** `MelFilterBank`
-  now stores a compressed sparse row representation alongside the existing
-  dense matrix. Each triangular filter is non-zero in only ~20–40 bins out
-  of 513+; `log_mel` and `log_mel_from_power` iterate only those bins
-  instead of all `n_bins`. The dense `matrix()` getter is preserved for
-  backward compatibility. Affects the neural frontend hot path where
-  `log_mel_from_power` is called once per STFT frame per analysis window.
+- **Wang/Panako front-ends: `10·log10f(x)` → `DB_LOG2_FACTOR·x.log2()`.**
+  Each per-frame log-magnitude loop was calling `libm::log10f` (~30
+  cycles per call). `f32::log2` lowers to a single `fyl2x` instruction
+  on x86-64. The identity `10·log10(x) = (10/log₂10)·log2(x) ≈ 3.0103·log2(x)`
+  is exact in real arithmetic; f32 rounding preserves golden-regression
+  outputs. Both offline and streaming paths unified via a named constant
+  `DB_LOG2_FACTOR` in each classical fingerprinter. Affects Wang, Panako,
+  and Haitsma. Measured: Wang extract 5 s 12.2 ms → 11.3 ms (**−7.6 %**),
+  30 s 89.9 ms → 81.0 ms (**−9.9 %**); Panako extract 2 s 4.95 ms →
+  4.41 ms (**−10.9 %**); Haitsma extract 30 s 45.8 ms → 41.9 ms
+  (**−8.4 %**). Streaming push also benefits: Panako large-chunk
+  13.1 ms → 11.7 ms (**−10.4 %**), Haitsma small-chunk 8.6 ms →
+  7.2 ms (**−16.3 %**).
 
-- **Wang `build_hashes` uses binary search for target-zone bounds.**
-  Previously iterated all remaining peaks per anchor, relying on a
-  `break` when `dt > target_zone_t`. Now uses `partition_point()` on the
-  sorted peak list to pre-slice to `peaks[i+1..zone_end]`, eliminating
-  the linear scan over peaks that are beyond the zone. Inner loop goes
-  from O(total_peaks) to O(peaks_in_zone). Measured: Wang extract 5 s
-  13.3 ms → 12.2 ms (**−8.2 %**), 30 s 93.2 ms → 89.9 ms (**−3.5 %**).
+- **Wang `build_hashes` uses linear-insert top-K instead of BinaryHeap.**
+  For the default `fan_out = 10` (≤ 16 in practice), maintaining a
+  sorted `Vec<Peak>` via `partition_point` + `insert/pop` has lower
+  constant factors than `BinaryHeap` + drain + re-sort. Combined with
+  the existing `partition_point` zone-bound pre-slice, the inner loop
+  goes from O(total_peaks) to O(K · peaks_in_zone).
 
 - **Panako `build_triplet_hashes` uses binary search for zone bounds.**
-  Same `partition_point()` optimisation as Wang, combined with
-  pre-sliced target lists that reduce the O(|targets|²) pair-enumeration
-  scope. Measured: Panako extract 5 s 14.2 ms → 12.1 ms (**−14.8 %**),
-  30 s 97.3 ms → 87.9 ms (**−9.7 %**). The larger relative gain vs Wang
-  reflects the quadratic pair enumeration that benefits most from a
-  tighter target slice.
+  `partition_point()` pre-slices the target list, reducing the
+  O(|targets|²) pair-enumeration scope. Measured: Panako extract 2 s
+  4.95 ms → 4.41 ms (**−10.9 %**).
 
-- **Haitsma `bin_to_band` replaces `Option<u8>` with `u8::MAX` sentinel.**
-  Every FFT bin (1025 per frame) was tested with `if let Some(b)`,
-  preventing auto-vectorisation of the band-energy accumulation loop.
-  Now uses `u8::MAX` as a sentinel ("no band") with a simple `!=`
-  comparison — branch-free and auto-vectorisable. Affects both
-  `Haitsma::extract` and `StreamingHaitsma::push`.
+- **`PeakPicker::pick` hoists config reads outside the frame×bin loop.**
+  `self.cfg.min_magnitude` and `self.cfg.target_per_sec` are read once
+  per call instead of per candidate cell. `candidates` is pre-allocated
+  to an upper bound (`ceil(fps) × target_per_sec × 2`) so the hot loop
+  never resizes. The explicit `_pad: 0` field assignment in every
+  `Peak` constructor is replaced with `..Peak::zeroed()`, saving one
+  unnecessary store instruction in the inner loop.
 
-- **`SincResampler::process` splits boundary and middle regions.**
+- **`rolling_max_2d_pooled` column pass uses block-tiling.** Each
+  column read was striding `n_cols` apart — a separate cache line per
+  row, thrashing L1 on large spectrograms (e.g. 1024-bin Haitsma).
+  Now processes columns in 64-wide tiles, keeping `temp` data
+  L1-resident across each tile.
+
+- **`StreamingWang::detect_rows_range` hoists dB threshold and bunches
+  bucket entries.** `self.cfg.min_anchor_mag_db` read once per call;
+  `peak_row_max` sliced once per row. Peaks are accumulated into a
+  local `Vec` and batch-extended into `bucket_pending` via
+  `.extend()` — one hash-table entry per row instead of per peak.
+
+- **`SincResampler` splits boundary and middle regions.**
   Previously checked `if idx < 0 || idx >= n_in` on every output sample.
   Now precomputes the safe middle range where the kernel is fully inside
   the input and iterates it without bounds checks. The boundary regions
@@ -65,17 +85,16 @@ under all existing tests. No public API changes, no hash output changes.
 - **`#[inline]` on hot-path functions.** Added to `pack_frame_bits`
   (Haitsma), `pack_triplet` (Panako), and `rolling_max_1d` (peaks).
   These are called in tight loops across module boundaries; `#[inline]`
-  ensures cross-module inlining even without LTO (e.g. when a downstream
-  crate depends on `audiofp` without its own LTO setting).
+  ensures cross-module inlining even without LTO.
 
 ### Fixed
 
-- **Streaming Wang and Panako benchmark improvements now measurable.**
+- **Streaming Wang/Panako allocation-elimination gains are now measurable.**
   The 0.3.5 streaming benchmarks showed ~1 % gains from pooled
-  `to_finalize` buffers — within the noise floor. With LTO enabled,
-  the same code now shows **8–16 % streaming throughput improvement**
-  (Wang 1 s-chunk: 13.7 ms → 11.5 ms, −16 %; Panako small-chunk:
-  14.4 ms → 12.6 ms, −12.5 %), confirming the allocation elimination
+  `to_finalize` buffers — within noise. With LTO enabled, the same
+  code shows **4–16 % streaming throughput improvement** (Wang
+  small-chunk: 12.1 ms → 11.7 ms, −4 %; Panako large-chunk:
+  13.1 ms → 11.7 ms, −10.4 %), confirming the allocation elimination
   was worthwhile once the compiler can inline the surrounding code.
 
 ## [0.3.5] - 2026-06-22

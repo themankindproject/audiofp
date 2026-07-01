@@ -874,6 +874,19 @@ Cutoff is automatically `min(from, to) / 2` to suppress aliasing on downsamples.
 
 The resampler also exposes `fn quality(&self) -> &SincQuality` for inspecting the quality parameters it was built with.
 
+For zero-allocation resampling in a hot loop, use `process_into`:
+
+```rust
+let r = SincResampler::new(44_100, 16_000);
+let mut out = Vec::new();
+for chunk in audio_chunks {
+    r.process_into(&chunk, &mut out);
+    // `out` is reused across chunks — capacity is preserved,
+    // no re-allocation after the largest chunk.
+    process_resampled(&out);
+}
+```
+
 ### `dsp::windows`
 
 ```rust

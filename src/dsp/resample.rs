@@ -192,11 +192,26 @@ impl SincResampler {
     /// neighbours are treated as zero (zero-pad boundary).
     #[must_use]
     pub fn process(&self, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.process_into(input, &mut out);
+        out
+    }
+
+    /// Resample `input` into a caller-owned buffer.
+    ///
+    /// Same semantics as [`process`](Self::process) but writes into `out`
+    /// (cleared and resized to the correct length) instead of allocating
+    /// a new buffer, so callers in a hot loop can reuse the allocation
+    /// across chunks.
+    pub fn process_into(&self, input: &[f32], out: &mut Vec<f32>) {
         if input.is_empty() {
-            return Vec::new();
+            out.clear();
+            return;
         }
         if self.from_sr == self.to_sr {
-            return input.to_vec();
+            out.clear();
+            out.extend_from_slice(input);
+            return;
         }
 
         let n_in = input.len();
@@ -208,15 +223,12 @@ impl SincResampler {
 
         // Determine the output-sample range where the kernel is fully
         // inside the input buffer (no bounds check needed).
-        // i_centre = floor(n * ratio), kernel covers [i_centre - half, i_centre + half].
-        // Fully inside when i_centre >= half AND i_centre + half < n_in.
-        // n * ratio >= half  →  n >= ceil(half / ratio)
-        // n * ratio < n_in - 1 - half  →  n < (n_in - 1 - half) / ratio
         let n_safe_start = ((half as f64) / ratio).ceil() as usize;
         let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
         let n_safe_end = n_safe_end.min(n_out);
 
-        let mut out = Vec::with_capacity(n_out);
+        out.clear();
+        out.reserve(n_out);
 
         // Left boundary: kernel may extend past the start of input.
         for n in 0..n_safe_start.min(n_out) {
@@ -271,8 +283,6 @@ impl SincResampler {
             }
             out.push(acc / self.dc_gain);
         }
-
-        out
     }
 }
 
