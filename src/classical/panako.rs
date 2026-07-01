@@ -124,7 +124,7 @@ const PANAKO_LOG_FLOOR: f32 = 1e-6;
 const PANAKO_LOG_FLOOR_POWER: f32 = PANAKO_LOG_FLOOR * PANAKO_LOG_FLOOR;
 /// Conversion factor: `10·log10(x) = DB_LOG2_FACTOR·log2(x)`.
 /// `10 / log2(10) ≈ 3.0103`.
-const DB_LOG2_FACTOR: f32 = 10.0 / std::f32::consts::LOG2_10;
+const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
 
 /// Panako offline fingerprinter.
 ///
