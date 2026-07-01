@@ -23,7 +23,7 @@
 
 use alloc::vec::Vec;
 
-use libm::log10f;
+use bytemuck::Zeroable;
 
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
@@ -90,6 +90,9 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 /// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
 /// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
 const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
+/// Conversion factor: `10·log10(x) = DB_LOG2_FACTOR·log2(x)`.
+/// `10 / log2(10) ≈ 3.0103`.
+const DB_LOG2_FACTOR: f32 = 10.0 / std::f32::consts::LOG2_10;
 
 /// Wang offline fingerprinter.
 ///
@@ -193,8 +196,9 @@ impl Fingerprinter for Wang {
         }
 
         // Convert power → dB log-magnitude in-place.
+        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
         for v in self.log_spec.iter_mut() {
-            *v = 10.0 * log10f(v.max(WANG_LOG_FLOOR_POWER));
+            *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
         }
 
         let peaks = self
@@ -219,8 +223,10 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
 
-    let mut heap: alloc::collections::BinaryHeap<MinByMagOwned> =
-        alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
+    // Pooled target list reused across anchors. Maintained sorted by
+    // (mag desc, position asc) via linear-insert. For fan_out ≤ 16 the
+    // O(K) insert is faster than BinaryHeap's O(log K) because the
+    // constant factor of partition_point + memmove is lower in practice.
     let mut targets: Vec<Peak> = Vec::with_capacity(fan_out);
 
     for (i, anchor) in peaks.iter().enumerate() {
@@ -231,7 +237,7 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
         let zone_limit = anchor.t_frame.saturating_add(target_zone_t);
         let zone_end = peaks[i + 1..].partition_point(|p| p.t_frame <= zone_limit);
 
-        heap.clear();
+        targets.clear();
         for target in &peaks[i + 1..i + 1 + zone_end] {
             let dt = target.t_frame - anchor.t_frame;
             if dt < 1 {
@@ -241,22 +247,37 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             if df.abs() > target_zone_f {
                 continue;
             }
-            heap.push(MinByMagOwned(*target));
-            if heap.len() > fan_out {
-                // Drop the current smallest — the heap top, by our reversed Ord.
-                heap.pop();
+            // Linear-insert into sorted list: maintains top-K peaks by
+            // (mag desc, position asc). partition_point finds where
+            // this target belongs; insert shifts elements right.
+            // O(K) insert per target beats BinaryHeap for K ≤ 16.
+            if targets.len() < fan_out {
+                let pos = targets.partition_point(|p| {
+                    p.mag > target.mag
+                        || (p.mag == target.mag
+                            && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
+                });
+                targets.insert(pos, *target);
+            } else if target.mag > targets.last().unwrap().mag
+                || (target.mag == targets.last().unwrap().mag
+                    && (target.t_frame, target.f_bin)
+                        < (
+                            targets.last().unwrap().t_frame,
+                            targets.last().unwrap().f_bin,
+                        ))
+            {
+                let pos = targets.partition_point(|p| {
+                    p.mag > target.mag
+                        || (p.mag == target.mag
+                            && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
+                });
+                targets.insert(pos, *target);
+                targets.pop();
             }
         }
 
-        // Drain the heap and re-sort the kept K for deterministic emission.
-        targets.clear();
-        targets.extend(heap.drain().map(|w| w.0));
-        targets.sort_unstable_by(|a, b| {
-            b.mag
-                .partial_cmp(&a.mag)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
-        });
+        // targets is already sorted by (mag desc, position asc) from the
+        // linear-insert logic, so we can emit directly.
 
         let f_a_q = quantise_freq(anchor.f_bin);
         for target in &targets {
@@ -470,6 +491,7 @@ impl StreamingWang {
             return;
         }
         let n_bins = self.spec_n_bins;
+        let min_mag = self.cfg.min_anchor_mag_db;
 
         for row in from_row..=to_row {
             if row >= self.spec_n_rows {
@@ -477,18 +499,26 @@ impl StreamingWang {
             }
             let abs_f = self.spec_first_frame + row as u32;
             let bucket = (abs_f as f32 / WANG_FRAMES_PER_SEC) as u32;
+            let row_start = row * n_bins;
+            let spec_row = &self.spec[row_start..row_start + n_bins];
+            let peak_max = &self.peak_row_max[..n_bins];
+            let mut peaks_here: Vec<Peak> = Vec::new();
             for bin in 0..n_bins {
-                let idx = row * n_bins + bin;
-                let v = self.spec[idx];
-                if v > self.cfg.min_anchor_mag_db && v >= self.peak_row_max[bin] {
-                    let peak = Peak {
+                let v = spec_row[bin];
+                if v > min_mag && v >= peak_max[bin] {
+                    peaks_here.push(Peak {
                         t_frame: abs_f,
                         f_bin: bin as u16,
-                        _pad: 0,
                         mag: v,
-                    };
-                    self.bucket_pending.entry(bucket).or_default().push(peak);
+                        ..Peak::zeroed()
+                    });
                 }
+            }
+            if !peaks_here.is_empty() {
+                self.bucket_pending
+                    .entry(bucket)
+                    .or_default()
+                    .extend(peaks_here);
             }
         }
     }
@@ -651,7 +681,7 @@ impl StreamingFingerprinter for StreamingWang {
                 &mut self.frame_scratch,
             );
             for v in self.frame_scratch.iter_mut() {
-                *v = 10.0 * libm::log10f(v.max(WANG_LOG_FLOOR_POWER));
+                *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
             }
             // Append `self.frame_scratch` directly via disjoint field
             // borrow, avoiding a per-frame `Vec::clone` of the row.
