@@ -109,6 +109,10 @@ pub struct Haitsma {
     /// Using a plain `u8` sentinel instead of `Option<u8>` eliminates
     /// the branch in the hot inner loop, enabling auto-vectorization.
     bin_to_band: Vec<u8>,
+    /// Reused buffer for per-frame band energies across `extract` calls.
+    energies_buf: Vec<[f32; HAITSMA_N_BANDS]>,
+    /// Reused buffer for packed frame hashes across `extract` calls.
+    frames_buf: Vec<u32>,
 }
 
 impl Default for Haitsma {
@@ -147,6 +151,8 @@ impl Haitsma {
             cfg,
             stft,
             bin_to_band,
+            energies_buf: Vec::new(),
+            frames_buf: Vec::new(),
         }
     }
 }
@@ -193,7 +199,8 @@ impl Fingerprinter for Haitsma {
         }
 
         // Compute per-frame band energies.
-        let mut energies: Vec<[f32; HAITSMA_N_BANDS]> = Vec::with_capacity(n_frames);
+        self.energies_buf.clear();
+        self.energies_buf.reserve(n_frames);
         for f in 0..n_frames {
             let row = &power_flat[f * n_bins..(f + 1) * n_bins];
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
@@ -203,17 +210,22 @@ impl Fingerprinter for Haitsma {
                     e[b as usize] += p;
                 }
             }
-            energies.push(e);
+            self.energies_buf.push(e);
         }
 
         // For each frame n >= 1, compute the 32-bit hash.
-        let mut frames = Vec::with_capacity(energies.len() - 1);
-        for n in 1..energies.len() {
-            frames.push(pack_frame_bits(&energies[n], &energies[n - 1]));
+        self.frames_buf.clear();
+        self.frames_buf.reserve(self.energies_buf.len() - 1);
+        for n in 1..self.energies_buf.len() {
+            self.frames_buf.push(pack_frame_bits(
+                &self.energies_buf[n],
+                &self.energies_buf[n - 1],
+            ));
         }
 
+        // Move ownership into the return value; the struct keeps capacity.
         Ok(HaitsmaFingerprint {
-            frames,
+            frames: core::mem::take(&mut self.frames_buf),
             frames_per_sec: HAITSMA_FRAMES_PER_SEC,
         })
     }

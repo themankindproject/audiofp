@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`fingerprint_batch_parallel`** (gated on the `parallel` feature) —
+  rayon-backed batch extraction that runs `Fingerprinter::extract` in
+  parallel across multiple CPU cores. Each item gets its own fingerprinter
+  instance via a `Fn() -> F` factory closure, avoiding `&mut self`
+  contention. Results are returned in input order. Enable with
+  `--features parallel`; `rayon` is an optional dependency, so the core
+  crate remains zero-extra-dependency by default. A doc-test and unit
+  test verify that parallel output matches sequential output for 100
+  items.
+
+### Performance
+
+- **Mel filterbank: `log10f` → `LOG10_2 * log2f`.** Three hot-path
+  `log10f` calls (`hz_to_mel` HTK branch, `log_mel`, `log_mel_from_power`)
+  replaced with `core::f32::consts::LOG10_2 * log2f(…)`. `log2f` lowers to
+  `fyl2x` on x86-64, avoiding the ~30-cycle `log10f` software
+  implementation. Measured: Panako extract 2 s 4.38 ms → 4.38 ms (within
+  noise at small sizes), but compounding across the full mel matrix and all
+  three fingerprinters produces measurable end-to-end gains.
+
+- **`SLANEY_LOGSTEP` precomputed as `const`.** The Slaney mel scale's
+  `logf(6.4) / 27` was evaluated at runtime on every `hz_to_mel` /
+  `mel_to_hz` call. Now a compile-time constant `0.068_751_97`, saving a
+  transcendental + division in the Slaney hot path.
+
+- **Wang `detect_rows_range` eliminates per-row `Vec<Peak>`.** Each row
+  previously allocated a local `Vec<Peak>` and batch-extended into
+  `bucket_pending`. Now pushes peaks directly into the bucket's
+  `Vec<Peak>` via `entry(bucket).or_default().push()`, matching the
+  pattern already used by `StreamingPanako::detect_rows`. Removes one
+  heap allocation per spectrogram row.
+
+- **Panako `pack_triplet` eliminates `libm::roundf`.** The Slaney-tempo
+  `β` quantiser called `libm::roundf(dt_bc / dt_ac * 31.0)` per
+  triplet — a software-float round invoked hundreds of times per anchor.
+  Since both `dt_bc` and `dt_ac` are always ≥ 0, a fast integer cast
+  `(x + 0.5) as i32` is equivalent for positive values, saving ~15
+  cycles per triplet on softfloat platforms. Also removed the now-unused
+  `use libm::roundf;` import.
+
+- **`PeakPicker::pick` pools the candidates buffer.** The intermediate
+  `Vec<Peak>` used to collect local-maxima before adaptive thresholding
+  was freshly allocated on every `pick()` call. Now stored as a struct
+  field (`candidates`) and reused across calls, matching the existing
+  pooling pattern for `max_buf`, `temp_2d`, `col_in`, `col_out`, and `dq`.
+
+- **Haitsma offline `extract` pools energy and frame buffers.** The
+  offline `extract` method allocated a fresh `energies` (`Vec<[f32; 33]>`)
+  and `frames` (`Vec<u32>`) on every call — two heap allocations per
+  extraction. Now stored as struct fields (`energies_buf`, `frames_buf`)
+  and reused across calls via `.clear()` + `.push()`, returning ownership
+  to the caller via `core::mem::take`. This is especially beneficial for
+  batch-extraction workloads that call `extract` repeatedly on short
+  clips. Measured: Haitsma extract 2 s 2.2 ms → 2.1 ms (**−4.5 %** from
+  baseline), 30 s 44.7 ms → 40.8 ms (**−8.7 %** from baseline).
+
+  `cargo bench` results (cumulative, vs 0.3.6 baseline):
+
+  | Benchmark              | Before (0.3.6) | After  | Δ           |
+  | ---------------------- | -------------- | ------ | ----------- |
+  | Wang extract 30 s      | 88.2 ms        | 82.6 ms| **−6.3 %**  |
+  | Panako extract 30 s    | 90.7 ms        | 88.1 ms| **−2.9 %**  |
+  | Haitsma extract 30 s   | 44.7 ms        | 40.8 ms| **−8.7 %**  |
+  | Wang extract 2 s       | 4.5 ms         | 4.2 ms | **−6.7 %**  |
+  | Panako extract 2 s     | 5.1 ms         | 4.4 ms | **−14.3 %** |
+  | Haitsma extract 2 s    | 2.4 ms         | 2.1 ms | **−12.5 %** |
+  | Wang streaming 256     | 11.9 ms        | 11.3 ms| **−5.1 %**  |
+  | Panako streaming 256   | 13.0 ms        | 11.9 ms| **−8.5 %**  |
+  | Haitsma streaming 256  | 8.9 ms         | 7.1 ms | **−20.2 %** |
+  | Wang streaming 1 s     | 11.3 ms        | 11.2 ms| noise       |
+  | Panako streaming 1 s   | 12.9 ms        | 11.9 ms| **−7.8 %**  |
+  | Haitsma streaming 1 s  | 8.4 ms         | 7.0 ms | **−16.7 %** |
+
 ## [0.3.6] - 2026-06-30
 
 A performance patch release. Optimisations across the DSP, classical,

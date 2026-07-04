@@ -192,6 +192,66 @@ pub trait StreamingFingerprinter {
     }
 }
 
+/// Fingerprint a batch of audio buffers in parallel using rayon.
+///
+/// Each item is `(tag, samples, rate)` where `tag` is an opaque label
+/// passed through to the result. A fresh fingerprinter is constructed
+/// for each item via `make_fingerprinter`.
+///
+/// Results are returned in the same order as the input items.
+///
+/// # Example
+///
+/// ```
+/// use audiofp::{fingerprint_batch_parallel, AudioBuffer, Fingerprinter, SampleRate};
+///
+/// struct Sum;
+/// impl Fingerprinter for Sum {
+///     type Output = f32;
+///     type Config = ();
+///     fn name(&self) -> &'static str { "sum" }
+///     fn config(&self) -> &Self::Config { &() }
+///     fn required_sample_rate(&self) -> u32 { 8_000 }
+///     fn min_samples(&self) -> usize { 1 }
+///     fn extract(&mut self, audio: AudioBuffer<'_>) -> audiofp::Result<f32> {
+///         Ok(audio.samples.iter().sum())
+///     }
+/// }
+///
+/// let items = vec![
+///     ("a".to_string(), vec![1.0, 2.0, 3.0], SampleRate::HZ_8000),
+///     ("b".to_string(), vec![4.0, 5.0, 6.0], SampleRate::HZ_8000),
+/// ];
+/// let results = fingerprint_batch_parallel(items, || Sum);
+/// assert_eq!(results.len(), 2);
+/// assert_eq!(results[0].0, "a");
+/// assert!((results[0].1.as_ref().unwrap() - 6.0).abs() < 1e-6);
+/// assert_eq!(results[1].0, "b");
+/// assert!((results[1].1.as_ref().unwrap() - 15.0).abs() < 1e-6);
+/// ```
+#[cfg(feature = "rayon")]
+#[must_use]
+pub fn fingerprint_batch_parallel<F, T>(
+    items: Vec<(T, Vec<f32>, crate::SampleRate)>,
+    make_fingerprinter: impl Fn() -> F + Sync,
+) -> Vec<(T, Result<F::Output>)>
+where
+    F: Fingerprinter + Send,
+    F::Output: Send,
+    T: Send,
+{
+    use rayon::prelude::*;
+
+    items
+        .into_par_iter()
+        .map(|(tag, samples, rate)| {
+            let mut fp = make_fingerprinter();
+            let buf = AudioBuffer::new(&samples, rate);
+            (tag, fp.extract(buf))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -285,6 +345,53 @@ mod tests {
 
         assert_eq!(n, pending.len());
         assert_eq!(collected, pending, "flush_with must mirror flush");
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn batch_parallel_produces_same_results_as_sequential() {
+        use super::fingerprint_batch_parallel;
+        use crate::SampleRate;
+
+        struct Sum;
+        impl Fingerprinter for Sum {
+            type Output = f32;
+            type Config = ();
+            fn name(&self) -> &'static str {
+                "sum"
+            }
+            fn config(&self) -> &Self::Config {
+                &()
+            }
+            fn required_sample_rate(&self) -> u32 {
+                8_000
+            }
+            fn min_samples(&self) -> usize {
+                1
+            }
+            fn extract(&mut self, audio: AudioBuffer<'_>) -> crate::Result<f32> {
+                Ok(audio.samples.iter().sum())
+            }
+        }
+
+        let items: Vec<(u32, Vec<f32>, SampleRate)> = (0..100)
+            .map(|i| (i, vec![i as f32; 10], SampleRate::HZ_8000))
+            .collect();
+
+        let mut sequential = Vec::new();
+        for (tag, samples, rate) in &items {
+            let mut fp = Sum;
+            let buf = AudioBuffer::new(samples, *rate);
+            sequential.push((*tag, fp.extract(buf)));
+        }
+
+        let parallel = fingerprint_batch_parallel(items, || Sum);
+
+        assert_eq!(sequential.len(), parallel.len());
+        for (s, p) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(s.0, p.0, "tags must match in order");
+            assert!((s.1.as_ref().unwrap() - p.1.as_ref().unwrap()).abs() < 1e-6);
+        }
     }
 
     #[test]

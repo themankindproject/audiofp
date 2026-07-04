@@ -55,8 +55,6 @@
 
 use alloc::vec::Vec;
 
-use libm::roundf;
-
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
@@ -376,7 +374,8 @@ fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
 
     let dt_ac = (c.t_frame - a.t_frame).max(1) as f32;
     let dt_bc = (c.t_frame - b.t_frame) as f32;
-    let beta = (roundf(dt_bc / dt_ac * 31.0) as i32).clamp(0, 31) as u32;
+    // Round without libm: (x + 0.5) as i32 ≡ roundf(x) as i32 for x ≥ 0.
+    let beta = ((dt_bc / dt_ac * 31.0 + 0.5) as i32).clamp(0, 31) as u32;
 
     let dab_u = (df_ab as i8 as u8) as u32;
     let dbc_u = (df_bc as i8 as u8) as u32;

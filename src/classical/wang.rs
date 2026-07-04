@@ -502,23 +502,19 @@ impl StreamingWang {
             let row_start = row * n_bins;
             let spec_row = &self.spec[row_start..row_start + n_bins];
             let peak_max = &self.peak_row_max[..n_bins];
-            let mut peaks_here: Vec<Peak> = Vec::new();
+            // Push peaks directly into bucket_pending — avoids a per-row
+            // Vec allocation (typically 1-3 peaks per row).  Matches
+            // Panako's `detect_rows` pattern.
             for bin in 0..n_bins {
                 let v = spec_row[bin];
                 if v > min_mag && v >= peak_max[bin] {
-                    peaks_here.push(Peak {
+                    self.bucket_pending.entry(bucket).or_default().push(Peak {
                         t_frame: abs_f,
                         f_bin: bin as u16,
                         mag: v,
                         ..Peak::zeroed()
                     });
                 }
-            }
-            if !peaks_here.is_empty() {
-                self.bucket_pending
-                    .entry(bucket)
-                    .or_default()
-                    .extend(peaks_here);
             }
         }
     }

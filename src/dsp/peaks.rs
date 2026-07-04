@@ -105,6 +105,8 @@ pub struct PeakPicker {
     col_out: Vec<f32>,
     /// Pooled monotonic deque for the 1-D rolling max passes.
     dq: VecDeque<usize>,
+    /// Pooled candidate buffer — avoids a per-call heap allocation.
+    candidates: Vec<Peak>,
 }
 
 impl PeakPicker {
@@ -118,6 +120,7 @@ impl PeakPicker {
             col_in: Vec::new(),
             col_out: Vec::new(),
             dq: VecDeque::new(),
+            candidates: Vec::new(),
         }
     }
 
@@ -178,15 +181,20 @@ impl PeakPicker {
             .max(1)
             .saturating_mul(2)
             .max(64);
-        let mut candidates: Vec<Peak> = Vec::with_capacity(upper);
+        self.candidates.clear();
+        // Reuse the pooled buffer if capacity already covers the
+        // typical case; otherwise this is a single realloc (same as
+        // before).  After the call the buffer retains its capacity
+        // for the next `pick`.
+        if self.candidates.capacity() < upper {
+            self.candidates.reserve(upper - self.candidates.capacity());
+        }
         for t in 0..n_frames {
             for f in 0..n_bins {
                 let idx = t * n_bins + f;
                 let v = spec[idx];
-                // A cell is a local maximum iff it equals the rolling max
-                // value at its own location (and is above the floor).
                 if v > min_mag && v >= self.max_buf[idx] {
-                    candidates.push(Peak {
+                    self.candidates.push(Peak {
                         t_frame: t as u32,
                         f_bin: f as u16,
                         mag: v,
@@ -196,12 +204,18 @@ impl PeakPicker {
             }
         }
 
-        if target_per_sec > 0 && frames_per_sec > 0.0 && !candidates.is_empty() {
-            candidates = adaptive_per_second(candidates, frames_per_sec, target_per_sec);
+        if target_per_sec > 0 && frames_per_sec > 0.0 && !self.candidates.is_empty() {
+            let capped = adaptive_per_second(
+                core::mem::take(&mut self.candidates),
+                frames_per_sec,
+                target_per_sec,
+            );
+            self.candidates = capped;
         }
 
-        candidates.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        candidates
+        self.candidates
+            .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+        core::mem::take(&mut self.candidates)
     }
 }
 

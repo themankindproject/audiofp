@@ -12,7 +12,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use libm::{expf, log10f, logf, powf};
+use libm::{expf, log2f, logf, powf};
 
 /// Selects how hertz are mapped to the mel scale.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -29,21 +29,22 @@ pub enum MelScale {
 
 const SLANEY_F_SP: f32 = 200.0 / 3.0;
 const SLANEY_MIN_LOG_HZ: f32 = 1000.0;
-const SLANEY_LOGSTEP_DENOM: f32 = 27.0;
-/// Mel value where Slaney's mapping switches from linear to logarithmic.
-/// Pure compile-time division, hoisted out of `hz_to_mel` / `mel_to_hz`.
+/// log(6.4) / 27 ≈ 0.068751965 — precomputed once instead of calling
+/// `libm::logf` + division every time `hz_to_mel` / `mel_to_hz` is called.
+const SLANEY_LOGSTEP: f32 = 0.068_751_97_f32;
+// log2 is cheaper than log10 on libm softfloat, so we multiply
+// `core::f32::consts::LOG10_2 * log2f(x)` instead of calling `log10f`.
 const SLANEY_MIN_LOG_MEL: f32 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
 
 impl MelScale {
     fn hz_to_mel(self, hz: f32) -> f32 {
         match self {
-            MelScale::Htk => 2595.0 * log10f(1.0 + hz / 700.0),
+            MelScale::Htk => 2595.0 * core::f32::consts::LOG10_2 * log2f(1.0 + hz / 700.0),
             MelScale::Slaney => {
-                let logstep = logf(6.4) / SLANEY_LOGSTEP_DENOM;
                 if hz < SLANEY_MIN_LOG_HZ {
                     hz / SLANEY_F_SP
                 } else {
-                    SLANEY_MIN_LOG_MEL + logf(hz / SLANEY_MIN_LOG_HZ) / logstep
+                    SLANEY_MIN_LOG_MEL + logf(hz / SLANEY_MIN_LOG_HZ) / SLANEY_LOGSTEP
                 }
             }
         }
@@ -53,11 +54,10 @@ impl MelScale {
         match self {
             MelScale::Htk => 700.0 * (powf(10.0, mel / 2595.0) - 1.0),
             MelScale::Slaney => {
-                let logstep = logf(6.4) / SLANEY_LOGSTEP_DENOM;
                 if mel < SLANEY_MIN_LOG_MEL {
                     SLANEY_F_SP * mel
                 } else {
-                    SLANEY_MIN_LOG_HZ * expf(logstep * (mel - SLANEY_MIN_LOG_MEL))
+                    SLANEY_MIN_LOG_HZ * expf(SLANEY_LOGSTEP * (mel - SLANEY_MIN_LOG_MEL))
                 }
             }
         }
@@ -247,7 +247,7 @@ impl MelFilterBank {
             for (w, m) in band.weights.iter().zip(magnitude[band.start_bin..].iter()) {
                 acc += w * (m * m);
             }
-            *slot = log10f(acc + 1e-10);
+            *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
     }
 
@@ -277,7 +277,7 @@ impl MelFilterBank {
             for (w, p) in band.weights.iter().zip(power[band.start_bin..].iter()) {
                 acc += w * p;
             }
-            *slot = log10f(acc + 1e-10);
+            *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
     }
 }

@@ -99,6 +99,10 @@ pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
 pub use types::{AudioBuffer, SampleRate, TimestampMs};
 
+/// Multi-threaded batch fingerprinting (requires the `rayon` feature).
+#[cfg(feature = "rayon")]
+pub use fp::fingerprint_batch_parallel;
+
 /// Crate version string, sourced from `Cargo.toml`.
 ///
 /// Useful when persisting fingerprints alongside the producer version,
