@@ -34,6 +34,7 @@
 //! Haitsma database must XOR or byte-reverse each 32-bit frame before
 //! comparison.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use libm::powf;
@@ -104,11 +105,10 @@ const NO_BAND: u8 = u8::MAX;
 pub struct Haitsma {
     cfg: HaitsmaConfig,
     stft: ShortTimeFFT,
-    /// `bin_to_band[i]` = band index (0..32) if FFT bin `i` falls inside
-    /// a band, or `NO_BAND` (255) if it lies outside `[fmin, fmax]`.
-    /// Using a plain `u8` sentinel instead of `Option<u8>` eliminates
-    /// the branch in the hot inner loop, enabling auto-vectorization.
-    bin_to_band: Vec<u8>,
+    /// Precomputed contiguous bin ranges for each band. `band_ranges[b] =
+    /// (start_bin, end_bin)` (exclusive end). Eliminates per-bin branching
+    /// in the energy accumulation loop and enables SIMD auto-vectorization.
+    band_ranges: Vec<(usize, usize)>,
     /// Reused buffer for per-frame band energies across `extract` calls.
     energies_buf: Vec<[f32; HAITSMA_N_BANDS]>,
     /// Reused buffer for packed frame hashes across `extract` calls.
@@ -146,11 +146,12 @@ impl Haitsma {
         });
 
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+        let band_ranges = build_band_ranges(&bin_to_band);
 
         Self {
             cfg,
             stft,
-            bin_to_band,
+            band_ranges,
             energies_buf: Vec::new(),
             frames_buf: Vec::new(),
         }
@@ -204,11 +205,8 @@ impl Fingerprinter for Haitsma {
         for f in 0..n_frames {
             let row = &power_flat[f * n_bins..(f + 1) * n_bins];
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (bin, &p) in row.iter().enumerate() {
-                let b = self.bin_to_band[bin];
-                if b != NO_BAND {
-                    e[b as usize] += p;
-                }
+            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
+                e[b] = row[start..end].iter().sum();
             }
             self.energies_buf.push(e);
         }
@@ -237,14 +235,30 @@ impl Fingerprinter for Haitsma {
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
     let mut hash = 0_u32;
     for b in 0..32 {
-        let lhs = curr[b] - curr[b + 1];
-        let rhs = prev[b] - prev[b + 1];
-        if lhs - rhs > 0.0 {
-            // "MSB-zero": band 0 lands in the most significant bit.
-            hash |= 1_u32 << (31 - b);
-        }
+        let diff = (curr[b] - curr[b + 1]) - (prev[b] - prev[b + 1]);
+        // Branchless: `(diff > 0.0) as u32` compiles to `fcmp + setg`
+        // without a branch, enabling LLVM to vectorize groups of bands.
+        hash |= ((diff > 0.0) as u32) << (31 - b);
     }
     hash
+}
+
+/// Precompute contiguous bin ranges for each band.
+/// `band_ranges[b] = (first_bin_inclusive, last_bin_exclusive)` for band b.
+fn build_band_ranges(bin_to_band: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = vec![(0usize, 0usize); HAITSMA_N_BANDS];
+    let mut found_start = [false; HAITSMA_N_BANDS];
+    for (i, &b) in bin_to_band.iter().enumerate() {
+        if b != NO_BAND {
+            let band = b as usize;
+            if !found_start[band] {
+                ranges[band].0 = i;
+                found_start[band] = true;
+            }
+            ranges[band].1 = i + 1;
+        }
+    }
+    ranges
 }
 
 /// Compute the FFT-bin → band-index lookup table.
@@ -305,7 +319,8 @@ pub struct StreamingHaitsma {
 
     stft: ShortTimeFFT,
     sample_carry: Vec<f32>,
-    bin_to_band: Vec<u8>,
+    /// Precomputed contiguous bin ranges for each band.
+    band_ranges: Vec<(usize, usize)>,
 
     /// Per-bin scratch for one frame's power spectrum.
     frame_power: Vec<f32>,
@@ -340,12 +355,13 @@ impl StreamingHaitsma {
             center: false,
         });
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+        let band_ranges = build_band_ranges(&bin_to_band);
         let n_bins = stft.n_bins();
         Self {
             cfg,
             stft,
             sample_carry: Vec::new(),
-            bin_to_band,
+            band_ranges,
             frame_power: alloc::vec![0.0_f32; n_bins],
             has_prev: false,
             prev_energy: [0.0_f32; HAITSMA_N_BANDS],
@@ -379,11 +395,8 @@ impl StreamingFingerprinter for StreamingHaitsma {
                 &mut self.frame_power,
             );
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (bin, &p) in self.frame_power.iter().enumerate() {
-                let b = self.bin_to_band[bin];
-                if b != NO_BAND {
-                    e[b as usize] += p;
-                }
+            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
+                e[b] = self.frame_power[start..end].iter().sum();
             }
 
             if self.has_prev {

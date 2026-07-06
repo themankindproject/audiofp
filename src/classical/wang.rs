@@ -769,7 +769,8 @@ impl StreamingFingerprinter for StreamingWang {
         // `Vec::collect()`, matching `finalize_buckets`. Index-based
         // loop to avoid the `drain` borrow conflict.
         self.to_finalize.clear();
-        self.to_finalize.extend(self.bucket_pending.iter().map(|e| e.0));
+        self.to_finalize
+            .extend(self.bucket_pending.iter().map(|e| e.0));
         let n = self.to_finalize.len();
         for i in 0..n {
             let bucket = self.to_finalize[i];

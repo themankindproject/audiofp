@@ -292,6 +292,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
     let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
         alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
     let mut triplets: Vec<(Peak, Peak, f32)> = Vec::with_capacity(fan_out);
+    let mut suffix_max: Vec<f32> = Vec::with_capacity(64);
 
     for (i, anchor) in peaks.iter().enumerate() {
         // Binary search for the upper bound: first peak with
@@ -315,8 +316,26 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         }
 
         // Heap-based top-K over (b, c) tuples, scored by `b.mag + c.mag`.
+        // Suffix-max array enables early-exit without reordering targets.
+        let targets_len = targets.len();
+        suffix_max.clear();
+        suffix_max.resize(targets_len + 1, 0.0_f32);
+        for j in (0..targets_len).rev() {
+            let m = targets[j].mag;
+            suffix_max[j] = if m > suffix_max[j + 1] { m } else { suffix_max[j + 1] };
+        }
+
         heap.clear();
         for (j, b) in targets.iter().enumerate() {
+            // Early skip: if b.mag + best remaining c can't beat the
+            // heap minimum, no pair involving this b can win.
+            if heap.len() >= fan_out {
+                if let Some(min) = heap.peek() {
+                    if b.mag + suffix_max[j + 1] < min.score {
+                        continue;
+                    }
+                }
+            }
             for c in &targets[j + 1..] {
                 let score = b.mag + c.mag;
                 heap.push(MinByScoreOwned::new(b, c, score));
@@ -684,7 +703,9 @@ impl StreamingPanako {
         // Sort targets by (t_frame, f_bin) to match the offline builder's
         // iteration order — required for (b, c) pair enumeration to produce
         // identical hashes (and avoid u32 underflow in pack_triplet).
-        anchor.targets.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+        anchor
+            .targets
+            .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
         let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
             alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
         for (j, b) in anchor.targets.iter().enumerate() {
@@ -798,7 +819,8 @@ impl StreamingFingerprinter for StreamingPanako {
         // `Vec::collect()`, matching `finalize_buckets`. Index-based
         // loop to avoid the `drain` borrow conflict.
         self.to_finalize.clear();
-        self.to_finalize.extend(self.bucket_pending.iter().map(|e| e.0));
+        self.to_finalize
+            .extend(self.bucket_pending.iter().map(|e| e.0));
         let n = self.to_finalize.len();
         for i in 0..n {
             let bucket = self.to_finalize[i];

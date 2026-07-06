@@ -201,12 +201,16 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
+                .process_with_scratch(
+                    &mut self.scratch_in,
+                    &mut self.scratch_out,
+                    &mut self.fft_scratch,
+                )
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (i, c) in self.scratch_out.iter().enumerate() {
-                row[i] = c.norm_sqr();
+            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
+                *o = c.re * c.re + c.im * c.im;
             }
         }
 
@@ -261,12 +265,16 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
+                .process_with_scratch(
+                    &mut self.scratch_in,
+                    &mut self.scratch_out,
+                    &mut self.fft_scratch,
+                )
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (i, c) in self.scratch_out.iter().enumerate() {
-                row[i] = c.norm_sqr();
+            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
+                *o = c.re * c.re + c.im * c.im;
             }
         }
 
@@ -318,12 +326,16 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
+                .process_with_scratch(
+                    &mut self.scratch_in,
+                    &mut self.scratch_out,
+                    &mut self.fft_scratch,
+                )
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (i, c) in self.scratch_out.iter().enumerate() {
-                row[i] = sqrtf(c.norm_sqr());
+            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
+                *o = sqrtf(c.re * c.re + c.im * c.im);
             }
         }
 
@@ -364,11 +376,15 @@ impl ShortTimeFFT {
         }
 
         self.fft
-            .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
+            .process_with_scratch(
+                &mut self.scratch_in,
+                &mut self.scratch_out,
+                &mut self.fft_scratch,
+            )
             .expect("FFT process: input/output length mismatch");
 
         for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
-            *o = c.norm_sqr();
+            *o = c.re * c.re + c.im * c.im;
         }
     }
 
@@ -387,11 +403,15 @@ impl ShortTimeFFT {
         }
 
         self.fft
-            .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
+            .process_with_scratch(
+                &mut self.scratch_in,
+                &mut self.scratch_out,
+                &mut self.fft_scratch,
+            )
             .expect("FFT process: input/output length mismatch");
 
         for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
-            *o = sqrtf(c.norm_sqr());
+            *o = sqrtf(c.re * c.re + c.im * c.im);
         }
     }
 

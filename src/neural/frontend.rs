@@ -88,7 +88,7 @@ impl LogMelFrontend {
         window: &[f32],
         mut callback: F,
     ) {
-        assert_eq!(
+        debug_assert_eq!(
             window.len(),
             self.window_samples,
             "for_each_frame requires exactly window_samples"

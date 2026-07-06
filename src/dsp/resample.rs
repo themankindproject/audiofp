@@ -259,10 +259,11 @@ impl SincResampler {
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let base = i_centre.wrapping_sub(half);
-            let mut acc = 0.0_f32;
-            for (k, &coeff) in kernel.iter().enumerate() {
-                acc += input[base + k] * coeff;
-            }
+            let acc: f32 = input[base..base + taps]
+                .iter()
+                .zip(kernel.iter())
+                .map(|(&s, &k)| s * k)
+                .sum();
             out.push(acc * self.inv_dc_gain);
         }
 

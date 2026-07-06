@@ -7,8 +7,8 @@
 
 #![cfg(feature = "watermark")]
 
-use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
 use audiofp::AfpError;
+use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
 
 #[test]
 fn config_new_uses_audioseal_defaults() {
@@ -87,8 +87,11 @@ fn corrupt_file_returns_model_load_error() {
     ));
     {
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03,
-                      0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]).unwrap();
+        f.write_all(&[
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01,
+            0x02, 0x03,
+        ])
+        .unwrap();
     }
     let res = WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()));
     std::fs::remove_file(&path).ok();
