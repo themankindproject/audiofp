@@ -322,7 +322,11 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         suffix_max.resize(targets_len + 1, 0.0_f32);
         for j in (0..targets_len).rev() {
             let m = targets[j].mag;
-            suffix_max[j] = if m > suffix_max[j + 1] { m } else { suffix_max[j + 1] };
+            suffix_max[j] = if m > suffix_max[j + 1] {
+                m
+            } else {
+                suffix_max[j + 1]
+            };
         }
 
         heap.clear();

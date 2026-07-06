@@ -64,6 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch-extraction workloads that call `extract` repeatedly on short
   clips.
 
+  `cargo bench` results (cumulative, vs published 0.3.6):
+
+  | Benchmark              | 0.3.6   | Current | Δ            |
+  | ---------------------- | ------- | ------- | ------------ |
+  | Wang extract 30 s      | 88.2 ms | 82.7 ms | **−6.2 %**  |
+  | Panako extract 30 s    | 90.7 ms | 85.9 ms | **−5.3 %**  |
+  | Haitsma extract 30 s   | 44.7 ms | 36.9 ms | **−17.4 %** |
+  | Wang extract 2 s       | 4.5 ms  | 4.2 ms  | **−6.7 %**  |
+  | Panako extract 2 s     | 5.1 ms  | 4.3 ms  | **−15.7 %** |
+  | Haitsma extract 2 s    | 2.4 ms  | 1.95 ms | **−18.8 %** |
+  | Wang streaming 256     | 11.9 ms | 11.3 ms | **−5.0 %**  |
+  | Panako streaming 256   | 13.0 ms | 12.1 ms | **−6.9 %**  |
+  | Haitsma streaming 256  | 8.9 ms  | 6.4 ms  | **−28.1 %** |
+  | Wang streaming 1 s     | 11.3 ms | 11.3 ms | noise        |
+  | Panako streaming 1 s   | 12.9 ms | 11.8 ms | **−8.5 %**  |
+  | Haitsma streaming 1 s  | 8.4 ms  | 6.4 ms  | **−23.8 %** |
+
 - **STFT: eliminate per-frame FFT scratch allocation.** `ShortTimeFFT`
   now stores a dedicated `fft_scratch: Vec<Complex<f32>>` and uses
   `realfft`'s `process_with_scratch()` instead of `process()`. The latter
