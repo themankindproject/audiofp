@@ -114,9 +114,9 @@ pub struct SincResampler {
     from_sr: u32,
     to_sr: u32,
     quality: SincQuality,
-    /// DC gain of the kernel; applied as a divisor to keep constant
-    /// signals constant.
-    dc_gain: f32,
+    /// Precomputed reciprocal of the kernel's DC gain; multiplied per
+    /// output sample to normalise constant signals to unity.
+    inv_dc_gain: f32,
     /// Precomputed polyphase kernel table: `[steps][2*half_taps+1]`.
     /// Each row holds the sinc·Kaiser coefficients for one fractional
     /// offset, avoiding per-sample kernel evaluation in `process`.
@@ -170,12 +170,13 @@ impl SincResampler {
         if dc_gain.abs() < 1e-10 {
             dc_gain = 1.0;
         }
+        let inv_dc_gain = 1.0 / dc_gain;
 
         Self {
             from_sr,
             to_sr,
             quality,
-            dc_gain,
+            inv_dc_gain,
             kernel_table,
         }
     }
@@ -235,7 +236,7 @@ impl SincResampler {
             let pos = n as f64 * ratio;
             let i_centre = pos.floor() as isize;
             let frac = (pos - pos.floor()) as f32;
-            let step = (frac * steps as f32) as usize % steps;
+            let step = ((frac * steps as f32) as usize).min(steps - 1);
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let mut acc = 0.0_f32;
@@ -246,7 +247,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc / self.dc_gain);
+            out.push(acc * self.inv_dc_gain);
         }
 
         // Middle: kernel is fully inside input — no bounds check.
@@ -254,7 +255,7 @@ impl SincResampler {
             let pos = n as f64 * ratio;
             let i_centre = pos.floor() as usize;
             let frac = (pos - pos.floor()) as f32;
-            let step = (frac * steps as f32) as usize % steps;
+            let step = ((frac * steps as f32) as usize).min(steps - 1);
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let base = i_centre.wrapping_sub(half);
@@ -262,7 +263,7 @@ impl SincResampler {
             for (k, &coeff) in kernel.iter().enumerate() {
                 acc += input[base + k] * coeff;
             }
-            out.push(acc / self.dc_gain);
+            out.push(acc * self.inv_dc_gain);
         }
 
         // Right boundary: kernel may extend past the end of input.
@@ -270,7 +271,7 @@ impl SincResampler {
             let pos = n as f64 * ratio;
             let i_centre = pos.floor() as isize;
             let frac = (pos - pos.floor()) as f32;
-            let step = (frac * steps as f32) as usize % steps;
+            let step = ((frac * steps as f32) as usize).min(steps - 1);
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let mut acc = 0.0_f32;
@@ -281,7 +282,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc / self.dc_gain);
+            out.push(acc * self.inv_dc_gain);
         }
     }
 }
@@ -312,18 +313,18 @@ fn kaiser_window_input(x: f32, half: f32, beta: f32, inv_i0_beta: f32) -> f32 {
 /// expansion. Converges fast for `|x| ≤ 30` (well past audio Kaiser β).
 #[inline]
 fn modified_bessel_i0(x: f32) -> f32 {
-    let mut sum = 1.0_f32;
-    let mut term = 1.0_f32;
-    let half_x_sq = (x * x) / 4.0;
+    let mut sum = 1.0_f64;
+    let mut term = 1.0_f64;
+    let half_x_sq = (x as f64 * x as f64) / 4.0;
     for k in 1..=30 {
-        let kf = k as f32;
+        let kf = k as f64;
         term *= half_x_sq / (kf * kf);
         sum += term;
-        if term / sum < 1e-9 {
+        if term / sum < 1e-12 {
             break;
         }
     }
-    sum
+    sum as f32
 }
 
 #[cfg(test)]

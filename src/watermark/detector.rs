@@ -10,6 +10,11 @@ use tract_onnx::prelude::*;
 
 use crate::{AfpError, AudioBuffer, Result};
 
+/// Type alias for the compiled runnable plan produced by
+/// `TypedModel::into_runnable()`. Cached to avoid rebuilding the
+/// execution plan on every `detect()` call.
+type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+
 /// Tunable parameters for [`WatermarkDetector`].
 ///
 /// `model_path` must point at an ONNX file whose first input accepts
@@ -77,12 +82,12 @@ pub struct WatermarkResult {
 pub struct WatermarkDetector {
     cfg: WatermarkConfig,
     model: InferenceModel,
-    /// Cached typed model paired with the input length it was built
+    /// Cached runnable plan paired with the input length it was built
     /// for. On a length mismatch the cache is rebuilt; equal-length
-    /// repeat calls reuse it directly.
+    /// repeat calls reuse the existing plan without cloning.
     ///
     /// [`detect`]: WatermarkDetector::detect
-    typed: Option<(usize, TypedModel)>,
+    cached: Option<(usize, Runnable)>,
 }
 
 impl WatermarkDetector {
@@ -134,7 +139,7 @@ impl WatermarkDetector {
         Ok(Self {
             cfg,
             model,
-            typed: None,
+            cached: None,
         })
     }
 
@@ -173,34 +178,31 @@ impl WatermarkDetector {
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
         // Concretise input shape and prepare a runnable plan.
-        // Reuse the cached TypedModel when the input length matches
-        // what the model was concretised for; otherwise rebuild for the
-        // new length so the caller never sees a cryptic Tract shape
-        // error from a length-mismatched cache.
-        let runnable = match &self.typed {
-            Some((cached_n, typed)) if *cached_n == n => typed
-                .clone()
-                .into_runnable()
-                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?,
-            _ => {
-                let typed = self
-                    .model
-                    .clone()
-                    .with_input_fact(
-                        0,
-                        InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
-                    )
-                    .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
-                    .into_typed()
-                    .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
-                let runnable = typed
-                    .clone()
-                    .into_runnable()
-                    .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
-                self.typed = Some((n, typed));
-                runnable
-            }
+        // Reuse the cached runnable when the input length matches;
+        // otherwise rebuild for the new length.
+        let needs_rebuild = match &self.cached {
+            Some((cached_n, _)) => *cached_n != n,
+            None => true,
         };
+
+        if needs_rebuild {
+            let typed = self
+                .model
+                .clone()
+                .with_input_fact(
+                    0,
+                    InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
+                )
+                .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
+                .into_typed()
+                .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
+            let runnable = typed
+                .into_runnable()
+                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
+            self.cached = Some((n, runnable));
+        }
+
+        let runnable = &self.cached.as_ref().unwrap().1;
 
         let outputs = runnable
             .run(tvec!(input_tensor.into()))

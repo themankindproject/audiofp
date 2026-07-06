@@ -81,6 +81,9 @@ pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
 /// # Ok(()) }
 /// ```
 pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<f32>> {
+    if target_sr == 0 {
+        return Err(AfpError::Config("target sample rate must be > 0".into()));
+    }
     let (samples, sr) = decode_to_mono(path)?;
     if sr == target_sr {
         Ok(samples)

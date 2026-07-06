@@ -215,7 +215,9 @@ impl PeakPicker {
 
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        core::mem::take(&mut self.candidates)
+        let result = self.candidates.clone();
+        self.candidates.clear();
+        result
     }
 }
 
@@ -497,14 +499,6 @@ impl IncrementalPeakDetector {
                 }
             }
             dq.push_back((abs, val));
-            // Expire entries outside the window.
-            let window_start = abs.saturating_sub(self.kt as u32);
-            // For the ripe row (center), the window extends kt on each side.
-            // But we need to consider what the ripe row is: it's abs - kt.
-            // The vertical window for the ripe row is [ripe - kt, ripe + kt].
-            // Since ripe = abs - kt, the window is [abs - 2*kt, abs].
-            // We expire anything < abs - 2*kt.
-            let _ = window_start; // not used directly; see below
         }
 
         // 3. Check if a ripe row exists (need at least kt+1 rows pushed).

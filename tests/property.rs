@@ -289,3 +289,61 @@ proptest! {
         });
     }
 }
+
+/// Panako is designed to be tempo-robust within ±5 %. This test
+/// time-stretches the same signal by factors in [0.96, 1.04] and
+/// asserts non-zero hash overlap with the original.
+#[test]
+fn panako_tempo_robustness() {
+    let sr = 8_000u32;
+    let dur = 6; // seconds — long enough for many hashes
+    let n = sr as usize * dur;
+    let original = synth(42, sr, n);
+
+    let mut panako_orig = Panako::default();
+    let fp_orig = panako_orig
+        .extract(AudioBuffer {
+            samples: &original,
+            rate: SampleRate::HZ_8000,
+        })
+        .unwrap();
+
+    // Time-stretch by linear interpolation (crude but sufficient for
+    // this invariant test — it doesn't introduce spectral artifacts
+    // that'd confuse peak detection at small stretch factors).
+    for &factor in &[0.96_f32, 0.98, 1.02, 1.04] {
+        let stretched_len = (n as f32 * factor) as usize;
+        let mut stretched = Vec::with_capacity(stretched_len);
+        for i in 0..stretched_len {
+            let pos = i as f64 / factor as f64;
+            let idx = pos.floor() as usize;
+            let frac = (pos - pos.floor()) as f32;
+            let a = original[idx.min(n - 1)];
+            let b = original[(idx + 1).min(n - 1)];
+            stretched.push(a * (1.0 - frac) + b * frac);
+        }
+
+        let mut panako_s = Panako::default();
+        let fp_stretched = panako_s
+            .extract(AudioBuffer {
+                samples: &stretched,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+
+        // Collect hash values (ignoring timestamps, which shift).
+        let orig_hashes: std::collections::HashSet<u32> =
+            fp_orig.hashes.iter().map(|h| h.hash).collect();
+        let stretched_hashes: std::collections::HashSet<u32> =
+            fp_stretched.hashes.iter().map(|h| h.hash).collect();
+
+        let overlap = orig_hashes.intersection(&stretched_hashes).count();
+        assert!(
+            overlap > 0,
+            "Panako tempo invariance broken at factor={factor}: \
+             0 hash overlap (orig={}, stretched={})",
+            orig_hashes.len(),
+            stretched_hashes.len(),
+        );
+    }
+}

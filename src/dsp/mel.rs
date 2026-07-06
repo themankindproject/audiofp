@@ -37,6 +37,7 @@ const SLANEY_LOGSTEP: f32 = 0.068_751_97_f32;
 const SLANEY_MIN_LOG_MEL: f32 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
 
 impl MelScale {
+    #[inline]
     fn hz_to_mel(self, hz: f32) -> f32 {
         match self {
             MelScale::Htk => 2595.0 * core::f32::consts::LOG10_2 * log2f(1.0 + hz / 700.0),
@@ -50,6 +51,7 @@ impl MelScale {
         }
     }
 
+    #[inline]
     fn mel_to_hz(self, mel: f32) -> f32 {
         match self {
             MelScale::Htk => 700.0 * (powf(10.0, mel / 2595.0) - 1.0),

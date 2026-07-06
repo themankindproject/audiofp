@@ -83,6 +83,7 @@ pub struct ShortTimeFFT {
     window: Vec<f32>,
     scratch_in: Vec<f32>,
     scratch_out: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
 }
 
 impl ShortTimeFFT {
@@ -111,6 +112,7 @@ impl ShortTimeFFT {
         let window = make_window(cfg.window, cfg.n_fft);
         let scratch_in = fft.make_input_vec();
         let scratch_out = fft.make_output_vec();
+        let fft_scratch = fft.make_scratch_vec();
 
         Self {
             cfg,
@@ -118,6 +120,7 @@ impl ShortTimeFFT {
             window,
             scratch_in,
             scratch_out,
+            fft_scratch,
         }
     }
 
@@ -198,7 +201,7 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process(&mut self.scratch_in, &mut self.scratch_out)
+                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
@@ -258,7 +261,7 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process(&mut self.scratch_in, &mut self.scratch_out)
+                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
@@ -315,7 +318,7 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process(&mut self.scratch_in, &mut self.scratch_out)
+                .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
@@ -361,7 +364,7 @@ impl ShortTimeFFT {
         }
 
         self.fft
-            .process(&mut self.scratch_in, &mut self.scratch_out)
+            .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
             .expect("FFT process: input/output length mismatch");
 
         for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
@@ -384,7 +387,7 @@ impl ShortTimeFFT {
         }
 
         self.fft
-            .process(&mut self.scratch_in, &mut self.scratch_out)
+            .process_with_scratch(&mut self.scratch_in, &mut self.scratch_out, &mut self.fft_scratch)
             .expect("FFT process: input/output length mismatch");
 
         for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
@@ -410,9 +413,9 @@ impl ShortTimeFFT {
             let src = &samples[s_off..s_off + n_fft];
             let win = &self.window[..n_fft];
             let dst = &mut self.scratch_in[..n_fft];
-            for i in 0..n_fft {
-                dst[i] = src[i] * win[i];
-            }
+            dst.iter_mut()
+                .zip(src.iter().zip(win.iter()))
+                .for_each(|(d, (s, w))| *d = s * w);
             return;
         }
 

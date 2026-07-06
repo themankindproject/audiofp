@@ -42,6 +42,7 @@ pub enum WindowKind {
 /// // Peaks near the centre.
 /// assert!(w[512] > 0.99);
 /// ```
+#[inline]
 #[must_use]
 pub fn make_window(kind: WindowKind, n: usize) -> Vec<f32> {
     if n == 0 {

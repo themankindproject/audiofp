@@ -31,9 +31,22 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // Roundtrip: u32 frame -> bytes -> u32 via bytemuck (not a tautology).
     for &frame in &fpr.frames {
-        let bytes: [u8; 4] = frame.to_le_bytes();
-        let roundtripped = u32::from_le_bytes(bytes);
+        let bytes: &[u8] = bytemuck::bytes_of(&frame);
+        let roundtripped: u32 = bytemuck::pod_read_unaligned(bytes);
         assert_eq!(frame, roundtripped);
     }
+
+    // Additional invariant: every frame is a valid 32-bit hash (all bits
+    // can be set; no bit is "reserved" in Haitsma). Verify that
+    // extracting the same audio again produces identical output
+    // (determinism).
+    let buf2 = AudioBuffer {
+        samples,
+        rate: SampleRate::HZ_5000,
+    };
+    let mut fp2 = Haitsma::new(HaitsmaConfig::default());
+    let fpr2 = fp2.extract(buf2).unwrap();
+    assert_eq!(fpr.frames, fpr2.frames, "determinism violation");
 });

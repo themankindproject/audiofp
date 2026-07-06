@@ -22,3 +22,10 @@ pub mod peaks;
 pub mod resample;
 pub mod stft;
 pub mod windows;
+
+/// Conversion factor: `10·log10(x) = DB_LOG2_FACTOR·log2(x)`.
+///
+/// Used by the Wang and Panako front-ends to compute dB magnitude from
+/// power spectra without a `log10` call (`log2` is faster on x86 via a
+/// single hardware instruction).
+pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;

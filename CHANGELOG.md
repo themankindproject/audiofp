@@ -82,6 +82,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | Panako streaming 1 s   | 12.9 ms        | 11.9 ms| **−7.8 %**  |
   | Haitsma streaming 1 s  | 8.4 ms         | 7.0 ms | **−16.7 %** |
 
+## [0.3.7] - 2026-07-07
+
+Production-grade performance, correctness, and testing improvements. All
+changes are non-breaking; no public API surface changes. Hash output
+unchanged (golden tests pass).
+
+### Performance
+
+- **STFT: eliminate per-frame FFT scratch allocation (H1).** `ShortTimeFFT`
+  now stores a dedicated `fft_scratch: Vec<Complex<f32>>` and uses
+  `realfft`'s `process_with_scratch()` instead of `process()`. The latter
+  allocates temporary scratch on every call; the new path reuses the
+  pre-allocated buffer. Eliminates ~1875 hidden heap allocations for a
+  30 s clip at 62.5 fps.
+
+- **Resampler: multiply by precomputed reciprocal (H2).** `SincResampler`
+  now stores `inv_dc_gain = 1.0 / dc_gain` and multiplies per output
+  sample instead of dividing. Float division is ~4× slower than
+  multiplication on modern CPUs.
+
+- **Watermark detector: cache `Runnable` plan (H3).** `WatermarkDetector`
+  now caches the Tract `SimplePlan` (runnable) directly. Previously, even
+  on a cache-hit (same input length), `detect()` would deep-clone the
+  `TypedModel` and rebuild the runnable on every call. Now the runnable is
+  reused by reference — only a length change triggers a rebuild.
+
+- **Streaming: pool output Vec (H4).** Both `StreamingWang` and
+  `StreamingPanako` now store an `emitted` buffer on the struct and return
+  it via `core::mem::take`. Eliminates one `Vec` allocation per `push()`
+  call (~62/sec in steady state).
+
+- **Streaming: replace BTreeMap with sorted Vec (M1).** The
+  `bucket_pending` field in both streaming fingerprinters used a
+  `BTreeMap<u32, Vec<Peak>>` with at most 3 entries. Now a sorted
+  `Vec<(u32, Vec<Peak>)>` with linear search — fewer allocations and
+  better cache locality for ≤3-element collections.
+
+- **Panako streaming: cap targets at 2×fan_out (M2).** `PendingAnchorPanako`
+  targets are now capped at `2 × fan_out` by magnitude. Prevents O(N²)
+  pair enumeration for dense audio where an anchor's target zone could
+  accumulate 60+ peaks.
+
+- **Peak picker: preserve Vec capacity (M4).** `PeakPicker::pick()` now
+  uses `clone()` + `clear()` instead of `core::mem::take()` for the
+  candidates buffer, retaining the allocation for the next call.
+
+- **Resampler: replace modulo with `.min(steps - 1)` (L3).** Polyphase
+  step selection used `% steps` (integer division) as a safety clamp.
+  Now uses `.min(steps - 1)` (branch-predicted comparison) — avoids an
+  integer division per output sample.
+
+- **Bessel I₀: f64 accumulation (L4).** `modified_bessel_i0` now
+  accumulates the series sum in `f64` and casts back to `f32` at the end.
+  Improves precision for large `β` values at negligible cost
+  (construction-only path).
+
+- **STFT windowing: iterator pattern (L1).** The fast-path windowing loop
+  in `fill_windowed` now uses `iter_mut().zip().for_each()` for more
+  reliable autovectorization by LLVM.
+
+- **Deduplicate `DB_LOG2_FACTOR` (L5).** Moved the shared constant to
+  `dsp::mod` and imported it in both `wang.rs` and `panako.rs`.
+
+- **Remove dead code (L8).** Removed unused `window_start` computation in
+  `IncrementalPeakDetector::push_row`.
+
+- **Inline hints (L9).** Added `#[inline]` to `MelScale::hz_to_mel`,
+  `MelScale::mel_to_hz`, and `make_window` for reliable cross-crate
+  inlining.
+
+### Fixed
+
+- **`decode_to_mono_at` validates `target_sr > 0` (M7).** Previously,
+  passing `target_sr = 0` would panic inside the resampler. Now returns
+  `AfpError::Config("target sample rate must be > 0")` immediately.
+
+### Testing
+
+- **Fixed `haitsma_hash_roundtrip` fuzz target (L10).** The assertion
+  `u32::from_le_bytes(frame.to_le_bytes()) == frame` was a tautology.
+  Now uses `bytemuck::pod_read_unaligned(bytes_of(&frame))` and adds a
+  determinism check (same input → same output).
+
+- **Added Panako tempo-robustness test (L11).** Property test stretches
+  audio by factors in [0.96, 1.04] and asserts non-zero hash overlap,
+  validating Panako's defining ±5% tempo tolerance.
+
+- **Added watermark integration test suite (L12).** Seven tests exercise
+  the public `WatermarkDetector` API: config validation, error variants,
+  and model-load failure paths.
+
 ## [0.3.6] - 2026-06-30
 
 A performance patch release. Optimisations across the DSP, classical,
