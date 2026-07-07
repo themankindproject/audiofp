@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/audiofp/badge.svg)](https://docs.rs/audiofp)
 [![License](https://img.shields.io/crates/l/audiofp)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/audiofp/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/audiofp/actions/workflows/ci.yml)
-![Rust Version](https://img.shields.io/badge/rust-1.85%2B-blue)
+![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 
 Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **streaming extraction**, **file decoding**, and **AudioSeal-compatible watermark detection**.
 
