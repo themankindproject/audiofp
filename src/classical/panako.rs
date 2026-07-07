@@ -333,12 +333,12 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         for (j, b) in targets.iter().enumerate() {
             // Early skip: if b.mag + best remaining c can't beat the
             // heap minimum, no pair involving this b can win.
-            if heap.len() >= fan_out {
-                if let Some(min) = heap.peek() {
-                    if b.mag + suffix_max[j + 1] < min.score {
-                        continue;
-                    }
-                }
+            if heap.len() >= fan_out
+                && heap
+                    .peek()
+                    .is_some_and(|min| b.mag + suffix_max[j + 1] < min.score)
+            {
+                continue;
             }
             for c in &targets[j + 1..] {
                 let score = b.mag + c.mag;

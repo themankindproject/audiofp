@@ -3,15 +3,16 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::audio::{Audio, AudioBuffer, GenericAudioBufferRef};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use crate::dsp::resample::SincResampler;
+use crate::error::IoError;
 use crate::{AfpError, Result};
 
 /// Decode an audio file into a mono `f32` buffer at the file's native
@@ -46,8 +47,7 @@ use crate::{AfpError, Result};
 /// ```
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
     let path = path.as_ref();
-    let file =
-        File::open(path).map_err(|e| AfpError::Io(format!("open {}: {e}", path.display())))?;
+    let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -94,85 +94,124 @@ pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<
 }
 
 fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> {
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
+        .probe(
             hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
-        .map_err(|e| AfpError::Io(format!("probe: {e}")))?;
-    let mut format = probed.format;
+        .map_err(|e| {
+            AfpError::Io(IoError::without_path(std::io::Error::other(format!(
+                "probe: {e}"
+            ))))
+        })?;
 
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| AfpError::Io("no audio track".into()))?
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| {
+            AfpError::Io(IoError::without_path(std::io::Error::other(
+                "no audio track",
+            )))
+        })?
         .clone();
     let track_id = track.id;
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| AfpError::Io("missing sample rate".into()))?;
 
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| AfpError::Io(format!("make decoder: {e}")))?;
+    let audio_params = match track.codec_params.as_ref() {
+        Some(symphonia::core::codecs::CodecParameters::Audio(params)) => params,
+        _ => {
+            return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+                "no audio codec params",
+            ))));
+        }
+    };
+
+    let sample_rate = audio_params.sample_rate.ok_or_else(|| {
+        AfpError::Io(IoError::without_path(std::io::Error::other(
+            "missing sample rate",
+        )))
+    })?;
+
+    let codecs = symphonia::default::get_codecs();
+    let decoder_factory = codecs
+        .get_audio_decoder(audio_params.codec)
+        .ok_or_else(|| {
+            AfpError::Io(IoError::without_path(std::io::Error::other(
+                "unsupported codec",
+            )))
+        })?;
+    let mut decoder = (decoder_factory.factory)(audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| {
+            AfpError::Io(IoError::without_path(std::io::Error::other(format!(
+                "make decoder: {e}"
+            ))))
+        })?;
 
     let mut samples: Vec<f32> = Vec::new();
     let mut convert_buf: Option<AudioBuffer<f32>> = None;
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => continue,
-            Err(e) => return Err(AfpError::Io(format!("next_packet: {e}"))),
+            Err(e) => {
+                return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+                    format!("next_packet: {e}"),
+                ))));
+            }
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
-        let decoded: AudioBufferRef = match decoder.decode(&packet) {
+        let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
             // Recoverable per-packet failures: skip and keep going.
             Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
                 continue;
             }
-            Err(e) => return Err(AfpError::Io(format!("decode: {e}"))),
+            Err(e) => {
+                return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+                    format!("decode: {e}"),
+                ))));
+            }
         };
 
         // Lazily allocate the f32 conversion buffer once the first packet
         // tells us the channel layout / capacity. Reallocate if a later
         // packet decodes to more frames than the current buffer can hold
         // (the first packet's capacity is not guaranteed to bound the rest).
+        let needed_cap = decoded.frames().max(decoded.capacity());
         let needs_buf = match &convert_buf {
             None => true,
-            Some(buf) => decoded.capacity() > buf.capacity(),
+            Some(buf) => needed_cap > buf.capacity(),
         };
         if needs_buf {
-            let spec = *decoded.spec();
-            let cap = decoded.capacity() as u64;
-            convert_buf = Some(AudioBuffer::<f32>::new(cap, spec));
+            let spec = decoded.spec().clone();
+            convert_buf = Some(AudioBuffer::<f32>::new(spec, needed_cap));
         }
         let buf = convert_buf.as_mut().unwrap();
 
-        decoded.convert(buf);
+        // In symphonia 0.6, copy_to requires the destination to have the
+        // same frame count as the source. Set it before copying.
+        buf.resize_uninit(decoded.frames());
+        decoded.copy_to::<f32, _>(buf);
 
         let n_frames = buf.frames();
-        let n_chans = buf.spec().channels.count();
+        let n_chans = buf.spec().channels().count();
 
         if n_chans == 1 {
-            samples.extend_from_slice(&buf.chan(0)[..n_frames]);
+            samples.extend_from_slice(&buf.plane(0).unwrap()[..n_frames]);
         } else {
             samples.reserve(n_frames);
             for i in 0..n_frames {
                 let mut sum = 0.0_f32;
                 for c in 0..n_chans {
-                    sum += buf.chan(c)[i];
+                    sum += buf.plane(c).unwrap()[i];
                 }
                 samples.push(sum / n_chans as f32);
             }

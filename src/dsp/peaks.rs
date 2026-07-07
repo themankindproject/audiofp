@@ -540,11 +540,7 @@ impl IncrementalPeakDetector {
         // [last_ripe + 1, n_pushed - 1], i.e. the last `min(kt, n_pushed-1)` frames.
         // But if n_pushed <= kt, then NO frames were emitted by push at all,
         // so we need to emit all of [0, n_pushed-1].
-        let first_flush = if self.n_pushed > self.kt as u32 {
-            self.n_pushed - self.kt as u32
-        } else {
-            0
-        };
+        let first_flush = self.n_pushed.saturating_sub(self.kt as u32);
         let last_flush = self.n_pushed - 1;
 
         // For flush frames, we can't push new rows — the deques already

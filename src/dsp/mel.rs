@@ -138,7 +138,10 @@ impl MelFilterBank {
         scale: MelScale,
     ) -> Self {
         assert!(n_mels > 0, "n_mels must be > 0");
-        assert!(n_fft >= 2 && n_fft % 2 == 0, "n_fft must be even and >= 2");
+        assert!(
+            n_fft >= 2 && n_fft.is_multiple_of(2),
+            "n_fft must be even and >= 2"
+        );
         assert!(fmin >= 0.0, "fmin must be >= 0");
         assert!(fmin < fmax, "fmin must be strictly less than fmax");
 

@@ -71,8 +71,89 @@ pub enum AfpError {
     Config(String),
 
     /// An I/O failure surfaced through `audiofp`.
+    ///
+    /// When the `std` feature is enabled, this carries a structured
+    /// [`IoError`] with path, kind, and source. Without `std`, it
+    /// carries only a string description.
+    #[cfg(feature = "std")]
+    #[error("{0}")]
+    Io(IoError),
+
+    /// An I/O failure (no_std fallback — string only).
+    #[cfg(not(feature = "std"))]
     #[error("io: {0}")]
     Io(String),
+}
+
+// ---------------------------------------------------------------------------
+// IoError — structured I/O error (std only)
+// ---------------------------------------------------------------------------
+
+/// Structured I/O error with path and source.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct IoError {
+    /// The file path where the error occurred, if known.
+    pub path: Option<std::path::PathBuf>,
+    /// The kind of I/O error.
+    pub kind: std::io::ErrorKind,
+    /// The underlying error.
+    pub source: std::io::Error,
+}
+
+#[cfg(feature = "std")]
+impl IoError {
+    /// Create a new `IoError` with a path.
+    pub fn new(path: impl Into<std::path::PathBuf>, source: std::io::Error) -> Self {
+        let kind = source.kind();
+        Self {
+            path: Some(path.into()),
+            kind,
+            source,
+        }
+    }
+
+    /// Create a new `IoError` without a path.
+    pub fn without_path(source: std::io::Error) -> Self {
+        let kind = source.kind();
+        Self {
+            path: None,
+            kind,
+            source,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for IoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.path {
+            Some(p) => write!(f, "io error at {}: {}", p.display(), self.source),
+            None => write!(f, "io error: {}", self.source),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for IoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for AfpError {
+    fn from(e: std::io::Error) -> Self {
+        AfpError::Io(IoError::without_path(e))
+    }
+}
+
+#[cfg(feature = "std")]
+impl AfpError {
+    /// Create an `Io` error with a path context.
+    pub fn io_with_path(path: impl Into<std::path::PathBuf>, source: std::io::Error) -> Self {
+        AfpError::Io(IoError::new(path, source))
+    }
 }
 
 /// Shorthand for `core::result::Result<T, AfpError>`.
@@ -157,6 +238,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
+    fn io_displays_path_and_source() {
+        let source = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = AfpError::io_with_path("/some/path.wav", source);
+        let s = err.to_string();
+        assert!(s.contains("/some/path.wav"), "got: {s}");
+        assert!(s.contains("file missing"), "got: {s}");
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn io_without_path_displays_source() {
+        let source = std::io::Error::other("disk full");
+        let err = AfpError::from(source);
+        let s = err.to_string();
+        assert!(s.contains("disk full"), "got: {s}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "std"))]
     fn io_displays_the_inner_message() {
         let err = AfpError::Io("disk full".to_string());
         assert_eq!(err.to_string(), "io: disk full");

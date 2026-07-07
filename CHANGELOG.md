@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV raised to 1.93.0** due to tract-onnx 0.23 requiring Rust ≥ 1.91.
+
+- **Bump `symphonia` 0.5.5 → 0.6.0.** Symphonia 0.6 restructured its
+  audio, format-reader, and codec APIs. The decoder module has been
+  rewritten to use the new `Audio` trait, `GenericAudioBufferRef`,
+  `Probe::probe()`, and `FormatReader::default_track()` entry points.
+  No public API change; `decode_to_mono` / `decode_to_mono_at` continue
+  to return the same results. Closes #49 (partial).
+
+- **Bump `tract-onnx` 0.22.1 → 0.23.3.** Updates to
+  `TypedSimplePlan` (two-param `SimplePlan`), `to_plain_array_view`,
+  and `as_slice_mut_unchecked`. Resolves RUSTSEC-2026-0009 transitive
+  advisory via updated `time` dep chain. Closes #49.
+
+- **`AfpError::Io` is now a structured `IoError` (std only).** The
+  `Io` variant carries `IoError { path: Option<PathBuf>, kind:
+  ErrorKind, source: io::Error }` instead of a bare `String`. Users
+  can now inspect `kind` for retry decisions, pattern-match on the
+  path, and access the `#[source]` chain. A `From<std::io::Error>` impl
+  is provided for ergonomic `?` propagation. The `no_std` variant
+  remains `Io(String)`. Closes #18.
+
 ### Added
 
 - **`fingerprint_batch_parallel`** (gated on the `parallel` feature) —
@@ -20,6 +44,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   items.
 
 ### Performance
+
+- **SIMD `fill_windowed` window-application inner loop (closes #21).**
+  The per-frame `dst[i] = src[i] * win[i]` multiply (executed once per
+  STFT frame, ~320K multiplies for 5 s of Wang audio) now dispatches to
+  an explicit AVX2 path on x86-64 (`f32x8` packed muls via
+  `_mm256_mul_ps`) and a NEON path on aarch64 (`vld1q_f32` /
+  `vmulq_f32`). Runtime detection via `is_x86_feature_detected!`
+  (std-only; no_std falls back to scalar). Scalar tail-handling for
+  `n_fft % 8 != 0`.
+
+  Measured on Intel i5-1135G7 (vs. previous iteration):
+
+  | Benchmark            | Before   | After    | Δ            |
+  | -------------------- | -------- | -------- | ------------ |
+  | Wang extract 30 s    | 91.3 ms  | 81.0 ms  | **−11.3 %** |
+  | Panako extract 30 s  | 101.0 ms | 84.2 ms  | **−16.6 %** |
+  | Haitsma extract 30 s | 37.0 ms  | 39.1 ms  | noise        |
+  | Wang extract 5 s     | 11.8 ms  | 11.3 ms  | **−4.2 %**  |
+  | Panako extract 5 s   | 14.4 ms  | 11.6 ms  | **−19.4 %** |
 
 - **Mel filterbank: `log10f` → `LOG10_2 * log2f`.** Three hot-path
   `log10f` calls (`hz_to_mel` HTK branch, `log_mel`, `log_mel_from_power`)

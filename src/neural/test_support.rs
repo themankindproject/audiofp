@@ -29,7 +29,7 @@ fn build_passthrough_runnable(n_mels: usize, n_frames: usize) -> Runnable {
         .add_source("x", f32::fact([1, n_mels, n_frames]))
         .expect("add_source");
     model
-        .set_output_outlets(&[input])
+        .select_output_outlets(&[input])
         .expect("set_output_outlets");
     model
         .into_optimized()

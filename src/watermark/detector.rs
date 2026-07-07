@@ -13,7 +13,7 @@ use crate::{AfpError, AudioBuffer, Result};
 /// Type alias for the compiled runnable plan produced by
 /// `TypedModel::into_runnable()`. Cached to avoid rebuilding the
 /// execution plan on every `detect()` call.
-type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = Arc<TypedSimplePlan>;
 
 /// Tunable parameters for [`WatermarkDetector`].
 ///
@@ -217,7 +217,7 @@ impl WatermarkDetector {
 
         // Output 0: detection scores → localization + mean confidence.
         let detection = outputs[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AfpError::Inference(format!("detection view: {e}")))?;
         let localization: Vec<f32> = detection.iter().copied().collect();
         let confidence = if localization.is_empty() {
@@ -229,7 +229,7 @@ impl WatermarkDetector {
 
         // Output 1: message bit logits → packed u32 (LSB-first).
         let message_view = outputs[1]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AfpError::Inference(format!("message view: {e}")))?;
         let bits = self.cfg.message_bits.min(32) as usize;
         let mut message: u32 = 0;

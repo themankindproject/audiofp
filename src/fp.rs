@@ -283,7 +283,7 @@ mod tests {
             let mut out = Vec::new();
             for _ in samples {
                 self.count += 1;
-                if self.count % 3 == 0 {
+                if self.count.is_multiple_of(3) {
                     out.push((TimestampMs(self.count as u64), self.count));
                 }
             }

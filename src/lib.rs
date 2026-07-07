@@ -95,6 +95,8 @@ mod error;
 mod fp;
 mod types;
 
+#[cfg(feature = "std")]
+pub use error::IoError;
 pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
 pub use types::{AudioBuffer, SampleRate, TimestampMs};

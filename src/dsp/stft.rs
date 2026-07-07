@@ -433,6 +433,26 @@ impl ShortTimeFFT {
             let src = &samples[s_off..s_off + n_fft];
             let win = &self.window[..n_fft];
             let dst = &mut self.scratch_in[..n_fft];
+
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    // SAFETY: we just checked AVX2 support, and src/win/dst all
+                    // have length >= n_fft.
+                    unsafe { apply_window_avx2(src, win, dst) };
+                    return;
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: NEON is always available on aarch64, and src/win/dst
+                // all have length >= n_fft.
+                unsafe { apply_window_neon(src, win, dst) };
+                return;
+            }
+
+            // Scalar fallback.
             dst.iter_mut()
                 .zip(src.iter().zip(win.iter()))
                 .for_each(|(d, (s, w))| *d = s * w);
@@ -450,6 +470,89 @@ impl ShortTimeFFT {
                 0.0
             };
             self.scratch_in[k] = s * self.window[k];
+        }
+    }
+}
+
+/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` for all i.
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - AVX2 is available on the current CPU
+/// - `src`, `win`, and `dst` all have the same length
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_window_avx2(src: &[f32], win: &[f32], dst: &mut [f32]) {
+    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+
+    let n = src.len();
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let src_ptr = src.as_ptr();
+    let win_ptr = win.as_ptr();
+    let dst_ptr = dst.as_mut_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 8;
+        // SAFETY: offset < n (since i < chunks = n/8), and all slices have length n.
+        // AVX2 availability is guaranteed by the caller.
+        unsafe {
+            let s = _mm256_loadu_ps(src_ptr.add(offset));
+            let w = _mm256_loadu_ps(win_ptr.add(offset));
+            let r = _mm256_mul_ps(s, w);
+            _mm256_storeu_ps(dst_ptr.add(offset), r);
+        }
+    }
+
+    // Handle remaining elements with scalar ops.
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        // SAFETY: tail_start + i < n, and all slices have length n.
+        unsafe {
+            *dst_ptr.add(tail_start + i) =
+                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
+        }
+    }
+}
+
+/// SIMD-accelerated window application using ARM NEON.
+///
+/// # Safety
+///
+/// Caller must ensure `src`, `win`, and `dst` all have the same length.
+/// NEON is always available on aarch64.
+#[cfg(target_arch = "aarch64")]
+unsafe fn apply_window_neon(src: &[f32], win: &[f32], dst: &mut [f32]) {
+    use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+
+    let n = src.len();
+    let chunks = n / 4;
+    let remainder = n % 4;
+
+    let src_ptr = src.as_ptr();
+    let win_ptr = win.as_ptr();
+    let dst_ptr = dst.as_mut_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        // SAFETY: offset < n (since i < chunks = n/4), and all slices have length n.
+        // NEON is always available on aarch64.
+        unsafe {
+            let s = vld1q_f32(src_ptr.add(offset));
+            let w = vld1q_f32(win_ptr.add(offset));
+            let r = vmulq_f32(s, w);
+            vst1q_f32(dst_ptr.add(offset), r);
+        }
+    }
+
+    let tail_start = chunks * 4;
+    for i in 0..remainder {
+        // SAFETY: tail_start + i < n, and all slices have length n.
+        unsafe {
+            *dst_ptr.add(tail_start + i) =
+                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
         }
     }
 }

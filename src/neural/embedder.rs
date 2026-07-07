@@ -100,8 +100,7 @@ pub struct NeuralFingerprint {
 
 /// Tract's typed runnable model. Expensive to build; we build it once
 /// in [`NeuralEmbedder::new`] and reuse it for every call.
-pub(crate) type Runnable =
-    SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+pub(crate) type Runnable = Arc<TypedSimplePlan>;
 
 /// Heavy state shared by [`NeuralEmbedder`] and
 /// [`super::StreamingNeuralEmbedder`]. Both compose this rather than
@@ -163,9 +162,8 @@ impl EmbedderCore {
         };
 
         {
-            let dst = tensor
-                .as_slice_mut::<f32>()
-                .map_err(|e| AfpError::Inference(format!("input slice: {e}")))?;
+            // SAFETY: we just allocated `tensor` as f32 with the correct shape above.
+            let dst = unsafe { tensor.as_slice_mut_unchecked::<f32>() };
             self.frontend.for_each_frame(window, |f, mel_row| {
                 // Strided write: position (m, f) in the `[n_mels, n_frames]`
                 // matrix lives at `m * n_frames + f`.
@@ -184,7 +182,7 @@ impl EmbedderCore {
         }
 
         let view = outputs[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AfpError::Inference(format!("output view: {e}")))?;
         if view.len() != self.embedding_dim {
             return Err(AfpError::Inference(format!(
@@ -372,7 +370,7 @@ impl NeuralEmbedder {
             ));
         }
         let probe_view = probe_out[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AfpError::Inference(format!("probe view: {e}")))?;
         let embedding_dim = probe_view.len();
         if embedding_dim == 0 {
