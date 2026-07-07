@@ -68,7 +68,7 @@
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
 //! | `std`        |   ✅    | Pulls in [`symphonia`](https://docs.rs/symphonia) → [`io`].       |
 //! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`]. |
-//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`]. |
+//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`](https://docs.rs/tract-onnx). |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator.      |
 //!
 //! See [`USAGE.md`](https://github.com/themankindproject/audiofp/blob/main/USAGE.md)

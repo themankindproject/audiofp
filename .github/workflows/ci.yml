@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: rustfmt
       - name: cargo fmt --check
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: unit and integration tests
         run: cargo test --all-features
@@ -61,14 +61,14 @@ jobs:
       - name: install cargo-audit
         run: cargo install cargo-audit@0.22.1 --locked
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0009 --ignore RUSTSEC-2026-0186 --ignore RUSTSEC-2026-0190
+        run: cargo audit
 
   property-tests:
     name: property tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: property-based tests (256 cases)
         run: cargo test --test property --all-features
@@ -76,11 +76,11 @@ jobs:
           PROPTEST_CASES: 256
 
   msrv:
-    name: MSRV (1.85.0)
+    name: MSRV (1.93.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: check (all features, MSRV)
         run: cargo check --all-features
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: check no_std (default target)
         run: cargo check --no-default-features
@@ -102,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (no default features)
         run: cargo test --no-default-features
