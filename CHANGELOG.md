@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is provided for ergonomic `?` propagation. The `no_std` variant
   remains `Io(String)`. Closes #18.
 
+  **Migration:** if you pattern-match on `AfpError::Io(msg)` where `msg`
+  was a `String`, change to `AfpError::Io(e)` — `e` is now an `IoError`
+  which implements `Display` (so `format!("{e}")` still works).
+  `AfpError::Io(_)` patterns compile unchanged.
+
 ### Added
 
 - **`fingerprint_batch_parallel`** (gated on the `parallel` feature) —
