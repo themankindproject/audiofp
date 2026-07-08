@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-08
+
 ### Changed
 
 - **MSRV raised to 1.93.0** due to tract-onnx 0.23 requiring Rust ≥ 1.91.
