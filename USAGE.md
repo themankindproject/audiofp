@@ -34,7 +34,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.6"
+audiofp = "0.3.7"
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -224,7 +224,7 @@ Milliseconds since stream start. `u64` gives ≈ 584 million years of headroom.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ```
 
-Crate version string, e.g. `"0.3.6"`. Useful for runtime sanity checks when the SDK is vendored.
+Crate version string, e.g. `"0.3.7"`. Useful for runtime sanity checks when the SDK is vendored.
 
 ---
 
@@ -507,7 +507,7 @@ Available with the `watermark` feature. Wraps `tract-onnx` to run an AudioSeal-c
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", features = ["watermark"] }
+audiofp = { version = "0.3.7", features = ["watermark"] }
 ```
 
 ### `WatermarkConfig`
@@ -580,7 +580,7 @@ Available with the `neural` feature (added in 0.3.0). Wraps `tract-onnx` to run 
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", features = ["neural"] }
+audiofp = { version = "0.3.7", features = ["neural"] }
 ```
 
 ### Model contract
@@ -1007,7 +1007,7 @@ It's there as a baseline. Use `SincResampler` for anything user-facing — the a
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", features = ["mimalloc"] }
+audiofp = { version = "0.3.7", features = ["mimalloc"] }
 ```
 
 This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary or in `default = ["std", "mimalloc"]` if you're vendoring `audiofp`.
@@ -1067,7 +1067,7 @@ per STFT frame per analysis window.
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", default-features = false }
+audiofp = { version = "0.3.7", default-features = false }
 ```
 
 This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::watermark`), and `mimalloc`. The DSP primitives and classical fingerprinters all remain available.
@@ -1076,7 +1076,7 @@ This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::wate
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", default-features = false, features = ["watermark"] }
+audiofp = { version = "0.3.7", default-features = false, features = ["watermark"] }
 ```
 
 `watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without Symphonia.
@@ -1089,7 +1089,7 @@ The DSP primitives and classical fingerprinters compile under `no_std + alloc`:
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.6", default-features = false }
+audiofp = { version = "0.3.7", default-features = false }
 ```
 
 In your crate root:

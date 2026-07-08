@@ -1071,7 +1071,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/themankindproject/audiofp/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/themankindproject/audiofp/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/themankindproject/audiofp/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/themankindproject/audiofp/compare/v0.3.3...v0.3.4
