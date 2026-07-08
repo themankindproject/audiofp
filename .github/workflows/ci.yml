@@ -43,13 +43,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: unit and integration tests
-        run: cargo test --all-features
+        run: cargo test --all-features -- --skip golden
       - name: doc tests
         run: cargo test --doc --all-features
       - name: doc build
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  golden:
+    name: golden hash drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: regression (bit-exact hash output)
+        run: cargo test --test regression --all-features
 
   audit:
     name: cargo audit
