@@ -1,31 +1,26 @@
-//! Compare two audio files by Wang hash overlap.
+//! Compare two audio files using the Wang fingerprint matcher.
+//!
+//! This is a sound replacement for the old hash-set-overlap approach.
+//! It uses the offset-histogram voter from `WangMatcher` — matching
+//! landmark hashes must agree on a constant time offset, which
+//! eliminates the false positives that plague naive hash-set overlap.
 //!
 //! ```bash
 //! cargo run --example match_two_files -- song.flac song_re_encoded.mp3
 //! ```
-//!
-//! Useful as a starter for "is B a re-encoding of A?" detection. For real
-//! matching at scale you'd use `t_anchor` to verify same-offset collisions
-//! and apply a histogram-of-time-deltas voter.
 
-use std::collections::HashSet;
-
-use audiofp::classical::Wang;
+use audiofp::classical::{Wang, WangFingerprint};
 use audiofp::io::decode_to_mono_at;
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
-fn fingerprint(wang: &mut Wang, path: &str) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
+fn fingerprint(wang: &mut Wang, path: &str) -> Result<WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
     let buf = AudioBuffer {
         samples: &samples,
         rate: SampleRate::HZ_8000,
     };
-    Ok(wang
-        .extract(buf)?
-        .hashes
-        .into_iter()
-        .map(|h| h.hash)
-        .collect())
+    Ok(wang.extract(buf)?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,31 +35,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wang = Wang::default();
 
     println!("Fingerprinting {a}...");
-    let fa = fingerprint(&mut wang, &a)?;
-    println!("  {} unique hashes", fa.len());
+    let fprint_a = fingerprint(&mut wang, &a)?;
+    println!("  {} landmarks", fprint_a.hashes.len());
 
     println!("Fingerprinting {b}...");
-    let fb = fingerprint(&mut wang, &b)?;
-    println!("  {} unique hashes", fb.len());
+    let fprint_b = fingerprint(&mut wang, &b)?;
+    println!("  {} landmarks", fprint_b.hashes.len());
 
-    let shared = fa.intersection(&fb).count();
-    let union = fa.union(&fb).count();
-    let pct_max = 100.0 * shared as f64 / fa.len().max(fb.len()) as f64;
-    let jaccard = if union == 0 {
-        0.0
-    } else {
-        shared as f64 / union as f64
-    };
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let result = matcher.match_one(&fprint_a, &fprint_b);
 
     println!();
-    println!("  shared hashes:    {shared}");
-    println!("  overlap (max):    {pct_max:.1} %");
-    println!("  jaccard:          {:.3}", jaccard);
+    println!("  score:      {:.4}", result.score);
+    println!("  votes:      {}", result.votes);
+    println!("  prominence: {:.2}", result.prominence);
+    println!(
+        "  offset:     {} ms ({} frames)",
+        result.offset.ms, result.offset.frames
+    );
 
-    if pct_max >= 50.0 {
-        println!("\n  → Likely the same recording.");
-    } else if pct_max >= 10.0 {
-        println!("\n  → Possibly related (cover, edit, or partial overlap).");
+    if result.is_match {
+        println!(
+            "\n  → Same recording (confidence {:.1}%)",
+            result.score * 100.0
+        );
+    } else if result.score > 0.05 {
+        println!("\n  → Possibly related (partial overlap, cover, or edit).");
     } else {
         println!("\n  → Unrelated.");
     }
