@@ -30,8 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ≥ one analysis window of silence at the model's rate.
     let n = emb.window_samples().max(emb.hop_samples() * 2);
     let samples = vec![0.0_f32; n];
-    let rate = SampleRate::new(emb.config().sample_rate)
-        .ok_or("model sample_rate must be non-zero")?;
+    let rate =
+        SampleRate::new(emb.config().sample_rate).ok_or("model sample_rate must be non-zero")?;
     let fp = emb.extract(AudioBuffer::new(&samples, rate))?;
 
     println!(
@@ -41,12 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fp.frames_per_sec
     );
     if let Some(e) = fp.embeddings.first() {
-        let preview: Vec<String> = e
-            .vector
-            .iter()
-            .take(8)
-            .map(|v| format!("{v:.4}"))
-            .collect();
+        let preview: Vec<String> = e.vector.iter().take(8).map(|v| format!("{v:.4}")).collect();
         println!(
             "  first @ {} ms: [{}{}]",
             e.t_start.0,

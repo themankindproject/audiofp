@@ -8,7 +8,9 @@
 //! The crate ships only the loader and decoder — the caller supplies
 //! the ONNX export themselves. Meta's [AudioSeal v0.2] is the reference
 //! target; any model that follows the contract documented on
-//! [`WatermarkConfig`] will work.
+//! [`WatermarkConfig`] will work. See [`WatermarkResult::localization`]
+//! for the detection-score / time-base contract (length is model-defined;
+//! `audiofp` does not resample or realign it).
 //!
 //! Available only when the `watermark` feature is enabled:
 //!

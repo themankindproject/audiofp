@@ -63,8 +63,30 @@ pub struct WatermarkResult {
     /// `message_bits` are populated; bits at or above `message_bits` are
     /// zero. Zero when the model returned fewer logits than requested.
     pub message: u32,
-    /// Raw per-output detection scores, exactly as the model emitted
-    /// them (no resampling). Length depends on the specific model.
+    /// Raw detection scores from the model's first ONNX output, **flattened**
+    /// with no resampling or time-axis remapping by `audiofp`.
+    ///
+    /// # Contract
+    ///
+    /// - **Values:** model-emitted `f32` scores (AudioSeal-style detectors
+    ///   typically emit probabilities in `[0, 1]`).
+    /// - **Length:** exactly the number of elements Tract yields when
+    ///   flattening output `[0]`. This is **not** guaranteed equal to
+    ///   `audio.samples.len()`.
+    /// - **Time base:** model-dependent. Some AudioSeal exports emit one
+    ///   score per input sample at [`WatermarkConfig::sample_rate`]; others
+    ///   emit coarser per-frame / pooled maps. Treat hop and alignment as
+    ///   part of the **model card**, not as a stable `audiofp` API promise.
+    /// - **Aggregation:** [`Self::confidence`] is the arithmetic mean of
+    ///   these scores (or `0.0` if empty); [`Self::detected`] compares that
+    ///   mean to [`WatermarkConfig::threshold`].
+    /// - **Stability:** tensor shape is **not** semver-guaranteed across
+    ///   model versions — only that this field forwards whatever output
+    ///   `[0]` contains.
+    ///
+    /// For “where is the watermark?”, threshold or plot this vector against
+    /// the model's documented time base. Do not assume index `i` maps to
+    /// sample `i` unless your specific ONNX export says so.
     pub localization: Vec<f32>,
 }
 

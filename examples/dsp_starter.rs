@@ -69,9 +69,6 @@ fn main() {
         frames_per_sec
     );
     for p in peaks.iter().take(8) {
-        println!(
-            "  t_frame={} f_bin={} mag={:.2}",
-            p.t_frame, p.f_bin, p.mag
-        );
+        println!("  t_frame={} f_bin={} mag={:.2}", p.t_frame, p.f_bin, p.mag);
     }
 }
