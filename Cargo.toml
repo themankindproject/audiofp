@@ -98,6 +98,17 @@ required-features = ["std"]
 [[example]]
 name = "stream_buffer"
 
+[[example]]
+name = "dsp_starter"
+
+[[example]]
+name = "neural_embed"
+required-features = ["neural"]
+
+[[example]]
+name = "watermark_detect"
+required-features = ["watermark"]
+
 [profile.release]
 lto           = "fat"
 codegen-units = 1
