@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Zero-deps README quick start** before the file-decode example (#38).
+- **Pinned performance numbers** to v0.2.0 / v0.3.4 with a YMMV note and
+  streaming bench pointer (#51).
+- **USAGE.md**: wrap copy-paste snippets in `fn main()`, replace undefined
+  `whole_song` / `audio_capture_iter` placeholders (#55); add async /
+  batching / watermark-model download guidance (#50); document
+  `WatermarkResult::localization` contract (#59).
+- **Examples**: `dsp_starter`, `neural_embed` (`neural`),
+  `watermark_detect` (`watermark`) (#39).
+
 ## [0.3.7] - 2026-07-08
 
 ### Changed
