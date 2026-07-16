@@ -189,3 +189,21 @@ fn real_audio_haitsma_robustness() {
         "Haitsma bit similarity under lowpass = {sim_lp:.3} (threshold 0.88)",
     );
 }
+
+#[test]
+fn real_audio_silence_handling() {
+    let silence = vec![0.0_f32; 8000 * 5]; // 5 seconds of silence at 8kHz
+
+    // Wang should not panic, and should produce zero hashes
+    let w_hashes = wang_hash_set(&silence, 8_000);
+    assert_eq!(w_hashes.len(), 0);
+
+    // Panako should not panic, and should produce zero hashes
+    let p_hashes = panako_hash_set(&silence, 8_000);
+    assert_eq!(p_hashes.len(), 0);
+
+    // Haitsma should not panic, and should produce frames (since energy difference of 0 is just constant bits)
+    let silence_5k = vec![0.0_f32; 5000 * 5];
+    let h_frames = haitsma_frames(&silence_5k, 5_000);
+    assert!(!h_frames.is_empty());
+}
