@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Optimize PeakPicker scratch buffers**: Replaced zero-filling resizes of reused vectors (`max_buf`, `temp_2d`, `col_in`, `col_out`) with conditional `set_len` when capacity is already sufficient, saving millions of writes on every extraction.
+- **Avoid heap allocations in Haitsma**: Introduced a reused `power_buf` buffer within `Haitsma` to eliminate `Vec<f32>` allocations in `stft.power_flat` on every extraction.
+- **Optimize suffix_max in Panako**: Replaced full zero-filling resizes of `suffix_max` in triplet generation with a conditional check, truncating and zeroing only the last element.
+
 ### Documentation
 
 - **Zero-deps README quick start** before the file-decode example (#38).
