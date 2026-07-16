@@ -318,8 +318,12 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         // Heap-based top-K over (b, c) tuples, scored by `b.mag + c.mag`.
         // Suffix-max array enables early-exit without reordering targets.
         let targets_len = targets.len();
-        suffix_max.clear();
-        suffix_max.resize(targets_len + 1, 0.0_f32);
+        if suffix_max.len() < targets_len + 1 {
+            suffix_max.resize(targets_len + 1, 0.0_f32);
+        } else {
+            suffix_max.truncate(targets_len + 1);
+            suffix_max[targets_len] = 0.0_f32;
+        }
         for j in (0..targets_len).rev() {
             let m = targets[j].mag;
             suffix_max[j] = if m > suffix_max[j + 1] {

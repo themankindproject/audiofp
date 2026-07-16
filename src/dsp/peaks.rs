@@ -151,15 +151,22 @@ impl PeakPicker {
         }
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
 
+        #[inline]
+        fn prepare_vec_uninit(v: &mut Vec<f32>, new_len: usize) {
+            if v.capacity() < new_len {
+                v.resize(new_len, 0.0);
+            } else {
+                unsafe {
+                    v.set_len(new_len);
+                }
+            }
+        }
+
         // Resize pooled scratch (no-op when capacity already covers it).
-        self.max_buf.clear();
-        self.max_buf.resize(spec.len(), 0.0);
-        self.temp_2d.clear();
-        self.temp_2d.resize(spec.len(), 0.0);
-        self.col_in.clear();
-        self.col_in.resize(n_frames, 0.0);
-        self.col_out.clear();
-        self.col_out.resize(n_frames, 0.0);
+        prepare_vec_uninit(&mut self.max_buf, spec.len());
+        prepare_vec_uninit(&mut self.temp_2d, spec.len());
+        prepare_vec_uninit(&mut self.col_in, n_frames);
+        prepare_vec_uninit(&mut self.col_out, n_frames);
 
         rolling_max_2d_pooled(
             spec,

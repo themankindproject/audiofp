@@ -113,6 +113,8 @@ pub struct Haitsma {
     energies_buf: Vec<[f32; HAITSMA_N_BANDS]>,
     /// Reused buffer for packed frame hashes across `extract` calls.
     frames_buf: Vec<u32>,
+    /// Reused buffer for STFT power spectrogram across `extract` calls.
+    power_buf: Vec<f32>,
 }
 
 impl Default for Haitsma {
@@ -154,6 +156,7 @@ impl Haitsma {
             band_ranges,
             energies_buf: Vec::new(),
             frames_buf: Vec::new(),
+            power_buf: Vec::new(),
         }
     }
 }
@@ -191,7 +194,10 @@ impl Fingerprinter for Haitsma {
 
         // Pull power directly — band energy is `Σ |X|²`, so the previous
         // path's `m * m` after a `sqrt(|X|²)` was redundant.
-        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
+        let (n_frames, n_bins) = self
+            .stft
+            .power_flat_into(audio.samples, &mut self.power_buf);
+        let power_flat = &self.power_buf;
         if n_frames < 2 {
             return Ok(HaitsmaFingerprint {
                 frames: Vec::new(),
