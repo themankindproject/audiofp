@@ -6,9 +6,11 @@
 
 use std::collections::HashSet;
 
-use audiofp::classical::{Haitsma, Panako, Wang};
-use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::classical::{
+    Haitsma, Panako, Wang, StreamingHaitsma, StreamingPanako, StreamingWang
+};
+use audiofp::io::{decode_to_mono, decode_to_mono_at};
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate, StreamingFingerprinter};
 
 // ---- Helper Functions ----
 
@@ -206,4 +208,93 @@ fn real_audio_silence_handling() {
     let silence_5k = vec![0.0_f32; 5000 * 5];
     let h_frames = haitsma_frames(&silence_5k, 5_000);
     assert!(!h_frames.is_empty());
+}
+
+#[test]
+fn real_audio_streaming_equivalence() {
+    let path = "tests/assets/speech.ogg";
+    let samples_8k = decode_to_mono_at(path, 8_000).expect("failed to decode at 8kHz");
+    
+    // --- Wang ---
+    let mut wang_offline = Wang::default();
+    let off_wang = wang_offline.extract(AudioBuffer { samples: &samples_8k, rate: SampleRate::HZ_8000 }).unwrap().hashes;
+
+    let mut wang_stream = StreamingWang::default();
+    let mut online_wang = Vec::new();
+    
+    let chunk_sizes = [128, 512, 1024, 256, 2048, 128];
+    let mut cursor = 0;
+    while cursor < samples_8k.len() {
+        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
+        let end = cursor + chunk_len;
+        online_wang.extend(wang_stream.push(&samples_8k[cursor..end]).into_iter().map(|(_, h)| h));
+        cursor = end;
+    }
+    online_wang.extend(wang_stream.flush().into_iter().map(|(_, h)| h));
+
+    let mut a_wang = off_wang;
+    let mut b_wang = online_wang;
+    a_wang.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+    b_wang.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+    assert_eq!(a_wang, b_wang);
+
+    // --- Panako ---
+    let mut panako_offline = Panako::default();
+    let off_panako = panako_offline.extract(AudioBuffer { samples: &samples_8k, rate: SampleRate::HZ_8000 }).unwrap().hashes;
+
+    let mut panako_stream = StreamingPanako::default();
+    let mut online_panako = Vec::new();
+    let mut cursor = 0;
+    while cursor < samples_8k.len() {
+        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
+        let end = cursor + chunk_len;
+        online_panako.extend(panako_stream.push(&samples_8k[cursor..end]).into_iter().map(|(_, h)| h));
+        cursor = end;
+    }
+    online_panako.extend(panako_stream.flush().into_iter().map(|(_, h)| h));
+
+    let mut a_panako = off_panako;
+    let mut b_panako = online_panako;
+    a_panako.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+    b_panako.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+    assert_eq!(a_panako, b_panako);
+
+    // --- Haitsma ---
+    let samples_5k = decode_to_mono_at(path, 5_000).expect("failed to decode at 5kHz");
+    let mut haitsma_offline = Haitsma::default();
+    let off_haitsma = haitsma_offline.extract(AudioBuffer { samples: &samples_5k, rate: SampleRate::HZ_5000 }).unwrap().frames;
+
+    let mut haitsma_stream = StreamingHaitsma::default();
+    let mut online_haitsma = Vec::new();
+    let mut cursor = 0;
+    while cursor < samples_5k.len() {
+        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_5k.len() - cursor);
+        let end = cursor + chunk_len;
+        online_haitsma.extend(haitsma_stream.push(&samples_5k[cursor..end]).into_iter().map(|(_, h)| h));
+        cursor = end;
+    }
+    online_haitsma.extend(haitsma_stream.flush().into_iter().map(|(_, h)| h));
+
+    assert_eq!(off_haitsma, online_haitsma);
+}
+
+#[test]
+fn real_audio_resampler_and_channel_verification() {
+    let path = "tests/assets/speech.ogg";
+    
+    // 1. decode_to_mono downmixes channels and yields native sampling rate
+    let (native_samples, native_sr) = decode_to_mono(path).expect("failed to decode mono");
+    assert!(native_sr > 0);
+    assert!(!native_samples.is_empty());
+
+    // 2. Resample using SincResampler directly
+    let resampler = audiofp::dsp::resample::SincResampler::new(native_sr, 8_000);
+    let resampled_manually = resampler.process(&native_samples);
+
+    // 3. Compare with decode_to_mono_at output
+    let resampled_auto = decode_to_mono_at(path, 8_000).expect("failed to decode at 8kHz");
+
+    assert_eq!(resampled_manually.len(), resampled_auto.len());
+    let diff: f32 = resampled_manually.iter().zip(resampled_auto.iter()).map(|(a, b)| (a - b).abs()).sum();
+    assert!(diff < 1e-4, "Resampler difference too large: {}", diff);
 }
