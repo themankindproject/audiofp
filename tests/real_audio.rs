@@ -6,9 +6,7 @@
 
 use std::collections::HashSet;
 
-use audiofp::classical::{
-    Haitsma, Panako, Wang, StreamingHaitsma, StreamingPanako, StreamingWang
-};
+use audiofp::classical::{Haitsma, Panako, StreamingHaitsma, StreamingPanako, StreamingWang, Wang};
 use audiofp::io::{decode_to_mono, decode_to_mono_at};
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate, StreamingFingerprinter};
 
@@ -112,7 +110,7 @@ fn haitsma_similarity(clean: &[u32], dirty: &[u32]) -> f32 {
 fn real_audio_speech_robustness() {
     let path = "tests/assets/speech.ogg";
     let clean = decode_to_mono_at(path, 8_000).expect("failed to decode speech.ogg at 8kHz");
-    
+
     // --- Wang ---
     // Test Noise Robustness (30 dB SNR)
     let noisy = add_noise(&clean, 30.0, 0x1234);
@@ -124,7 +122,10 @@ fn real_audio_speech_robustness() {
 
     // Test Lowpass Robustness
     let lowpassed = lowpass(&clean, 0.20);
-    let overlap_lp = jaccard(&wang_hash_set(&clean, 8_000), &wang_hash_set(&lowpassed, 8_000));
+    let overlap_lp = jaccard(
+        &wang_hash_set(&clean, 8_000),
+        &wang_hash_set(&lowpassed, 8_000),
+    );
     assert!(
         overlap_lp >= 0.50,
         "Wang speech Jaccard under lowpass = {overlap_lp:.3} (threshold 0.50)",
@@ -132,14 +133,20 @@ fn real_audio_speech_robustness() {
 
     // --- Panako ---
     // Test Noise Robustness (30 dB SNR)
-    let overlap_noise_panako = jaccard(&panako_hash_set(&clean, 8_000), &panako_hash_set(&noisy, 8_000));
+    let overlap_noise_panako = jaccard(
+        &panako_hash_set(&clean, 8_000),
+        &panako_hash_set(&noisy, 8_000),
+    );
     assert!(
         overlap_noise_panako >= 0.20,
         "Panako speech Jaccard at 30 dB SNR = {overlap_noise_panako:.3} (threshold 0.20)",
     );
 
     // Test Lowpass Robustness
-    let overlap_lp_panako = jaccard(&panako_hash_set(&clean, 8_000), &panako_hash_set(&lowpassed, 8_000));
+    let overlap_lp_panako = jaccard(
+        &panako_hash_set(&clean, 8_000),
+        &panako_hash_set(&lowpassed, 8_000),
+    );
     assert!(
         overlap_lp_panako >= 0.40,
         "Panako speech Jaccard under lowpass = {overlap_lp_panako:.3} (threshold 0.40)",
@@ -153,14 +160,20 @@ fn real_audio_piano_robustness() {
 
     // Test Lowpass Robustness for Wang
     let lowpassed = lowpass(&clean, 0.20);
-    let overlap_lp_wang = jaccard(&wang_hash_set(&clean, 8_000), &wang_hash_set(&lowpassed, 8_000));
+    let overlap_lp_wang = jaccard(
+        &wang_hash_set(&clean, 8_000),
+        &wang_hash_set(&lowpassed, 8_000),
+    );
     assert!(
         overlap_lp_wang >= 0.50,
         "Wang piano Jaccard under lowpass = {overlap_lp_wang:.3} (threshold 0.50)",
     );
 
     // Test Lowpass Robustness for Panako
-    let overlap_lp_panako = jaccard(&panako_hash_set(&clean, 8_000), &panako_hash_set(&lowpassed, 8_000));
+    let overlap_lp_panako = jaccard(
+        &panako_hash_set(&clean, 8_000),
+        &panako_hash_set(&lowpassed, 8_000),
+    );
     assert!(
         overlap_lp_panako >= 0.40,
         "Panako piano Jaccard under lowpass = {overlap_lp_panako:.3} (threshold 0.40)",
@@ -214,20 +227,31 @@ fn real_audio_silence_handling() {
 fn real_audio_streaming_equivalence() {
     let path = "tests/assets/speech.ogg";
     let samples_8k = decode_to_mono_at(path, 8_000).expect("failed to decode at 8kHz");
-    
+
     // --- Wang ---
     let mut wang_offline = Wang::default();
-    let off_wang = wang_offline.extract(AudioBuffer { samples: &samples_8k, rate: SampleRate::HZ_8000 }).unwrap().hashes;
+    let off_wang = wang_offline
+        .extract(AudioBuffer {
+            samples: &samples_8k,
+            rate: SampleRate::HZ_8000,
+        })
+        .unwrap()
+        .hashes;
 
     let mut wang_stream = StreamingWang::default();
     let mut online_wang = Vec::new();
-    
+
     let chunk_sizes = [128, 512, 1024, 256, 2048, 128];
     let mut cursor = 0;
     while cursor < samples_8k.len() {
         let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
         let end = cursor + chunk_len;
-        online_wang.extend(wang_stream.push(&samples_8k[cursor..end]).into_iter().map(|(_, h)| h));
+        online_wang.extend(
+            wang_stream
+                .push(&samples_8k[cursor..end])
+                .into_iter()
+                .map(|(_, h)| h),
+        );
         cursor = end;
     }
     online_wang.extend(wang_stream.flush().into_iter().map(|(_, h)| h));
@@ -240,7 +264,13 @@ fn real_audio_streaming_equivalence() {
 
     // --- Panako ---
     let mut panako_offline = Panako::default();
-    let off_panako = panako_offline.extract(AudioBuffer { samples: &samples_8k, rate: SampleRate::HZ_8000 }).unwrap().hashes;
+    let off_panako = panako_offline
+        .extract(AudioBuffer {
+            samples: &samples_8k,
+            rate: SampleRate::HZ_8000,
+        })
+        .unwrap()
+        .hashes;
 
     let mut panako_stream = StreamingPanako::default();
     let mut online_panako = Vec::new();
@@ -248,7 +278,12 @@ fn real_audio_streaming_equivalence() {
     while cursor < samples_8k.len() {
         let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
         let end = cursor + chunk_len;
-        online_panako.extend(panako_stream.push(&samples_8k[cursor..end]).into_iter().map(|(_, h)| h));
+        online_panako.extend(
+            panako_stream
+                .push(&samples_8k[cursor..end])
+                .into_iter()
+                .map(|(_, h)| h),
+        );
         cursor = end;
     }
     online_panako.extend(panako_stream.flush().into_iter().map(|(_, h)| h));
@@ -262,7 +297,13 @@ fn real_audio_streaming_equivalence() {
     // --- Haitsma ---
     let samples_5k = decode_to_mono_at(path, 5_000).expect("failed to decode at 5kHz");
     let mut haitsma_offline = Haitsma::default();
-    let off_haitsma = haitsma_offline.extract(AudioBuffer { samples: &samples_5k, rate: SampleRate::HZ_5000 }).unwrap().frames;
+    let off_haitsma = haitsma_offline
+        .extract(AudioBuffer {
+            samples: &samples_5k,
+            rate: SampleRate::HZ_5000,
+        })
+        .unwrap()
+        .frames;
 
     let mut haitsma_stream = StreamingHaitsma::default();
     let mut online_haitsma = Vec::new();
@@ -270,7 +311,12 @@ fn real_audio_streaming_equivalence() {
     while cursor < samples_5k.len() {
         let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_5k.len() - cursor);
         let end = cursor + chunk_len;
-        online_haitsma.extend(haitsma_stream.push(&samples_5k[cursor..end]).into_iter().map(|(_, h)| h));
+        online_haitsma.extend(
+            haitsma_stream
+                .push(&samples_5k[cursor..end])
+                .into_iter()
+                .map(|(_, h)| h),
+        );
         cursor = end;
     }
     online_haitsma.extend(haitsma_stream.flush().into_iter().map(|(_, h)| h));
@@ -281,7 +327,7 @@ fn real_audio_streaming_equivalence() {
 #[test]
 fn real_audio_resampler_and_channel_verification() {
     let path = "tests/assets/speech.ogg";
-    
+
     // 1. decode_to_mono downmixes channels and yields native sampling rate
     let (native_samples, native_sr) = decode_to_mono(path).expect("failed to decode mono");
     assert!(native_sr > 0);
@@ -295,6 +341,10 @@ fn real_audio_resampler_and_channel_verification() {
     let resampled_auto = decode_to_mono_at(path, 8_000).expect("failed to decode at 8kHz");
 
     assert_eq!(resampled_manually.len(), resampled_auto.len());
-    let diff: f32 = resampled_manually.iter().zip(resampled_auto.iter()).map(|(a, b)| (a - b).abs()).sum();
+    let diff: f32 = resampled_manually
+        .iter()
+        .zip(resampled_auto.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum();
     assert!(diff < 1e-4, "Resampler difference too large: {}", diff);
 }

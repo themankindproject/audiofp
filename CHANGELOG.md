@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Real Audio integration tests**: Added CC0 speech and piano Ogg assets (`tests/assets/`) and integration test suite (`tests/real_audio.rs`) to verify Wang, Panako, and Haitsma robustness against 30 dB SNR noise, highband lowpass filtering, flat silence handling, resampling invariance, and streaming equivalence.
+
 ### Performance
 
 - **Optimize PeakPicker scratch buffers**: Replaced zero-filling resizes of reused vectors (`max_buf`, `temp_2d`, `col_in`, `col_out`) with conditional `set_len` when capacity is already sufficient, saving millions of writes on every extraction.
