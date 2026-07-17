@@ -54,6 +54,9 @@ pub struct HaitsmaFingerprint {
 }
 
 /// Tunable parameters for [`Haitsma`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `HaitsmaConfig { fmin: 400.0, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct HaitsmaConfig {
     /// Lowest band edge in Hz. Default 300.

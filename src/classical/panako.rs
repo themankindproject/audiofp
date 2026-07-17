@@ -85,6 +85,9 @@ pub struct PanakoFingerprint {
 }
 
 /// Tunable parameters for [`Panako`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `PanakoConfig { fan_out: 3, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct PanakoConfig {
     /// Triplets emitted per anchor. Default 5; raising this fattens the
@@ -105,13 +108,15 @@ pub struct PanakoConfig {
     pub max_input_samples: Option<usize>,
     /// Maximum number of hashes allowed. `None` disables. Default: 500_000.
     pub max_hashes: Option<usize>,
-    /// Maximum number of pending anchors in the streaming pipeline
-    /// (oldest-first eviction when exceeded). `None` disables.
+    /// Maximum number of pending anchors in the streaming pipeline.
+    /// `None` disables (default). When set, anchors exceeding this cap
+    /// are dropped oldest-first so memory stays bounded. Relevant only
+    /// for [`StreamingPanako`].
     pub max_pending_anchors: Option<usize>,
     /// Maximum samples accepted in a single `push` call. `None` disables
-    /// (default). Streaming is bounded per-frame internally, but one
-    /// hostile `push(&[f32; huge])` still allocates ~chunk. Set this to
-    /// cap per-push memory.
+    /// (default). When set, excess samples beyond the cap are **dropped**
+    /// (streaming `push` is infallible). Use this to bound per-push
+    /// memory under hostile chunk sizes.
     pub max_push_samples: Option<usize>,
 }
 
@@ -264,12 +269,13 @@ impl Fingerprinter for Panako {
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
 
         if let Some(limit) = self.cfg.max_hashes
-            && hashes.len() > limit {
-                return Err(AfpError::InputTooLarge {
-                    limit,
-                    provided: hashes.len(),
-                });
-            }
+            && hashes.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: hashes.len(),
+            });
+        }
 
         Ok(PanakoFingerprint {
             hashes,
@@ -710,6 +716,14 @@ impl StreamingPanako {
                     anchor.targets.swap_remove(min_idx);
                 }
             }
+            // Register this peak as a new ANCHOR.
+            // If a hard cap is configured, evict oldest anchors first
+            // so memory stays bounded under adversarial / dense input.
+            if let Some(limit) = self.cfg.max_pending_anchors {
+                while self.pending_anchors.len() >= limit {
+                    self.pending_anchors.pop_front();
+                }
+            }
             self.pending_anchors.push_back(PendingAnchorPanako {
                 peak,
                 targets: Vec::new(),
@@ -820,6 +834,10 @@ impl StreamingPanako {
     // ── Private helpers for the zero-alloc push_with / flush_with path ──
 
     fn process_push_samples(&mut self, samples: &[f32]) {
+        let samples = match self.cfg.max_push_samples {
+            Some(limit) if samples.len() > limit => &samples[..limit],
+            _ => samples,
+        };
         self.sample_carry.extend_from_slice(samples);
 
         let mut off = 0usize;
@@ -1774,5 +1792,33 @@ mod tests {
         };
         let err = fp.extract(buf).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn max_pending_anchors_evicts_oldest() {
+        let cfg = PanakoConfig {
+            max_pending_anchors: Some(100),
+            ..PanakoConfig::default()
+        };
+        let mut s = StreamingPanako::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 20);
+        let mut hashes = s.push(&samples);
+        hashes.extend(s.flush());
+        assert!(s.config().max_pending_anchors.is_some());
+        assert!(!hashes.is_empty(), "should produce hashes with cap=100");
+    }
+
+    #[test]
+    fn max_push_samples_truncates_hostile_chunk() {
+        let cfg = PanakoConfig {
+            max_push_samples: Some(512),
+            ..PanakoConfig::default()
+        };
+        let mut s = StreamingPanako::new(cfg);
+        // One huge push must not panic; only the first 512 samples are kept.
+        let samples = synthetic_audio(0xBEEF, 8_000 * 5);
+        let _ = s.push(&samples);
+        let _ = s.flush();
+        assert_eq!(s.config().max_push_samples, Some(512));
     }
 }

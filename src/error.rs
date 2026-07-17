@@ -62,14 +62,17 @@ pub enum AfpError {
     /// The input exceeds the configured maximum. Raised early in decode
     /// and extract paths to prevent OOM from untrusted audio. The limit
     /// can be raised or disabled entirely via the config struct.
+    ///
+    /// `limit` / `provided` share the same unit as the check that failed
+    /// (samples, bytes, or hash count — see the call site).
     #[error(
-        "input too large: {provided} samples exceeds maximum {limit}; \
+        "input too large: {provided} exceeds maximum {limit}; \
          raise the limit or set it to None to disable"
     )]
     InputTooLarge {
         /// Configured limit that was exceeded.
         limit: usize,
-        /// Number of samples actually passed.
+        /// Actual size that exceeded the limit (same unit as `limit`).
         provided: usize,
     },
 

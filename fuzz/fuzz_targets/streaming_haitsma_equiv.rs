@@ -29,6 +29,7 @@ fuzz_target!(|data: &[u8]| {
         fmin,
         fmax,
         max_input_samples: None,
+        ..Default::default()
     };
 
     let samples = &input.samples[..min_len];

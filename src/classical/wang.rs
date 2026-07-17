@@ -51,6 +51,9 @@ pub struct WangFingerprint {
 }
 
 /// Tunable parameters for [`Wang`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `WangConfig { fan_out: 5, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct WangConfig {
     /// `F`: target peaks paired with each anchor. Default 10; embedded
@@ -241,12 +244,13 @@ impl Fingerprinter for Wang {
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
 
         if let Some(limit) = self.cfg.max_hashes
-            && hashes.len() > limit {
-                return Err(AfpError::InputTooLarge {
-                    limit,
-                    provided: hashes.len(),
-                });
-            }
+            && hashes.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: hashes.len(),
+            });
+        }
 
         Ok(WangFingerprint {
             hashes,

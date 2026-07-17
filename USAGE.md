@@ -94,7 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The [`prelude`] module pulls in all three classical fingerprinters, both
 core traits, error types, and value types with one glob import.
 [`fingerprint_file`] handles decode → resample → extract in one call
-(requires `std`).
+(requires `std`). For untrusted uploads prefer
+`fingerprint_file_capped` with `io::DecodeLimits::both(...)`.
 
 ### Detect duplicate songs across re-encodings
 
@@ -290,6 +291,9 @@ pub struct WangConfig {
     pub target_zone_f: u16,      // default 64 bins
     pub peaks_per_sec: u16,      // default 30
     pub min_anchor_mag_db: f32,  // default -50.0
+    pub max_input_samples: Option<usize>, // default 14_400_000; None to disable
+    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
+    pub max_pending_anchors: Option<usize>, // default None; streaming only
 }
 ```
 
@@ -301,6 +305,8 @@ pub struct WangConfig {
 | `peaks_per_sec`     | 30      | Peaks the picker keeps per 1 s bucket                      |
 | `min_anchor_mag_db` | -50.0   | Magnitude floor: peaks below this dB level are ignored     |
 | `max_input_samples` | 14 400 000 (30 min @ 8 kHz) | Rejects larger inputs early with `InputTooLarge`. `None` disables. |
+| `max_hashes` | 500 000 | Rejects extracts that would emit more hashes. `None` disables. |
+| `max_pending_anchors` | `None` | Streaming: oldest-first eviction when pending anchors exceed the cap. |
 
 #### Output: `WangFingerprint`
 
@@ -364,6 +370,9 @@ pub struct PanakoConfig {
     pub peaks_per_sec: u16,      // default 30
     pub min_anchor_mag_db: f32,  // default -50.0
     pub max_input_samples: Option<usize>, // default 14 400 000; None to disable
+    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
+    pub max_pending_anchors: Option<usize>, // default None; streaming eviction
+    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
 }
 ```
 
@@ -532,23 +541,40 @@ Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::
 let samples = decode_to_mono_at("song.mp3", 8_000)?;
 ```
 
-### `decode_to_mono_capped` and `decode_to_mono_at_capped` (OOM protection)
+### `decode_to_mono_capped` / `decode_to_mono_limited` (OOM protection)
 
 ```rust
+pub struct DecodeLimits {
+    pub max_bytes: u64,              // 0 = unlimited
+    pub max_samples: Option<usize>,  // None = unlimited
+}
+
 pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)>;
+pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
 pub fn decode_to_mono_at_capped<P: AsRef<Path>>(path: P, target_sr: u32, max_bytes: u64) -> Result<Vec<f32>>;
+pub fn decode_to_mono_at_limited<P: AsRef<Path>>(path: P, target_sr: u32, limits: DecodeLimits) -> Result<Vec<f32>>;
 ```
 
-Cap the source file at `max_bytes` using `fs::metadata()` before opening the
-stream — a malicious 4 GB upload is rejected in < 1 µs without touching
-the decoder. Pass `max_bytes = 0` for unlimited.
+`max_bytes` is checked via `fs::metadata()` **before** opening the stream —
+a malicious 4 GB upload is rejected in < 1 µs. Pass `max_bytes = 0` for
+unlimited. Oversized inputs return `AfpError::InputTooLarge`.
+
+For **compressed** uploads, also set `max_samples` (use
+`DecodeLimits::both`) — on-disk size does not bound decoded PCM.
 
 ```rust
-use audiofp::io::decode_to_mono_capped;
+use audiofp::io::{decode_to_mono_capped, decode_to_mono_limited, DecodeLimits};
 
-// Reject anything larger than 50 MB:
+// Byte cap only:
 let (samples, sr) = decode_to_mono_capped("user_upload.mp3", 50 * 1024 * 1024)?;
+
+// Production: byte + sample caps:
+let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
+let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
 ```
+
+`fingerprint_file` is for trusted paths. For uploads use
+`fingerprint_file_capped(&mut fp, path, limits)`.
 
 ### Supported formats
 
@@ -572,7 +598,7 @@ The decoder probes magic bytes too — extension-less files still work as long a
 | Format unrecognised                       | `AfpError::Io`                   |
 | Per-packet decode failure                 | (silently skipped — resilient)   |
 | Stream-fatal decode failure               | `AfpError::Io`                   |
-| File exceeds `max_bytes` cap              | `AfpError::Config`               |
+| File exceeds `max_bytes` / `max_samples` cap | `AfpError::InputTooLarge`        |
 
 Recoverable per-packet failures are silently skipped to keep one corrupt block from killing a whole-file decode; only stream-fatal errors propagate.
 
@@ -1127,7 +1153,7 @@ pub enum AfpError {
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun { dropped: usize },
 
-    #[error("input too large: {provided} samples exceeds maximum {limit}")]
+    #[error("input too large: {provided} exceeds maximum {limit}")]
     InputTooLarge { limit: usize, provided: usize },
 
     #[error("invalid configuration: {0}")]

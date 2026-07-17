@@ -18,27 +18,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes the field (default `None` for BYO-model scenarios where the
   caller knows the model's limits). A 4 GB malicious upload now returns
   `InputTooLarge` instead of OOM.
-- **OOM protection — decoder file-size caps.**
-  `io::decode_to_mono_capped(path, max_bytes)` and
-  `io::decode_to_mono_at_capped(path, target_sr, max_bytes)` reject files
+- **OOM protection — decoder file-size and PCM caps.**
+  `io::decode_to_mono_capped` / `io::decode_to_mono_at_capped` reject files
   whose on-disk size exceeds `max_bytes` (0 = unlimited) before opening
-  the stream. The pre-check uses `fs::metadata()` so a 4 GB file fails
-  in < 1 µs without touching the decoder. Closes #68.
+  the stream, returning `AfpError::InputTooLarge`.
+  `DecodeLimits` + `decode_to_mono_limited` / `decode_to_mono_at_limited`
+  also bound **decoded mono sample count** so compressed formats cannot
+  inflate past a sample budget. Closes #68.
 - **`AfpError::InputTooLarge` error variant.** Structured error reporting
-  the configured limit and the actual input size. `Display` text
-  includes both numbers and a hint about raising the limit.
+  the configured limit and the actual input size (samples, bytes, or
+  hashes depending on the check). `Display` text includes both numbers
+  and a hint about raising the limit.
 - **`audiofp::prelude` module (#14).** Convenience glob import
   (`use audiofp::prelude::*`) that pulls in all three classical
   fingerprinters with their config/hash types, both core traits,
   error types, and value types. Includes a doc-test showing the
   shortest path from zero to a fingerprint.
-- **`fingerprint_file` one-shot helper (#15).** `fingerprint_file(&mut
-  fingerprinter, path)` decodes the file, resamples to the
-  algorithm's required rate, and extracts the fingerprint — all in one
-  call. Requires `std`. Re-exported at `audiofp::fingerprint_file`.
+- **`fingerprint_file` / `fingerprint_file_capped` (#15).** One-shot
+  decode → resample → extract. `fingerprint_file` is for trusted paths;
+  `fingerprint_file_capped` takes `DecodeLimits` for untrusted uploads.
+  Requires `std`. Re-exported at the crate root.
 
 ### Fixed
 
+- **`decode_to_mono_capped` returned `Config` instead of `InputTooLarge`.**
+  Oversized files now match the documented `InputTooLarge` variant.
+- **`PanakoConfig::max_pending_anchors` was dead.** Streaming Panako now
+  evicts oldest-first, matching Wang.
+- **`PanakoConfig::max_push_samples` was dead.** Streaming Panako now
+  truncates hostile `push` chunks to the configured cap.
 - **Panako `target_zone_t == 0` underflow** (P0): Setting `PanakoConfig::target_zone_t` to 0 caused `u32::MAX`-byte allocation via `saturating_add(u32::MAX - 1)`, guaranteed OOM. All four constructors (`Wang`, `StreamingWang`, `Panako`, `StreamingPanako`) now clamp `target_zone_t ∈ [1, 512]` and `fan_out ∈ [1, 64]`. `peaks_per_sec` is also capped at ≤ 500 to bound per-second allocation. Extreme config values (e.g. `u16::MAX`) are silently clamped rather than panicking — fully backward-compatible for all values within the default range.
 - **Decoder `n_chans == 0` guard**: Corrupt packets reporting 0 channels previously caused division-by-zero producing NaN/Inf PCM samples. Malformed packets are now silently skipped (same policy as recoverable decode errors).
 - **Streaming `push_with` / `flush_with` zero-alloc overrides**: All three classical streaming fingerprinters (`StreamingWang`, `StreamingPanako`, `StreamingHaitsma`) now override the default trait implementations with genuine zero-allocation callback loops. Previously fell back to the trait default which allocates a `Vec` on every call, contradicting the documented contract.
