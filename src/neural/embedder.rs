@@ -51,6 +51,12 @@ pub struct NeuralEmbedderConfig {
     /// L2-normalise emitted embeddings. Default `true` — appropriate
     /// when downstream similarity is cosine.
     pub l2_normalize: bool,
+    /// Maximum input sample count accepted by [`extract`]. `None`
+    /// disables the check. Default: `None` (unlimited — neural
+    /// models may handle long audio). Set to limit memory.
+    ///
+    /// [`extract`]: NeuralEmbedder::extract
+    pub max_input_samples: Option<usize>,
 }
 
 impl NeuralEmbedderConfig {
@@ -73,6 +79,7 @@ impl NeuralEmbedderConfig {
             window_secs: 1.0,
             hop_secs: 1.0,
             l2_normalize: true,
+            max_input_samples: None,
         }
     }
 }
@@ -434,6 +441,14 @@ impl Fingerprinter for NeuralEmbedder {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        if let Some(limit) = self.core.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
         if audio.rate.hz() != self.core.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }

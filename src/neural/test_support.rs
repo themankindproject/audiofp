@@ -150,5 +150,6 @@ pub(crate) fn small_cfg() -> NeuralEmbedderConfig {
         window_secs: 0.25, // 4_000 samples → (4000-256)/128 + 1 = 30 frames
         hop_secs: 0.25,
         l2_normalize: true,
+        max_input_samples: None,
     }
 }
