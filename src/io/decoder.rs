@@ -58,6 +58,36 @@ pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
     decode_inner(mss, &hint)
 }
 
+/// Decode with a cap on total bytes read from disk. Returns Ok if the
+/// file fits within `max_bytes`; returns [`AfpError::InputTooLarge`]
+/// otherwise. `max_bytes == 0` means unlimited (same as
+/// [`decode_to_mono`]).
+///
+/// Use this when accepting untrusted uploads — a malicious 4 GB file
+/// won't OOM the host.
+pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)> {
+    let path = path.as_ref();
+    // Pre-check: don't even open files that are clearly too large.
+    if max_bytes > 0 {
+        let meta = std::fs::metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+        if meta.len() > max_bytes {
+            return Err(AfpError::Config(format!(
+                "file size {} exceeds max_bytes {max_bytes}",
+                meta.len(),
+            )));
+        }
+    }
+    let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    decode_inner(mss, &hint)
+}
+
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
 ///
 /// Pass-through (no resample) when the file already matches `target_sr`.
@@ -85,6 +115,25 @@ pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<
         return Err(AfpError::Config("target sample rate must be > 0".into()));
     }
     let (samples, sr) = decode_to_mono(path)?;
+    if sr == target_sr {
+        Ok(samples)
+    } else {
+        let r = SincResampler::new(sr, target_sr);
+        Ok(r.process(&samples))
+    }
+}
+
+/// Same as [`decode_to_mono_at`] but caps the source file at
+/// `max_bytes` to prevent OOM from maliciously large inputs.
+pub fn decode_to_mono_at_capped<P: AsRef<Path>>(
+    path: P,
+    target_sr: u32,
+    max_bytes: u64,
+) -> Result<Vec<f32>> {
+    if target_sr == 0 {
+        return Err(AfpError::Config("target sample rate must be > 0".into()));
+    }
+    let (samples, sr) = decode_to_mono_capped(path, max_bytes)?;
     if sr == target_sr {
         Ok(samples)
     } else {
@@ -203,6 +252,12 @@ fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> 
 
         let n_frames = buf.frames();
         let n_chans = buf.spec().channels().count();
+
+        // Defensive: skip packets that report 0 channels (malformed /
+        // corrupt). Avoids division by zero and `.plane(0).unwrap()` panic.
+        if n_chans == 0 {
+            continue;
+        }
 
         if n_chans == 1 {
             samples.extend_from_slice(&buf.plane(0).unwrap()[..n_frames]);
