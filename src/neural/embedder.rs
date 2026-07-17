@@ -342,7 +342,7 @@ impl NeuralEmbedder {
         }
         let model = tract_onnx::onnx()
             .model_for_path(path)
-            .map_err(|e| map_model_load_err(e))?;
+            .map_err(map_model_load_err)?;
 
         // Concretise input shape, type, optimise, and build the runnable
         // plan — once. This is the work the watermark detector

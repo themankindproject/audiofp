@@ -18,7 +18,7 @@ pub(crate) fn reject_non_finite(samples: &[f32]) -> Result<()> {
 
 /// Truncate a streaming `push` chunk to `max` samples when configured.
 #[inline]
-pub(crate) fn truncate_push<'a>(samples: &'a [f32], max: Option<usize>) -> &'a [f32] {
+pub(crate) fn truncate_push(samples: &[f32], max: Option<usize>) -> &[f32] {
     match max {
         Some(limit) if samples.len() > limit => &samples[..limit],
         _ => samples,
