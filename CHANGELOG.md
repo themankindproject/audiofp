@@ -9,13 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Real Audio integration tests**: Added CC0 speech and piano Ogg assets (`tests/assets/`) and integration test suite (`tests/real_audio.rs`) to verify Wang, Panako, and Haitsma robustness against 30 dB SNR noise, highband lowpass filtering, flat silence handling, resampling invariance, and streaming equivalence.
+- **OOM protection — `max_input_samples` on all offline fingerprinter configs (#68).**
+  `WangConfig`, `PanakoConfig`, and `HaitsmaConfig` each gain a
+  `max_input_samples: Option<usize>` field. When set, `extract()` rejects
+  inputs larger than the cap with `AfpError::InputTooLarge` before any
+  allocation. Safe defaults (30 min at each algorithm's required rate)
+  ship out of the box; pass `None` to disable. `NeuralEmbedderConfig` also
+  exposes the field (default `None` for BYO-model scenarios where the
+  caller knows the model's limits). A 4 GB malicious upload now returns
+  `InputTooLarge` instead of OOM.
+- **OOM protection — decoder file-size caps.**
+  `io::decode_to_mono_capped(path, max_bytes)` and
+  `io::decode_to_mono_at_capped(path, target_sr, max_bytes)` reject files
+  whose on-disk size exceeds `max_bytes` (0 = unlimited) before opening
+  the stream. The pre-check uses `fs::metadata()` so a 4 GB file fails
+  in < 1 µs without touching the decoder. Closes #68.
+- **`AfpError::InputTooLarge` error variant.** Structured error reporting
+  the configured limit and the actual input size. `Display` text
+  includes both numbers and a hint about raising the limit.
+
+### Fixed
+
+- **Panako `target_zone_t == 0` underflow** (P0): Setting `PanakoConfig::target_zone_t` to 0 caused `u32::MAX`-byte allocation via `saturating_add(u32::MAX - 1)`, guaranteed OOM. All four constructors (`Wang`, `StreamingWang`, `Panako`, `StreamingPanako`) now clamp `target_zone_t ∈ [1, 512]` and `fan_out ∈ [1, 64]`. `peaks_per_sec` is also capped at ≤ 500 to bound per-second allocation. Extreme config values (e.g. `u16::MAX`) are silently clamped rather than panicking — fully backward-compatible for all values within the default range.
+- **Decoder `n_chans == 0` guard**: Corrupt packets reporting 0 channels previously caused division-by-zero producing NaN/Inf PCM samples. Malformed packets are now silently skipped (same policy as recoverable decode errors).
+- **Streaming `push_with` / `flush_with` zero-alloc overrides**: All three classical streaming fingerprinters (`StreamingWang`, `StreamingPanako`, `StreamingHaitsma`) now override the default trait implementations with genuine zero-allocation callback loops. Previously fell back to the trait default which allocates a `Vec` on every call, contradicting the documented contract.
+- **Streaming `push()` / `flush()` pooled Vec retention**: `push()` and `flush()` now use `out.append(&mut self.emitted)` instead of `core::mem::take(&mut self.emitted)` followed by `extend(drain(..))`. The pooled allocation stays with the struct across calls — no per-push reallocation. Measured: Wang extract 2 s −13.8 % wall time, streaming Wang small-chunk −29.5 % (cumulative vs pre-pool baseline).
+- **`reset()` on all three streaming types**: `StreamingWang`, `StreamingPanako`, and `StreamingHaitsma` each expose a `reset()` method that clears all internal state (buffered audio, pending peaks/anchors, frame counter). Reusing a single instance across independent streams now works correctly without stale data bleed.
 
 ### Performance
 
 - **Optimize PeakPicker scratch buffers**: Replaced zero-filling resizes of reused vectors (`max_buf`, `temp_2d`, `col_in`, `col_out`) with conditional `set_len` when capacity is already sufficient, saving millions of writes on every extraction.
 - **Avoid heap allocations in Haitsma**: Introduced a reused `power_buf` buffer within `Haitsma` to eliminate `Vec<f32>` allocations in `stft.power_flat` on every extraction.
 - **Optimize suffix_max in Panako**: Replaced full zero-filling resizes of `suffix_max` in triplet generation with a conditional check, truncating and zeroing only the last element.
+
+### Testing
+
+- **21 new tests**: Constructor clamping (defaults preserved, zero clamped to 1, extreme capped to safe bounds, clamped config still produces hashes), streaming reset+replay correctness (×3), `push_with` ≡ `push`+`flush` output parity (×6), and `flush_with` ≡ `flush` parity (×3). Test count: 265 → 286.
 
 ### Documentation
 
