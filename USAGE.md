@@ -16,6 +16,7 @@
   - [Wang (landmark pairs)](#wang-landmark-pairs)
   - [Panako (triplet hashes)](#panako-triplet-hashes)
   - [Haitsma–Kalker (band-power sign bits)](#haitsmakalker-band-power-sign-bits)
+- [Matching / Identification](#matching--identification)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
@@ -104,13 +105,15 @@ All three:
 - need at least **2 seconds** of audio
 - produce hash structs that are `bytemuck::Pod` — castable directly to bytes for storage / IPC
 
-### Indexing is out of scope
+### Matching vs persistence
 
-`audiofp` extracts fingerprints. **Storage, ANN search, and scoring are the caller's responsibility.** A typical pipeline is:
+**In-memory matching is in scope** — see [Matching / Identification](#matching--identification). Use `WangMatcher` (or `HaitsmaMatcher`) instead of naive hash-set overlap.
 
-1. `audiofp` → `Vec<WangHash>` per song
-2. Your indexer (e.g. RocksDB, FAISS, custom hash table) → "songs that share hash X at offset Y"
-3. Your scorer → "song A has 47 same-offset matches with query, song B has 3 → A wins"
+**Persistence is still out of scope.** There is no on-disk index, wire format, or database adapter. A typical production pipeline is:
+
+1. `audiofp` → fingerprints per song
+2. Your store (RocksDB, SQLite, object store, …) → durable catalog
+3. Load candidates into memory → `WangMatcher` / `WangIndex` / `match_ranked`
 
 ---
 
@@ -377,6 +380,59 @@ pub struct HaitsmaFingerprint {
 ```
 
 > Frame 0 has no hash (the algorithm needs frame n−1 for the delta). Frame indexing in `frames` is therefore offset by one relative to the spectrogram.
+
+---
+
+## Matching / Identification
+
+`audiofp::matching` scores a **query** fingerprint against one or more **references** entirely in memory. There is no persistence layer.
+
+| Matcher | Fingerprint | Strategy |
+| --- | --- | --- |
+| `WangMatcher` | `WangFingerprint` | Offset-histogram voter (Shazam-style) |
+| `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT) |
+| `NeuralMatcher` | `NeuralFingerprint` | Cosine similarity (`neural` feature) |
+| `PanakoMatcher` | `PanakoFingerprint` | **Stub** — always non-match until 2-D Hough lands |
+
+### 1:1 Wang match
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::io::decode_to_mono_at;
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+fn fingerprint(path: &str) -> Result<audiofp::classical::WangFingerprint, Box<dyn std::error::Error>> {
+    let samples = decode_to_mono_at(path, 8_000)?;
+    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+    Ok(Wang::default().extract(buf)?)
+}
+
+let query = fingerprint("clip.wav")?;
+let reference = fingerprint("catalog_track.flac")?;
+
+let matcher = WangMatcher::new(WangMatchConfig::default());
+let m = matcher.match_one(&query, &reference);
+if m.is_match {
+    println!("match: score={:.3} offset={} ms", m.score, m.offset.ms);
+}
+```
+
+Also see `cargo run --example match_two_files -- a.flac b.mp3`.
+
+### 1:N helpers
+
+- `match_best(matcher, query, refs)` — single best `(index, MatchResult)`
+- `match_ranked(matcher, query, refs)` — all refs sorted by score descending
+- `WangIndex::build(refs, max_postings_per_hash)` — inverted-index accelerator for Wang catalogs (still in-memory only)
+
+`PanakoIndex` exists for API symmetry but is a stub like `PanakoMatcher`.
+
+### Benchmarks
+
+```bash
+cargo bench --bench matching
+```
 
 ---
 

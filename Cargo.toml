@@ -75,6 +75,10 @@ required-features = ["neural"]
 name    = "streaming"
 harness = false
 
+[[bench]]
+name    = "matching"
+harness = false
+
 [lib]
 name = "audiofp"
 path = "src/lib.rs"

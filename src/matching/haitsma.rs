@@ -10,7 +10,7 @@
 //! Most offsets die in the first few frames.
 //!
 //! **Sub-fingerprint LUT** — when `reference.len() > 512`, build a
-//! `BTreeMap<u32, Vec<pos>>` over reference frames. Haitsma's key
+//! hash map `u32 → Vec<pos>` over reference frames. Haitsma's key
 //! property: when `BER < ~0.35`, at least one query frame is bit-exact,
 //! so probe each query frame's exact `u32` (plus optional 1–2 bit-flip
 //! probes) → candidate offsets → run exact BER verification only there.
@@ -20,14 +20,14 @@
 //!
 //! - Exact: `O(Q·R)` popcounts with aggressive early-abort.
 //! - LUT: `O(Q + candidates·overlap)` — sub-millisecond for song-length.
-//! - Memory: transient `BTreeMap<u32, Vec<usize>>` ≈ `r_len*12` bytes.
+//! - Memory: transient hash map ≈ `r_len*12` bytes (`HashMap` under `std`).
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::classical::HaitsmaFingerprint;
+use crate::matching::maps::HashMap;
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score};
 
 // ---------------------------------------------------------------------------
@@ -87,8 +87,8 @@ fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Build a LUT: `u32` sub-fingerprint → list of reference frame indices.
-fn build_lut(reference: &[u32]) -> BTreeMap<u32, Vec<usize>> {
-    let mut lut: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+fn build_lut(reference: &[u32]) -> HashMap<u32, Vec<usize>> {
+    let mut lut: HashMap<u32, Vec<usize>> = HashMap::new();
     for (pos, &frame) in reference.iter().enumerate() {
         lut.entry(frame).or_default().push(pos);
     }
@@ -97,7 +97,7 @@ fn build_lut(reference: &[u32]) -> BTreeMap<u32, Vec<usize>> {
 
 /// Probe all 1-bit-flip variants of `frame` (32 variants).
 #[inline]
-fn probe_1flip(frame: u32, lut: &BTreeMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
+fn probe_1flip(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
     if let Some(v) = lut.get(&frame) {
         f(v);
     }
@@ -110,7 +110,7 @@ fn probe_1flip(frame: u32, lut: &BTreeMap<u32, Vec<usize>>, f: &mut impl FnMut(&
 
 /// Probe exact + 1-bit + 2-bit-flip variants (1 + 32 + 496 = 529 probes).
 #[inline]
-fn probe_2flip(frame: u32, lut: &BTreeMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
+fn probe_2flip(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
     probe_1flip(frame, lut, f);
     for b1 in 0..32 {
         for b2 in (b1 + 1)..32 {
@@ -123,7 +123,7 @@ fn probe_2flip(frame: u32, lut: &BTreeMap<u32, Vec<usize>>, f: &mut impl FnMut(&
 
 /// Probe exact only (no bit flips).
 #[inline]
-fn probe_exact(frame: u32, lut: &BTreeMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
+fn probe_exact(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
     if let Some(v) = lut.get(&frame) {
         f(v);
     }

@@ -1,6 +1,9 @@
 # audiofp — Matching Subsystem Plan
 
-**Status:** proposal / not yet implemented
+**Status:** implemented on `feat/matching-subsystem` (Phases 0–2, 4–6);
+**Phase 3 (Panako 2-D Hough) is still a stub** — `PanakoMatcher` /
+`PanakoIndex` always return non-match / empty. Hot-path maps use
+`HashMap` under `std` (`BTreeMap` without `std`).
 **Scope:** add an in-memory **matching / identification** layer on top of the
 existing fingerprinters.
 **Explicit constraint:** *matching only* — **no storage, no persistence, no

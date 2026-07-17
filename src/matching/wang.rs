@@ -22,14 +22,16 @@
 //!
 //! - Time: `O(R + Q + range)` — sub-millisecond for song-length inputs.
 //! - Memory: dense histogram ≈ 4 bytes/frame → ~60 KB for 4 min @ 62.5 fps.
+//! - Index: [`HashMap`](std::collections::HashMap) under `std` (default);
+//!   `BTreeMap` fallback when built without `std`.
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::classical::WangFingerprint;
+use crate::matching::maps::HashMap;
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence};
 
 /// Configuration for [`WangMatcher`].
@@ -89,7 +91,7 @@ impl Matcher for WangMatcher {
         let cfg = &self.cfg;
 
         // --- 1. Index the reference ---
-        let mut index: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut index: HashMap<u32, Vec<u32>> = HashMap::new();
         for h in &reference.hashes {
             index.entry(h.hash).or_default().push(h.t_anchor);
         }

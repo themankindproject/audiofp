@@ -11,7 +11,7 @@
 //! | Matcher | Fingerprint | Strategy |
 //! |---|---|---|
 //! | [`WangMatcher`] | [`WangFingerprint`](crate::classical::WangFingerprint) | Offset-histogram voter (Shazam-style) |
-//! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | 2-D Hough (scale, offset) + optional RANSAC |
+//! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | **Stub** — always non-match until Phase 3 |
 //! | [`HaitsmaMatcher`] | [`HaitsmaFingerprint`](crate::classical::HaitsmaFingerprint) | BER sliding + sub-fingerprint LUT |
 //! | [`NeuralMatcher`] | [`NeuralFingerprint`](crate::neural::NeuralFingerprint) | Cosine similarity (requires the `neural` feature) |
 //!
@@ -56,6 +56,8 @@ pub use neural::{Aggregation, NeuralMatchConfig, NeuralMatcher};
 
 mod index;
 pub use index::{PanakoIndex, WangIndex, match_best, match_ranked};
+
+mod maps;
 
 // ---------------------------------------------------------------------------
 // Common types

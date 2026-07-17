@@ -1,11 +1,21 @@
 //! Panako matcher — tempo-invariant 2-D Hough voter.
 //!
-//! Placeholder — implemented in Phase 3.
+//! # Status: stub (Phase 3)
+//!
+//! [`PanakoMatcher::match_one`] always returns [`MatchResult::NONE`].
+//! Config fields document the intended API so callers can prepare for
+//! [#100](https://github.com/themankindproject/audiofp/issues/100)
+//! (2-D Hough over scale×offset + optional RANSAC).
+//!
+//! Until then, use [`super::WangMatcher`] for constant-tempo identification,
+//! or extract Panako hashes for storage only.
 
 use crate::classical::PanakoFingerprint;
 use crate::matching::{MatchResult, Matcher};
 
 /// Configuration for [`PanakoMatcher`].
+///
+/// Fields are accepted and stored but **ignored** while the matcher is a stub.
 #[derive(Clone, Debug)]
 pub struct PanakoMatchConfig {
     /// Minimum time-scale to search. Default 0.80.
@@ -45,6 +55,8 @@ impl Default for PanakoMatchConfig {
 }
 
 /// Offline 1:1 Panako matcher (2-D Hough + optional RANSAC).
+///
+/// **Stub:** always returns [`MatchResult::NONE`] until Phase 3 lands.
 pub struct PanakoMatcher {
     cfg: PanakoMatchConfig,
 }
@@ -62,8 +74,7 @@ impl Matcher for PanakoMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
-        let _ = query;
-        let _ = reference;
+        let _ = (query, reference, &self.cfg);
         MatchResult::NONE
     }
 }

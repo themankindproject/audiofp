@@ -10,6 +10,8 @@ use crate::matching::{MatchResult, Matcher};
 
 use alloc::vec::Vec;
 
+use crate::matching::maps::HashMap;
+
 /// Find the single best-matching reference.
 ///
 /// Returns `Some((index, result))` if any reference clears its
@@ -60,7 +62,7 @@ pub fn match_ranked<M: Matcher>(
 /// never serialised.
 pub struct WangIndex {
     /// Inverted index: hash → list of (reference id, t_anchor).
-    map: alloc::collections::BTreeMap<u32, alloc::vec::Vec<(usize, u32)>>,
+    map: HashMap<u32, alloc::vec::Vec<(usize, u32)>>,
     /// Frame rates are stored per-reference for offset conversion.
     fps: alloc::vec::Vec<f32>,
 }
@@ -71,9 +73,7 @@ impl WangIndex {
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
-        use alloc::collections::BTreeMap;
-
-        let mut map: BTreeMap<u32, Vec<(usize, u32)>> = BTreeMap::new();
+        let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -108,7 +108,6 @@ impl WangIndex {
         cfg: &crate::matching::WangMatchConfig,
     ) -> Option<(usize, MatchResult)> {
         use crate::matching::{TimeOffset, clamp_score, match_result_compare_desc};
-        use alloc::collections::BTreeMap;
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
@@ -117,7 +116,7 @@ impl WangIndex {
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Tracking the query-hash index lets us count *distinct* query
         // landmarks that align (contrib), mirroring `WangMatcher`.
-        let mut per_ref: BTreeMap<usize, Vec<(i64, u32)>> = BTreeMap::new();
+        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> = HashMap::new();
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
@@ -133,7 +132,7 @@ impl WangIndex {
 
         for (&ref_id, votes) in &per_ref {
             // Raw per-offset bin counts (sparse).
-            let mut bins: BTreeMap<i64, u32> = BTreeMap::new();
+            let mut bins: HashMap<i64, u32> = HashMap::new();
             for &(d, _) in votes {
                 *bins.entry(d).or_insert(0) += 1;
             }
@@ -173,7 +172,7 @@ impl WangIndex {
             }
 
             // Contrib: distinct query-hash indices voting within ±tol of peak.
-            let mut contrib_bits: BTreeMap<u32, ()> = BTreeMap::new();
+            let mut contrib_bits: HashMap<u32, ()> = HashMap::new();
             for &(d, qi) in votes {
                 if (d - peak_off).abs() <= tol {
                     contrib_bits.insert(qi, ());
@@ -209,13 +208,19 @@ impl WangIndex {
 
 /// An in-memory inverted index over several Panako fingerprints.
 ///
-/// See [`WangIndex`] for the design rationale.
+/// **Stub (Phase 3 / [#100](https://github.com/themankindproject/audiofp/issues/100)).**
+/// `build` accepts fingerprints but stores nothing; `query` always
+/// returns `None`. Tempo-invariant 1:N matching is not available yet —
+/// use [`WangIndex`] for constant-tempo catalogs, or wait for the
+/// Panako matcher implementation.
+///
+/// See [`WangIndex`] for the intended design once this is filled in.
 pub struct PanakoIndex {
     _private: (),
 }
 
 impl PanakoIndex {
-    /// Build an index from a slice of Panako fingerprints (placeholder).
+    /// Build an index from a slice of Panako fingerprints (**no-op stub**).
     pub fn build(
         _refs: &[crate::classical::PanakoFingerprint],
         _max_postings_per_hash: u32,
@@ -223,7 +228,7 @@ impl PanakoIndex {
         Self { _private: () }
     }
 
-    /// Query the index (placeholder).
+    /// Query the index (**always `None` until Phase 3**).
     #[must_use]
     pub fn query(
         &self,

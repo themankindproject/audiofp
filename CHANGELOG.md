@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **In-memory matching subsystem** (`audiofp::matching`) — `WangMatcher`,
+  `HaitsmaMatcher`, `NeuralMatcher` (feature-gated), plus `match_best` /
+  `match_ranked` and a transient `WangIndex` for 1:N Wang queries. Purely
+  in-memory: no persistence, wire format, or DB adapters. See `USAGE.md`
+  and `plan.md`.
+- **`benches/matching.rs`** — Criterion benches for Wang/Haitsma 1:1 and
+  small `WangIndex` (N=100) queries (`cargo bench --bench matching`).
+
+### Changed
+
+- **Matching hot path uses `HashMap` under `std`** (default). Without
+  `std`, the same code paths fall back to `BTreeMap` via an internal
+  alias so `no_std + alloc` builds keep working.
+- **`PanakoMatcher` / `PanakoIndex` documented as stubs** — they always
+  return non-match / empty until Phase 3 (2-D Hough) lands. Prefer
+  `WangMatcher` for constant-tempo identification today.
+
 ## [0.3.7] - 2026-07-08
 
 ### Changed
