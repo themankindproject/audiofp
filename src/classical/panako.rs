@@ -103,6 +103,16 @@ pub struct PanakoConfig {
     ///
     /// [`extract`]: Panako::extract
     pub max_input_samples: Option<usize>,
+    /// Maximum number of hashes allowed. `None` disables. Default: 500_000.
+    pub max_hashes: Option<usize>,
+    /// Maximum number of pending anchors in the streaming pipeline
+    /// (oldest-first eviction when exceeded). `None` disables.
+    pub max_pending_anchors: Option<usize>,
+    /// Maximum samples accepted in a single `push` call. `None` disables
+    /// (default). Streaming is bounded per-frame internally, but one
+    /// hostile `push(&[f32; huge])` still allocates ~chunk. Set this to
+    /// cap per-push memory.
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for PanakoConfig {
@@ -114,6 +124,9 @@ impl Default for PanakoConfig {
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
             max_input_samples: Some(30 * 60 * PANAKO_SR as usize),
+            max_hashes: Some(500_000),
+            max_pending_anchors: None,
+            max_push_samples: None,
         }
     }
 }
@@ -249,6 +262,14 @@ impl Fingerprinter for Panako {
 
         let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+
+        if let Some(limit) = self.cfg.max_hashes
+            && hashes.len() > limit {
+                return Err(AfpError::InputTooLarge {
+                    limit,
+                    provided: hashes.len(),
+                });
+            }
 
         Ok(PanakoFingerprint {
             hashes,
@@ -1737,5 +1758,21 @@ mod tests {
             rate: SampleRate::HZ_8000,
         };
         fp.extract(buf).unwrap();
+    }
+
+    #[test]
+    fn max_hashes_enforced_rejects_too_many() {
+        let cfg = PanakoConfig {
+            max_hashes: Some(10),
+            ..PanakoConfig::default()
+        };
+        let mut fp = Panako::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
 }

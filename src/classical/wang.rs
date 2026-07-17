@@ -70,6 +70,14 @@ pub struct WangConfig {
     ///
     /// [`extract`]: Wang::extract
     pub max_input_samples: Option<usize>,
+    /// Maximum number of hashes allowed. `None` disables. Default: 500_000
+    /// — enough for ~2 hours of rich music at default fan_out=10.
+    pub max_hashes: Option<usize>,
+    /// Maximum number of pending anchors in the streaming pipeline.
+    /// `None` disables (default). Conservative: anchors exceeding this
+    /// cap are dropped oldest-first so memory stays bounded. Relevant
+    /// only for [`StreamingWang`].
+    pub max_pending_anchors: Option<usize>,
 }
 
 impl Default for WangConfig {
@@ -81,6 +89,8 @@ impl Default for WangConfig {
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
             max_input_samples: Some(30 * 60 * WANG_SR as usize),
+            max_hashes: Some(500_000),
+            max_pending_anchors: None,
         }
     }
 }
@@ -229,6 +239,14 @@ impl Fingerprinter for Wang {
         let mut hashes = build_hashes(&peaks, &self.cfg);
         // Stable, deterministic ordering for round-trip and golden tests.
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+
+        if let Some(limit) = self.cfg.max_hashes
+            && hashes.len() > limit {
+                return Err(AfpError::InputTooLarge {
+                    limit,
+                    provided: hashes.len(),
+                });
+            }
 
         Ok(WangFingerprint {
             hashes,
@@ -629,6 +647,13 @@ impl StreamingWang {
                 }
             }
             // Register this peak as a new ANCHOR.
+            // If a hard cap is configured, evict oldest anchors first
+            // so memory stays bounded under adversarial / dense input.
+            if let Some(limit) = self.cfg.max_pending_anchors {
+                while self.pending_anchors.len() >= limit {
+                    self.pending_anchors.pop_front();
+                }
+            }
             self.pending_anchors.push_back(PendingAnchor {
                 peak,
                 targets: alloc::collections::BinaryHeap::with_capacity(fan_out + 1),
@@ -1720,5 +1745,35 @@ mod tests {
             rate: SampleRate::HZ_8000,
         };
         fp.extract(buf).unwrap();
+    }
+
+    #[test]
+    fn max_hashes_enforced_rejects_too_many() {
+        let cfg = WangConfig {
+            max_hashes: Some(10),
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn max_pending_anchors_evicts_oldest() {
+        let cfg = WangConfig {
+            max_pending_anchors: Some(100),
+            ..WangConfig::default()
+        };
+        let mut s = StreamingWang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 20);
+        let mut hashes = s.push(&samples);
+        hashes.extend(s.flush());
+        assert!(s.config().max_pending_anchors.is_some());
+        assert!(!hashes.is_empty(), "should produce hashes with cap=100");
     }
 }
