@@ -151,5 +151,6 @@ pub(crate) fn small_cfg() -> NeuralEmbedderConfig {
         hop_secs: 0.25,
         l2_normalize: true,
         max_input_samples: None,
+        max_push_samples: None,
     }
 }

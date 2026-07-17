@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SECURITY.md` + threat model (#74).** Documents responsible disclosure,
+  trust boundaries (untrusted audio vs trusted ONNX), and production
+  defaults (`DecodeLimits` / `fingerprint_file_capped`). Linked from README.
+- **`CODE_OF_CONDUCT.md`, issue/PR templates, CONTRIBUTING MSRV 1.93 (#83).**
+- **`AfpError::NonFiniteSample` + PCM policy (#75).** Offline `extract` /
+  watermark `detect` reject NaN/Inf. Streaming `push` sanitizes them to
+  `0.0` (infallible API). Helper module `pcm`.
+- **`max_push_samples` on Wang, Haitsma, and neural streaming (#80).**
+  Matches Panako: truncate hostile `push` chunks when set.
 - **OOM protection — `max_input_samples` on all offline fingerprinter configs (#68).**
   `WangConfig`, `PanakoConfig`, and `HaitsmaConfig` each gain a
   `max_input_samples: Option<usize>` field. When set, `extract()` rejects
@@ -41,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Model load TOCTOU (#79).** Dropped `path.exists()` before Tract load;
+  missing files map to `ModelNotFound`, other failures to `ModelLoad`.
+- **SIMD window length asserts (#82).** `debug_assert_eq!` on AVX2/NEON
+  window helpers. `BufferOverrun` kept for future mic pipeline (#98).
 - **`decode_to_mono_capped` returned `Config` instead of `InputTooLarge`.**
   Oversized files now match the documented `InputTooLarge` variant.
 - **`PanakoConfig::max_pending_anchors` was dead.** Streaming Panako now

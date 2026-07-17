@@ -228,6 +228,7 @@ impl Fingerprinter for Panako {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
         if let Some(limit) = self.cfg.max_input_samples
             && audio.samples.len() > limit
         {
@@ -834,11 +835,8 @@ impl StreamingPanako {
     // ── Private helpers for the zero-alloc push_with / flush_with path ──
 
     fn process_push_samples(&mut self, samples: &[f32]) {
-        let samples = match self.cfg.max_push_samples {
-            Some(limit) if samples.len() > limit => &samples[..limit],
-            _ => samples,
-        };
-        self.sample_carry.extend_from_slice(samples);
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= PANAKO_N_FFT {

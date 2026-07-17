@@ -1,0 +1,46 @@
+name: Bug report
+description: Something is broken or incorrect
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For security issues, use [SECURITY.md](https://github.com/themankindproject/audiofp/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: audiofp version / commit
+      placeholder: "0.3.7 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: rustc
+    attributes:
+      label: rustc --version
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal code or command, plus audio format / sample rate / duration if relevant.
+      render: rust
+    validations:
+      required: true
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Expected API impact if fixed
+      options:
+        - non-breaking (bugfix / docs)
+        - possibly breaking (0.4 territory)
+        - unknown
+    validations:
+      required: true

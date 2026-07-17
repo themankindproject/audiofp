@@ -77,10 +77,24 @@ pub enum AfpError {
     },
 
     /// A streaming pipeline dropped samples because the consumer fell behind.
+    ///
+    /// Reserved for bounded real-time capture (e.g. mic ring buffer). Not
+    /// emitted by classical/neural extractors today; see issue tracking the
+    /// mic orchestrator.
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun {
         /// Number of samples dropped.
         dropped: usize,
+    },
+
+    /// Input PCM contained NaN or ±Inf at `index`.
+    ///
+    /// Offline `extract` / watermark `detect` reject non-finite samples.
+    /// Streaming `push` sanitizes them to `0.0` instead (infallible API).
+    #[error("audio contains non-finite sample (NaN or Inf) at index {index}")]
+    NonFiniteSample {
+        /// Index of the first non-finite sample.
+        index: usize,
     },
 
     /// A configuration value was rejected (out of range, mutually exclusive, …).
@@ -226,6 +240,13 @@ mod tests {
                 "found stale supported-rate {rate} in: {s}",
             );
         }
+    }
+
+    #[test]
+    fn non_finite_sample_displays_index() {
+        let s = AfpError::NonFiniteSample { index: 42 }.to_string();
+        assert!(s.contains("42"));
+        assert!(s.contains("non-finite"));
     }
 
     #[test]

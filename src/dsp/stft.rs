@@ -486,6 +486,9 @@ impl ShortTimeFFT {
 unsafe fn apply_window_avx2(src: &[f32], win: &[f32], dst: &mut [f32]) {
     use core::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
 
+    debug_assert_eq!(src.len(), win.len());
+    debug_assert_eq!(src.len(), dst.len());
+
     let n = src.len();
     let chunks = n / 8;
     let remainder = n % 8;
@@ -526,6 +529,9 @@ unsafe fn apply_window_avx2(src: &[f32], win: &[f32], dst: &mut [f32]) {
 #[cfg(target_arch = "aarch64")]
 unsafe fn apply_window_neon(src: &[f32], win: &[f32], dst: &mut [f32]) {
     use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+
+    debug_assert_eq!(src.len(), win.len());
+    debug_assert_eq!(src.len(), dst.len());
 
     let n = src.len();
     let chunks = n / 4;

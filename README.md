@@ -315,8 +315,13 @@ cargo run --example watermark_detect --features watermark -- path/to/audioseal.o
 
 The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `fingerprint_file_capped` / `DecodeLimits` for untrusted uploads.
+
 ## Contributing
 
+Please read the [Code of Conduct](CODE_OF_CONDUCT.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 Contributions are welcome! Please:
 
 1. Fork the repository

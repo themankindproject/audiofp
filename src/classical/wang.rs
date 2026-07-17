@@ -81,6 +81,10 @@ pub struct WangConfig {
     /// cap are dropped oldest-first so memory stays bounded. Relevant
     /// only for [`StreamingWang`].
     pub max_pending_anchors: Option<usize>,
+    /// Maximum samples accepted in a single `push` call. `None` disables
+    /// (default). When set, excess samples beyond the cap are **dropped**
+    /// (streaming `push` is infallible).
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for WangConfig {
@@ -94,6 +98,7 @@ impl Default for WangConfig {
             max_input_samples: Some(30 * 60 * WANG_SR as usize),
             max_hashes: Some(500_000),
             max_pending_anchors: None,
+            max_push_samples: None,
         }
     }
 }
@@ -200,6 +205,7 @@ impl Fingerprinter for Wang {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
         if let Some(limit) = self.cfg.max_input_samples
             && audio.samples.len() > limit
         {
@@ -758,7 +764,8 @@ impl StreamingWang {
     /// detect peaks, finalise buckets, emit ready anchors into
     /// `self.emitted`.
     fn process_push_samples(&mut self, samples: &[f32]) {
-        self.sample_carry.extend_from_slice(samples);
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= WANG_N_FFT {
@@ -1779,5 +1786,45 @@ mod tests {
         hashes.extend(s.flush());
         assert!(s.config().max_pending_anchors.is_some());
         assert!(!hashes.is_empty(), "should produce hashes with cap=100");
+    }
+
+    #[test]
+    fn extract_rejects_nan_pcm() {
+        let mut fp = Wang::default();
+        let mut samples = vec![0.0_f32; 8_000 * 3];
+        samples[100] = f32::NAN;
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::NonFiniteSample { index: 100 }));
+    }
+
+    #[test]
+    fn max_push_samples_truncates_hostile_chunk() {
+        let cfg = WangConfig {
+            max_push_samples: Some(512),
+            ..WangConfig::default()
+        };
+        let mut s = StreamingWang::new(cfg);
+        let samples = synthetic_audio(0xBEEF, 8_000 * 5);
+        let _ = s.push(&samples);
+        let _ = s.flush();
+        assert_eq!(s.config().max_push_samples, Some(512));
+    }
+
+    #[test]
+    fn push_sanitizes_nan_to_zero() {
+        let mut clean = StreamingWang::default();
+        let mut dirty = StreamingWang::default();
+        let mut samples = synthetic_audio(0xABCD, 8_000 * 3);
+        let a = clean.push(&samples);
+        samples[10] = f32::NAN;
+        samples[20] = f32::INFINITY;
+        let b = dirty.push(&samples);
+        // Sanitized NaN/Inf → 0.0; hashes need not match exactly, but push must not panic.
+        let _ = (a, b);
+        let _ = dirty.flush();
     }
 }

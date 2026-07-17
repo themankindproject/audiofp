@@ -68,6 +68,9 @@ pub struct HaitsmaConfig {
     ///
     /// [`extract`]: Haitsma::extract
     pub max_input_samples: Option<usize>,
+    /// Maximum samples accepted in a single streaming `push`. `None`
+    /// disables (default). Excess samples are dropped.
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for HaitsmaConfig {
@@ -76,6 +79,7 @@ impl Default for HaitsmaConfig {
             fmin: 300.0,
             fmax: 2_000.0,
             max_input_samples: Some(30 * 60 * HAITSMA_SR as usize),
+            max_push_samples: None,
         }
     }
 }
@@ -191,6 +195,7 @@ impl Fingerprinter for Haitsma {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
         if let Some(limit) = self.cfg.max_input_samples
             && audio.samples.len() > limit
         {
@@ -413,7 +418,8 @@ impl StreamingHaitsma {
     /// Core processing: advance the STFT, pack hashes, push into
     /// `self.pending`. Shared by `push()` and `push_with()`.
     fn process_push(&mut self, samples: &[f32]) {
-        self.sample_carry.extend_from_slice(samples);
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= HAITSMA_N_FFT {
@@ -737,6 +743,7 @@ mod tests {
             fmin: 500.0,
             fmax: 1500.0,
             max_input_samples: None,
+            max_push_samples: None,
         };
         let mut h = Haitsma::new(cfg.clone());
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
@@ -756,6 +763,7 @@ mod tests {
             fmin: 1000.0,
             fmax: 1000.0,
             max_input_samples: None,
+            max_push_samples: None,
         });
     }
 
@@ -766,6 +774,7 @@ mod tests {
             fmin: 300.0,
             fmax: 3_000.0,
             max_input_samples: None,
+            max_push_samples: None,
         });
     }
 

@@ -294,6 +294,7 @@ pub struct WangConfig {
     pub max_input_samples: Option<usize>, // default 14_400_000; None to disable
     pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
     pub max_pending_anchors: Option<usize>, // default None; streaming only
+    pub max_push_samples: Option<usize>,    // default None; truncate hostile push chunks
 }
 ```
 
@@ -307,6 +308,7 @@ pub struct WangConfig {
 | `max_input_samples` | 14 400 000 (30 min @ 8 kHz) | Rejects larger inputs early with `InputTooLarge`. `None` disables. |
 | `max_hashes` | 500 000 | Rejects extracts that would emit more hashes. `None` disables. |
 | `max_pending_anchors` | `None` | Streaming: oldest-first eviction when pending anchors exceed the cap. |
+| `max_push_samples` | `None` | Streaming: truncate a single `push` chunk to this many samples. |
 
 #### Output: `WangFingerprint`
 
@@ -417,6 +419,7 @@ pub struct HaitsmaConfig {
     pub fmin: f32,    // default 300.0
     pub fmax: f32,    // default 2000.0
     pub max_input_samples: Option<usize>, // default 9 000 000; None to disable
+    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
 }
 ```
 
@@ -747,6 +750,8 @@ pub struct NeuralEmbedderConfig {
     pub window_secs: f32,        // default 1.0  (analysis-window length)
     pub hop_secs: f32,           // default 1.0  (between successive windows; non-overlapping)
     pub l2_normalize: bool,      // default true
+    pub max_input_samples: Option<usize>, // default None
+    pub max_push_samples: Option<usize>,  // default None; streaming truncate
 }
 ```
 
@@ -1153,6 +1158,9 @@ pub enum AfpError {
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun { dropped: usize },
 
+    #[error("audio contains non-finite sample (NaN or Inf) at index {index}")]
+    NonFiniteSample { index: usize },
+
     #[error("input too large: {provided} exceeds maximum {limit}")]
     InputTooLarge { limit: usize, provided: usize },
 
@@ -1163,6 +1171,8 @@ pub enum AfpError {
     Io(String),
 }
 ```
+
+**PCM policy:** offline `extract` / watermark `detect` return `NonFiniteSample` on NaN/Inf. Streaming `push` replaces non-finite samples with `0.0` (API is infallible until 0.4).
 
 `#[non_exhaustive]` — match exhaustively only inside the crate. Add a `_` arm to keep your match safe across SDK upgrades.
 

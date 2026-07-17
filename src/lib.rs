@@ -96,6 +96,7 @@ pub mod watermark;
 
 mod error;
 mod fp;
+mod pcm;
 mod types;
 
 #[cfg(feature = "std")]

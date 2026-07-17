@@ -10,6 +10,19 @@ use tract_onnx::prelude::*;
 
 use crate::{AfpError, AudioBuffer, Result};
 
+/// Map a failed filesystem open of a model path.
+fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AfpError::ModelNotFound(path.to_string())
+    } else {
+        AfpError::ModelLoad(format!("open: {e}"))
+    }
+}
+
+fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
+    AfpError::ModelLoad(format!("load: {e}"))
+}
+
 /// Type alias for the compiled runnable plan produced by
 /// `TypedModel::into_runnable()`. Cached to avoid rebuilding the
 /// execution plan on every `detect()` call.
@@ -150,13 +163,12 @@ impl WatermarkDetector {
         }
 
         let path = Path::new(&cfg.model_path);
-        if !path.exists() {
-            return Err(AfpError::ModelNotFound(cfg.model_path.clone()));
+        if let Err(e) = std::fs::File::open(path) {
+            return Err(map_model_open_io(&cfg.model_path, e));
         }
-
         let model = tract_onnx::onnx()
             .model_for_path(path)
-            .map_err(|e| AfpError::ModelLoad(format!("load: {e}")))?;
+            .map_err(map_model_load_err)?;
 
         Ok(Self {
             cfg,
@@ -187,6 +199,7 @@ impl WatermarkDetector {
     ///   typing, building the runnable plan, running inference, or extracting
     ///   the output tensors. The variant payload identifies which step.
     pub fn detect(&mut self, audio: AudioBuffer<'_>) -> Result<WatermarkResult> {
+        crate::pcm::reject_non_finite(audio.samples)?;
         if audio.rate.hz() != self.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
