@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`AfpError::InputTooLarge` error variant.** Structured error reporting
   the configured limit and the actual input size. `Display` text
   includes both numbers and a hint about raising the limit.
+- **`audiofp::prelude` module (#14).** Convenience glob import
+  (`use audiofp::prelude::*`) that pulls in all three classical
+  fingerprinters with their config/hash types, both core traits,
+  error types, and value types. Includes a doc-test showing the
+  shortest path from zero to a fingerprint.
+- **`fingerprint_file` one-shot helper (#15).** `fingerprint_file(&mut
+  fingerprinter, path)` decodes the file, resamples to the
+  algorithm's required rate, and extracts the fingerprint — all in one
+  call. Requires `std`. Re-exported at `audiofp::fingerprint_file`.
 
 ### Fixed
 

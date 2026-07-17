@@ -78,6 +78,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### One-liner with `fingerprint_file` and the `prelude`
+
+```rust
+use audiofp::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut wang = Wang::default();
+    let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
+    println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
+    Ok(())
+}
+```
+
+The [`prelude`] module pulls in all three classical fingerprinters, both
+core traits, error types, and value types with one glob import.
+[`fingerprint_file`] handles decode → resample → extract in one call
+(requires `std`).
+
 ### Detect duplicate songs across re-encodings
 
 ```rust
@@ -282,6 +300,7 @@ pub struct WangConfig {
 | `target_zone_f`     | 64      | Maximum |Δf| (FFT bins) for valid pairs                    |
 | `peaks_per_sec`     | 30      | Peaks the picker keeps per 1 s bucket                      |
 | `min_anchor_mag_db` | -50.0   | Magnitude floor: peaks below this dB level are ignored     |
+| `max_input_samples` | 14 400 000 (30 min @ 8 kHz) | Rejects larger inputs early with `InputTooLarge`. `None` disables. |
 
 #### Output: `WangFingerprint`
 
@@ -344,6 +363,7 @@ pub struct PanakoConfig {
     pub target_zone_f: u16,      // default 96
     pub peaks_per_sec: u16,      // default 30
     pub min_anchor_mag_db: f32,  // default -50.0
+    pub max_input_samples: Option<usize>, // default 14 400 000; None to disable
 }
 ```
 
@@ -387,6 +407,7 @@ Packed `u32` with **band 0 in the most significant bit** (the "MSB-zero" convent
 pub struct HaitsmaConfig {
     pub fmin: f32,    // default 300.0
     pub fmax: f32,    // default 2000.0
+    pub max_input_samples: Option<usize>, // default 9 000 000; None to disable
 }
 ```
 
@@ -511,6 +532,24 @@ Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::
 let samples = decode_to_mono_at("song.mp3", 8_000)?;
 ```
 
+### `decode_to_mono_capped` and `decode_to_mono_at_capped` (OOM protection)
+
+```rust
+pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)>;
+pub fn decode_to_mono_at_capped<P: AsRef<Path>>(path: P, target_sr: u32, max_bytes: u64) -> Result<Vec<f32>>;
+```
+
+Cap the source file at `max_bytes` using `fs::metadata()` before opening the
+stream — a malicious 4 GB upload is rejected in < 1 µs without touching
+the decoder. Pass `max_bytes = 0` for unlimited.
+
+```rust
+use audiofp::io::decode_to_mono_capped;
+
+// Reject anything larger than 50 MB:
+let (samples, sr) = decode_to_mono_capped("user_upload.mp3", 50 * 1024 * 1024)?;
+```
+
 ### Supported formats
 
 Whatever Symphonia provides with the features enabled in `Cargo.toml`:
@@ -533,6 +572,7 @@ The decoder probes magic bytes too — extension-less files still work as long a
 | Format unrecognised                       | `AfpError::Io`                   |
 | Per-packet decode failure                 | (silently skipped — resilient)   |
 | Stream-fatal decode failure               | `AfpError::Io`                   |
+| File exceeds `max_bytes` cap              | `AfpError::Config`               |
 
 Recoverable per-packet failures are silently skipped to keep one corrupt block from killing a whole-file decode; only stream-fatal errors propagate.
 
@@ -1086,6 +1126,9 @@ pub enum AfpError {
 
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun { dropped: usize },
+
+    #[error("input too large: {provided} samples exceeds maximum {limit}")]
+    InputTooLarge { limit: usize, provided: usize },
 
     #[error("invalid configuration: {0}")]
     Config(String),
