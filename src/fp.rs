@@ -15,7 +15,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{AudioBuffer, Result, TimestampMs};
+use crate::{AudioBuffer, Result, SampleRate, TimestampMs};
 
 /// Offline (whole-buffer) fingerprinter.
 ///
@@ -250,6 +250,43 @@ where
             (tag, fp.extract(buf))
         })
         .collect()
+}
+
+/// Decode an audio file and fingerprint it in one call.
+///
+/// Uses [`crate::io::decode_to_mono_at`] to decode + resample the file
+/// to `fingerprinter.required_sample_rate()`, then calls
+/// [`Fingerprinter::extract`]. Requires the `std` feature.
+///
+/// The caller constructs the fingerprinter with whatever config they
+/// want — this helper only owns the decode/resample/exract plumbing.
+///
+/// # Errors
+///
+/// Surfaces every error [`crate::io::decode_to_mono_at`] can return
+/// (missing file, unsupported format, corrupt decode) plus any
+/// error from `extract` (wrong rate, too short, input too large).
+///
+/// # Example
+///
+/// ```ignore
+/// use audiofp::classical::Wang;
+///
+/// let mut wang = Wang::default();
+/// let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
+/// println!("{} hashes", fp.hashes.len());
+/// ```
+#[cfg(feature = "std")]
+pub fn fingerprint_file<F: Fingerprinter>(
+    fingerprinter: &mut F,
+    path: impl AsRef<std::path::Path>,
+) -> Result<F::Output> {
+    let sr = fingerprinter.required_sample_rate();
+    let rate = SampleRate::new(sr)
+        .expect("Fingerprinter::required_sample_rate() returned 0; contract violation");
+    let samples = crate::io::decode_to_mono_at(path, sr)?;
+    let buf = AudioBuffer::new(&samples, rate);
+    fingerprinter.extract(buf)
 }
 
 #[cfg(test)]
