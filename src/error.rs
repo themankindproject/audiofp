@@ -59,6 +59,20 @@ pub enum AfpError {
     #[error("inference failed: {0}")]
     Inference(String),
 
+    /// The input exceeds the configured maximum. Raised early in decode
+    /// and extract paths to prevent OOM from untrusted audio. The limit
+    /// can be raised or disabled entirely via the config struct.
+    #[error(
+        "input too large: {provided} samples exceeds maximum {limit}; \
+         raise the limit or set it to None to disable"
+    )]
+    InputTooLarge {
+        /// Configured limit that was exceeded.
+        limit: usize,
+        /// Number of samples actually passed.
+        provided: usize,
+    },
+
     /// A streaming pipeline dropped samples because the consumer fell behind.
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun {
@@ -215,6 +229,18 @@ mod tests {
     fn buffer_overrun_reports_drop_count() {
         let s = AfpError::BufferOverrun { dropped: 1024 }.to_string();
         assert!(s.contains("1024"));
+    }
+
+    #[test]
+    fn input_too_large_displays_both_limit_and_provided() {
+        let err = AfpError::InputTooLarge {
+            limit: 1_000_000,
+            provided: 5_000_000,
+        };
+        let s = err.to_string();
+        assert!(s.contains("1000000"), "got: {s}");
+        assert!(s.contains("5000000"), "got: {s}");
+        assert!(s.contains("exceeds maximum"), "got: {s}");
     }
 
     #[test]
