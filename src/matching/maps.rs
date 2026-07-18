@@ -52,10 +52,7 @@ impl SortedPostings {
     ///
     /// Drops entries where the hash appears in more than `max_postings`
     /// positions (stop-hash removal). Returns `None` if nothing remains.
-    pub(crate) fn build(
-        pairs: &[(u32, u32)],
-        max_postings: u32,
-    ) -> Option<Self> {
+    pub(crate) fn build(pairs: &[(u32, u32)], max_postings: u32) -> Option<Self> {
         if pairs.is_empty() {
             return None;
         }
@@ -184,11 +181,8 @@ mod tests {
 
     #[test]
     fn multiple_hashes() {
-        let sp = SortedPostings::build(
-            &[(1, 10), (2, 20), (1, 30), (3, 40), (2, 50)],
-            100,
-        )
-        .unwrap();
+        let sp =
+            SortedPostings::build(&[(1, 10), (2, 20), (1, 30), (3, 40), (2, 50)], 100).unwrap();
         assert_eq!(sp.get(1), &[10, 30]);
         assert_eq!(sp.get(2), &[20, 50]);
         assert_eq!(sp.get(3), &[40]);
