@@ -82,10 +82,7 @@ impl WangIndex {
     ///
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
-    pub fn build(
-        refs: &[crate::classical::WangFingerprint],
-        max_postings_per_hash: u32,
-    ) -> Self {
+    pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
         let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
@@ -206,9 +203,7 @@ impl WangIndex {
 
             let better = match &best {
                 None => true,
-                Some((_, b)) => {
-                    match_result_compare_desc(&result, b) == core::cmp::Ordering::Less
-                }
+                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
             };
             if better {
                 best = Some((ref_id, result));
@@ -259,9 +254,7 @@ impl HaitsmaIndex {
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for (pos, &frame) in fp.frames.iter().enumerate() {
-                lut.entry(frame)
-                    .or_default()
-                    .push((ref_id, pos as u32));
+                lut.entry(frame).or_default().push((ref_id, pos as u32));
             }
         }
 
@@ -354,15 +347,13 @@ impl HaitsmaIndex {
             };
 
             let score = crate::matching::clamp_score(1.0 - ber);
-            let is_match =
-                ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
+            let is_match = ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
 
             // Prominence: approximate — compare the winning BER against
             // what you'd expect from random alignment (~0.5).
             let prominence = if ber > 1e-6 { 0.5 / ber } else { 100.0 };
 
-            let offset =
-                crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id]);
+            let offset = crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id]);
 
             let result = MatchResult {
                 is_match,
@@ -379,9 +370,7 @@ impl HaitsmaIndex {
 
             let better = match &best {
                 None => true,
-                Some((_, b)) => {
-                    match_result_compare_desc(&result, b) == core::cmp::Ordering::Less
-                }
+                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
             };
             if better {
                 best = Some((ref_id, result));
@@ -422,10 +411,7 @@ pub struct PanakoIndex {
 
 impl PanakoIndex {
     /// Build from a slice of Panako fingerprints.
-    pub fn build(
-        refs: &[crate::classical::PanakoFingerprint],
-        max_postings_per_hash: u32,
-    ) -> Self {
+    pub fn build(refs: &[crate::classical::PanakoFingerprint], max_postings_per_hash: u32) -> Self {
         let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = HashMap::new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
@@ -497,8 +483,7 @@ impl PanakoIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         for (&ref_id, bins) in &acc {
-            let bin_vec: Vec<((u32, i64), u32)> =
-                bins.iter().map(|(&k, &v)| (k, v)).collect();
+            let bin_vec: Vec<((u32, i64), u32)> = bins.iter().map(|(&k, &v)| (k, v)).collect();
 
             // Find peak bin via neighbourhood consolidation.
             let mut peak_votes = 0u32;
@@ -525,13 +510,11 @@ impl PanakoIndex {
             }
 
             // Prominence.
-            let peak_bin_val =
-                bins.get(&(peak_s_bin, peak_off_key)).copied().unwrap_or(0);
+            let peak_bin_val = bins.get(&(peak_s_bin, peak_off_key)).copied().unwrap_or(0);
             let total: u64 = bin_vec.iter().map(|&(_, c)| c as u64).sum();
             let n_bins = bin_vec.len();
             let mean_rest = if n_bins > 1 {
-                (total.saturating_sub(peak_bin_val as u64)) as f32
-                    / (n_bins - 1) as f32
+                (total.saturating_sub(peak_bin_val as u64)) as f32 / (n_bins - 1) as f32
             } else {
                 0.0
             };
@@ -545,8 +528,7 @@ impl PanakoIndex {
                 continue;
             }
 
-            let coarse_s = scale_min
-                + (peak_s_bin as f64 + 0.5) * scale_per_bin;
+            let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
             let coarse_b = peak_off_key as f64 * (tol.max(1)) as f64;
 
             let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
@@ -555,19 +537,13 @@ impl PanakoIndex {
                 score,
                 votes: peak_votes,
                 prominence,
-                offset: TimeOffset::from_frames(
-                    coarse_b.round() as i64,
-                    fps,
-                ),
+                offset: TimeOffset::from_frames(coarse_b.round() as i64, fps),
                 time_scale: coarse_s.clamp(0.5, 2.0) as f32,
             };
 
             let better = match &best {
                 None => true,
-                Some((_, b)) => {
-                    match_result_compare_desc(&result, b)
-                        == core::cmp::Ordering::Less
-                }
+                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
             };
             if better {
                 best = Some((ref_id, result));
@@ -670,8 +646,7 @@ mod tests {
             let (_, a) = &w[0];
             let (_, b) = &w[1];
             assert!(
-                a.score >= b.score
-                    || (a.score - b.score).abs() < 1e-6,
+                a.score >= b.score || (a.score - b.score).abs() < 1e-6,
                 "not sorted: {} (score {}) before {} (score {})",
                 w[0].0,
                 a.score,
@@ -759,7 +734,9 @@ mod tests {
 
     #[test]
     fn haitsma_index_self_match() {
-        let ref_frames: Vec<u32> = (0..600).map(|i| (i as u32).wrapping_mul(0x01010101)).collect();
+        let ref_frames: Vec<u32> = (0..600)
+            .map(|i| (i as u32).wrapping_mul(0x01010101))
+            .collect();
         let fp = mk_haitsma_fp(&ref_frames, 78.125);
         let refs = alloc::vec![fp.clone()];
         let index = HaitsmaIndex::build(&refs);
@@ -840,7 +817,11 @@ mod tests {
         let (_id, res) = index
             .query(&mk_haitsma_fp(&query_frames, 78.125), &cfg)
             .expect("must find offset sub-sequence");
-        assert_eq!(res.offset.frames, 100, "offset must be +100, got {}", res.offset.frames);
+        assert_eq!(
+            res.offset.frames, 100,
+            "offset must be +100, got {}",
+            res.offset.frames
+        );
     }
 
     // --- PanakoIndex ---
@@ -890,8 +871,9 @@ mod tests {
     #[test]
     fn panako_index_identifies_correct_ref() {
         // Use enough triples to satisfy min_votes=5.
-        let triples: Vec<(u32, u32, u32)> =
-            (0..10u32).map(|i| (i * 40 + 10, i * 40 + 20, i * 40 + 30)).collect();
+        let triples: Vec<(u32, u32, u32)> = (0..10u32)
+            .map(|i| (i * 40 + 10, i * 40 + 20, i * 40 + 30))
+            .collect();
         let r0 = mk_panako_fp(&triples, 0);
         let r1 = mk_panako_fp(&triples, 1_000);
         let refs = alloc::vec![r0.clone(), r1.clone()];

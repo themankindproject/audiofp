@@ -9,8 +9,8 @@
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::matching::{
-    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher,
-    WangMatchConfig, WangMatcher,
+    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig,
+    WangMatcher,
 };
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 

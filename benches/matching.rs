@@ -11,8 +11,8 @@ use audiofp::Fingerprinter;
 use audiofp::SampleRate;
 use audiofp::classical::{Haitsma, Panako, Wang, WangFingerprint};
 use audiofp::matching::{
-    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher,
-    WangIndex, WangMatchConfig, WangMatcher,
+    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangIndex,
+    WangMatchConfig, WangMatcher,
 };
 
 fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
@@ -112,5 +112,11 @@ fn bench_wang_index(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_wang_one, bench_haitsma_one, bench_panako_one, bench_wang_index);
+criterion_group!(
+    benches,
+    bench_wang_one,
+    bench_haitsma_one,
+    bench_panako_one,
+    bench_wang_index
+);
 criterion_main!(benches);

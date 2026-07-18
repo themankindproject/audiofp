@@ -156,9 +156,9 @@ impl Matcher for PanakoMatcher {
                     let b = tr_a as f64 - s * h.t_anchor as f64;
 
                     // Compute bin indices
-                    let s_bin =
-                        ((s - scale_min) / scale_per_bin).clamp(0.0, (cfg.scale_bins - 1) as f64)
-                            as u32;
+                    let s_bin = ((s - scale_min) / scale_per_bin)
+                        .clamp(0.0, (cfg.scale_bins - 1) as f64)
+                        as u32;
                     // Offset floor for the accumulator bin (±tol consolidation
                     // happens around the peak, so use the raw floored value).
                     let off_key = (b / (tol.max(1)) as f64).round() as i64;
@@ -368,10 +368,7 @@ mod tests {
     use crate::classical::PanakoHash;
 
     /// Build a synthetic Panako fingerprint.
-    fn make_fp(
-        triples: &[(u32, u32, u32)],
-        hash_offset: u32,
-    ) -> PanakoFingerprint {
+    fn make_fp(triples: &[(u32, u32, u32)], hash_offset: u32) -> PanakoFingerprint {
         PanakoFingerprint {
             hashes: triples
                 .iter()
@@ -473,7 +470,11 @@ mod tests {
         );
         let res = m.match_one(&q, &r);
         assert!(res.is_match, "shifted match expected: {res:?}");
-        assert_eq!(res.offset.frames, 50, "offset must be +50, got {}", res.offset.frames);
+        assert_eq!(
+            res.offset.frames, 50,
+            "offset must be +50, got {}",
+            res.offset.frames
+        );
     }
 
     #[test]
@@ -521,8 +522,10 @@ mod tests {
         let res = m.match_one(&fast, &normal);
         // With our synthetic data and relaxed thresholds, a tempo
         // stretch should be detectable.
-        assert!(res.is_match || res.votes > 0,
-            "tempo-stretched variant should produce votes or match: {res:?}");
+        assert!(
+            res.is_match || res.votes > 0,
+            "tempo-stretched variant should produce votes or match: {res:?}"
+        );
     }
 
     #[test]
