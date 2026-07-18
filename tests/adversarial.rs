@@ -22,7 +22,10 @@ fn silence_5sec_wang() {
         .unwrap();
     // Silence should produce an empty or very sparse fingerprint — never panic.
     // Self-match of empty fingerprint → MatchResult::NONE (tested in unit tests).
-    assert!(fp.hashes.is_empty(), "silence must produce empty fingerprint");
+    assert!(
+        fp.hashes.is_empty(),
+        "silence must produce empty fingerprint"
+    );
 }
 
 #[test]
@@ -33,7 +36,10 @@ fn silence_5sec_haitsma() {
         .extract(AudioBuffer::new(&silence, SampleRate::HZ_5000))
         .unwrap();
     // Haitsma silence → all-zero frames
-    assert!(fp.frames.iter().all(|&f| f == 0), "silence must produce zero frames");
+    assert!(
+        fp.frames.iter().all(|&f| f == 0),
+        "silence must produce zero frames"
+    );
 }
 
 #[test]
@@ -43,7 +49,10 @@ fn silence_5sec_panako() {
     let fp = p
         .extract(AudioBuffer::new(&silence, SampleRate::HZ_8000))
         .unwrap();
-    assert!(fp.hashes.is_empty(), "silence must produce empty fingerprint");
+    assert!(
+        fp.hashes.is_empty(),
+        "silence must produce empty fingerprint"
+    );
 }
 
 #[test]
@@ -84,7 +93,10 @@ fn wrong_sample_rate_wang() {
         .extract(AudioBuffer::new(&audio, SampleRate::HZ_16000))
         .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("sample rate"), "expected sample-rate error: {msg}");
+    assert!(
+        msg.contains("sample rate"),
+        "expected sample-rate error: {msg}"
+    );
 }
 
 #[test]
@@ -95,7 +107,10 @@ fn wrong_sample_rate_haitsma() {
         .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
         .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("sample rate"), "expected sample-rate error: {msg}");
+    assert!(
+        msg.contains("sample rate"),
+        "expected sample-rate error: {msg}"
+    );
 }
 
 #[test]
@@ -106,7 +121,10 @@ fn wrong_sample_rate_panako() {
         .extract(AudioBuffer::new(&audio, SampleRate::HZ_16000))
         .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("sample rate"), "expected sample-rate error: {msg}");
+    assert!(
+        msg.contains("sample rate"),
+        "expected sample-rate error: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +154,10 @@ fn very_short_input_panako() {
 #[test]
 fn amplitude_clipping_no_nan() {
     // Clipping at ±1.0 should not produce NaN in output.
-    let sig = audio_gen::multi_instrument(5, 4.0).into_iter().map(|s| s.clamp(-1.0, 1.0)).collect::<Vec<_>>();
+    let sig = audio_gen::multi_instrument(5, 4.0)
+        .into_iter()
+        .map(|s| s.clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
     let pcm = audio_gen::resample_48k_to_8k(&sig);
     let mut w = Wang::default();
     let fp = w
@@ -177,11 +198,16 @@ fn empty_catalog_query_returns_none() {
 
     let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(1, 3.0));
     let mut w = Wang::default();
-    let fp = w.extract(AudioBuffer::new(&sig, SampleRate::HZ_8000)).unwrap();
+    let fp = w
+        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .unwrap();
 
     let index = WangIndex::build(&[], 100);
     let cfg = WangMatchConfig::default();
-    assert!(index.query(&fp, &cfg).is_none(), "empty catalog must return None");
+    assert!(
+        index.query(&fp, &cfg).is_none(),
+        "empty catalog must return None"
+    );
 }
 
 #[test]
@@ -192,13 +218,17 @@ fn catalog_all_different_no_false_positive() {
     let mut refs = Vec::new();
     for i in 0..20u64 {
         let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(i + 100, 4.0));
-        let fp = w.extract(AudioBuffer::new(&sig, SampleRate::HZ_8000)).unwrap();
+        let fp = w
+            .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+            .unwrap();
         refs.push(fp);
     }
 
     // Query is a completely different piece (percussion vs multi-instrument)
     let query_sig = audio_gen::resample_48k_to_8k(&audio_gen::percussion(999, 4.0));
-    let query = w.extract(AudioBuffer::new(&query_sig, SampleRate::HZ_8000)).unwrap();
+    let query = w
+        .extract(AudioBuffer::new(&query_sig, SampleRate::HZ_8000))
+        .unwrap();
 
     let index = WangIndex::build(&refs, 100);
     let cfg = WangMatchConfig::default();

@@ -3,6 +3,7 @@
 //! All generators are fully deterministic (seeded xorshift) and produce
 //! representative audio without requiring external CC0 files. This lets
 //! the codec round-trip and pipeline tests run in CI without downloads.
+#![allow(dead_code)]
 //!
 //! # Generators
 //!
@@ -202,16 +203,20 @@ pub fn speech_like(seed: u64, secs: f32) -> Vec<f32> {
     let mut s3 = [0.0f32; 2];
 
     let glottal_shape = |t: f32| -> f32 {
-        if t < 0.0 || t > 1.0 {
+        if !(0.0..=1.0).contains(&t) {
             return 0.0;
         }
         // LF model glottal pulse approximation
         let open = (t * PI).sin().powf(2.0);
-        let close = if t > 0.7 { (-(t - 0.7) * 20.0).exp() } else { 0.0 };
+        let close = if t > 0.7 {
+            (-(t - 0.7) * 20.0).exp()
+        } else {
+            0.0
+        };
         open * 0.8 + close
     };
 
-    for i in 0..n {
+    for (i, sample) in out.iter_mut().enumerate() {
         let t_in_period = (i % pulse_period) as f32 / pulse_period as f32;
         let pulse = glottal_shape(t_in_period);
 
@@ -232,8 +237,8 @@ pub fn speech_like(seed: u64, secs: f32) -> Vec<f32> {
         let res2 = resonator(pulse, &mut s2, r2, theta2);
         let res3 = resonator(pulse, &mut s3, r3, theta3);
 
-        out[i] = (res1 * 0.5 + res2 * 0.3 + res3 * 0.15 + rng.f32_bipolar() * 0.002)
-            .clamp(-1.0, 1.0);
+        *sample =
+            (res1 * 0.5 + res2 * 0.3 + res3 * 0.15 + rng.f32_bipolar() * 0.002).clamp(-1.0, 1.0);
     }
 
     out
@@ -269,8 +274,9 @@ pub fn ambient_pad(seed: u64, secs: f32) -> Vec<f32> {
         let noise = rng.f32_bipolar() * 0.15;
         lp += alpha * (noise - lp);
 
-        let s = (osc1.sample(sr) * 0.35 + osc2.sample(sr) * 0.3 + osc3.sample(sr) * 0.25 + lp * 0.4)
-            * env;
+        let s =
+            (osc1.sample(sr) * 0.35 + osc2.sample(sr) * 0.3 + osc3.sample(sr) * 0.25 + lp * 0.4)
+                * env;
 
         *sample = s.clamp(-1.0, 1.0);
     }
@@ -318,7 +324,8 @@ pub fn percussion(seed: u64, secs: f32) -> Vec<f32> {
 
         // Hi-hat on 8th notes
         let hat = if beat_pos % (beat_samples / 2) < (beat_samples / 16) {
-            rng.f32_bipolar() * 0.15
+            rng.f32_bipolar()
+                * 0.15
                 * (1.0 - (beat_pos % (beat_samples / 2)) as f32 / (beat_samples / 16) as f32)
         } else {
             0.0
@@ -379,7 +386,14 @@ pub fn resample_48k_to_16k(samples: &[f32]) -> Vec<f32> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn envelope_value(total: usize, attack: f32, decay: f32, sustain: f32, release: f32, t: usize) -> f32 {
+fn envelope_value(
+    total: usize,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    t: usize,
+) -> f32 {
     let atk = (total as f32 * attack) as usize;
     let dcy = (total as f32 * decay) as usize;
     let rel = (total as f32 * release) as usize;
