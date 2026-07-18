@@ -15,6 +15,19 @@ use crate::{AfpError, AudioBuffer, Fingerprinter, Result, TimestampMs};
 
 use super::frontend::LogMelFrontend;
 
+/// Map a failed filesystem open of a model path.
+fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AfpError::ModelNotFound(path.to_string())
+    } else {
+        AfpError::ModelLoad(format!("open: {e}"))
+    }
+}
+
+fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
+    AfpError::ModelLoad(format!("load: {e}"))
+}
+
 /// Tunable parameters for [`NeuralEmbedder`] / [`super::StreamingNeuralEmbedder`].
 ///
 /// `model_path` must point at an ONNX model whose first input accepts a
@@ -51,6 +64,15 @@ pub struct NeuralEmbedderConfig {
     /// L2-normalise emitted embeddings. Default `true` — appropriate
     /// when downstream similarity is cosine.
     pub l2_normalize: bool,
+    /// Maximum input sample count accepted by [`extract`]. `None`
+    /// disables the check. Default: `None` (unlimited — neural
+    /// models may handle long audio). Set to limit memory.
+    ///
+    /// [`extract`]: NeuralEmbedder::extract
+    pub max_input_samples: Option<usize>,
+    /// Maximum samples accepted in a single streaming `push`. `None`
+    /// disables (default). Excess samples are dropped (push is infallible).
+    pub max_push_samples: Option<usize>,
 }
 
 impl NeuralEmbedderConfig {
@@ -73,6 +95,8 @@ impl NeuralEmbedderConfig {
             window_secs: 1.0,
             hop_secs: 1.0,
             l2_normalize: true,
+            max_input_samples: None,
+            max_push_samples: None,
         }
     }
 }
@@ -311,13 +335,14 @@ impl NeuralEmbedder {
             return Err(AfpError::ModelNotFound(String::new()));
         }
         let path = Path::new(&cfg.model_path);
-        if !path.exists() {
-            return Err(AfpError::ModelNotFound(cfg.model_path.clone()));
+        // Open first so missing paths become `ModelNotFound` without an
+        // `exists()` race; Tract re-opens by path for the actual parse.
+        if let Err(e) = std::fs::File::open(path) {
+            return Err(map_model_open_io(&cfg.model_path, e));
         }
-
         let model = tract_onnx::onnx()
             .model_for_path(path)
-            .map_err(|e| AfpError::ModelLoad(format!("load: {e}")))?;
+            .map_err(map_model_load_err)?;
 
         // Concretise input shape, type, optimise, and build the runnable
         // plan — once. This is the work the watermark detector
@@ -434,6 +459,15 @@ impl Fingerprinter for NeuralEmbedder {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.core.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
         if audio.rate.hz() != self.core.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }

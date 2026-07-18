@@ -15,6 +15,52 @@ use crate::dsp::resample::SincResampler;
 use crate::error::IoError;
 use crate::{AfpError, Result};
 
+/// Resource limits for untrusted-upload decoding.
+///
+/// Use **both** caps in production: `max_bytes` rejects oversized files
+/// before opening the stream, while `max_samples` bounds decoded mono
+/// PCM growth (critical for compressed formats where on-disk size does
+/// not bound decoded size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeLimits {
+    /// Reject when on-disk file size exceeds this many bytes.
+    /// `0` disables the byte check.
+    pub max_bytes: u64,
+    /// Reject when decoded mono PCM would exceed this many samples.
+    /// `None` disables the sample check.
+    pub max_samples: Option<usize>,
+}
+
+impl DecodeLimits {
+    /// Byte-only cap (`max_samples = None`). Prefer [`Self::both`] for
+    /// compressed uploads.
+    #[must_use]
+    pub const fn bytes(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            max_samples: None,
+        }
+    }
+
+    /// Sample-only cap (`max_bytes = 0`).
+    #[must_use]
+    pub const fn samples(max_samples: usize) -> Self {
+        Self {
+            max_bytes: 0,
+            max_samples: Some(max_samples),
+        }
+    }
+
+    /// Both on-disk and decoded-PCM caps.
+    #[must_use]
+    pub const fn both(max_bytes: u64, max_samples: usize) -> Self {
+        Self {
+            max_bytes,
+            max_samples: Some(max_samples),
+        }
+    }
+}
+
 /// Decode an audio file into a mono `f32` buffer at the file's native
 /// sample rate.
 ///
@@ -46,7 +92,48 @@ use crate::{AfpError, Result};
 /// # Ok(()) }
 /// ```
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
+    decode_to_mono_limited(path, DecodeLimits::default())
+}
+
+/// Decode with a cap on total bytes read from disk. Returns Ok if the
+/// file fits within `max_bytes`; returns [`AfpError::InputTooLarge`]
+/// otherwise. `max_bytes == 0` means unlimited (same as
+/// [`decode_to_mono`]).
+///
+/// Use this when accepting untrusted uploads — a malicious 4 GB file
+/// won't OOM the host. For compressed audio prefer
+/// [`decode_to_mono_limited`] with [`DecodeLimits::both`] so decoded PCM
+/// is also bounded.
+pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)> {
+    decode_to_mono_limited(path, DecodeLimits::bytes(max_bytes))
+}
+
+/// Decode with explicit on-disk and/or decoded-PCM caps.
+///
+/// # Errors
+///
+/// - [`AfpError::InputTooLarge`] if the file exceeds `max_bytes` or
+///   decoded mono samples would exceed `max_samples`.
+/// - [`AfpError::Io`] for missing/unrecognised/corrupt streams (same as
+///   [`decode_to_mono`]).
+pub fn decode_to_mono_limited<P: AsRef<Path>>(
+    path: P,
+    limits: DecodeLimits,
+) -> Result<(Vec<f32>, u32)> {
     let path = path.as_ref();
+    // Pre-check: don't even open files that are clearly too large.
+    // Note: this is best-effort against TOCTOU (file can grow after the
+    // stat); `max_samples` is the hard bound on decoded PCM.
+    if limits.max_bytes > 0 {
+        let meta = std::fs::metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+        let len = meta.len();
+        if len > limits.max_bytes {
+            return Err(AfpError::InputTooLarge {
+                limit: usize::try_from(limits.max_bytes).unwrap_or(usize::MAX),
+                provided: usize::try_from(len).unwrap_or(usize::MAX),
+            });
+        }
+    }
     let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -55,7 +142,7 @@ pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
         hint.with_extension(ext);
     }
 
-    decode_inner(mss, &hint)
+    decode_inner(mss, &hint, limits.max_samples)
 }
 
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
@@ -81,10 +168,29 @@ pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
 /// # Ok(()) }
 /// ```
 pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<f32>> {
+    decode_to_mono_at_limited(path, target_sr, DecodeLimits::default())
+}
+
+/// Same as [`decode_to_mono_at`] but caps the source file at
+/// `max_bytes` to prevent OOM from maliciously large inputs.
+pub fn decode_to_mono_at_capped<P: AsRef<Path>>(
+    path: P,
+    target_sr: u32,
+    max_bytes: u64,
+) -> Result<Vec<f32>> {
+    decode_to_mono_at_limited(path, target_sr, DecodeLimits::bytes(max_bytes))
+}
+
+/// Same as [`decode_to_mono_at`] with full [`DecodeLimits`].
+pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
+    path: P,
+    target_sr: u32,
+    limits: DecodeLimits,
+) -> Result<Vec<f32>> {
     if target_sr == 0 {
         return Err(AfpError::Config("target sample rate must be > 0".into()));
     }
-    let (samples, sr) = decode_to_mono(path)?;
+    let (samples, sr) = decode_to_mono_limited(path, limits)?;
     if sr == target_sr {
         Ok(samples)
     } else {
@@ -93,7 +199,11 @@ pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<
     }
 }
 
-fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> {
+fn decode_inner(
+    mss: MediaSourceStream,
+    hint: &Hint,
+    max_samples: Option<usize>,
+) -> Result<(Vec<f32>, u32)> {
     let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
         .probe(
             hint,
@@ -203,6 +313,23 @@ fn decode_inner(mss: MediaSourceStream, hint: &Hint) -> Result<(Vec<f32>, u32)> 
 
         let n_frames = buf.frames();
         let n_chans = buf.spec().channels().count();
+
+        // Defensive: skip packets that report 0 channels (malformed /
+        // corrupt). Avoids division by zero and `.plane(0).unwrap()` panic.
+        if n_chans == 0 {
+            continue;
+        }
+
+        // Bound decoded PCM growth before allocating more samples.
+        if let Some(limit) = max_samples {
+            let next = samples.len().saturating_add(n_frames);
+            if next > limit {
+                return Err(AfpError::InputTooLarge {
+                    limit,
+                    provided: next,
+                });
+            }
+        }
 
         if n_chans == 1 {
             samples.extend_from_slice(&buf.plane(0).unwrap()[..n_frames]);
@@ -429,5 +556,53 @@ mod tests {
             "upsampled len = {}",
             samples.len()
         );
+    }
+
+    #[test]
+    fn capped_rejects_oversized_file_with_input_too_large() {
+        let path = write_test_wav(1, 8_000, 8_000);
+        let meta_len = std::fs::metadata(&path).unwrap().len();
+        assert!(meta_len > 100, "expected a non-trivial wav, got {meta_len}");
+        let err = decode_to_mono_capped(&path, 100).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        match err {
+            AfpError::InputTooLarge { limit, provided } => {
+                assert_eq!(limit, 100);
+                assert_eq!(provided, usize::try_from(meta_len).unwrap());
+            }
+            other => panic!("expected InputTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capped_accepts_file_under_byte_limit() {
+        let path = write_test_wav(1, 8_000, 1_000);
+        let meta_len = std::fs::metadata(&path).unwrap().len();
+        let (samples, sr) = decode_to_mono_capped(&path, meta_len).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(sr, 8_000);
+        assert_eq!(samples.len(), 1_000);
+    }
+
+    #[test]
+    fn limited_rejects_when_decoded_samples_exceed_cap() {
+        let path = write_test_wav(1, 8_000, 4_000);
+        let err = decode_to_mono_limited(&path, DecodeLimits::samples(100)).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, AfpError::InputTooLarge { limit: 100, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn limited_both_caps_small_file_ok() {
+        let path = write_test_wav(1, 8_000, 500);
+        let meta_len = std::fs::metadata(&path).unwrap().len();
+        let (samples, sr) =
+            decode_to_mono_limited(&path, DecodeLimits::both(meta_len, 500)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(sr, 8_000);
+        assert_eq!(samples.len(), 500);
     }
 }

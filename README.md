@@ -87,6 +87,27 @@ audiofp = { version = "0.3", features = ["mimalloc"] }
 
 ## Quick Start
 
+### Zero-deps (no audio file)
+
+Paste this into a fresh `cargo new` binary after `cargo add audiofp` — no MP3 required:
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+fn main() {
+    // 3 s of silence at Wang's 8 kHz. Silence yields 0 hashes, but the SDK path runs.
+    let samples = vec![0.0_f32; 8_000 * 3];
+    let mut wang = Wang::default();
+    let fp = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    println!("{} hashes (silence → usually 0)", fp.hashes.len());
+}
+```
+
+### Fingerprint a file
+
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
@@ -94,10 +115,11 @@ use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Decode any supported file format and resample to Wang's 8 kHz.
+    // Needs ≥ ~2 s of audio or extract returns AudioTooShort.
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
-    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
     let fp = wang.extract(buf)?;
 
     println!("{} hashes at {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
@@ -138,8 +160,9 @@ use audiofp::StreamingFingerprinter;
 fn main() {
     let mut s = StreamingWang::default();
 
-    // Pretend incoming 8 kHz mono f32 chunks (e.g., 16 ms at 128 samples).
-    for chunk in audio_chunks() {
+    // Synthetic 8 kHz mono chunks (16 ms ≈ 128 samples). Swap for mic/file chunks.
+    let chunk = vec![0.0_f32; 128];
+    for _ in 0..100 {
         for (timestamp, hash) in s.push(&chunk) {
             println!("{:?} {:08x}", timestamp, hash.hash);
         }
@@ -152,7 +175,6 @@ fn main() {
 
     println!("latency: {} ms", s.latency_ms());
 }
-# fn audio_chunks() -> impl Iterator<Item = Vec<f32>> { std::iter::empty() }
 ```
 
 ## Documentation
@@ -221,8 +243,17 @@ F[n][b] = ((E[n][b] − E[n][b+1]) − (E[n−1][b] − E[n−1][b+1])) > 0
 
 ## Performance
 
-Measured on Intel i5-1135G7 (4 cores, 8 threads, 2.40 GHz) with `cargo
-bench --bench extract`:
+> Performance numbers from **v0.2.0** (offline extract) and **v0.3.4**
+> (streaming), measured on an Intel i5-1135G7 (4 cores, 8 threads,
+> 2.40 GHz base). Your numbers will vary by CPU, features, and input.
+> Reproduce locally with `cargo bench --bench extract` and
+> `cargo bench --bench streaming`.
+>
+> Since **v0.3.4** the classical streaming `push` path is ~16× faster
+> (~94 % less wall time on Wang/Panako small-chunk benches) — see
+> [CHANGELOG](CHANGELOG.md#034---2026-06-14).
+
+Offline extract (`cargo bench --bench extract`, 30 s of synthetic audio):
 
 | Algorithm  | 30 s of audio | Realtime factor |
 | ---------- | ------------- | --------------- |
@@ -245,6 +276,7 @@ Hot-path design notes:
 Run benchmarks for your own host:
 ```bash
 cargo bench --bench extract
+cargo bench --bench streaming
 cargo bench --bench extract -- --save-baseline main   # save for diffing later
 ```
 
@@ -290,15 +322,29 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 
 The `examples/` directory contains complete working programs that can be run with `cargo run --example <name>`:
 
-- `enroll_file` — fingerprint a single audio file and print the unique Wang landmark count.
-- `match_two_files` — identify whether two files are the same recording via `WangMatcher` (score, votes, offset).
+- `enroll_file` — fingerprint a single audio file and print the unique Wang landmark count (`--features` default / `std`).
+- `match_two_files` — print the number of Wang hash collisions between two files (the canonical "is this the same recording?" check).
 - `compare_algorithms` — run Wang, Panako, and Haitsma–Kalker over the same file and report per-algorithm timing and hash counts.
 - `stream_buffer` — feed Wang's streaming fingerprinter from an `io::Read` chunk-by-chunk.
+- `dsp_starter` — STFT → mel → peaks pipeline on synthetic audio (no file, no optional features).
+- `neural_embed` — load a BYO ONNX embedder and print embedding dim (`--features neural`).
+- `watermark_detect` — load an AudioSeal-compatible ONNX model and print confidence (`--features watermark`).
+
+```bash
+cargo run --example dsp_starter
+cargo run --example neural_embed --features neural -- path/to/model.onnx
+cargo run --example watermark_detect --features watermark -- path/to/audioseal.onnx [audio.wav]
+```
 
 The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `fingerprint_file_capped` / `DecodeLimits` for untrusted uploads.
+
 ## Contributing
 
+Please read the [Code of Conduct](CODE_OF_CONDUCT.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 Contributions are welcome! Please:
 
 1. Fork the repository

@@ -98,11 +98,15 @@ pub mod io;
 pub mod matching;
 #[cfg(feature = "neural")]
 pub mod neural;
+/// Convenience re-exports of the most commonly used types. See
+/// [`prelude`] for details.
+pub mod prelude;
 #[cfg(feature = "watermark")]
 pub mod watermark;
 
 mod error;
 mod fp;
+mod pcm;
 mod types;
 
 #[cfg(feature = "std")]
@@ -110,6 +114,16 @@ pub use error::IoError;
 pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
 pub use types::{AudioBuffer, SampleRate, TimestampMs};
+
+/// One-shot: decode an audio file and fingerprint it. Requires `std`.
+/// See [`fp::fingerprint_file`] for details.
+#[cfg(feature = "std")]
+pub use fp::fingerprint_file;
+
+/// One-shot fingerprint with decode size caps for untrusted uploads.
+/// Requires `std`. See [`fp::fingerprint_file_capped`].
+#[cfg(feature = "std")]
+pub use fp::fingerprint_file_capped;
 
 /// Multi-threaded batch fingerprinting (requires the `rayon` feature).
 #[cfg(feature = "rayon")]

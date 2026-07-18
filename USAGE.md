@@ -22,10 +22,12 @@
 - [Watermark Detection](#watermark-detection)
 - [Neural Embedder](#neural-embedder)
 - [DSP Primitives](#dsp-primitives)
+- [Async, batching, and models](#async-batching-and-models)
 - [Error Handling](#error-handling)
 - [Performance Tips](#performance-tips)
 - [Feature Flags](#feature-flags)
 - [no_std / Embedded](#no_std--embedded)
+- [Examples](#examples)
 
 ---
 
@@ -36,6 +38,22 @@ Add the dependency:
 ```toml
 [dependencies]
 audiofp = "0.3.7"
+```
+
+### Basic example: fingerprint silence (zero deps)
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+fn main() {
+    let samples = vec![0.0_f32; 8_000 * 3]; // 3 s @ 8 kHz
+    let mut wang = Wang::default();
+    let fp = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    println!("{} hashes", fp.hashes.len()); // silence → usually 0
+}
 ```
 
 ### Basic example: fingerprint an MP3 with Wang
@@ -50,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
-    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
     let fp = wang.extract(buf)?;
 
     println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
@@ -60,6 +78,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### One-liner with `fingerprint_file` and the `prelude`
+
+```rust
+use audiofp::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut wang = Wang::default();
+    let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
+    println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
+    Ok(())
+}
+```
+
+The [`prelude`] module pulls in all three classical fingerprinters, both
+core traits, error types, and value types with one glob import.
+[`fingerprint_file`] handles decode → resample → extract in one call
+(requires `std`). For untrusted uploads prefer
+`fingerprint_file_capped` with `io::DecodeLimits::both(...)`.
 
 ### Detect duplicate songs across re-encodings
 
@@ -72,15 +109,18 @@ use std::collections::HashSet;
 fn fingerprint(path: &str) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
     let mut wang = Wang::default();
-    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
     Ok(wang.extract(buf)?.hashes.into_iter().map(|h| h.hash).collect())
 }
 
-let original = fingerprint("song.flac")?;
-let mp3 = fingerprint("song_128kbps.mp3")?;
-let overlap = original.intersection(&mp3).count();
-let pct = 100.0 * overlap as f64 / original.len().max(mp3.len()) as f64;
-println!("{overlap} hashes shared ({pct:.1} %)");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let original = fingerprint("song.flac")?;
+    let mp3 = fingerprint("song_128kbps.mp3")?;
+    let overlap = original.intersection(&mp3).count();
+    let pct = 100.0 * overlap as f64 / original.len().max(mp3.len()) as f64;
+    println!("{overlap} hashes shared ({pct:.1} %)");
+    Ok(())
+}
 ```
 
 ---
@@ -254,6 +294,10 @@ pub struct WangConfig {
     pub target_zone_f: u16,      // default 64 bins
     pub peaks_per_sec: u16,      // default 30
     pub min_anchor_mag_db: f32,  // default -50.0
+    pub max_input_samples: Option<usize>, // default 14_400_000; None to disable
+    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
+    pub max_pending_anchors: Option<usize>, // default None; streaming only
+    pub max_push_samples: Option<usize>,    // default None; truncate hostile push chunks
 }
 ```
 
@@ -264,6 +308,10 @@ pub struct WangConfig {
 | `target_zone_f`     | 64      | Maximum |Δf| (FFT bins) for valid pairs                    |
 | `peaks_per_sec`     | 30      | Peaks the picker keeps per 1 s bucket                      |
 | `min_anchor_mag_db` | -50.0   | Magnitude floor: peaks below this dB level are ignored     |
+| `max_input_samples` | 14 400 000 (30 min @ 8 kHz) | Rejects larger inputs early with `InputTooLarge`. `None` disables. |
+| `max_hashes` | 500 000 | Rejects extracts that would emit more hashes. `None` disables. |
+| `max_pending_anchors` | `None` | Streaming: oldest-first eviction when pending anchors exceed the cap. |
+| `max_push_samples` | `None` | Streaming: truncate a single `push` chunk to this many samples. |
 
 #### Output: `WangFingerprint`
 
@@ -287,15 +335,19 @@ pub struct WangHash {
 use audiofp::classical::{Wang, WangConfig};
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
-let cfg = WangConfig {
-    fan_out: 5,             // smaller fingerprint
-    peaks_per_sec: 20,      // fewer peaks → faster matching
-    ..Default::default()
-};
-let mut wang = Wang::new(cfg);
+fn main() -> Result<(), audiofp::AfpError> {
+    let cfg = WangConfig {
+        fan_out: 5,             // smaller fingerprint
+        peaks_per_sec: 20,      // fewer peaks → faster matching
+        ..Default::default()
+    };
+    let mut wang = Wang::new(cfg);
 
-let samples = vec![0.0_f32; 8_000 * 4];
-let fp = wang.extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })?;
+    let samples = vec![0.0_f32; 8_000 * 4];
+    let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+    println!("{} hashes", fp.hashes.len());
+    Ok(())
+}
 ```
 
 ### Panako (triplet hashes)
@@ -322,6 +374,10 @@ pub struct PanakoConfig {
     pub target_zone_f: u16,      // default 96
     pub peaks_per_sec: u16,      // default 30
     pub min_anchor_mag_db: f32,  // default -50.0
+    pub max_input_samples: Option<usize>, // default 14 400 000; None to disable
+    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
+    pub max_pending_anchors: Option<usize>, // default None; streaming eviction
+    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
 }
 ```
 
@@ -365,6 +421,8 @@ Packed `u32` with **band 0 in the most significant bit** (the "MSB-zero" convent
 pub struct HaitsmaConfig {
     pub fmin: f32,    // default 300.0
     pub fmax: f32,    // default 2000.0
+    pub max_input_samples: Option<usize>, // default 9 000 000; None to disable
+    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
 }
 ```
 
@@ -454,20 +512,24 @@ Each streaming variant also exposes `fn config(&self) -> &XConfig` for inspectin
 use audiofp::classical::StreamingWang;
 use audiofp::StreamingFingerprinter;
 
-let mut s = StreamingWang::default();
-let mut all = Vec::new();
+fn main() {
+    let mut s = StreamingWang::default();
+    let mut all = Vec::new();
 
-// Pretend incoming audio chunks (must be 8 kHz mono f32):
-for chunk in audio_capture_iter() {
-    for (t, hash) in s.push(&chunk) {
-        all.push((t, hash));
+    // Synthetic 8 kHz mono chunks (swap for mic / decoder frames).
+    // Real capture: read from cpal / rodio / your own ring buffer.
+    let chunk = vec![0.0_f32; 128]; // ~16 ms at 8 kHz
+    for _ in 0..200 {
+        for (t, hash) in s.push(&chunk) {
+            all.push((t, hash));
+        }
     }
+
+    // Drain whatever's pending at end-of-stream.
+    all.extend(s.flush());
+
+    println!("{} hashes total, {} ms latency", all.len(), s.latency_ms());
 }
-
-// Drain whatever's pending at end-of-stream.
-all.extend(s.flush());
-
-println!("{} hashes total, {:.1} ms latency", all.len(), s.latency_ms());
 ```
 
 ### Why the latency differs
@@ -478,22 +540,30 @@ println!("{} hashes total, {:.1} ms latency", all.len(), s.latency_ms());
 ### Bit-exact equivalence
 
 ```rust
-// Same audio fed offline vs streaming → same hash multiset.
-let offline = Wang::default()
-    .extract(AudioBuffer { samples: &whole_song, rate: SampleRate::HZ_8000 })?;
+use audiofp::classical::{StreamingWang, Wang};
+use audiofp::{AudioBuffer, Fingerprinter, StreamingFingerprinter, SampleRate};
 
-let mut streaming = StreamingWang::default();
-let mut online = Vec::new();
-for chunk in whole_song.chunks(1024) {
-    online.extend(streaming.push(chunk).into_iter().map(|(_, h)| h));
+fn main() -> Result<(), audiofp::AfpError> {
+    // Your decoded mono PCM at 8 kHz (≥ ~2 s). Silence is fine for the API path.
+    let whole_song: Vec<f32> = vec![0.0; 16_000];
+
+    let offline = Wang::default()
+        .extract(AudioBuffer::new(&whole_song, SampleRate::HZ_8000))?;
+
+    let mut streaming = StreamingWang::default();
+    let mut online = Vec::new();
+    for chunk in whole_song.chunks(1024) {
+        online.extend(streaming.push(chunk).into_iter().map(|(_, h)| h));
+    }
+    online.extend(streaming.flush().into_iter().map(|(_, h)| h));
+
+    let mut a = offline.hashes;
+    let mut b = online;
+    a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+    b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+    assert_eq!(a, b); // guaranteed under arbitrary chunking
+    Ok(())
 }
-online.extend(streaming.flush().into_iter().map(|(_, h)| h));
-
-let mut a = offline.hashes;
-let mut b = online;
-a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
-b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
-assert_eq!(a, b);   // ✅ guaranteed
 ```
 
 ---
@@ -530,6 +600,41 @@ Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::
 let samples = decode_to_mono_at("song.mp3", 8_000)?;
 ```
 
+### `decode_to_mono_capped` / `decode_to_mono_limited` (OOM protection)
+
+```rust
+pub struct DecodeLimits {
+    pub max_bytes: u64,              // 0 = unlimited
+    pub max_samples: Option<usize>,  // None = unlimited
+}
+
+pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)>;
+pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
+pub fn decode_to_mono_at_capped<P: AsRef<Path>>(path: P, target_sr: u32, max_bytes: u64) -> Result<Vec<f32>>;
+pub fn decode_to_mono_at_limited<P: AsRef<Path>>(path: P, target_sr: u32, limits: DecodeLimits) -> Result<Vec<f32>>;
+```
+
+`max_bytes` is checked via `fs::metadata()` **before** opening the stream —
+a malicious 4 GB upload is rejected in < 1 µs. Pass `max_bytes = 0` for
+unlimited. Oversized inputs return `AfpError::InputTooLarge`.
+
+For **compressed** uploads, also set `max_samples` (use
+`DecodeLimits::both`) — on-disk size does not bound decoded PCM.
+
+```rust
+use audiofp::io::{decode_to_mono_capped, decode_to_mono_limited, DecodeLimits};
+
+// Byte cap only:
+let (samples, sr) = decode_to_mono_capped("user_upload.mp3", 50 * 1024 * 1024)?;
+
+// Production: byte + sample caps:
+let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
+let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
+```
+
+`fingerprint_file` is for trusted paths. For uploads use
+`fingerprint_file_capped(&mut fp, path, limits)`.
+
 ### Supported formats
 
 Whatever Symphonia provides with the features enabled in `Cargo.toml`:
@@ -552,6 +657,7 @@ The decoder probes magic bytes too — extension-less files still work as long a
 | Format unrecognised                       | `AfpError::Io`                   |
 | Per-packet decode failure                 | (silently skipped — resilient)   |
 | Stream-fatal decode failure               | `AfpError::Io`                   |
+| File exceeds `max_bytes` / `max_samples` cap | `AfpError::InputTooLarge`        |
 
 Recoverable per-packet failures are silently skipped to keep one corrupt block from killing a whole-file decode; only stream-fatal errors propagate.
 
@@ -580,24 +686,27 @@ pub struct WatermarkConfig {
 Constructor with AudioSeal defaults:
 
 ```rust
-use audiofp::watermark::WatermarkConfig;
+use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
+use audiofp::{AudioBuffer, SampleRate};
 
-let cfg = WatermarkConfig::new("audioseal_v0.2.onnx");
-// message_bits: 16, threshold: 0.5, sample_rate: 16_000
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = WatermarkConfig::new("audioseal_v0.2.onnx");
+    // message_bits: 16, threshold: 0.5, sample_rate: 16_000
+
+    let mut det = WatermarkDetector::new(cfg)?;
+    let audio = vec![0.0_f32; 16_000]; // 1 s mono @ 16 kHz
+    let r = det.detect(AudioBuffer::new(&audio, SampleRate::HZ_16000))?;
+
+    println!(
+        "detected={} confidence={:.3} message={:#018b}",
+        r.detected, r.confidence, r.message
+    );
+    println!("localization length: {} (flattened ONNX output[0])", r.localization.len());
+    Ok(())
+}
 ```
 
 ### `WatermarkDetector`
-
-```rust
-let mut det = WatermarkDetector::new(cfg)?;
-
-let buf = AudioBuffer { samples: &audio, rate: SampleRate::HZ_16000 };
-let r = det.detect(buf)?;
-
-println!("detected={} confidence={:.3} message={:#018b}",
-         r.detected, r.confidence, r.message);
-println!("localization length: {} samples", r.localization.len());
-```
 
 The detector caches the typed model after the first call, keyed by input
 length: subsequent calls with the same buffer length skip
@@ -615,7 +724,25 @@ The detector also exposes `fn config(&self) -> &WatermarkConfig` for inspecting 
 | `detected`     | `bool`      | `true` iff `confidence > threshold`                                     |
 | `confidence`   | `f32`       | Mean of the per-output detection scores                                 |
 | `message`      | `u32`       | Decoded message bits, LSB-first; bits at or above `message_bits` are 0  |
-| `localization` | `Vec<f32>`  | Raw per-output detection scores (length depends on the model)           |
+| `localization` | `Vec<f32>`  | Flattened detection-score tensor (see contract below)                   |
+
+#### `localization` contract
+
+`localization` is the **flattened** first ONNX output (detection scores),
+copied element-wise with **no resampling, hop remapping, or time-axis
+alignment** applied by `audiofp`.
+
+| Property | Contract |
+| -------- | -------- |
+| Values | Model-emitted `f32` scores, typically in `[0, 1]` for AudioSeal-style detectors |
+| Length | Exactly the number of elements in output `[0]` after Tract flattens it — **not** guaranteed equal to `audio.samples.len()` |
+| Time axis | Model-dependent. AudioSeal detector exports often emit **one score per input sample** at the model rate (`sample_rate`, default 16 kHz), but other exports may emit per-frame / pooled maps. Treat length and hop as **part of the model card**, not part of the `audiofp` API |
+| Aggregation | `confidence = mean(localization)` (or `0.0` if empty); `detected = confidence > threshold` |
+| Stability | Shape is **not** semver-stable across model versions — only that `audiofp` forwards whatever Tract returns for output `[0]` |
+
+For “where in the clip is the watermark?”, plot or threshold `localization`
+against the model’s documented time base. Do not assume index `i` maps to
+sample `i` unless your specific ONNX export says so.
 
 ### Model contract
 
@@ -627,6 +754,21 @@ The detector also exposes `fn config(&self) -> &WatermarkConfig` for inspecting 
    - `[1]`: message bit logits tensor (any shape; first `message_bits` values are read).
 
 Bits are decoded as `logit ≥ 0`. If your AudioSeal export has a different layout, post-process accordingly before feeding it through this wrapper.
+
+### Obtaining a watermark model
+
+`audiofp` does **not** bundle the AudioSeal ONNX weights. Download / export
+them from Meta’s [AudioSeal](https://github.com/facebookresearch/audioseal)
+repository (follow their docs for `audioseal_detector_16khz` / ONNX export),
+then pass the filesystem path to `WatermarkConfig::new(...)`.
+
+```rust
+use audiofp::watermark::WatermarkConfig;
+
+let cfg = WatermarkConfig::new("/models/audioseal_detector.onnx");
+```
+
+Runnable starter: `cargo run --example watermark_detect --features watermark -- /path/to/model.onnx`.
 
 ---
 
@@ -664,6 +806,8 @@ pub struct NeuralEmbedderConfig {
     pub window_secs: f32,        // default 1.0  (analysis-window length)
     pub hop_secs: f32,           // default 1.0  (between successive windows; non-overlapping)
     pub l2_normalize: bool,      // default true
+    pub max_input_samples: Option<usize>, // default None
+    pub max_push_samples: Option<usize>,  // default None; streaming truncate
 }
 ```
 
@@ -719,15 +863,24 @@ pub struct NeuralEmbedding {
 use audiofp::neural::{NeuralEmbedderConfig, StreamingNeuralEmbedder};
 use audiofp::StreamingFingerprinter;
 
-let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 
-// Feed 16 kHz mono PCM in arbitrary-sized chunks.
-for chunk in audio_capture_iter() {
-    for (t, vector) in s.push(&chunk) {
-        println!("t={} ms, dim={}", t.0, vector.len());
+    // Feed 16 kHz mono PCM in arbitrary-sized chunks.
+    // Prefer try_push / try_push_with in production (push panics on inference errors).
+    let chunk = vec![0.0_f32; 320]; // 20 ms at 16 kHz
+    for _ in 0..100 {
+        for (t, vector) in s.try_push(&chunk)? {
+            println!("t={} ms, dim={}", t.0, vector.len());
+        }
     }
+    // flush() is infallible at the trait layer; prefer draining via try_push
+    // with trailing silence if you need Result semantics end-to-end.
+    for (t, vector) in s.flush() {
+        println!("flush t={} ms, dim={}", t.0, vector.len());
+    }
+    Ok(())
 }
-all.extend(s.flush());
 ```
 
 `StreamingNeuralEmbedder` exposes three push variants:
@@ -933,13 +1086,19 @@ The resampler also exposes `fn quality(&self) -> &SincQuality` for inspecting th
 For zero-allocation resampling in a hot loop, use `process_into`:
 
 ```rust
-let r = SincResampler::new(44_100, 16_000);
-let mut out = Vec::new();
-for chunk in audio_chunks {
-    r.process_into(&chunk, &mut out);
-    // `out` is reused across chunks — capacity is preserved,
-    // no re-allocation after the largest chunk.
-    process_resampled(&out);
+use audiofp::dsp::resample::SincResampler;
+
+fn main() {
+    let r = SincResampler::new(44_100, 16_000);
+    let mut out = Vec::new();
+    // Replace with your decoder / capture chunks at 44.1 kHz.
+    let audio_chunks: [Vec<f32>; 2] = [vec![0.0; 1024], vec![0.0; 1024]];
+    for chunk in &audio_chunks {
+        r.process_into(chunk, &mut out);
+        // `out` is reused across chunks — capacity is preserved,
+        // no re-allocation after the largest chunk.
+        let _ = out.len();
+    }
 }
 ```
 
@@ -952,6 +1111,77 @@ let w = make_window(WindowKind::Hann, 1024);
 ```
 
 Periodic windows (period N, not N-1) — matches librosa / `scipy.signal.get_window(..., fftbins=True)`.
+
+---
+
+## Async, batching, and models
+
+### Async usage
+
+`audiofp` is **synchronous**. From `tokio` (or any async runtime), offload
+CPU-heavy extract/decode onto a blocking pool:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+async fn fingerprint_blocking(
+    samples: Vec<f32>,
+) -> Result<audiofp::classical::WangFingerprint, audiofp::AfpError> {
+    let wang = Arc::new(Mutex::new(Wang::default()));
+    tokio::task::spawn_blocking(move || {
+        let mut wang = wang.lock().unwrap();
+        wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+    })
+    .await
+    .expect("blocking task join")
+}
+```
+
+Keep fingerprinters off the async executor thread: STFT + peak picking
+are CPU-bound and would stall the runtime.
+
+### Batching files
+
+Reuse one fingerprinter across paths (plans and scratch stay warm):
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::io::decode_to_mono_at;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use std::path::PathBuf;
+
+fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wang = Wang::default();
+    for path in paths {
+        let samples = decode_to_mono_at(path, 8_000)?;
+        let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+        println!("{} → {} hashes", path.display(), fp.hashes.len());
+        // db.insert(track_id, &fp.hashes);
+    }
+    Ok(())
+}
+```
+
+For true parallelism enable the `rayon` feature and use
+[`fingerprint_batch_parallel`](https://docs.rs/audiofp/latest/audiofp/fn.fingerprint_batch_parallel.html),
+or wrap your loop in `rayon::iter::ParallelIterator`.
+
+### Watermark / neural model download
+
+Neither `watermark` nor `neural` ships ONNX weights:
+
+| Feature | Where to get a model |
+| ------- | -------------------- |
+| `watermark` | Meta [AudioSeal](https://github.com/facebookresearch/audioseal) — export / download an ONNX detector (e.g. 16 kHz) and pass the path to `WatermarkConfig::new` |
+| `neural` | Bring your own log-mel embedder ONNX that matches the Neural Embedder model contract above |
+
+```bash
+cargo run --example watermark_detect --features watermark -- /path/to/audioseal.onnx
+cargo run --example neural_embed --features neural -- /path/to/embedder.onnx
+```
 
 ---
 
@@ -984,6 +1214,12 @@ pub enum AfpError {
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun { dropped: usize },
 
+    #[error("audio contains non-finite sample (NaN or Inf) at index {index}")]
+    NonFiniteSample { index: usize },
+
+    #[error("input too large: {provided} exceeds maximum {limit}")]
+    InputTooLarge { limit: usize, provided: usize },
+
     #[error("invalid configuration: {0}")]
     Config(String),
 
@@ -991,6 +1227,8 @@ pub enum AfpError {
     Io(String),
 }
 ```
+
+**PCM policy:** offline `extract` / watermark `detect` return `NonFiniteSample` on NaN/Inf. Streaming `push` replaces non-finite samples with `0.0` (API is infallible until 0.4).
 
 `#[non_exhaustive]` — match exhaustively only inside the crate. Add a `_` arm to keep your match safe across SDK upgrades.
 
@@ -1025,18 +1263,20 @@ match wang.extract(buf) {
 `Wang::new` allocates an FFT plan, window table, and scratch buffers. Don't recreate one per file:
 
 ```rust
-// Slow: allocates per file
-for path in paths {
-    let mut wang = Wang::default();
-    let samples = decode_to_mono_at(path, 8_000)?;
-    let fp = wang.extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })?;
-}
+use audiofp::classical::Wang;
+use audiofp::io::decode_to_mono_at;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use std::path::Path;
 
-// Fast: one Wang, many extractions
-let mut wang = Wang::default();
-for path in paths {
-    let samples = decode_to_mono_at(path, 8_000)?;
-    let fp = wang.extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })?;
+fn enroll(paths: &[&Path]) -> Result<(), Box<dyn std::error::Error>> {
+    // Fast: one Wang, many extractions
+    let mut wang = Wang::default();
+    for path in paths {
+        let samples = decode_to_mono_at(path, 8_000)?;
+        let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+        let _ = fp.hashes.len();
+    }
+    Ok(())
 }
 ```
 
@@ -1182,6 +1422,20 @@ What works without `std` today:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Examples
+
+Runnable starters under `examples/` (also listed in the README):
+
+| Example | Features | Command |
+| ------- | -------- | ------- |
+| `enroll_file` | `std` (default) | `cargo run --example enroll_file -- song.flac` |
+| `match_two_files` | `std` | `cargo run --example match_two_files -- a.flac b.mp3` |
+| `compare_algorithms` | `std` | `cargo run --example compare_algorithms -- song.flac` |
+| `stream_buffer` | default | `cargo run --example stream_buffer -- song.wav` |
+| `dsp_starter` | none | `cargo run --example dsp_starter` |
+| `neural_embed` | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
+| `watermark_detect` | `watermark` | `cargo run --example watermark_detect --features watermark -- model.onnx [audio.wav]` |
 
 ## Links
 

@@ -85,6 +85,9 @@ pub struct PanakoFingerprint {
 }
 
 /// Tunable parameters for [`Panako`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `PanakoConfig { fan_out: 3, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct PanakoConfig {
     /// Triplets emitted per anchor. Default 5; raising this fattens the
@@ -98,6 +101,23 @@ pub struct PanakoConfig {
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
     pub min_anchor_mag_db: f32,
+    /// Maximum input sample count accepted by [`extract`]. `None` disables
+    /// the check. Default: 14_400_000 (30 minutes at 8 kHz).
+    ///
+    /// [`extract`]: Panako::extract
+    pub max_input_samples: Option<usize>,
+    /// Maximum number of hashes allowed. `None` disables. Default: 500_000.
+    pub max_hashes: Option<usize>,
+    /// Maximum number of pending anchors in the streaming pipeline.
+    /// `None` disables (default). When set, anchors exceeding this cap
+    /// are dropped oldest-first so memory stays bounded. Relevant only
+    /// for [`StreamingPanako`].
+    pub max_pending_anchors: Option<usize>,
+    /// Maximum samples accepted in a single `push` call. `None` disables
+    /// (default). When set, excess samples beyond the cap are **dropped**
+    /// (streaming `push` is infallible). Use this to bound per-push
+    /// memory under hostile chunk sizes.
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for PanakoConfig {
@@ -108,6 +128,10 @@ impl Default for PanakoConfig {
             target_zone_f: 96,
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
+            max_input_samples: Some(30 * 60 * PANAKO_SR as usize),
+            max_hashes: Some(500_000),
+            max_pending_anchors: None,
+            max_push_samples: None,
         }
     }
 }
@@ -152,8 +176,16 @@ impl Default for Panako {
 
 impl Panako {
     /// Build a Panako extractor with the given config.
+    ///
+    /// Clamps `target_zone_t` to a minimum of 1 and `fan_out` to a
+    /// minimum of 1 to prevent underflows/empty output from degenerate
+    /// configurations. Caps `target_zone_t` at 512 and `fan_out` at 64
+    /// to prevent OOM from extreme values.
     #[must_use]
-    pub fn new(cfg: PanakoConfig) -> Self {
+    pub fn new(mut cfg: PanakoConfig) -> Self {
+        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
+        cfg.fan_out = cfg.fan_out.clamp(1, 64);
+        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -196,6 +228,15 @@ impl Fingerprinter for Panako {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
         if audio.rate.hz() != PANAKO_SR {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
@@ -227,6 +268,15 @@ impl Fingerprinter for Panako {
 
         let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+
+        if let Some(limit) = self.cfg.max_hashes
+            && hashes.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: hashes.len(),
+            });
+        }
 
         Ok(PanakoFingerprint {
             hashes,
@@ -318,8 +368,12 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         // Heap-based top-K over (b, c) tuples, scored by `b.mag + c.mag`.
         // Suffix-max array enables early-exit without reordering targets.
         let targets_len = targets.len();
-        suffix_max.clear();
-        suffix_max.resize(targets_len + 1, 0.0_f32);
+        if suffix_max.len() < targets_len + 1 {
+            suffix_max.resize(targets_len + 1, 0.0_f32);
+        } else {
+            suffix_max.truncate(targets_len + 1);
+            suffix_max[targets_len] = 0.0_f32;
+        }
         for j in (0..targets_len).rev() {
             let m = targets[j].mag;
             suffix_max[j] = if m > suffix_max[j + 1] {
@@ -484,8 +538,16 @@ impl Default for StreamingPanako {
 
 impl StreamingPanako {
     /// Build a streaming Panako extractor with the given config.
+    ///
+    /// Clamps `target_zone_t` to a minimum of 1 and `fan_out` to a
+    /// minimum of 1 to prevent underflows/empty output from degenerate
+    /// configurations. Caps `target_zone_t` at 512 and `fan_out` at 64
+    /// to prevent OOM from extreme values.
     #[must_use]
-    pub fn new(cfg: PanakoConfig) -> Self {
+    pub fn new(mut cfg: PanakoConfig) -> Self {
+        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
+        cfg.fan_out = cfg.fan_out.clamp(1, 64);
+        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -524,6 +586,24 @@ impl StreamingPanako {
     #[must_use]
     pub fn config(&self) -> &PanakoConfig {
         &self.cfg
+    }
+
+    /// Reset all internal state. The stream behaves as if freshly
+    /// constructed: no buffered audio, no pending peaks or anchors.
+    /// Call between independent streams sharing one instance so stale
+    /// data from a previous stream doesn't bleed into new hashes.
+    pub fn reset(&mut self) {
+        self.sample_carry.clear();
+        self.peak_det.reset();
+        self.spec_n_rows = 0;
+        self.spec_first_frame = 0;
+        self.n_frames_total = 0;
+        self.last_pd_frame = -1;
+        self.bucket_pending.clear();
+        self.last_finalized_bucket = -1;
+        self.pending_anchors.clear();
+        self.to_finalize.clear();
+        self.emitted.clear();
     }
 
     fn lookahead_frames(&self) -> u32 {
@@ -637,6 +717,14 @@ impl StreamingPanako {
                     anchor.targets.swap_remove(min_idx);
                 }
             }
+            // Register this peak as a new ANCHOR.
+            // If a hard cap is configured, evict oldest anchors first
+            // so memory stays bounded under adversarial / dense input.
+            if let Some(limit) = self.cfg.max_pending_anchors {
+                while self.pending_anchors.len() >= limit {
+                    self.pending_anchors.pop_front();
+                }
+            }
             self.pending_anchors.push_back(PendingAnchorPanako {
                 peak,
                 targets: Vec::new(),
@@ -744,14 +832,11 @@ impl StreamingPanako {
             ));
         }
     }
-}
+    // ── Private helpers for the zero-alloc push_with / flush_with path ──
 
-impl StreamingFingerprinter for StreamingPanako {
-    type Frame = PanakoHash;
-
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
-        self.emitted.clear();
-        self.sample_carry.extend_from_slice(samples);
+    fn process_push_samples(&mut self, samples: &[f32]) {
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= PANAKO_N_FFT {
@@ -783,11 +868,9 @@ impl StreamingFingerprinter for StreamingPanako {
 
         self.finalize_buckets();
         self.emit_finalized_anchors();
-        core::mem::take(&mut self.emitted)
     }
 
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        self.emitted.clear();
+    fn process_flush(&mut self) {
         let n_bins = self.spec_n_bins;
         let min_mag = self.cfg.min_anchor_mag_db;
         let spec = &self.spec;
@@ -818,10 +901,6 @@ impl StreamingFingerprinter for StreamingPanako {
                 *last_pd = ripe_abs as i32;
             });
 
-        // Finalise every remaining bucket — no more peaks can arrive.
-        // Reuse the pooled buffer (`to_finalize`) rather than a fresh
-        // `Vec::collect()`, matching `finalize_buckets`. Index-based
-        // loop to avoid the `drain` borrow conflict.
         self.to_finalize.clear();
         self.to_finalize
             .extend(self.bucket_pending.iter().map(|e| e.0));
@@ -832,12 +911,61 @@ impl StreamingFingerprinter for StreamingPanako {
         }
         self.to_finalize.clear();
 
-        // Emit every remaining anchor — no more targets can arrive.
         let mut emitted = core::mem::take(&mut self.emitted);
         while let Some(anchor) = self.pending_anchors.pop_front() {
             self.build_triplets_for_anchor(anchor, &mut emitted);
         }
-        emitted
+        self.emitted = emitted;
+    }
+}
+
+impl StreamingFingerprinter for StreamingPanako {
+    type Frame = PanakoHash;
+
+    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
+        self.emitted.clear();
+        self.process_push_samples(samples);
+        let mut out = Vec::new();
+        out.append(&mut self.emitted);
+        out
+    }
+
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        self.emitted.clear();
+        self.process_push_samples(samples);
+        let mut n = 0usize;
+        for (t, frame) in self.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        self.emitted.clear();
+        n
+    }
+
+    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
+        self.emitted.clear();
+        self.process_flush();
+        let mut out = Vec::new();
+        out.append(&mut self.emitted);
+        out
+    }
+
+    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        self.emitted.clear();
+        self.process_flush();
+        let mut n = 0usize;
+        for (t, frame) in self.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        self.emitted.clear();
+        n
     }
 
     fn latency_ms(&self) -> u32 {
@@ -1477,7 +1605,218 @@ mod tests {
         assert_eq!(fp.min_samples(), 16_000);
 
         let s = StreamingPanako::default();
-        // 2 784 ms at the documented defaults.
         assert_eq!(s.latency_ms(), 2_784);
+    }
+
+    // ── Backward-compat (& forward-safe) constructor clamping tests ──
+
+    #[test]
+    fn default_config_is_unchanged_by_guard_clamps() {
+        let fp = Panako::default();
+        assert_eq!(fp.config().fan_out, 5);
+        assert_eq!(fp.config().target_zone_t, 96);
+        assert_eq!(fp.config().peaks_per_sec, 30);
+    }
+
+    #[test]
+    fn zero_target_zone_is_clamped_to_one_not_underflow() {
+        let cfg = PanakoConfig {
+            target_zone_t: 0,
+            fan_out: 0,
+            ..PanakoConfig::default()
+        };
+        let fp = Panako::new(cfg);
+        assert_eq!(fp.config().target_zone_t, 1);
+        assert_eq!(fp.config().fan_out, 1);
+    }
+
+    #[test]
+    fn extreme_config_is_clamped_within_safe_bounds() {
+        let cfg = PanakoConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..PanakoConfig::default()
+        };
+        let fp = Panako::new(cfg);
+        assert_eq!(fp.config().fan_out, 64);
+        assert_eq!(fp.config().target_zone_t, 512);
+        assert_eq!(fp.config().peaks_per_sec, 500);
+    }
+
+    #[test]
+    fn clamped_config_still_produces_valid_hashes() {
+        let cfg = PanakoConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..PanakoConfig::default()
+        };
+        let mut fp = Panako::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 3);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let fpr = fp.extract(buf).unwrap();
+        assert!(!fpr.hashes.is_empty());
+    }
+
+    #[test]
+    fn streaming_default_config_is_unchanged_by_guard_clamps() {
+        let s = StreamingPanako::default();
+        let cfg = s.config();
+        assert_eq!(cfg.fan_out, 5);
+        assert_eq!(cfg.target_zone_t, 96);
+        assert_eq!(cfg.peaks_per_sec, 30);
+    }
+
+    #[test]
+    fn streaming_extreme_config_is_clamped_within_safe_bounds() {
+        let cfg = PanakoConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..PanakoConfig::default()
+        };
+        let s = StreamingPanako::new(cfg);
+        assert_eq!(s.config().fan_out, 64);
+        assert_eq!(s.config().target_zone_t, 512);
+        assert_eq!(s.config().peaks_per_sec, 500);
+    }
+
+    #[test]
+    fn streaming_reset_clears_all_state() {
+        let mut s = StreamingPanako::default();
+        let samples = synthetic_audio(0xFEED, 8_000 * 5);
+        let before = s.push(&samples);
+        assert!(!before.is_empty(), "should produce hashes");
+
+        s.reset();
+        assert!(s.push(&[]).is_empty(), "reset should clear state");
+        let after_reset = s.push(&samples);
+        assert!(!after_reset.is_empty());
+        assert_eq!(
+            before, after_reset,
+            "reset+replay must produce identical hashes"
+        );
+    }
+
+    // ── Performance regression: zero-alloc push_with contract ──
+
+    #[test]
+    fn push_with_matches_push_output_count() {
+        let mut a = StreamingPanako::default();
+        let mut b = StreamingPanako::default();
+        let samples = synthetic_audio(0xABCD, 8_000 * 5);
+
+        let via_push = a.push(&samples);
+        let mut via_cb: Vec<(TimestampMs, PanakoHash)> = Vec::new();
+        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f)));
+        let via_flush = b.flush();
+        let flush_len = via_flush.len();
+        via_cb.extend(via_flush);
+
+        let mut all_via_push = via_push;
+        all_via_push.extend(a.flush());
+
+        assert_eq!(n + flush_len, all_via_push.len());
+        assert_eq!(
+            via_cb, all_via_push,
+            "push_with must emit exactly what push+flush emits"
+        );
+    }
+
+    #[test]
+    fn flush_with_matches_flush_output() {
+        let mut a = StreamingPanako::default();
+        let mut b = StreamingPanako::default();
+        let samples = synthetic_audio(0xF00D, 8_000 * 5);
+        let _ = a.push(&samples);
+        let _ = b.push(&samples);
+
+        let via_flush = a.flush();
+        let mut via_cb: Vec<(TimestampMs, PanakoHash)> = Vec::new();
+        let n = b.flush_with(|t, f| via_cb.push((t, *f)));
+
+        assert_eq!(n, via_flush.len());
+        assert_eq!(via_cb, via_flush);
+    }
+
+    // ── OOM protection: max_input_samples enforcement ──
+
+    #[test]
+    fn input_larger_than_max_is_rejected() {
+        let cfg = PanakoConfig {
+            max_input_samples: Some(1_000),
+            ..PanakoConfig::default()
+        };
+        let mut fp = Panako::new(cfg);
+        let samples = vec![0.0_f32; 2_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn none_disables_max_input_check() {
+        let cfg = PanakoConfig {
+            max_input_samples: None,
+            ..PanakoConfig::default()
+        };
+        let mut fp = Panako::new(cfg);
+        let samples = vec![0.0_f32; 16_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        fp.extract(buf).unwrap();
+    }
+
+    #[test]
+    fn max_hashes_enforced_rejects_too_many() {
+        let cfg = PanakoConfig {
+            max_hashes: Some(10),
+            ..PanakoConfig::default()
+        };
+        let mut fp = Panako::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn max_pending_anchors_evicts_oldest() {
+        let cfg = PanakoConfig {
+            max_pending_anchors: Some(100),
+            ..PanakoConfig::default()
+        };
+        let mut s = StreamingPanako::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 20);
+        let mut hashes = s.push(&samples);
+        hashes.extend(s.flush());
+        assert!(s.config().max_pending_anchors.is_some());
+        assert!(!hashes.is_empty(), "should produce hashes with cap=100");
+    }
+
+    #[test]
+    fn max_push_samples_truncates_hostile_chunk() {
+        let cfg = PanakoConfig {
+            max_push_samples: Some(512),
+            ..PanakoConfig::default()
+        };
+        let mut s = StreamingPanako::new(cfg);
+        // One huge push must not panic; only the first 512 samples are kept.
+        let samples = synthetic_audio(0xBEEF, 8_000 * 5);
+        let _ = s.push(&samples);
+        let _ = s.flush();
+        assert_eq!(s.config().max_push_samples, Some(512));
     }
 }

@@ -54,12 +54,23 @@ pub struct HaitsmaFingerprint {
 }
 
 /// Tunable parameters for [`Haitsma`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `HaitsmaConfig { fmin: 400.0, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct HaitsmaConfig {
     /// Lowest band edge in Hz. Default 300.
     pub fmin: f32,
     /// Highest band edge in Hz. Default 2000.
     pub fmax: f32,
+    /// Maximum input sample count accepted by [`extract`]. `None` disables
+    /// the check. Default: 9_000_000 (30 minutes at 5 kHz).
+    ///
+    /// [`extract`]: Haitsma::extract
+    pub max_input_samples: Option<usize>,
+    /// Maximum samples accepted in a single streaming `push`. `None`
+    /// disables (default). Excess samples are dropped.
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for HaitsmaConfig {
@@ -67,6 +78,8 @@ impl Default for HaitsmaConfig {
         Self {
             fmin: 300.0,
             fmax: 2_000.0,
+            max_input_samples: Some(30 * 60 * HAITSMA_SR as usize),
+            max_push_samples: None,
         }
     }
 }
@@ -113,6 +126,8 @@ pub struct Haitsma {
     energies_buf: Vec<[f32; HAITSMA_N_BANDS]>,
     /// Reused buffer for packed frame hashes across `extract` calls.
     frames_buf: Vec<u32>,
+    /// Reused buffer for STFT power spectrogram across `extract` calls.
+    power_buf: Vec<f32>,
 }
 
 impl Default for Haitsma {
@@ -154,6 +169,7 @@ impl Haitsma {
             band_ranges,
             energies_buf: Vec::new(),
             frames_buf: Vec::new(),
+            power_buf: Vec::new(),
         }
     }
 }
@@ -179,6 +195,15 @@ impl Fingerprinter for Haitsma {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
         if audio.rate.hz() != HAITSMA_SR {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
@@ -191,7 +216,10 @@ impl Fingerprinter for Haitsma {
 
         // Pull power directly — band energy is `Σ |X|²`, so the previous
         // path's `m * m` after a `sqrt(|X|²)` was redundant.
-        let (power_flat, n_frames, n_bins) = self.stft.power_flat(audio.samples);
+        let (n_frames, n_bins) = self
+            .stft
+            .power_flat_into(audio.samples, &mut self.power_buf);
+        let power_flat = &self.power_buf;
         if n_frames < 2 {
             return Ok(HaitsmaFingerprint {
                 frames: Vec::new(),
@@ -375,21 +403,26 @@ impl StreamingHaitsma {
     pub fn config(&self) -> &HaitsmaConfig {
         &self.cfg
     }
-}
 
-impl StreamingFingerprinter for StreamingHaitsma {
-    type Frame = u32;
+    /// Reset all internal state. The stream behaves as if freshly
+    /// constructed: no buffered audio, no pending frames, frame
+    /// counter restarted. Call between independent input streams
+    /// sharing one instance.
+    pub fn reset(&mut self) {
+        self.sample_carry.clear();
+        self.has_prev = false;
+        self.next_frame_idx = 1;
+        self.pending.clear();
+    }
 
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
-        self.sample_carry.extend_from_slice(samples);
+    /// Core processing: advance the STFT, pack hashes, push into
+    /// `self.pending`. Shared by `push()` and `push_with()`.
+    fn process_push(&mut self, samples: &[f32]) {
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
-        // Walk frames with an offset cursor so we drain `sample_carry`
-        // exactly once at the end of the call, instead of shifting the
-        // whole tail by `HAITSMA_HOP` after every frame. The single-push
-        // frame loop becomes O(frames) instead of O(frames × buffer).
         let mut off = 0usize;
         while self.sample_carry.len() - off >= HAITSMA_N_FFT {
-            // Compute power, then sum into bands.
             self.stft.process_frame_power(
                 &self.sample_carry[off..off + HAITSMA_N_FFT],
                 &mut self.frame_power,
@@ -400,9 +433,6 @@ impl StreamingFingerprinter for StreamingHaitsma {
             }
 
             if self.has_prev {
-                // Frame index is 1-based here. Frame N corresponds to
-                // hash index N-1 in the offline output, but absolute
-                // frame index is `next_frame_idx`.
                 let hash = pack_frame_bits(&e, &self.prev_energy);
                 let abs_frame = self.next_frame_idx;
                 let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
@@ -418,19 +448,51 @@ impl StreamingFingerprinter for StreamingHaitsma {
         if off > 0 {
             self.sample_carry.drain(0..off);
         }
+    }
+}
 
-        core::mem::take(&mut self.pending)
+impl StreamingFingerprinter for StreamingHaitsma {
+    type Frame = u32;
+
+    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
+        self.process_push(samples);
+        let mut out = Vec::new();
+        out.append(&mut self.pending);
+        out
+    }
+
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        self.process_push(samples);
+        let mut n = 0usize;
+        for (t, frame) in self.pending.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        n
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        // No buffered partial work — every complete frame has been
-        // emitted by `push`. `pending` holds anything not yet drained.
-        core::mem::take(&mut self.pending)
+        let mut out = Vec::new();
+        out.append(&mut self.pending);
+        out
+    }
+
+    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        let mut n = 0usize;
+        for (t, frame) in self.pending.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        n
     }
 
     fn latency_ms(&self) -> u32 {
-        // A sample at the start of frame n is only covered fully once
-        // frame n's STFT is ready, i.e. n_fft samples later.
         (HAITSMA_N_FFT as u32 * 1000) / HAITSMA_SR
     }
 }
@@ -680,6 +742,8 @@ mod tests {
         let cfg = HaitsmaConfig {
             fmin: 500.0,
             fmax: 1500.0,
+            max_input_samples: None,
+            max_push_samples: None,
         };
         let mut h = Haitsma::new(cfg.clone());
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
@@ -698,6 +762,8 @@ mod tests {
         let _ = Haitsma::new(HaitsmaConfig {
             fmin: 1000.0,
             fmax: 1000.0,
+            max_input_samples: None,
+            max_push_samples: None,
         });
     }
 
@@ -707,6 +773,8 @@ mod tests {
         let _ = Haitsma::new(HaitsmaConfig {
             fmin: 300.0,
             fmax: 3_000.0,
+            max_input_samples: None,
+            max_push_samples: None,
         });
     }
 
@@ -790,8 +858,26 @@ mod tests {
         assert_eq!(fp.min_samples(), 10_000);
 
         let s = StreamingHaitsma::default();
-        // 409 ms at the documented defaults (n_fft=2048, sr=5 000).
         assert_eq!(s.latency_ms(), 409);
+    }
+
+    // ── Backward-compat correctness tests ──
+
+    #[test]
+    fn streaming_reset_clears_all_state() {
+        let mut s = StreamingHaitsma::default();
+        let samples = synthetic_audio(0xFEED, 5_000 * 3);
+        let before = s.push(&samples);
+        assert!(!before.is_empty(), "should produce frames");
+
+        s.reset();
+        assert!(s.push(&[]).is_empty(), "reset should clear state");
+        let after_reset = s.push(&samples);
+        assert!(!after_reset.is_empty());
+        assert_eq!(
+            before, after_reset,
+            "reset+replay must produce identical frames"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -821,5 +907,70 @@ mod tests {
             ..HaitsmaConfig::default()
         };
         let _ = Haitsma::new(cfg);
+    }
+
+    // ── Performance regression: zero-alloc push_with contract ──
+
+    #[test]
+    fn push_with_matches_push_output_count() {
+        let mut a = StreamingHaitsma::default();
+        let mut b = StreamingHaitsma::default();
+        let samples = synthetic_audio(0xABCD, 5_000 * 4);
+
+        let via_push = a.push(&samples);
+        let mut via_cb: Vec<(TimestampMs, u32)> = Vec::new();
+        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f)));
+
+        assert_eq!(n, via_push.len());
+        assert_eq!(via_cb, via_push);
+    }
+
+    #[test]
+    fn flush_with_matches_flush_output() {
+        let mut a = StreamingHaitsma::default();
+        let mut b = StreamingHaitsma::default();
+        let samples = synthetic_audio(0xF00D, 5_000 * 4);
+        let _ = a.push(&samples);
+        let _ = b.push(&samples);
+
+        let via_flush = a.flush();
+        let mut via_cb: Vec<(TimestampMs, u32)> = Vec::new();
+        let n = b.flush_with(|t, f| via_cb.push((t, *f)));
+
+        assert_eq!(n, via_flush.len());
+        assert_eq!(via_cb, via_flush);
+    }
+
+    // ── OOM protection: max_input_samples enforcement ──
+
+    #[test]
+    fn input_larger_than_max_is_rejected() {
+        let cfg = HaitsmaConfig {
+            max_input_samples: Some(1_000),
+            ..HaitsmaConfig::default()
+        };
+        let mut fp = Haitsma::new(cfg);
+        let samples = vec![0.0_f32; 2_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn none_disables_max_input_check() {
+        let cfg = HaitsmaConfig {
+            max_input_samples: None,
+            ..HaitsmaConfig::default()
+        };
+        let mut fp = Haitsma::new(cfg);
+        let samples = vec![0.0_f32; 10_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        fp.extract(buf).unwrap();
     }
 }
