@@ -55,7 +55,7 @@ mod neural;
 pub use neural::{Aggregation, NeuralMatchConfig, NeuralMatcher};
 
 mod index;
-pub use index::{PanakoIndex, WangIndex, match_best, match_ranked};
+pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
 
 mod maps;
 

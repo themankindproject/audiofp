@@ -9,9 +9,10 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use audiofp::AudioBuffer;
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
-use audiofp::classical::{Haitsma, Wang, WangFingerprint};
+use audiofp::classical::{Haitsma, Panako, Wang, WangFingerprint};
 use audiofp::matching::{
-    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, WangIndex, WangMatchConfig, WangMatcher,
+    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher,
+    WangIndex, WangMatchConfig, WangMatcher,
 };
 
 fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
@@ -77,6 +78,23 @@ fn bench_haitsma_one(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_panako_one(c: &mut Criterion) {
+    let samples = synth(3, 8_000, 5);
+    let buf = AudioBuffer {
+        samples: &samples,
+        rate: SampleRate::HZ_8000,
+    };
+    let fp = Panako::default().extract(buf).expect("panako extract");
+    let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
+
+    let mut g = c.benchmark_group("matching/panako_1to1");
+    g.throughput(Throughput::Elements(fp.hashes.len() as u64));
+    g.bench_function("self_match_5s", |b| {
+        b.iter(|| black_box(matcher.match_one(black_box(&fp), black_box(&fp))));
+    });
+    g.finish();
+}
+
 fn bench_wang_index(c: &mut Criterion) {
     let query = wang_fp(7, 3);
     let refs: Vec<WangFingerprint> = (0..100u32).map(|i| wang_fp(10 + i, 3)).collect();
@@ -94,5 +112,5 @@ fn bench_wang_index(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_wang_one, bench_haitsma_one, bench_wang_index);
+criterion_group!(benches, bench_wang_one, bench_haitsma_one, bench_panako_one, bench_wang_index);
 criterion_main!(benches);
