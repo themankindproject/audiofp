@@ -17,6 +17,7 @@
 
 use crate::matching::{MatchResult, Matcher};
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::matching::maps::HashMap;

@@ -264,8 +264,10 @@ fn extract_then_match_adversarial_pcm_no_panic() {
         Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig, WangMatcher,
     };
 
-    // Hostile PCM: NaNs and Infs — extraction must not panic; matching
-    // empty/sparse fingerprints must return a well-formed NONE/result.
+    // Hostile PCM: NaNs and Infs — must not panic. Offline extract may
+    // return Err(NonFiniteSample) (base-branch PCM policy) or succeed
+    // with a sparse fingerprint; either path is acceptable so long as
+    // matching on a successful extract is also panic-free.
     let mut pcm = vec![0.0f32; 8000 * 2];
     pcm[100] = f32::NAN;
     pcm[200] = f32::INFINITY;
@@ -273,15 +275,22 @@ fn extract_then_match_adversarial_pcm_no_panic() {
 
     let mut w = Wang::default();
     let mut p = Panako::default();
-    let wang_fp = w
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
-        .unwrap();
-    let panako_fp = p
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
-        .unwrap();
-
     let wang = WangMatcher::new(WangMatchConfig::default());
     let panako = PanakoMatcher::new(PanakoMatchConfig::default());
-    let _ = wang.match_one(&wang_fp, &wang_fp);
-    let _ = panako.match_one(&panako_fp, &panako_fp);
+
+    if let Ok(wang_fp) = w.extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000)) {
+        let _ = wang.match_one(&wang_fp, &wang_fp);
+    }
+    if let Ok(panako_fp) = p.extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000)) {
+        let _ = panako.match_one(&panako_fp, &panako_fp);
+    }
+
+    // Finite path: matching empty/sparse fingerprints must stay well-formed.
+    let silence = vec![0.0f32; 8000 * 2];
+    if let Ok(wang_fp) = w.extract(AudioBuffer::new(&silence, SampleRate::HZ_8000)) {
+        let _ = wang.match_one(&wang_fp, &wang_fp);
+    }
+    if let Ok(panako_fp) = p.extract(AudioBuffer::new(&silence, SampleRate::HZ_8000)) {
+        let _ = panako.match_one(&panako_fp, &panako_fp);
+    }
 }
