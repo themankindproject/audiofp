@@ -32,7 +32,9 @@ use alloc::vec::Vec;
 
 use crate::classical::WangFingerprint;
 use crate::matching::maps::SortedPostings;
-use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence};
+use crate::matching::{
+    MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence, frames_per_sec_compatible,
+};
 
 /// Configuration for [`WangMatcher`].
 #[derive(Clone, Debug)]
@@ -79,10 +81,10 @@ impl Matcher for WangMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
-        debug_assert_eq!(
-            query.frames_per_sec, reference.frames_per_sec,
-            "query and reference must use the same frame rate"
-        );
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
 
         if query.hashes.is_empty() || reference.hashes.is_empty() {
             return MatchResult::NONE;

@@ -505,9 +505,10 @@ pub fn match_ranked<M: Matcher>(m: &M, query: &M::Fingerprint, refs: &[M::Finger
     -> Vec<(usize, MatchResult)>;
 ```
 
-- With **`rayon`** enabled, both parallelize across references
-  (`refs.into_par_iter()`), reusing the existing feature. Parallel results must
-  equal sequential (mirror `lib.rs::batch_parallel_produces_same_results_as_sequential`).
+- ~~With **`rayon`** enabled, both parallelize across references~~
+  **Superseded:** matching stays sequential; use `WangIndex` /
+  `HaitsmaIndex` / `PanakoIndex` for large 1:N. The `rayon` feature
+  parallelises batch fingerprinting only (`fingerprint_batch_parallel`).
 
 **Optional transient index** (`matching/index.rs`) — `WangIndex` / `PanakoIndex`:
 ingest several references into one combined in-memory inverted index
@@ -571,7 +572,7 @@ Each phase is independently shippable and reviewable. Run after every phase:
 | **2. Haitsma** | `HaitsmaMatcher` (exact BER + early-abort, then LUT + optional bit-flip probes) | `matching/haitsma.rs` | self-match `BER=0`; offset recovery; `haitsma_robust_to_lowpass/noise` corpora stay under `max_ber`; LUT path == exact path |
 | **3. Panako** | `PanakoMatcher` (2-D Hough + optional RANSAC) | `matching/panako.rs` | recovers `(scale, offset)` on time-stretched copy; passes `property.rs::panako_tempo_robustness`; unrelated `is_match=false` |
 | **4. Neural** | `NeuralMatcher` (cosine; Global + SlidingMax; Dtw optional) behind `neural` | `matching/neural.rs` | identical clips → cosine 1.0 via passthrough fixture in `neural/test_support.rs`; SlidingMax localizes a sub-clip |
-| **5. 1:N** | `match_best`, `match_ranked`; `rayon` parallel; optional `WangIndex`/`PanakoIndex` | `matching/index.rs`, `matching/mod.rs` | ranking order correct; parallel == sequential; index query == pairwise `match_one` |
+| **5. 1:N** | `match_best`, `match_ranked`; optional `WangIndex`/`HaitsmaIndex`/`PanakoIndex` (no rayon matching) | `matching/index.rs`, `matching/mod.rs` | ranking order correct; index query ≈ pairwise `match_one` |
 | **6. Integrate** | Rewrite `examples/match_two_files.rs` on `WangMatcher`; `benches/matching.rs`; `USAGE.md` + README section; mark `future.md` | `examples/`, `benches/`, docs | example prints score/offset; bench runs; clippy/fmt/test green |
 
 Dependency order: **0 → 1 → {2,3,4} → 5 → 6**. Phases 2/3/4 are parallelizable
@@ -630,7 +631,8 @@ synthetic signals.** Document this dependency in the matcher rustdoc.
 | Neural SlidingMax | `O(Nq·Nr·D)` | O(1) beyond inputs | `Nq/Nr` tiny (≈ seconds) |
 
 - No allocation in inner loops beyond the histogram/index built once per match.
-- `rayon` 1:N scales across references; each `match_one` is independent.
+- Matching 1:N is sequential; use in-memory indexes for large catalogs.
+  (`rayon` applies to batch fingerprinting, not matching.)
 
 ---
 

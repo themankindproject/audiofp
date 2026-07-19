@@ -115,6 +115,9 @@ impl SortedPostings {
     }
 
     /// Return all `t_anchor` values for `hash`, or an empty slice if absent.
+    ///
+    /// Anchors within a hash group are sorted ascending (invariant of
+    /// [`Self::build`]). Callers may rely on this for ordered scans.
     #[inline]
     pub(crate) fn get(&self, hash: u32) -> &[u32] {
         match self.hashes.binary_search(&hash) {
@@ -148,10 +151,6 @@ impl SortedPostings {
         self.hashes.len()
     }
 }
-
-// SAFETY: SortedPostings owns all its data with no shared state.
-unsafe impl Send for SortedPostings {}
-unsafe impl Sync for SortedPostings {}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 
 use crate::classical::HaitsmaFingerprint;
 use crate::matching::maps::HashMap;
-use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score};
+use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 // ---------------------------------------------------------------------------
 // Core BER computation
@@ -189,6 +189,11 @@ impl Matcher for HaitsmaMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
+
         let q_frames = &query.frames;
         let r_frames = &reference.frames;
         let q_len = q_frames.len();

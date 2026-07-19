@@ -221,9 +221,9 @@ fn pipeline_tempo_speedup_105x_panako() {
         ..Default::default()
     });
     let res = matcher.match_one(&query, &reference);
-    // With linear resample pitch+tempo shift, Panako may or may not
-    // maintain enough β invariance. Accept either outcome but verify
-    // no panics and the result is well-formed.
+    // Always well-formed; when matched, public time_scale ≈ 0.95
+    // (query faster → shorter duration relative to reference).
+    assert!(res.score.is_finite() && res.prominence.is_finite() && res.time_scale.is_finite());
     if res.is_match {
         assert!(
             (res.time_scale - 0.95).abs() < 0.15,
@@ -289,7 +289,7 @@ fn pipeline_catalog_haitsma_identify() {
     let target = h.extract(buf).unwrap();
     refs.push(target.clone());
 
-    let index = HaitsmaIndex::build(&refs);
+    let index = HaitsmaIndex::build(&refs, 100);
     let cfg = HaitsmaMatchConfig {
         min_overlap_frames: 200,
         ..Default::default()

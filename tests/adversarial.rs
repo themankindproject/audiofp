@@ -237,3 +237,51 @@ fn catalog_all_different_no_false_positive() {
         "unrelated query must not falsely match in catalog"
     );
 }
+
+#[test]
+fn wang_match_mismatched_frames_per_sec_is_none() {
+    use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
+
+    let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(42, 3.0));
+    let mut w = Wang::default();
+    let mut q = w
+        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .unwrap();
+    let r = q.clone();
+    q.frames_per_sec = r.frames_per_sec * 2.0;
+
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let res = matcher.match_one(&q, &r);
+    assert!(
+        !res.is_match && res.votes == 0,
+        "fps mismatch must soft-fail to NONE: {res:?}"
+    );
+}
+
+#[test]
+fn extract_then_match_adversarial_pcm_no_panic() {
+    use audiofp::matching::{
+        Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig, WangMatcher,
+    };
+
+    // Hostile PCM: NaNs and Infs — extraction must not panic; matching
+    // empty/sparse fingerprints must return a well-formed NONE/result.
+    let mut pcm = vec![0.0f32; 8000 * 2];
+    pcm[100] = f32::NAN;
+    pcm[200] = f32::INFINITY;
+    pcm[300] = f32::NEG_INFINITY;
+
+    let mut w = Wang::default();
+    let mut p = Panako::default();
+    let wang_fp = w
+        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .unwrap();
+    let panako_fp = p
+        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .unwrap();
+
+    let wang = WangMatcher::new(WangMatchConfig::default());
+    let panako = PanakoMatcher::new(PanakoMatchConfig::default());
+    let _ = wang.match_one(&wang_fp, &wang_fp);
+    let _ = panako.match_one(&panako_fp, &panako_fp);
+}

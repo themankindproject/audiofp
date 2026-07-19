@@ -6,11 +6,14 @@
 //! lifetime of the struct. They are never serialised, never persisted,
 //! and carry no file handles.
 //!
-//! # Rayon parallel 1:N
+//! # Parallel / large 1:N
 //!
-//! When the `rayon` feature is enabled, [`match_best`] and
-//! [`match_ranked`] parallelise the per-reference loop. Their output
-//! is identical to the sequential path (tested).
+//! [`match_best`] and [`match_ranked`] are sequential pairwise loops.
+//! Matching itself has **no** `rayon` path — the `rayon` feature only
+//! parallelises batch *fingerprinting* (`fingerprint_batch_parallel`).
+//! For large catalogs, prefer the in-memory index types
+//! ([`WangIndex`], [`HaitsmaIndex`], [`PanakoIndex`]) which amortise one
+//! inverted-index build across many queries.
 
 use crate::matching::{MatchResult, Matcher};
 
@@ -18,22 +21,50 @@ use alloc::vec::Vec;
 
 use crate::matching::maps::HashMap;
 
+/// Soft cap on votes recorded per reference in [`WangIndex::query`].
+///
+/// Mirrors [`WangMatcher`](super::WangMatcher)'s dense-histogram
+/// `MAX_HIST_BINS` so a pathological query/catalog cannot grow unbounded
+/// `Vec`s under hash flooding (audit 67-6).
+const MAX_VOTES_PER_REF: usize = 10_000_000;
+
 /// Find the single best-matching reference.
 ///
 /// Returns `Some((index, result))` if any reference clears its
 /// decision threshold, or `None` if no reference matched.
 ///
-/// Callers can pair this with `match_ranked` to see the full ranking
-/// even when the best reference barely failed.
+/// Scans references once and keeps the best `is_match` result (by
+/// [`match_result_compare_desc`](crate::matching::match_result_compare_desc)).
+/// Stops early when a perfect score (`score >= 1.0`) is found. For the
+/// full ranking of every reference use [`match_ranked`]; for large
+/// catalogs prefer the index types.
 #[must_use]
 pub fn match_best<M: Matcher>(
     matcher: &M,
     query: &M::Fingerprint,
     refs: &[M::Fingerprint],
 ) -> Option<(usize, MatchResult)> {
-    match_ranked(matcher, query, refs)
-        .into_iter()
-        .find(|(_, r)| r.is_match)
+    let mut best: Option<(usize, MatchResult)> = None;
+    for (i, r) in refs.iter().enumerate() {
+        let result = matcher.match_one(query, r);
+        if !result.is_match {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((_, b)) => {
+                crate::matching::match_result_compare_desc(&result, b) == core::cmp::Ordering::Less
+            }
+        };
+        if better {
+            // Perfect hit: no later reference can outrank score 1.0.
+            if result.score >= 1.0 {
+                return Some((i, result));
+            }
+            best = Some((i, result));
+        }
+    }
+    best
 }
 
 /// Score every reference and return all results sorted by descending
@@ -42,9 +73,10 @@ pub fn match_best<M: Matcher>(
 /// Empty reference list → empty result. Unmatched references appear
 /// with `is_match == false` — the caller can inspect their scores.
 ///
-/// For parallel 1:N, use the in-memory index types
+/// For large 1:N catalogs, use the in-memory index types
 /// ([`WangIndex`], [`HaitsmaIndex`], [`PanakoIndex`]) which amortise
-/// the inverted-index build across queries.
+/// the inverted-index build across queries. Pairwise [`match_ranked`]
+/// always evaluates every reference.
 #[must_use]
 pub fn match_ranked<M: Matcher>(
     matcher: &M,
@@ -117,19 +149,25 @@ impl WangIndex {
         query: &crate::classical::WangFingerprint,
         cfg: &crate::matching::WangMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use crate::matching::{TimeOffset, clamp_score, match_result_compare_desc};
+        use crate::matching::{
+            TimeOffset, clamp_score, compute_prominence, match_result_compare_desc,
+        };
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
         }
 
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
+        // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
         let mut per_ref: HashMap<usize, Vec<(i64, u32)>> = HashMap::new();
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
                     let d = tr as i64 - h.t_anchor as i64;
-                    per_ref.entry(ref_id).or_default().push((d, qi as u32));
+                    let entry = per_ref.entry(ref_id).or_default();
+                    if entry.len() < MAX_VOTES_PER_REF {
+                        entry.push((d, qi as u32));
+                    }
                 }
             }
         }
@@ -139,42 +177,64 @@ impl WangIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         for (&ref_id, votes) in &per_ref {
-            // Raw per-offset bin counts (sparse).
+            // Raw per-offset bin counts (sparse), sorted by offset so
+            // all downstream steps (peak search, prominence, plateau
+            // selection) are independent of HashMap iteration order
+            // (audit 67-1).
             let mut bins: HashMap<i64, u32> = HashMap::new();
             for &(d, _) in votes {
                 *bins.entry(d).or_insert(0) += 1;
             }
-            let bin_vec: Vec<(i64, u32)> = bins.iter().map(|(&d, &c)| (d, c)).collect();
+            let mut bin_vec: Vec<(i64, u32)> = bins.iter().map(|(&d, &c)| (d, c)).collect();
+            bin_vec.sort_unstable_by_key(|&(d, _)| d);
 
-            // Consolidated peak.
+            // Consolidated peak with a parallel consolidated-values
+            // vector (audit 67-2): peak selection sums ±tol neighbours,
+            // so prominence must be computed on the same consolidated
+            // values, not on raw bin counts. This matches WangMatcher's
+            // prefix-sum consolidation on the dense histogram.
+            let mut consolidated: Vec<u32> = vec![0u32; bin_vec.len()];
             let mut peak_votes = 0u32;
-            let mut peak_off = 0i64;
-            for &(d0, _) in &bin_vec {
+            let mut peak_linear_idx = 0usize;
+
+            for (i, &(d0, _)) in bin_vec.iter().enumerate() {
                 let mut s = 0u32;
                 for &(d, c) in &bin_vec {
                     if (d - d0).abs() <= tol {
                         s += c;
                     }
                 }
+                consolidated[i] = s;
                 if s > peak_votes {
                     peak_votes = s;
-                    peak_off = d0;
+                    peak_linear_idx = i;
                 }
             }
+
+            // Plateau-centre tie-break: if multiple offsets share the
+            // same consolidated peak, pick the median offset of the
+            // plateau so the result is deterministic (audit 67-1).
+            let peak_off = {
+                let plateau: Vec<i64> = bin_vec
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| consolidated[i] == peak_votes)
+                    .map(|(_, &(d, _))| d)
+                    .collect();
+                let mid = plateau.len() / 2;
+                plateau
+                    .get(mid)
+                    .copied()
+                    .unwrap_or_else(|| bin_vec.get(peak_linear_idx).map(|&(d, _)| d).unwrap_or(0))
+            };
+
             if peak_votes < cfg.min_votes {
                 continue;
             }
 
-            // Prominence.
-            let peak_bin = bins.get(&peak_off).copied().unwrap_or(0);
-            let total: u64 = bin_vec.iter().map(|&(_, c)| c as u64).sum();
-            let n_bins = bin_vec.len();
-            let mean_rest = if n_bins > 1 {
-                (total.saturating_sub(peak_bin as u64)) as f32 / (n_bins - 1) as f32
-            } else {
-                0.0
-            };
-            let prominence = peak_votes as f32 / (mean_rest + 1.0);
+            // Prominence on the consolidated histogram (parity with
+            // WangMatcher — audit 67-2).
+            let prominence = compute_prominence(&consolidated, peak_linear_idx);
             if prominence < cfg.min_prominence {
                 continue;
             }
@@ -247,7 +307,17 @@ pub struct HaitsmaIndex {
 
 impl HaitsmaIndex {
     /// Build from a slice of Haitsma fingerprints.
-    pub fn build(refs: &[crate::classical::HaitsmaFingerprint]) -> Self {
+    ///
+    /// `max_postings_per_hash` caps the size of each sub-fingerprint's
+    /// posting list. Hashes that appear in more than this many positions
+    /// (silence / DC / highly repetitive content) are dropped entirely —
+    /// the same TF-IDF-style stop-hash pruning used by [`WangIndex`] and
+    /// [`PanakoIndex`]. This keeps query-time memory and work bounded on
+    /// pathological catalogs (audit B7 / A1).
+    pub fn build(
+        refs: &[crate::classical::HaitsmaFingerprint],
+        max_postings_per_hash: u32,
+    ) -> Self {
         let mut lut: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
         let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
@@ -257,6 +327,11 @@ impl HaitsmaIndex {
                 lut.entry(frame).or_default().push((ref_id, pos as u32));
             }
         }
+
+        // Stop-hash prune: drop sub-fingerprints whose posting list exceeds
+        // the cap. Without this, silence/DC frames produce enormous lists
+        // that blow up memory and query time.
+        lut.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         Self { lut, frames, fps }
     }
@@ -312,10 +387,14 @@ impl HaitsmaIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         // Group candidates by ref_id and pick the top δ per reference.
+        // On tied hit counts, prefer the δ with the smallest absolute
+        // value (closest to zero alignment) so the winner is independent
+        // of HashMap iteration order (audit B8).
         let mut per_ref: HashMap<usize, (i64, u32)> = HashMap::new();
         for (&(ref_id, delta), &hits) in &candidates {
             let entry = per_ref.entry(ref_id).or_insert((delta, hits));
-            if hits > entry.1 {
+            let better = hits > entry.1 || (hits == entry.1 && delta.abs() < entry.0.abs());
+            if better {
                 entry.0 = delta;
                 entry.1 = hits;
             }
@@ -323,15 +402,7 @@ impl HaitsmaIndex {
 
         for (ref_id, (delta, _hits)) in per_ref {
             let r_frames = &self.frames[ref_id];
-            let overlap = {
-                let d = delta;
-                if d >= 0 {
-                    q_len.min(r_frames.len().saturating_sub(d as usize))
-                } else {
-                    let d_abs = (-d) as usize;
-                    q_len.saturating_sub(d_abs).min(r_frames.len())
-                }
-            };
+            let overlap = overlap_at(q_len, r_frames.len(), delta);
 
             if overlap < min_overlap {
                 continue;
@@ -439,7 +510,12 @@ impl PanakoIndex {
         query: &crate::classical::PanakoFingerprint,
         cfg: &crate::matching::PanakoMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use crate::matching::{TimeOffset, clamp_score, match_result_compare_desc};
+        use super::panako::validate_config;
+        use crate::matching::{
+            TimeOffset, clamp_score, compute_prominence, match_result_compare_desc,
+        };
+
+        validate_config(cfg);
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
@@ -485,12 +561,17 @@ impl PanakoIndex {
         for (&ref_id, bins) in &acc {
             let bin_vec: Vec<((u32, i64), u32)> = bins.iter().map(|(&k, &v)| (k, v)).collect();
 
-            // Find peak bin via neighbourhood consolidation.
+            // Find peak bin via neighbourhood consolidation. Build a
+            // consolidated-values vector aligned with `bin_vec` so
+            // prominence is computed on the same neighbourhood-summed
+            // values that selected the peak (parity with PanakoMatcher
+            // and WangMatcher — audit B5).
+            let mut consolidated: Vec<u32> = vec![0u32; bin_vec.len()];
             let mut peak_votes = 0u32;
             let mut peak_s_bin: u32 = 0;
             let mut peak_off_key: i64 = 0;
 
-            for &((s_bin, off_key), _) in &bin_vec {
+            for (i, &((s_bin, off_key), _)) in bin_vec.iter().enumerate() {
                 let mut neigh = 0u32;
                 for &((ns, no), v) in &bin_vec {
                     let ds = ns.abs_diff(s_bin);
@@ -498,6 +579,7 @@ impl PanakoIndex {
                         neigh += v;
                     }
                 }
+                consolidated[i] = neigh;
                 if neigh > peak_votes {
                     peak_votes = neigh;
                     peak_s_bin = s_bin;
@@ -509,16 +591,14 @@ impl PanakoIndex {
                 continue;
             }
 
-            // Prominence.
-            let peak_bin_val = bins.get(&(peak_s_bin, peak_off_key)).copied().unwrap_or(0);
-            let total: u64 = bin_vec.iter().map(|&(_, c)| c as u64).sum();
-            let n_bins = bin_vec.len();
-            let mean_rest = if n_bins > 1 {
-                (total.saturating_sub(peak_bin_val as u64)) as f32 / (n_bins - 1) as f32
-            } else {
-                0.0
-            };
-            let prominence = peak_votes as f32 / (mean_rest + 1.0);
+            // Prominence on the consolidated histogram. Find the index of
+            // the chosen peak in `bin_vec` so we pass the right offset to
+            // `compute_prominence`.
+            let peak_linear_idx = bin_vec
+                .iter()
+                .position(|&((s, o), _)| s == peak_s_bin && o == peak_off_key)
+                .unwrap_or(0);
+            let prominence = compute_prominence(&consolidated, peak_linear_idx);
             if prominence < cfg.min_prominence {
                 continue;
             }
@@ -531,6 +611,15 @@ impl PanakoIndex {
             let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
             let coarse_b = peak_off_key as f64 * (tol.max(1)) as f64;
 
+            // Public contract: `time_scale = query_duration /
+            // reference_duration` = `1 / s` where `s = ref_span /
+            // query_span` is the internal Hough scale (audit B3).
+            let time_scale = if coarse_s.abs() > 1e-6 {
+                (1.0 / coarse_s).clamp(0.5, 2.0) as f32
+            } else {
+                1.0
+            };
+
             let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,
@@ -538,7 +627,7 @@ impl PanakoIndex {
                 votes: peak_votes,
                 prominence,
                 offset: TimeOffset::from_frames(coarse_b.round() as i64, fps),
-                time_scale: coarse_s.clamp(0.5, 2.0) as f32,
+                time_scale,
             };
 
             let better = match &best {
@@ -739,7 +828,7 @@ mod tests {
             .collect();
         let fp = mk_haitsma_fp(&ref_frames, 78.125);
         let refs = alloc::vec![fp.clone()];
-        let index = HaitsmaIndex::build(&refs);
+        let index = HaitsmaIndex::build(&refs, 100);
         let cfg = HaitsmaMatchConfig {
             min_overlap_frames: 256,
             ..Default::default()
@@ -767,7 +856,7 @@ mod tests {
             mk_haitsma_fp(&r1, 78.125),
             mk_haitsma_fp(&r2, 78.125),
         ];
-        let index = HaitsmaIndex::build(&refs);
+        let index = HaitsmaIndex::build(&refs, 100);
         let cfg = HaitsmaMatchConfig {
             min_overlap_frames: 256,
             ..Default::default()
@@ -785,7 +874,7 @@ mod tests {
             .map(|i| (i as u32).wrapping_mul(7919).wrapping_add(0xA000_0000))
             .collect();
         let refs = alloc::vec![mk_haitsma_fp(&r0, 78.125)];
-        let index = HaitsmaIndex::build(&refs);
+        let index = HaitsmaIndex::build(&refs, 100);
         let cfg = HaitsmaMatchConfig::default();
 
         let unrelated: Vec<u32> = (0..600)
@@ -808,7 +897,7 @@ mod tests {
         // Query = reference frames 100..500
         let query_frames: Vec<u32> = ref_frames[100..500].to_vec();
         let refs = alloc::vec![mk_haitsma_fp(&ref_frames, 78.125)];
-        let index = HaitsmaIndex::build(&refs);
+        let index = HaitsmaIndex::build(&refs, 100);
         let cfg = HaitsmaMatchConfig {
             min_overlap_frames: 200,
             ..Default::default()
@@ -821,6 +910,29 @@ mod tests {
             res.offset.frames, 100,
             "offset must be +100, got {}",
             res.offset.frames
+        );
+    }
+
+    #[test]
+    fn haitsma_index_empty_refs_returns_none() {
+        let index = HaitsmaIndex::build(&[], 100);
+        let cfg = HaitsmaMatchConfig::default();
+        let q = mk_haitsma_fp(&[1, 2, 3, 4, 5], 78.125);
+        assert!(index.query(&q, &cfg).is_none());
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn haitsma_index_stop_hash_prune() {
+        // max_postings_per_hash = 1: a hash appearing in two refs is dropped.
+        let shared = 0xABCD_EF01u32;
+        let r0 = mk_haitsma_fp(&[shared, 0x1111_1111, 0x2222_2222], 78.125);
+        let r1 = mk_haitsma_fp(&[shared, 0x3333_3333, 0x4444_4444], 78.125);
+        let index = HaitsmaIndex::build(&[r0, r1], 1);
+        // Only unique frames remain; the shared hash must be pruned.
+        assert!(
+            index.len() < 5,
+            "stop-hash prune should drop the shared posting"
         );
     }
 
@@ -866,6 +978,111 @@ mod tests {
         assert_eq!(id, 0);
         assert!(res.is_match);
         assert_eq!(res.offset.frames, 0);
+        assert!(
+            (res.time_scale - 1.0).abs() < 0.1,
+            "self-match time_scale must be ~1.0, got {}",
+            res.time_scale
+        );
+    }
+
+    #[test]
+    fn panako_index_recovers_offset() {
+        let r = mk_panako_fp(
+            &[
+                (150, 155, 165),
+                (190, 195, 205),
+                (230, 235, 245),
+                (270, 275, 285),
+                (310, 315, 325),
+                (350, 355, 365),
+                (390, 395, 405),
+                (430, 435, 445),
+            ],
+            0,
+        );
+        let q = mk_panako_fp(
+            &[
+                (100, 105, 115),
+                (140, 145, 155),
+                (180, 185, 195),
+                (220, 225, 235),
+                (260, 265, 275),
+                (300, 305, 315),
+                (340, 345, 355),
+                (380, 385, 395),
+            ],
+            0,
+        );
+        let refs = alloc::vec![r];
+        let index = PanakoIndex::build(&refs, 100);
+        let cfg = PanakoMatchConfig {
+            ransac_refine: false,
+            ..Default::default()
+        };
+        let (id, res) = index.query(&q, &cfg).expect("offset match must succeed");
+        assert_eq!(id, 0);
+        assert_eq!(
+            res.offset.frames, 50,
+            "offset must be +50, got {}",
+            res.offset.frames
+        );
+        assert!(
+            (res.time_scale - 1.0).abs() < 0.1,
+            "constant-tempo time_scale must be ~1.0, got {}",
+            res.time_scale
+        );
+    }
+
+    #[test]
+    fn panako_index_recovers_scale() {
+        // Query timestamps compressed by 0.9 → internal s ≈ 1.111,
+        // public time_scale ≈ 0.90.
+        let normal = mk_panako_fp(
+            &[
+                (100, 120, 150),
+                (200, 220, 250),
+                (300, 320, 350),
+                (400, 420, 450),
+                (500, 520, 550),
+                (600, 620, 650),
+                (700, 720, 750),
+                (800, 820, 850),
+            ],
+            0,
+        );
+        let fast = mk_panako_fp(
+            &[
+                (90, 108, 135),
+                (180, 198, 225),
+                (270, 288, 315),
+                (360, 378, 405),
+                (450, 468, 495),
+                (540, 558, 585),
+                (630, 648, 675),
+                (720, 738, 765),
+            ],
+            0,
+        );
+        let refs = alloc::vec![normal];
+        let index = PanakoIndex::build(&refs, 100);
+        let cfg = PanakoMatchConfig {
+            scale_min: 0.85,
+            scale_max: 1.20,
+            ransac_refine: false,
+            min_votes: 3,
+            min_prominence: 1.0,
+            min_score: 0.05,
+            ..Default::default()
+        };
+        let (id, res) = index
+            .query(&fast, &cfg)
+            .expect("tempo-stretched query must match");
+        assert_eq!(id, 0);
+        assert!(
+            (res.time_scale - 0.9).abs() < 0.08,
+            "expected time_scale ~0.90, got {}",
+            res.time_scale
+        );
     }
 
     #[test]
