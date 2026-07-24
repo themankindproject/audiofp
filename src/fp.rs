@@ -103,7 +103,6 @@ pub trait Fingerprinter {
 ///
 /// impl StreamingFingerprinter for EveryThird {
 ///     type Frame = u32;
-///     fn required_sample_rate(&self) -> u32 { 8_000 }
 ///     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
 ///         let mut out = Vec::new();
 ///         for s in samples {
@@ -132,7 +131,12 @@ pub trait StreamingFingerprinter {
     /// accepts raw `&[f32]` with no embedded rate tag, so there is no
     /// runtime check. Feeding the wrong rate produces garbage hashes
     /// silently.
-    fn required_sample_rate(&self) -> u32;
+    ///
+    /// The default implementation returns `0` (unspecified). All built-in
+    /// streaming fingerprinters override this with their actual rate.
+    fn required_sample_rate(&self) -> u32 {
+        0
+    }
 
     /// Feed PCM samples and return any fingerprints that became available
     /// during this push.
@@ -287,10 +291,6 @@ mod tests {
 
     impl StreamingFingerprinter for CountByThree {
         type Frame = u32;
-
-        fn required_sample_rate(&self) -> u32 {
-            8_000
-        }
 
         fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
             let mut out = Vec::new();

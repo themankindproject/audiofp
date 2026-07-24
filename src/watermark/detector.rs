@@ -201,10 +201,7 @@ impl WatermarkDetector {
     pub fn detect(&mut self, audio: AudioBuffer<'_>) -> Result<WatermarkResult> {
         crate::pcm::reject_non_finite(audio.samples)?;
         if audio.rate.hz() != self.cfg.sample_rate {
-            return Err(AfpError::UnsupportedSampleRate {
-                got: audio.rate.hz(),
-                expected: self.cfg.sample_rate,
-            });
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
         let n = audio.samples.len();
         if n == 0 {

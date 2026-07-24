@@ -78,25 +78,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### One-liner with `fingerprint_file` and the `prelude`
-
-```rust
-use audiofp::prelude::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut wang = Wang::default();
-    let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
-    println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
-    Ok(())
-}
-```
-
-The [`prelude`] module pulls in all three classical fingerprinters, both
-core traits, error types, and value types with one glob import.
-[`fingerprint_file`] handles decode → resample → extract in one call
-(requires `std`). For untrusted uploads prefer
-`fingerprint_file_capped` with `io::DecodeLimits::both(...)`.
-
 ### Detect duplicate songs across re-encodings
 
 ```rust
@@ -191,6 +172,7 @@ Incremental, low-latency extraction.
 pub trait StreamingFingerprinter {
     type Frame;
 
+    fn required_sample_rate(&self) -> u32;
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)>;
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)>;
     fn latency_ms(&self) -> u32;
@@ -202,6 +184,8 @@ pub trait StreamingFingerprinter {
     where F: FnMut(TimestampMs, &Self::Frame);
 }
 ```
+
+`required_sample_rate()` returns the sample rate (Hz) the stream expects. Feed wrong-rate samples and you'll get garbage hashes silently — there's no runtime check on `push`, so callers should assert or resample upfront.
 
 `push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
 
@@ -423,7 +407,7 @@ pub struct HaitsmaConfig {
 }
 ```
 
-`Haitsma::new` panics if `fmin >= fmax` or `fmax >= sr / 2` (above Nyquist for the fixed 5 kHz operating rate).
+`Haitsma::new` returns `Err(AfpError::Config(...))` if `fmin <= 0`, `fmin >= fmax`, or `fmax >= sr / 2` (above Nyquist for the fixed 5 kHz operating rate). `StreamingHaitsma::new` performs the same validation.
 
 #### Output: `HaitsmaFingerprint`
 
@@ -544,7 +528,7 @@ Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::
 let samples = decode_to_mono_at("song.mp3", 8_000)?;
 ```
 
-### `decode_to_mono_capped` / `decode_to_mono_limited` (OOM protection)
+### `decode_to_mono_limited` / `decode_to_mono_at_limited` (OOM protection)
 
 ```rust
 pub struct DecodeLimits {
@@ -552,9 +536,7 @@ pub struct DecodeLimits {
     pub max_samples: Option<usize>,  // None = unlimited
 }
 
-pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)>;
 pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
-pub fn decode_to_mono_at_capped<P: AsRef<Path>>(path: P, target_sr: u32, max_bytes: u64) -> Result<Vec<f32>>;
 pub fn decode_to_mono_at_limited<P: AsRef<Path>>(path: P, target_sr: u32, limits: DecodeLimits) -> Result<Vec<f32>>;
 ```
 
@@ -566,18 +548,15 @@ For **compressed** uploads, also set `max_samples` (use
 `DecodeLimits::both`) — on-disk size does not bound decoded PCM.
 
 ```rust
-use audiofp::io::{decode_to_mono_capped, decode_to_mono_limited, DecodeLimits};
+use audiofp::io::{decode_to_mono_limited, DecodeLimits};
 
 // Byte cap only:
-let (samples, sr) = decode_to_mono_capped("user_upload.mp3", 50 * 1024 * 1024)?;
+let (samples, sr) = decode_to_mono_limited("user_upload.mp3", DecodeLimits::bytes(50 * 1024 * 1024))?;
 
 // Production: byte + sample caps:
 let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
 let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
 ```
-
-`fingerprint_file` is for trusted paths. For uploads use
-`fingerprint_file_capped(&mut fp, path, limits)`.
 
 ### Supported formats
 

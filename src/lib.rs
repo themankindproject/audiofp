@@ -105,16 +105,6 @@ pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
 pub use types::{AudioBuffer, SampleRate, TimestampMs};
 
-/// One-shot: decode an audio file and fingerprint it. Requires `std`.
-/// See [`fp::fingerprint_file`] for details.
-#[cfg(feature = "std")]
-pub use fp::fingerprint_file;
-
-/// One-shot fingerprint with decode size caps for untrusted uploads.
-/// Requires `std`. See [`fp::fingerprint_file_capped`].
-#[cfg(feature = "std")]
-pub use fp::fingerprint_file_capped;
-
 /// Multi-threaded batch fingerprinting (requires the `rayon` feature).
 #[cfg(feature = "rayon")]
 pub use fp::fingerprint_batch_parallel;

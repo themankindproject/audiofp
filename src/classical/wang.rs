@@ -164,9 +164,15 @@ impl Wang {
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
         // Reject zero-value limits (would reject all inputs/outputs).
-        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
-        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
-        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
+        if cfg.max_input_samples == Some(0) {
+            cfg.max_input_samples = Some(1);
+        }
+        if cfg.max_hashes == Some(0) {
+            cfg.max_hashes = Some(1);
+        }
+        if cfg.max_pending_anchors == Some(0) {
+            cfg.max_pending_anchors = Some(1);
+        }
         cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
         cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
@@ -223,10 +229,7 @@ impl Fingerprinter for Wang {
             });
         }
         if audio.rate.hz() != WANG_SR {
-            return Err(AfpError::UnsupportedSampleRate {
-                got: audio.rate.hz(),
-                expected: WANG_SR,
-            });
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
         if audio.samples.len() < self.min_samples() {
             return Err(AfpError::AudioTooShort {
@@ -491,9 +494,15 @@ impl StreamingWang {
         cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
-        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
-        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
-        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
+        if cfg.max_input_samples == Some(0) {
+            cfg.max_input_samples = Some(1);
+        }
+        if cfg.max_hashes == Some(0) {
+            cfg.max_hashes = Some(1);
+        }
+        if cfg.max_pending_anchors == Some(0) {
+            cfg.max_pending_anchors = Some(1);
+        }
         cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
         cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
@@ -961,7 +970,7 @@ mod tests {
             rate: SampleRate::HZ_16000,
         };
         match fp.extract(buf) {
-            Err(AfpError::UnsupportedSampleRate { got: 16_000, expected: 8_000 }) => {}
+            Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
     }

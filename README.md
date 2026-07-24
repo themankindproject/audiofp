@@ -317,7 +317,7 @@ The doctests across the public API and [USAGE.md](USAGE.md) cover the full surfa
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `fingerprint_file_capped` / `DecodeLimits` for untrusted uploads.
+See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `DecodeLimits` with `decode_to_mono_limited` for untrusted uploads.
 
 ## Contributing
 

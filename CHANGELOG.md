@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`SECURITY.md` + threat model (#74).** Documents responsible disclosure,
   trust boundaries (untrusted audio vs trusted ONNX), and production
-  defaults (`DecodeLimits` / `fingerprint_file_capped`). Linked from README.
+  defaults (`DecodeLimits`). Linked from README.
 - **`CODE_OF_CONDUCT.md`, issue/PR templates, CONTRIBUTING MSRV 1.93 (#83).**
 - **`AfpError::NonFiniteSample` + PCM policy (#75).** Offline `extract` /
   watermark `detect` reject NaN/Inf. Streaming `push` sanitizes them to
@@ -28,12 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller knows the model's limits). A 4 GB malicious upload now returns
   `InputTooLarge` instead of OOM.
 - **OOM protection — decoder file-size and PCM caps.**
-  `io::decode_to_mono_capped` / `io::decode_to_mono_at_capped` reject files
-  whose on-disk size exceeds `max_bytes` (0 = unlimited) before opening
-  the stream, returning `AfpError::InputTooLarge`.
-  `DecodeLimits` + `decode_to_mono_limited` / `decode_to_mono_at_limited`
-  also bound **decoded mono sample count** so compressed formats cannot
-  inflate past a sample budget. Closes #68.
+  `decode_to_mono_limited` / `decode_to_mono_at_limited` accept a
+  `DecodeLimits` struct with `max_bytes` (rejects on-disk size before
+  opening the stream) and `max_samples` (bounds decoded mono PCM so
+  compressed formats cannot inflate past a sample budget).
+  `DecodeLimits::bytes(n)`, `DecodeLimits::samples(n)`, and
+  `DecodeLimits::both(bytes, samples)` cover the common cases.
+  The base `decode_to_mono` / `decode_to_mono_at` remain unlimited
+  (`DecodeLimits::default()`). Closes #68.
 - **`AfpError::InputTooLarge` error variant.** Structured error reporting
   the configured limit and the actual input size (samples, bytes, or
   hashes depending on the check). `Display` text includes both numbers
@@ -43,18 +45,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprinters with their config/hash types, both core traits,
   error types, and value types. Includes a doc-test showing the
   shortest path from zero to a fingerprint.
-- **`fingerprint_file` / `fingerprint_file_capped` (#15).** One-shot
-  decode → resample → extract. `fingerprint_file` is for trusted paths;
-  `fingerprint_file_capped` takes `DecodeLimits` for untrusted uploads.
-  Requires `std`. Re-exported at the crate root.
+- **`StreamingFingerprinter::required_sample_rate()`.**  Callers can now
+  query the expected sample rate at construction rather than feeding
+  wrong-rate samples silently. Implemented for all four streaming types.
+
+### Changed
+
+- **`Haitsma::try_new()` and `StreamingHaitsma::try_new()`.**
+  Fallible constructors returning `Result<Self, AfpError>` on invalid
+  `fmin`/`fmax`/Nyquist config. The existing `new()` remains infallible
+  (panics on bad config) for backward compatibility.
+- **`#[non_exhaustive]` on all config and fingerprint structs.**
+  `WangConfig`, `PanakoConfig`, `HaitsmaConfig`, `WangFingerprint`,
+  `PanakoFingerprint`, `HaitsmaFingerprint` — adding fields in future
+  patches is no longer a semver break.
+- **`AfpError::UnsupportedSampleRate` docstring enriched.** Now links to
+  both `Fingerprinter::required_sample_rate` and
+  `StreamingFingerprinter::required_sample_rate` for discoverability.
+- **`max_pending_anchors` defaults to `Some(10_000)`** for both Wang and
+  Panako. Memory is bounded by default under adversarial dense-peak
+  input. Pass `None` to disable.
+- **`target_zone_f` clamped to `[1, 512]`; `min_anchor_mag_db` clamped to
+  `[-200.0, 0.0]`** in all Wang/Panako constructors.
+- **Zero-value `Option` limits** (`max_input_samples`, `max_hashes`,
+  `max_pending_anchors` = `Some(0)`) are silently clamped to `Some(1)`.
+- **`native-tls` banned in `deny.toml`** (pulls openssl transitively).
 
 ### Fixed
 
+- **UB in `PeakPicker` scratch buffers.** `prepare_vec_uninit` used
+  `unsafe { v.set_len(new_len) }` leaving uninitialized `f32`s that
+  could be read before overwrite under aggressive LLVM optimizations.
+  Replaced with safe `clear()` + `resize()`.
+- **`decode_to_mono` Security docstring.** Now warns callers about
+  decompression bombs and directs to `decode_to_mono_limited` for
+  untrusted input.
 - **Model load TOCTOU (#79).** Dropped `path.exists()` before Tract load;
   missing files map to `ModelNotFound`, other failures to `ModelLoad`.
 - **SIMD window length asserts (#82).** `debug_assert_eq!` on AVX2/NEON
   window helpers. `BufferOverrun` kept for future mic pipeline (#98).
-- **`decode_to_mono_capped` returned `Config` instead of `InputTooLarge`.**
+- **`decode_to_mono_limited` returned `Config` instead of `InputTooLarge`.**
   Oversized files now match the documented `InputTooLarge` variant.
 - **`PanakoConfig::max_pending_anchors` was dead.** Streaming Panako now
   evicts oldest-first, matching Wang.
@@ -74,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
-- **21 new tests**: Constructor clamping (defaults preserved, zero clamped to 1, extreme capped to safe bounds, clamped config still produces hashes), streaming reset+replay correctness (×3), `push_with` ≡ `push`+`flush` output parity (×6), and `flush_with` ≡ `flush` parity (×3). Test count: 265 → 286.
+- **21 new tests**: Constructor clamping (defaults preserved, zero clamped to 1, extreme capped to safe bounds, clamped config still produces hashes), streaming reset+replay correctness (×3), `push_with` ≡ `push`+`flush` output parity (×6), and `flush_with` ≡ `flush` parity (×3). Test count: 227 → 280 (`cargo test --all-features --tests`).
 
 ### Documentation
 

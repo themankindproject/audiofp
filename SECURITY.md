@@ -32,7 +32,7 @@ Include: crate version / git commit, feature flags, minimal repro (file or PCM d
 
 - Fail with structured errors (`AfpError`) rather than panicking on normal bad input where APIs are fallible (`extract`, decode helpers).
 - Provide **optional resource budgets** for untrusted paths:
-  - `io::DecodeLimits` / `decode_to_mono_limited` / `fingerprint_file_capped`
+  - `io::DecodeLimits` / `decode_to_mono_limited`
   - `max_input_samples` on classical (and neural) configs
   - Streaming: `max_push_samples` where implemented (Panako today; others tracked in issues)
 - Document panic surfaces (e.g. some constructors still `assert!` on invalid config; neural streaming `push` may panic on inference failure — use `try_push` when you need `Result`).
@@ -52,7 +52,7 @@ Include: crate version / git commit, feature flags, minimal repro (file or PCM d
 
 For multi-tenant upload services:
 
-1. Prefer **`fingerprint_file_capped`** or `decode_to_mono_limited` with `DecodeLimits::both(max_bytes, max_samples)` — never rely on on-disk size alone for compressed formats.
+1. Prefer **`decode_to_mono_limited`** with `DecodeLimits::both(max_bytes, max_samples)` — never rely on on-disk size alone for compressed formats.
 2. Keep classical `max_input_samples` at the safe default (or tighter); set `None` only for trusted offline batch jobs.
 3. Load **only pinned, reviewed** ONNX weights for `neural` / `watermark`; do not accept user-uploaded models.
 4. Run the service with OS-level memory limits (cgroups) even when library caps are set.
@@ -62,18 +62,20 @@ Example (trusted path vs upload path):
 
 ```rust
 use audiofp::classical::Wang;
-use audiofp::io::DecodeLimits;
+use audiofp::io::{decode_to_mono_at, decode_to_mono_at_limited, DecodeLimits};
 use audiofp::prelude::*;
 
 fn enroll_trusted(path: &str) -> audiofp::Result<WangFingerprint> {
+    let samples = decode_to_mono_at(path, 8_000)?;
     let mut wang = Wang::default();
-    audiofp::fingerprint_file(&mut wang, path)
+    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
 }
 
 fn enroll_upload(path: &str) -> audiofp::Result<WangFingerprint> {
-    let mut wang = Wang::default();
     let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 8_000);
-    audiofp::fingerprint_file_capped(&mut wang, path, limits)
+    let samples = decode_to_mono_at_limited(path, 8_000, limits)?;
+    let mut wang = Wang::default();
+    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
 }
 ```
 
