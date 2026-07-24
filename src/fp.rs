@@ -103,6 +103,7 @@ pub trait Fingerprinter {
 ///
 /// impl StreamingFingerprinter for EveryThird {
 ///     type Frame = u32;
+///     fn required_sample_rate(&self) -> u32 { 8_000 }
 ///     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
 ///         let mut out = Vec::new();
 ///         for s in samples {
@@ -124,6 +125,14 @@ pub trait Fingerprinter {
 pub trait StreamingFingerprinter {
     /// One unit of fingerprint material the stream emits.
     type Frame;
+
+    /// Sample rate, in hertz, the stream expects its input at.
+    ///
+    /// Callers **must** feed samples at this rate — the streaming API
+    /// accepts raw `&[f32]` with no embedded rate tag, so there is no
+    /// runtime check. Feeding the wrong rate produces garbage hashes
+    /// silently.
+    fn required_sample_rate(&self) -> u32;
 
     /// Feed PCM samples and return any fingerprints that became available
     /// during this push.
@@ -252,82 +261,6 @@ where
         .collect()
 }
 
-/// Decode an audio file and fingerprint it in one call.
-///
-/// Uses [`crate::io::decode_to_mono_at`] to decode + resample the file
-/// to `fingerprinter.required_sample_rate()`, then calls
-/// [`Fingerprinter::extract`]. Requires the `std` feature.
-///
-/// **Trusted paths only.** This helper does not bound on-disk size or
-/// decoded PCM; a malicious upload can still OOM during decode. For
-/// untrusted uploads use [`fingerprint_file_capped`].
-///
-/// The caller constructs the fingerprinter with whatever config they
-/// want — this helper only owns the decode/resample/extract plumbing.
-///
-/// # Errors
-///
-/// Surfaces every error [`crate::io::decode_to_mono_at`] can return
-/// (missing file, unsupported format, corrupt decode) plus any
-/// error from `extract` (wrong rate, too short, input too large).
-///
-/// # Example
-///
-/// ```ignore
-/// use audiofp::classical::Wang;
-///
-/// let mut wang = Wang::default();
-/// let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
-/// println!("{} hashes", fp.hashes.len());
-/// ```
-#[cfg(feature = "std")]
-pub fn fingerprint_file<F: Fingerprinter>(
-    fingerprinter: &mut F,
-    path: impl AsRef<std::path::Path>,
-) -> Result<F::Output> {
-    use crate::SampleRate;
-
-    let sr = fingerprinter.required_sample_rate();
-    let rate = SampleRate::new(sr)
-        .expect("Fingerprinter::required_sample_rate() returned 0; contract violation");
-    let samples = crate::io::decode_to_mono_at(path, sr)?;
-    let buf = AudioBuffer::new(&samples, rate);
-    fingerprinter.extract(buf)
-}
-
-/// Decode + fingerprint with on-disk / decoded-PCM caps for untrusted uploads.
-///
-/// Same as [`fingerprint_file`], but decode goes through
-/// [`crate::io::decode_to_mono_at_limited`]. Prefer
-/// [`crate::io::DecodeLimits::both`] so compressed audio cannot inflate
-/// past a sample budget before `extract` runs.
-///
-/// # Example
-///
-/// ```ignore
-/// use audiofp::classical::Wang;
-/// use audiofp::io::DecodeLimits;
-///
-/// let mut wang = Wang::default();
-/// let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 8_000);
-/// let fp = audiofp::fingerprint_file_capped(&mut wang, "upload.mp3", limits)?;
-/// ```
-#[cfg(feature = "std")]
-pub fn fingerprint_file_capped<F: Fingerprinter>(
-    fingerprinter: &mut F,
-    path: impl AsRef<std::path::Path>,
-    limits: crate::io::DecodeLimits,
-) -> Result<F::Output> {
-    use crate::SampleRate;
-
-    let sr = fingerprinter.required_sample_rate();
-    let rate = SampleRate::new(sr)
-        .expect("Fingerprinter::required_sample_rate() returned 0; contract violation");
-    let samples = crate::io::decode_to_mono_at_limited(path, sr, limits)?;
-    let buf = AudioBuffer::new(&samples, rate);
-    fingerprinter.extract(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -354,6 +287,10 @@ mod tests {
 
     impl StreamingFingerprinter for CountByThree {
         type Frame = u32;
+
+        fn required_sample_rate(&self) -> u32 {
+            8_000
+        }
 
         fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
             let mut out = Vec::new();

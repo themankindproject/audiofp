@@ -163,6 +163,10 @@ impl Wang {
         cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        // Reject zero-value limits (would reject all inputs/outputs).
+        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
+        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
+        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -482,6 +486,9 @@ impl StreamingWang {
         cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
+        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
+        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -855,6 +862,10 @@ impl StreamingWang {
 
 impl StreamingFingerprinter for StreamingWang {
     type Frame = WangHash;
+
+    fn required_sample_rate(&self) -> u32 {
+        WANG_SR
+    }
 
     fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();

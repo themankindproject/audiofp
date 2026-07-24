@@ -134,26 +134,29 @@ pub struct Haitsma {
 
 impl Default for Haitsma {
     fn default() -> Self {
-        Self::new(HaitsmaConfig::default())
+        Self::new(HaitsmaConfig::default()).expect("default HaitsmaConfig is valid")
     }
 }
 
 impl Haitsma {
     /// Build a Haitsma extractor with the given config.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `cfg.fmin <= 0`, `cfg.fmax <= cfg.fmin`, or
-    /// `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist).
-    #[must_use]
-    pub fn new(cfg: HaitsmaConfig) -> Self {
-        assert!(cfg.fmin > 0.0, "fmin must be positive");
-        assert!(cfg.fmax > cfg.fmin, "fmax must exceed fmin");
-        assert!(
-            cfg.fmax < HAITSMA_SR as f32 / 2.0,
-            "fmax must be below Nyquist ({} Hz)",
-            HAITSMA_SR / 2
-        );
+    /// Returns [`AfpError::Config`] if `cfg.fmin <= 0`, `cfg.fmax <= cfg.fmin`,
+    /// or `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist).
+    pub fn new(cfg: HaitsmaConfig) -> crate::Result<Self> {
+        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
+            return Err(crate::AfpError::Config("fmin must be positive".into()));
+        }
+        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
+            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
+        }
+        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
+            return Err(crate::AfpError::Config(
+                alloc::format!("fmax must be below Nyquist ({} Hz)", HAITSMA_SR / 2),
+            ));
+        }
 
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: HAITSMA_N_FFT,
@@ -165,14 +168,14 @@ impl Haitsma {
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
         let band_ranges = build_band_ranges(&bin_to_band);
 
-        Self {
+        Ok(Self {
             cfg,
             stft,
             band_ranges,
             energies_buf: Vec::new(),
             frames_buf: Vec::new(),
             power_buf: Vec::new(),
-        }
+        })
     }
 }
 
@@ -370,14 +373,30 @@ pub struct StreamingHaitsma {
 
 impl Default for StreamingHaitsma {
     fn default() -> Self {
-        Self::new(HaitsmaConfig::default())
+        Self::new(HaitsmaConfig::default()).expect("default HaitsmaConfig is valid")
     }
 }
 
 impl StreamingHaitsma {
     /// Build a streaming Haitsma extractor with the given config.
-    #[must_use]
-    pub fn new(cfg: HaitsmaConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AfpError::Config`] if `cfg.fmin <= 0`, `cfg.fmax <= cfg.fmin`,
+    /// or `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist).
+    pub fn new(cfg: HaitsmaConfig) -> crate::Result<Self> {
+        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
+            return Err(crate::AfpError::Config("fmin must be positive".into()));
+        }
+        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
+            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
+        }
+        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
+            return Err(crate::AfpError::Config(
+                alloc::format!("fmax must be below Nyquist ({} Hz)", HAITSMA_SR / 2),
+            ));
+        }
+
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: HAITSMA_N_FFT,
             hop: HAITSMA_HOP,
@@ -387,7 +406,7 @@ impl StreamingHaitsma {
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
         let band_ranges = build_band_ranges(&bin_to_band);
         let n_bins = stft.n_bins();
-        Self {
+        Ok(Self {
             cfg,
             stft,
             sample_carry: Vec::new(),
@@ -397,7 +416,7 @@ impl StreamingHaitsma {
             prev_energy: [0.0_f32; HAITSMA_N_BANDS],
             next_frame_idx: 1,
             pending: Vec::new(),
-        }
+        })
     }
 
     /// Borrow the configuration this stream was built with.
@@ -455,6 +474,10 @@ impl StreamingHaitsma {
 
 impl StreamingFingerprinter for StreamingHaitsma {
     type Frame = u32;
+
+    fn required_sample_rate(&self) -> u32 {
+        HAITSMA_SR
+    }
 
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.process_push(samples);
@@ -747,7 +770,7 @@ mod tests {
             max_input_samples: None,
             max_push_samples: None,
         };
-        let mut h = Haitsma::new(cfg.clone());
+        let mut h = Haitsma::new(cfg.clone()).unwrap();
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
         let buf = AudioBuffer {
             samples: &samples,
@@ -759,25 +782,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "fmax must exceed fmin")]
-    fn invalid_band_range_panics() {
-        let _ = Haitsma::new(HaitsmaConfig {
+    fn invalid_band_range_returns_config_error() {
+        let result = Haitsma::new(HaitsmaConfig {
             fmin: 1000.0,
             fmax: 1000.0,
             max_input_samples: None,
             max_push_samples: None,
         });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmax must exceed fmin")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "below Nyquist")]
-    fn fmax_above_nyquist_panics() {
-        let _ = Haitsma::new(HaitsmaConfig {
+    fn fmax_above_nyquist_returns_config_error() {
+        let result = Haitsma::new(HaitsmaConfig {
             fmin: 300.0,
             fmax: 3_000.0,
             max_input_samples: None,
             max_push_samples: None,
         });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("Nyquist")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -885,30 +922,36 @@ mod tests {
     // -----------------------------------------------------------------
     // Constructor panic coverage.
     //
-    // `Haitsma::new` (used by the `Haitsma` extractor) asserts
+    // `Haitsma::new` (used by the `Haitsma` extractor) validates
     // `fmin > 0`, `fmax > fmin`, and `fmax < Nyquist`. The latter two
-    // are already covered by `invalid_band_range_panics` and
-    // `fmax_above_nyquist_panics`. The fmin>0 case is the gap.
+    // are already covered by `invalid_band_range_returns_config_error`
+    // and `fmax_above_nyquist_returns_config_error`. The fmin>0 case:
     // -----------------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "fmin must be positive")]
-    fn haitsma_new_panics_on_zero_fmin() {
+    fn haitsma_new_rejects_zero_fmin() {
         let cfg = HaitsmaConfig {
             fmin: 0.0,
             ..HaitsmaConfig::default()
         };
-        let _ = Haitsma::new(cfg);
+        let err = match Haitsma::new(cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmin must be positive")));
     }
 
     #[test]
-    #[should_panic(expected = "fmin must be positive")]
-    fn haitsma_new_panics_on_negative_fmin() {
+    fn haitsma_new_rejects_negative_fmin() {
         let cfg = HaitsmaConfig {
             fmin: -10.0,
             ..HaitsmaConfig::default()
         };
-        let _ = Haitsma::new(cfg);
+        let err = match Haitsma::new(cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmin must be positive")));
     }
 
     // ── Performance regression: zero-alloc push_with contract ──
@@ -951,7 +994,7 @@ mod tests {
             max_input_samples: Some(1_000),
             ..HaitsmaConfig::default()
         };
-        let mut fp = Haitsma::new(cfg);
+        let mut fp = Haitsma::new(cfg).unwrap();
         let samples = vec![0.0_f32; 2_000];
         let buf = AudioBuffer {
             samples: &samples,
@@ -967,7 +1010,7 @@ mod tests {
             max_input_samples: None,
             ..HaitsmaConfig::default()
         };
-        let mut fp = Haitsma::new(cfg);
+        let mut fp = Haitsma::new(cfg).unwrap();
         let samples = vec![0.0_f32; 10_000];
         let buf = AudioBuffer {
             samples: &samples,

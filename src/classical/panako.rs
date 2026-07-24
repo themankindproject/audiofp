@@ -188,6 +188,9 @@ impl Panako {
         cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
+        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
+        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -550,6 +553,9 @@ impl StreamingPanako {
         cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
         cfg.fan_out = cfg.fan_out.clamp(1, 64);
         cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
+        if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
+        if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -923,6 +929,10 @@ impl StreamingPanako {
 
 impl StreamingFingerprinter for StreamingPanako {
     type Frame = PanakoHash;
+
+    fn required_sample_rate(&self) -> u32 {
+        PANAKO_SR
+    }
 
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();
