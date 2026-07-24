@@ -40,8 +40,13 @@ pub enum AfpError {
     /// expects. Each fingerprinter has a single required rate; consult
     /// [`Fingerprinter::required_sample_rate`](crate::Fingerprinter::required_sample_rate)
     /// (or the algorithm's documentation) to learn the value.
-    #[error("unsupported sample rate: {0} Hz")]
-    UnsupportedSampleRate(u32),
+    #[error("unsupported sample rate: got {got} Hz, expected {expected} Hz")]
+    UnsupportedSampleRate {
+        /// The sample rate that was provided.
+        got: u32,
+        /// The sample rate the fingerprinter requires.
+        expected: u32,
+    },
 
     /// The audio has a channel count `audiofp` cannot consume (must be mono).
     #[error("unsupported channel count: {0}")]
@@ -221,25 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sample_rate_displays_offending_value_only() {
-        // The message must NOT claim a global "supported" list — each
-        // fingerprinter has its own required rate, so any list we
-        // hardcode here would be wrong for at least one of them
-        // (Haitsma needs 5 kHz; the rest don't).
-        let s = AfpError::UnsupportedSampleRate(7_000).to_string();
-        assert!(s.contains("7000"));
+    fn unsupported_sample_rate_displays_both_rates() {
+        // The message must include both the provided and expected rates.
+        let s = AfpError::UnsupportedSampleRate { got: 7_000, expected: 8_000 }.to_string();
+        assert!(s.contains("7000"), "must contain the provided rate: {s}");
+        assert!(s.contains("8000"), "must contain the expected rate: {s}");
         assert!(
             !s.contains("(supported"),
             "must not advertise a hardcoded supported list: {s}",
         );
-        // None of the previously-hardcoded "supported" rate strings
-        // should appear in the error.
-        for rate in ["8000", "11025", "16000", "22050", "44100", "48000"] {
-            assert!(
-                !s.contains(rate),
-                "found stale supported-rate {rate} in: {s}",
-            );
-        }
     }
 
     #[test]

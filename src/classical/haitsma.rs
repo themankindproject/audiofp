@@ -210,7 +210,10 @@ impl Fingerprinter for Haitsma {
             });
         }
         if audio.rate.hz() != HAITSMA_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+            return Err(AfpError::UnsupportedSampleRate {
+                got: audio.rate.hz(),
+                expected: HAITSMA_SR,
+            });
         }
         if audio.samples.len() < self.min_samples() {
             return Err(AfpError::AudioTooShort {
@@ -571,8 +574,8 @@ mod tests {
             rate: SampleRate::HZ_16000,
         };
         match fp.extract(buf) {
-            Err(AfpError::UnsupportedSampleRate(16_000)) => {}
-            other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
+            Err(AfpError::UnsupportedSampleRate { got: 16_000, expected: 5_000 }) => {}
+            other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
     }
 

@@ -83,6 +83,14 @@ impl DecodeLimits {
 ///
 /// # Example
 ///
+/// # Security
+///
+/// This function applies **no resource limits**. A compressed
+/// decompression bomb (tiny on-disk, expands to gigabytes of PCM) will
+/// succeed and may OOM the process. For untrusted uploads use
+/// [`decode_to_mono_limited`] with [`DecodeLimits::both`] so both
+/// on-disk size and decoded PCM are bounded.
+///
 /// ```no_run
 /// use audiofp::io::decode_to_mono;
 ///
@@ -93,19 +101,6 @@ impl DecodeLimits {
 /// ```
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)> {
     decode_to_mono_limited(path, DecodeLimits::default())
-}
-
-/// Decode with a cap on total bytes read from disk. Returns Ok if the
-/// file fits within `max_bytes`; returns [`AfpError::InputTooLarge`]
-/// otherwise. `max_bytes == 0` means unlimited (same as
-/// [`decode_to_mono`]).
-///
-/// Use this when accepting untrusted uploads — a malicious 4 GB file
-/// won't OOM the host. For compressed audio prefer
-/// [`decode_to_mono_limited`] with [`DecodeLimits::both`] so decoded PCM
-/// is also bounded.
-pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)> {
-    decode_to_mono_limited(path, DecodeLimits::bytes(max_bytes))
 }
 
 /// Decode with explicit on-disk and/or decoded-PCM caps.
@@ -169,16 +164,6 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
 /// ```
 pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<f32>> {
     decode_to_mono_at_limited(path, target_sr, DecodeLimits::default())
-}
-
-/// Same as [`decode_to_mono_at`] but caps the source file at
-/// `max_bytes` to prevent OOM from maliciously large inputs.
-pub fn decode_to_mono_at_capped<P: AsRef<Path>>(
-    path: P,
-    target_sr: u32,
-    max_bytes: u64,
-) -> Result<Vec<f32>> {
-    decode_to_mono_at_limited(path, target_sr, DecodeLimits::bytes(max_bytes))
 }
 
 /// Same as [`decode_to_mono_at`] with full [`DecodeLimits`].
@@ -563,7 +548,7 @@ mod tests {
         let path = write_test_wav(1, 8_000, 8_000);
         let meta_len = std::fs::metadata(&path).unwrap().len();
         assert!(meta_len > 100, "expected a non-trivial wav, got {meta_len}");
-        let err = decode_to_mono_capped(&path, 100).unwrap_err();
+        let err = decode_to_mono_limited(&path, DecodeLimits::bytes(100)).unwrap_err();
         std::fs::remove_file(&path).ok();
         match err {
             AfpError::InputTooLarge { limit, provided } => {
@@ -578,7 +563,7 @@ mod tests {
     fn capped_accepts_file_under_byte_limit() {
         let path = write_test_wav(1, 8_000, 1_000);
         let meta_len = std::fs::metadata(&path).unwrap().len();
-        let (samples, sr) = decode_to_mono_capped(&path, meta_len).unwrap();
+        let (samples, sr) = decode_to_mono_limited(&path, DecodeLimits::bytes(meta_len)).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(sr, 8_000);
         assert_eq!(samples.len(), 1_000);

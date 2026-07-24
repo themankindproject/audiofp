@@ -191,6 +191,8 @@ impl Panako {
         if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
         if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
         if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
+        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
+        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -243,7 +245,10 @@ impl Fingerprinter for Panako {
             });
         }
         if audio.rate.hz() != PANAKO_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+            return Err(AfpError::UnsupportedSampleRate {
+                got: audio.rate.hz(),
+                expected: PANAKO_SR,
+            });
         }
         if audio.samples.len() < self.min_samples() {
             return Err(AfpError::AudioTooShort {
@@ -556,6 +561,8 @@ impl StreamingPanako {
         if cfg.max_input_samples == Some(0) { cfg.max_input_samples = Some(1); }
         if cfg.max_hashes == Some(0) { cfg.max_hashes = Some(1); }
         if cfg.max_pending_anchors == Some(0) { cfg.max_pending_anchors = Some(1); }
+        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
+        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -1033,8 +1040,8 @@ mod tests {
             rate: SampleRate::HZ_16000,
         };
         match fp.extract(buf) {
-            Err(AfpError::UnsupportedSampleRate(16_000)) => {}
-            other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
+            Err(AfpError::UnsupportedSampleRate { got: 16_000, expected: 8_000 }) => {}
+            other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
     }
 

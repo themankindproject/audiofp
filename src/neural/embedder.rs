@@ -469,7 +469,10 @@ impl Fingerprinter for NeuralEmbedder {
             });
         }
         if audio.rate.hz() != self.core.cfg.sample_rate {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+            return Err(AfpError::UnsupportedSampleRate {
+                got: audio.rate.hz(),
+                expected: self.core.cfg.sample_rate,
+            });
         }
         if audio.samples.len() < self.core.window_samples {
             return Err(AfpError::AudioTooShort {
