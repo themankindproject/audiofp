@@ -237,13 +237,17 @@ impl MelFilterBank {
             return Err(crate::AfpError::Config("n_mels must be > 0".into()));
         }
         if n_fft < 2 || !n_fft.is_multiple_of(2) {
-            return Err(crate::AfpError::Config("n_fft must be even and >= 2".into()));
+            return Err(crate::AfpError::Config(
+                "n_fft must be even and >= 2".into(),
+            ));
         }
         if fmin < 0.0 || fmin.is_nan() {
             return Err(crate::AfpError::Config("fmin must be >= 0".into()));
         }
         if fmin >= fmax || fmax.is_nan() {
-            return Err(crate::AfpError::Config("fmin must be strictly less than fmax".into()));
+            return Err(crate::AfpError::Config(
+                "fmin must be strictly less than fmax".into(),
+            ));
         }
         Ok(Self::new(n_mels, n_fft, sr, fmin, fmax, scale))
     }

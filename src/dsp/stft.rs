@@ -133,14 +133,17 @@ impl ShortTimeFFT {
     /// - `hop` is zero or larger than `n_fft`
     pub fn try_new(cfg: StftConfig) -> crate::Result<Self> {
         if cfg.n_fft == 0 || !cfg.n_fft.is_power_of_two() {
-            return Err(crate::AfpError::Config(
-                alloc::format!("n_fft must be a non-zero power of two, got {}", cfg.n_fft),
-            ));
+            return Err(crate::AfpError::Config(alloc::format!(
+                "n_fft must be a non-zero power of two, got {}",
+                cfg.n_fft
+            )));
         }
         if cfg.hop == 0 || cfg.hop > cfg.n_fft {
-            return Err(crate::AfpError::Config(
-                alloc::format!("hop must be in (0, n_fft], got hop={} n_fft={}", cfg.hop, cfg.n_fft),
-            ));
+            return Err(crate::AfpError::Config(alloc::format!(
+                "hop must be in (0, n_fft], got hop={} n_fft={}",
+                cfg.hop,
+                cfg.n_fft
+            )));
         }
         Ok(Self::new(cfg))
     }

@@ -196,13 +196,17 @@ impl SincResampler {
     /// Fallible version of [`with_quality`](Self::with_quality).
     pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
         if from_sr == 0 || to_sr == 0 {
-            return Err(crate::AfpError::Config("sample rates must be non-zero".into()));
+            return Err(crate::AfpError::Config(
+                "sample rates must be non-zero".into(),
+            ));
         }
         if quality.half_taps == 0 {
             return Err(crate::AfpError::Config("half_taps must be > 0".into()));
         }
         if quality.polyphase_steps == 0 {
-            return Err(crate::AfpError::Config("polyphase_steps must be > 0".into()));
+            return Err(crate::AfpError::Config(
+                "polyphase_steps must be > 0".into(),
+            ));
         }
         Ok(Self::with_quality(from_sr, to_sr, quality))
     }
