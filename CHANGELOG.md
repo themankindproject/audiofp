@@ -122,6 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DecodeLimits` byte/sample caps, stereo/5.1 multichannel downmix,
   odd sample rates 11025/22050/44100 Hz).
 - Test count: 280 → 303 (`cargo test --all-features --tests`).
+- **Codec round-trip robustness tests (×12).** Same music ("Galway" by
+  Kevin MacLeod, CC-BY 3.0) encoded as FLAC, MP3, OGG-Vorbis, AAC/M4A,
+  and WAV. Asserts minimum Jaccard / bit-similarity thresholds vs. the
+  FLAC lossless reference for all three algorithms. Test assets committed
+  to `tests/assets/galway.*`.
 
 ### Documentation
 
