@@ -112,6 +112,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Testing
 
 - **21 new tests**: Constructor clamping (defaults preserved, zero clamped to 1, extreme capped to safe bounds, clamped config still produces hashes), streaming reset+replay correctness (×3), `push_with` ≡ `push`+`flush` output parity (×6), and `flush_with` ≡ `flush` parity (×3). Test count: 227 → 280 (`cargo test --all-features --tests`).
+- **Real audio golden regression tests (×6).** Byte-exact hash snapshots
+  for Wang, Panako, and Haitsma on `piano.ogg` and `speech.ogg`. Any
+  code change that alters hash output on real audio breaks these.
+- **E2E real audio tests (×17):** segment/offset matching (hash subset
+  verification), gain invariance (0.1× quiet, 3× clipped), 10×
+  determinism (all 3 algorithms), Panako ±5% time-stretch robustness,
+  decoder edge cases (short audio, empty file, corrupt header,
+  `DecodeLimits` byte/sample caps, stereo/5.1 multichannel downmix,
+  odd sample rates 11025/22050/44100 Hz).
+- Test count: 280 → 303 (`cargo test --all-features --tests`).
 
 ### Documentation
 
