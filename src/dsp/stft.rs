@@ -124,6 +124,27 @@ impl ShortTimeFFT {
         }
     }
 
+    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// parameters instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// - `n_fft` is zero or not a power of two
+    /// - `hop` is zero or larger than `n_fft`
+    pub fn try_new(cfg: StftConfig) -> crate::Result<Self> {
+        if cfg.n_fft == 0 || !cfg.n_fft.is_power_of_two() {
+            return Err(crate::AfpError::Config(
+                alloc::format!("n_fft must be a non-zero power of two, got {}", cfg.n_fft),
+            ));
+        }
+        if cfg.hop == 0 || cfg.hop > cfg.n_fft {
+            return Err(crate::AfpError::Config(
+                alloc::format!("hop must be in (0, n_fft], got hop={} n_fft={}", cfg.hop, cfg.n_fft),
+            ));
+        }
+        Ok(Self::new(cfg))
+    }
+
     /// Borrow the configuration this instance was built with.
     #[must_use]
     pub fn config(&self) -> &StftConfig {

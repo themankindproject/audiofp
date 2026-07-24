@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`try_new()` on `MelFilterBank`, `ShortTimeFFT`, `SincResampler` (#86).**
+  Fallible constructors returning `Result<Self, AfpError::Config>` for
+  callers who prefer error handling over panics. The existing `new()`
+  methods remain unchanged (panic on invalid params).
+- **`WatermarkConfig::max_input_samples` (#81).** When set, `detect()`
+  rejects inputs exceeding the cap with `AfpError::InputTooLarge` before
+  any inference. Default `None` (unbounded). Matches the pattern on
+  classical fingerprinter configs.
+- **Expanded Symphonia codec/format support (#112).** Enabled `adpcm`,
+  `alac` (Apple Lossless), and `mkv` (Matroska/WebM) features. Files in
+  these formats now decode out-of-the-box without user feature-flag work.
 - **`SECURITY.md` + threat model (#74).** Documents responsible disclosure,
   trust boundaries (untrusted audio vs trusted ONNX), and production
   defaults (`DecodeLimits`). Linked from README.

@@ -600,10 +600,18 @@ audiofp = { version = "0.3.7", features = ["watermark"] }
 ```rust
 pub struct WatermarkConfig {
     pub model_path: String,
-    pub message_bits: u8,    // ≤ 32, default 16
-    pub threshold: f32,      // [0, 1], default 0.5
-    pub sample_rate: u32,    // default 16_000
+    pub message_bits: u8,          // ≤ 32, default 16
+    pub threshold: f32,            // [0, 1], default 0.5
+    pub sample_rate: u32,          // default 16_000
+    pub max_input_samples: Option<usize>,  // None = unlimited (default)
 }
+```
+
+Set `max_input_samples` to bound inference cost for untrusted uploads:
+
+```rust
+let mut cfg = WatermarkConfig::new("model.onnx");
+cfg.max_input_samples = Some(30 * 60 * 16_000); // 30 min at 16 kHz
 ```
 
 Constructor with AudioSeal defaults:
@@ -929,6 +937,15 @@ let fb = MelFilterBank::new(
 
 let mut log_mel = vec![0.0_f32; 128];
 fb.log_mel(&magnitude_spectrum, &mut log_mel);
+```
+
+All DSP constructors (`MelFilterBank`, `ShortTimeFFT`, `SincResampler`) also provide a **`try_new()`** variant that returns `Result<Self, AfpError::Config>` instead of panicking on invalid parameters:
+
+```rust
+// Fallible — returns Err on bad params:
+let fb = MelFilterBank::try_new(128, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney)?;
+let stft = ShortTimeFFT::try_new(StftConfig { n_fft: 1024, hop: 128, .. })?;
+let resampler = SincResampler::try_new(44_100, 8_000)?;
 ```
 
 Slaney-normalised triangular filters; matches librosa's `feature.melspectrogram` defaults. Internally stores a compressed sparse row (CSR) representation so `log_mel` and `log_mel_from_power` iterate only the ~20–40 non-zero bins per mel band instead of all `n_bins`.
