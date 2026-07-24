@@ -16,8 +16,8 @@ use audiofp::io::decode_to_mono_at;
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
 fn wang_hashes(path: &str) -> HashSet<u32> {
-    let samples = decode_to_mono_at(path, 8_000)
-        .unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
+    let samples =
+        decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut wang = Wang::default();
     wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
         .unwrap()
@@ -60,7 +60,10 @@ fn same_track_different_codecs_high_overlap() {
     let freak_mp3 = wang_hashes("tests/assets/freak.mp3");
     let j = jaccard(&freak_flac, &freak_mp3);
     eprintln!("Freak MP3 vs FLAC: Jaccard = {j:.3}");
-    assert!(j >= 0.20, "Same track cross-codec Jaccard = {j:.3} (expected ≥0.20)");
+    assert!(
+        j >= 0.20,
+        "Same track cross-codec Jaccard = {j:.3} (expected ≥0.20)"
+    );
 }
 
 #[test]
