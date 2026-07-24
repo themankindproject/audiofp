@@ -17,8 +17,8 @@ use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn wang_hashes(path: &str) -> HashSet<u32> {
-    let samples = decode_to_mono_at(path, 8_000)
-        .unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
+    let samples =
+        decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut wang = Wang::default();
     wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
         .unwrap()
@@ -29,8 +29,8 @@ fn wang_hashes(path: &str) -> HashSet<u32> {
 }
 
 fn panako_hashes(path: &str) -> HashSet<u32> {
-    let samples = decode_to_mono_at(path, 8_000)
-        .unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
+    let samples =
+        decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut panako = Panako::default();
     panako
         .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
@@ -42,8 +42,8 @@ fn panako_hashes(path: &str) -> HashSet<u32> {
 }
 
 fn haitsma_frames(path: &str) -> Vec<u32> {
-    let samples = decode_to_mono_at(path, 5_000)
-        .unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
+    let samples =
+        decode_to_mono_at(path, 5_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut h = Haitsma::default();
     h.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
         .unwrap()
@@ -82,7 +82,11 @@ fn wang_mp3_vs_flac() {
     let ref_h = wang_hashes(REF);
     let mp3_h = wang_hashes("tests/assets/galway.mp3");
     let j = jaccard(&ref_h, &mp3_h);
-    eprintln!("Wang MP3 vs FLAC: Jaccard = {j:.3} ({} ref, {} mp3)", ref_h.len(), mp3_h.len());
+    eprintln!(
+        "Wang MP3 vs FLAC: Jaccard = {j:.3} ({} ref, {} mp3)",
+        ref_h.len(),
+        mp3_h.len()
+    );
     assert!(j >= 0.25, "Wang MP3 Jaccard = {j:.3} (expected ≥0.25)");
 }
 
@@ -111,7 +115,10 @@ fn wang_wav_vs_flac() {
     let j = jaccard(&ref_h, &wav_h);
     eprintln!("Wang WAV vs FLAC: Jaccard = {j:.3}");
     // WAV and FLAC are both lossless — should be nearly identical
-    assert!(j >= 0.95, "Wang WAV vs FLAC Jaccard = {j:.3} (expected ≥0.95)");
+    assert!(
+        j >= 0.95,
+        "Wang WAV vs FLAC Jaccard = {j:.3} (expected ≥0.95)"
+    );
 }
 
 // ── Panako codec tests ───────────────────────────────────────────────────
@@ -151,7 +158,10 @@ fn haitsma_mp3_vs_flac() {
     let mp3_f = haitsma_frames("tests/assets/galway.mp3");
     let sim = haitsma_bit_similarity(&ref_f, &mp3_f);
     eprintln!("Haitsma MP3 vs FLAC: bit-sim = {sim:.3}");
-    assert!(sim >= 0.80, "Haitsma MP3 bit-sim = {sim:.3} (expected ≥0.80)");
+    assert!(
+        sim >= 0.80,
+        "Haitsma MP3 bit-sim = {sim:.3} (expected ≥0.80)"
+    );
 }
 
 #[test]
@@ -160,7 +170,10 @@ fn haitsma_ogg_vs_flac() {
     let ogg_f = haitsma_frames("tests/assets/galway.ogg");
     let sim = haitsma_bit_similarity(&ref_f, &ogg_f);
     eprintln!("Haitsma OGG vs FLAC: bit-sim = {sim:.3}");
-    assert!(sim >= 0.80, "Haitsma OGG bit-sim = {sim:.3} (expected ≥0.80)");
+    assert!(
+        sim >= 0.80,
+        "Haitsma OGG bit-sim = {sim:.3} (expected ≥0.80)"
+    );
 }
 
 #[test]
@@ -169,7 +182,10 @@ fn haitsma_m4a_vs_flac() {
     let m4a_f = haitsma_frames("tests/assets/galway.m4a");
     let sim = haitsma_bit_similarity(&ref_f, &m4a_f);
     eprintln!("Haitsma M4A/AAC vs FLAC: bit-sim = {sim:.3}");
-    assert!(sim >= 0.75, "Haitsma M4A bit-sim = {sim:.3} (expected ≥0.75)");
+    assert!(
+        sim >= 0.75,
+        "Haitsma M4A bit-sim = {sim:.3} (expected ≥0.75)"
+    );
 }
 
 #[test]
@@ -179,7 +195,10 @@ fn haitsma_wav_vs_flac() {
     let sim = haitsma_bit_similarity(&ref_f, &wav_f);
     eprintln!("Haitsma WAV vs FLAC: bit-sim = {sim:.3}");
     // Both lossless — should be identical
-    assert!(sim >= 0.99, "Haitsma WAV vs FLAC bit-sim = {sim:.3} (expected ≥0.99)");
+    assert!(
+        sim >= 0.99,
+        "Haitsma WAV vs FLAC bit-sim = {sim:.3} (expected ≥0.99)"
+    );
 }
 
 // ── Cross-codec: all formats decode successfully ─────────────────────────

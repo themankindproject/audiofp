@@ -52,7 +52,7 @@ num-traits  = { version = "0.2.19", default-features = false }
 num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive"] }
-symphonia   = { version = "0.6", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm", "adpcm", "alac", "mkv"], optional = true }
+symphonia   = { version = "0.6", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm", "adpcm", "alac", "mkv", "aiff"], optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }
 
