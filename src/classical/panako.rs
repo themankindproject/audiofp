@@ -77,7 +77,6 @@ pub struct PanakoHash {
 
 /// All triplet hashes produced by [`Panako`] over an audio buffer.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct PanakoFingerprint {
     /// Hashes sorted by `(t_anchor, t_b, t_c, hash)`.
     pub hashes: Vec<PanakoHash>,
@@ -90,7 +89,6 @@ pub struct PanakoFingerprint {
 /// Always construct with FRU so future additive fields stay compatible:
 /// `PanakoConfig { fan_out: 3, ..Default::default() }`.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct PanakoConfig {
     /// Triplets emitted per anchor. Default 5; raising this fattens the
     /// hash database with marginally weaker triplets.
@@ -111,8 +109,9 @@ pub struct PanakoConfig {
     /// Maximum number of hashes allowed. `None` disables. Default: 500_000.
     pub max_hashes: Option<usize>,
     /// Maximum number of pending anchors in the streaming pipeline.
-    /// `None` disables (unbounded). Default: 10 000 — anchors exceeding
+    /// `None` disables (default, unbounded). When set, anchors exceeding
     /// this cap are dropped oldest-first so memory stays bounded.
+    /// Recommended: `Some(10_000)` for untrusted input.
     /// Relevant only for [`StreamingPanako`].
     pub max_pending_anchors: Option<usize>,
     /// Maximum samples accepted in a single `push` call. `None` disables
@@ -132,7 +131,7 @@ impl Default for PanakoConfig {
             min_anchor_mag_db: -50.0,
             max_input_samples: Some(30 * 60 * PANAKO_SR as usize),
             max_hashes: Some(500_000),
-            max_pending_anchors: Some(10_000),
+            max_pending_anchors: None,
             max_push_samples: None,
         }
     }

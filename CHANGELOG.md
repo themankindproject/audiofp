@@ -55,16 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fallible constructors returning `Result<Self, AfpError>` on invalid
   `fmin`/`fmax`/Nyquist config. The existing `new()` remains infallible
   (panics on bad config) for backward compatibility.
-- **`#[non_exhaustive]` on all config and fingerprint structs.**
-  `WangConfig`, `PanakoConfig`, `HaitsmaConfig`, `WangFingerprint`,
-  `PanakoFingerprint`, `HaitsmaFingerprint` — adding fields in future
-  patches is no longer a semver break.
-- **`AfpError::UnsupportedSampleRate` docstring enriched.** Now links to
-  both `Fingerprinter::required_sample_rate` and
-  `StreamingFingerprinter::required_sample_rate` for discoverability.
-- **`max_pending_anchors` defaults to `Some(10_000)`** for both Wang and
-  Panako. Memory is bounded by default under adversarial dense-peak
-  input. Pass `None` to disable.
+- **`#[non_exhaustive]` removed from config and fingerprint structs.**
+  Originally added in this cycle but reverted — it breaks the documented
+  `WangConfig { fan_out: 5, ..Default::default() }` pattern for external
+  crates. Deferred to 0.4.0.
+- **`max_pending_anchors` doc recommends `Some(10_000)` for untrusted
+  input.** Default remains `None` (unbounded) for backward compatibility.
 - **`target_zone_f` clamped to `[1, 512]`; `min_anchor_mag_db` clamped to
   `[-200.0, 0.0]`** in all Wang/Panako constructors.
 - **Zero-value `Option` limits** (`max_input_samples`, `max_hashes`,

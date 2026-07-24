@@ -45,7 +45,6 @@ use crate::{AfpError, AudioBuffer, Fingerprinter, Result, StreamingFingerprinter
 
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct HaitsmaFingerprint {
     /// One `u32` per STFT frame from `n=1` onwards.
     pub frames: Vec<u32>,
@@ -59,7 +58,6 @@ pub struct HaitsmaFingerprint {
 /// Always construct with FRU so future additive fields stay compatible:
 /// `HaitsmaConfig { fmin: 400.0, ..Default::default() }`.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct HaitsmaConfig {
     /// Lowest band edge in Hz. Default 300.
     pub fmin: f32,
