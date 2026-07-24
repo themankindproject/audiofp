@@ -124,7 +124,7 @@ impl ShortTimeFFT {
         }
     }
 
-    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
     /// parameters instead of panicking.
     ///
     /// # Errors
