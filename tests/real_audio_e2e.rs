@@ -3,9 +3,9 @@
 #![cfg(feature = "std")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
-use audiofp::io::{decode_to_mono, decode_to_mono_at, decode_to_mono_limited, DecodeLimits};
-use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate};
 use audiofp::dsp::resample::SincResampler;
+use audiofp::io::{DecodeLimits, decode_to_mono, decode_to_mono_at, decode_to_mono_limited};
+use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate};
 use std::collections::HashSet;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -19,7 +19,9 @@ fn segment_hashes_are_subset_of_full_clip() {
     let full = decode_to_mono_at("tests/assets/piano.ogg", 8_000).unwrap();
     let mut wang = Wang::default();
 
-    let full_fp = wang.extract(AudioBuffer::new(&full, SampleRate::HZ_8000)).unwrap();
+    let full_fp = wang
+        .extract(AudioBuffer::new(&full, SampleRate::HZ_8000))
+        .unwrap();
     let full_hashes: HashSet<u32> = full_fp.hashes.iter().map(|h| h.hash).collect();
 
     // Take a 3-second segment starting at 1 second
@@ -27,7 +29,9 @@ fn segment_hashes_are_subset_of_full_clip() {
     let end = (start + 8_000 * 3).min(full.len());
     let segment = &full[start..end];
 
-    let seg_fp = wang.extract(AudioBuffer::new(segment, SampleRate::HZ_8000)).unwrap();
+    let seg_fp = wang
+        .extract(AudioBuffer::new(segment, SampleRate::HZ_8000))
+        .unwrap();
     let seg_hashes: HashSet<u32> = seg_fp.hashes.iter().map(|h| h.hash).collect();
 
     // At least 30% of segment hashes should appear in full clip
@@ -49,8 +53,12 @@ fn gain_invariance_quiet() {
     let quiet: Vec<f32> = samples.iter().map(|s| s * 0.1).collect();
 
     let mut wang = Wang::default();
-    let original = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let scaled = wang.extract(AudioBuffer::new(&quiet, SampleRate::HZ_8000)).unwrap();
+    let original = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let scaled = wang
+        .extract(AudioBuffer::new(&quiet, SampleRate::HZ_8000))
+        .unwrap();
 
     let orig_set: HashSet<u32> = original.hashes.iter().map(|h| h.hash).collect();
     let scaled_set: HashSet<u32> = scaled.hashes.iter().map(|h| h.hash).collect();
@@ -72,8 +80,12 @@ fn gain_invariance_loud() {
     let loud: Vec<f32> = samples.iter().map(|s| (s * 3.0).clamp(-1.0, 1.0)).collect();
 
     let mut wang = Wang::default();
-    let original = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let clipped = wang.extract(AudioBuffer::new(&loud, SampleRate::HZ_8000)).unwrap();
+    let original = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let clipped = wang
+        .extract(AudioBuffer::new(&loud, SampleRate::HZ_8000))
+        .unwrap();
 
     let orig_set: HashSet<u32> = original.hashes.iter().map(|h| h.hash).collect();
     let clip_set: HashSet<u32> = clipped.hashes.iter().map(|h| h.hash).collect();
@@ -94,10 +106,14 @@ fn gain_invariance_loud() {
 fn determinism_wang() {
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 8_000).unwrap();
     let mut wang = Wang::default();
-    let reference = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+    let reference = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
 
     for i in 1..10 {
-        let result = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+        let result = wang
+            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .unwrap();
         assert_eq!(
             reference.hashes, result.hashes,
             "Wang extraction #{i} differs from reference!"
@@ -109,10 +125,14 @@ fn determinism_wang() {
 fn determinism_panako() {
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 8_000).unwrap();
     let mut panako = Panako::default();
-    let reference = panako.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+    let reference = panako
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
 
     for i in 1..10 {
-        let result = panako.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+        let result = panako
+            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .unwrap();
         assert_eq!(
             reference.hashes, result.hashes,
             "Panako extraction #{i} differs from reference!"
@@ -124,10 +144,14 @@ fn determinism_panako() {
 fn determinism_haitsma() {
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 5_000).unwrap();
     let mut haitsma = Haitsma::default();
-    let reference = haitsma.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000)).unwrap();
+    let reference = haitsma
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+        .unwrap();
 
     for i in 1..10 {
-        let result = haitsma.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000)).unwrap();
+        let result = haitsma
+            .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+            .unwrap();
         assert_eq!(
             reference.frames, result.frames,
             "Haitsma extraction #{i} differs from reference!"
@@ -156,8 +180,12 @@ fn panako_survives_5_percent_speedup() {
     let stretched = time_stretch(&samples, 1.05, 8_000);
 
     let mut panako = Panako::default();
-    let orig = panako.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let sped = panako.extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000)).unwrap();
+    let orig = panako
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let sped = panako
+        .extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000))
+        .unwrap();
 
     let orig_set: HashSet<u32> = orig.hashes.iter().map(|h| h.hash).collect();
     let sped_set: HashSet<u32> = sped.hashes.iter().map(|h| h.hash).collect();
@@ -191,8 +219,12 @@ fn panako_survives_5_percent_slowdown() {
     let stretched = time_stretch(&samples, 0.95, 8_000);
 
     let mut panako = Panako::default();
-    let orig = panako.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let slow = panako.extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000)).unwrap();
+    let orig = panako
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let slow = panako
+        .extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000))
+        .unwrap();
 
     let orig_set: HashSet<u32> = orig.hashes.iter().map(|h| h.hash).collect();
     let slow_set: HashSet<u32> = slow.hashes.iter().map(|h| h.hash).collect();
@@ -226,8 +258,12 @@ fn wang_degrades_under_time_stretch() {
     let stretched = time_stretch(&samples, 1.05, 8_000);
 
     let mut wang = Wang::default();
-    let orig = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let sped = wang.extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000)).unwrap();
+    let orig = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let sped = wang
+        .extract(AudioBuffer::new(&stretched, SampleRate::HZ_8000))
+        .unwrap();
 
     let orig_set: HashSet<u32> = orig.hashes.iter().map(|h| h.hash).collect();
     let sped_set: HashSet<u32> = sped.hashes.iter().map(|h| h.hash).collect();
@@ -248,7 +284,9 @@ fn short_audio_returns_audio_too_short() {
     // 1 second at 8kHz — below Wang's minimum (~2s)
     let samples = vec![0.1_f32; 8_000];
     let mut wang = Wang::default();
-    let err = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap_err();
+    let err = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap_err();
     assert!(matches!(err, AfpError::AudioTooShort { .. }));
 }
 
@@ -299,7 +337,10 @@ fn odd_sample_rates_resample_correctly() {
     // Decode at various odd target rates
     for target_sr in [11_025, 22_050, 44_100] {
         let samples = decode_to_mono_at(path, target_sr).unwrap();
-        assert!(!samples.is_empty(), "decode_to_mono_at({target_sr}) returned empty");
+        assert!(
+            !samples.is_empty(),
+            "decode_to_mono_at({target_sr}) returned empty"
+        );
         // Verify approximate expected length
         let (raw, native_sr) = decode_to_mono(path).unwrap();
         let expected_len = (raw.len() as f64 * target_sr as f64 / native_sr as f64) as usize;

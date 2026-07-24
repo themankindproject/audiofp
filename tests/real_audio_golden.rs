@@ -11,18 +11,36 @@ use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 fn assert_golden_wang(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut wang = Wang::default();
-    let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let actual: Vec<u8> = fp.hashes.iter().flat_map(|h| h.hash.to_le_bytes()).collect();
+    let fp = wang
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let actual: Vec<u8> = fp
+        .hashes
+        .iter()
+        .flat_map(|h| h.hash.to_le_bytes())
+        .collect();
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}. Run: cargo test --test generate_real_goldens --all-features -- --ignored"));
-    assert_eq!(actual, expected, "Wang hash drift detected on {asset}! {} hashes, golden has {} bytes", fp.hashes.len(), expected.len());
+    assert_eq!(
+        actual,
+        expected,
+        "Wang hash drift detected on {asset}! {} hashes, golden has {} bytes",
+        fp.hashes.len(),
+        expected.len()
+    );
 }
 
 fn assert_golden_panako(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut panako = Panako::default();
-    let fp = panako.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
-    let actual: Vec<u8> = fp.hashes.iter().flat_map(|h| h.hash.to_le_bytes()).collect();
+    let fp = panako
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .unwrap();
+    let actual: Vec<u8> = fp
+        .hashes
+        .iter()
+        .flat_map(|h| h.hash.to_le_bytes())
+        .collect();
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}."));
     assert_eq!(actual, expected, "Panako hash drift detected on {asset}!");
@@ -31,7 +49,9 @@ fn assert_golden_panako(asset: &str, golden_path: &str) {
 fn assert_golden_haitsma(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 5_000).unwrap();
     let mut haitsma = Haitsma::default();
-    let fp = haitsma.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000)).unwrap();
+    let fp = haitsma
+        .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+        .unwrap();
     let actual: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}."));
@@ -45,25 +65,40 @@ fn wang_piano_golden() {
 
 #[test]
 fn wang_speech_golden() {
-    assert_golden_wang("tests/assets/speech.ogg", "tests/goldens/wang_v1_speech.bin");
+    assert_golden_wang(
+        "tests/assets/speech.ogg",
+        "tests/goldens/wang_v1_speech.bin",
+    );
 }
 
 #[test]
 fn panako_piano_golden() {
-    assert_golden_panako("tests/assets/piano.ogg", "tests/goldens/panako_v2_piano.bin");
+    assert_golden_panako(
+        "tests/assets/piano.ogg",
+        "tests/goldens/panako_v2_piano.bin",
+    );
 }
 
 #[test]
 fn panako_speech_golden() {
-    assert_golden_panako("tests/assets/speech.ogg", "tests/goldens/panako_v2_speech.bin");
+    assert_golden_panako(
+        "tests/assets/speech.ogg",
+        "tests/goldens/panako_v2_speech.bin",
+    );
 }
 
 #[test]
 fn haitsma_piano_golden() {
-    assert_golden_haitsma("tests/assets/piano.ogg", "tests/goldens/haitsma_v1_piano.bin");
+    assert_golden_haitsma(
+        "tests/assets/piano.ogg",
+        "tests/goldens/haitsma_v1_piano.bin",
+    );
 }
 
 #[test]
 fn haitsma_speech_golden() {
-    assert_golden_haitsma("tests/assets/speech.ogg", "tests/goldens/haitsma_v1_speech.bin");
+    assert_golden_haitsma(
+        "tests/assets/speech.ogg",
+        "tests/goldens/haitsma_v1_speech.bin",
+    );
 }
