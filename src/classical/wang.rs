@@ -42,6 +42,7 @@ pub struct WangHash {
 
 /// All hashes produced by [`Wang`] over an audio buffer.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WangFingerprint {
     /// Hashes sorted by `(t_anchor, hash)`.
     pub hashes: Vec<WangHash>,
@@ -55,6 +56,7 @@ pub struct WangFingerprint {
 /// Always construct with FRU so future additive fields stay compatible:
 /// `WangConfig { fan_out: 5, ..Default::default() }`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WangConfig {
     /// `F`: target peaks paired with each anchor. Default 10; embedded
     /// builds typically lower this to 5.
@@ -77,9 +79,9 @@ pub struct WangConfig {
     /// — enough for ~2 hours of rich music at default fan_out=10.
     pub max_hashes: Option<usize>,
     /// Maximum number of pending anchors in the streaming pipeline.
-    /// `None` disables (default). Conservative: anchors exceeding this
-    /// cap are dropped oldest-first so memory stays bounded. Relevant
-    /// only for [`StreamingWang`].
+    /// `None` disables (unbounded). Default: 10 000 — anchors exceeding
+    /// this cap are dropped oldest-first so memory stays bounded.
+    /// Relevant only for [`StreamingWang`].
     pub max_pending_anchors: Option<usize>,
     /// Maximum samples accepted in a single `push` call. `None` disables
     /// (default). When set, excess samples beyond the cap are **dropped**
@@ -97,7 +99,7 @@ impl Default for WangConfig {
             min_anchor_mag_db: -50.0,
             max_input_samples: Some(30 * 60 * WANG_SR as usize),
             max_hashes: Some(500_000),
-            max_pending_anchors: None,
+            max_pending_anchors: Some(10_000),
             max_push_samples: None,
         }
     }
