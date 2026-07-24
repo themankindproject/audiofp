@@ -21,9 +21,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let cfg = PanakoConfig {
-        fan_out: input.fan_out.max(1).min(10),
-        ..Default::default()
+    let cfg = {
+        let mut c = PanakoConfig::default();
+        c.fan_out = input.fan_out.max(1).min(10);
+        c
     };
 
     let samples = &input.samples[..min_len];

@@ -22,9 +22,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let cfg = WangConfig {
-        fan_out: input.fan_out.max(1).min(20),
-        ..Default::default()
+    let cfg = {
+        let mut c = WangConfig::default();
+        c.fan_out = input.fan_out.max(1).min(20);
+        c
     };
 
     let samples = &input.samples[..min_len];
