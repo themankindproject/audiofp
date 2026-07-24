@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-07-24
+
 ### Added
 
 - **`try_new()` on `MelFilterBank`, `ShortTimeFFT`, `SincResampler` (#86).**
@@ -1204,7 +1206,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/themankindproject/audiofp/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/themankindproject/audiofp/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/themankindproject/audiofp/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/themankindproject/audiofp/compare/v0.3.4...v0.3.5
