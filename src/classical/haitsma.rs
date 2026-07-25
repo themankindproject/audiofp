@@ -276,12 +276,28 @@ impl Fingerprinter for Haitsma {
 #[inline]
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
     let mut hash = 0_u32;
-    for b in 0..32 {
-        let diff = (curr[b] - curr[b + 1]) - (prev[b] - prev[b + 1]);
-        // Branchless: `(diff > 0.0) as u32` compiles to `fcmp + setg`
-        // without a branch, enabling LLVM to vectorize groups of bands.
-        hash |= ((diff > 0.0) as u32) << (31 - b);
+
+    // Vectorize the band-difference computation using f32x8.
+    // Compute all 32 diffs in 4 SIMD iterations, then extract sign bits.
+    use wide::f32x8;
+
+    for chunk in 0..4 {
+        let off = chunk * 8;
+        let curr_lo = f32x8::new(curr[off..off + 8].try_into().unwrap());
+        let curr_hi = f32x8::new(curr[off + 1..off + 9].try_into().unwrap());
+        let prev_lo = f32x8::new(prev[off..off + 8].try_into().unwrap());
+        let prev_hi = f32x8::new(prev[off + 1..off + 9].try_into().unwrap());
+
+        // diff[i] = (curr[i] - curr[i+1]) - (prev[i] - prev[i+1])
+        let diff = (curr_lo - curr_hi) - (prev_lo - prev_hi);
+        let arr = diff.to_array();
+
+        // Pack sign bits: band at offset+i maps to bit (31 - offset - i).
+        for (i, &d) in arr.iter().enumerate() {
+            hash |= ((d > 0.0) as u32) << (31 - off - i);
+        }
     }
+
     hash
 }
 

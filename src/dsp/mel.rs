@@ -102,13 +102,11 @@ pub struct MelFilterBank {
     /// Mel scale convention used to lay out filter centres.
     pub scale: MelScale,
 
-    /// Row-major `(n_mels, n_fft/2 + 1)` weight matrix.
-    matrix: Vec<f32>,
-
     /// Sparse (CSR) representation of each mel band. Only stores the
     /// non-zero weight range per band so `log_mel_from_power` iterates
-    /// ~20-40 bins instead of all `n_bins` (513+). This is the hot-path
-    /// representation; `matrix` is kept for the `matrix()` getter.
+    /// ~20-40 bins instead of all `n_bins` (513+). This is the sole
+    /// hot-path representation; the dense matrix is reconstructed
+    /// on-demand via the `matrix()` getter.
     sparse: Vec<MelBand>,
 }
 
@@ -211,7 +209,6 @@ impl MelFilterBank {
             fmin,
             fmax,
             scale,
-            matrix,
             sparse,
         }
     }
@@ -258,10 +255,21 @@ impl MelFilterBank {
         self.n_fft / 2 + 1
     }
 
-    /// Borrow the row-major weight matrix.
+    /// Reconstruct the row-major weight matrix from the sparse
+    /// representation. Allocates a new `Vec<f32>` on each call.
+    ///
+    /// This method is provided for inspection/debugging; the hot path
+    /// uses the sparse CSR representation directly.
     #[must_use]
-    pub fn matrix(&self) -> &[f32] {
-        &self.matrix
+    pub fn matrix(&self) -> Vec<f32> {
+        let n_bins = self.n_bins();
+        let mut mat = vec![0.0_f32; self.n_mels * n_bins];
+        for (k, band) in self.sparse.iter().enumerate() {
+            for (j, &w) in band.weights.iter().enumerate() {
+                mat[k * n_bins + band.start_bin + j] = w;
+            }
+        }
+        mat
     }
 
     /// Compute one log-mel frame from a magnitude spectrum.
@@ -282,6 +290,7 @@ impl MelFilterBank {
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
         // Use the sparse representation: only iterate non-zero bins per band.
+        // Square magnitude to power inline while accumulating.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
             let mut acc = 0.0_f32;
@@ -312,15 +321,44 @@ impl MelFilterBank {
 
         // Use the sparse representation: only iterate non-zero bins per band.
         // Each triangular filter spans ~20-40 bins instead of all n_bins.
+        // The dot product is vectorized 8-wide via `wide::f32x8`.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
-            let mut acc = 0.0_f32;
-            for (w, p) in band.weights.iter().zip(power[band.start_bin..].iter()) {
-                acc += w * p;
-            }
+            let acc = dot_mel_wide(
+                &band.weights,
+                &power[band.start_bin..band.start_bin + band.weights.len()],
+            );
             *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
     }
+}
+
+/// SIMD-accelerated dot product for mel band application.
+///
+/// Computes `sum(weights[i] * power[i])` using `wide::f32x8`.
+/// Band widths are typically 10-50 bins — enough for 1-6 SIMD iterations.
+#[inline]
+fn dot_mel_wide(weights: &[f32], power: &[f32]) -> f32 {
+    use wide::f32x8;
+
+    debug_assert_eq!(weights.len(), power.len());
+    let n = weights.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
+
+    let mut acc = f32x8::ZERO;
+    for i in 0..chunks {
+        let off = i * 8;
+        let w = f32x8::new(weights[off..off + 8].try_into().unwrap());
+        let p = f32x8::new(power[off..off + 8].try_into().unwrap());
+        acc = w.mul_add(p, acc);
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in tail_start..n {
+        sum += weights[i] * power[i];
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -357,8 +395,9 @@ mod tests {
     fn each_filter_has_a_peak_in_band() {
         let fb = MelFilterBank::new(40, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
         let n_bins = fb.n_bins();
+        let mat = fb.matrix();
         for k in 0..fb.n_mels {
-            let row = &fb.matrix[k * n_bins..(k + 1) * n_bins];
+            let row = &mat[k * n_bins..(k + 1) * n_bins];
             let max = row.iter().cloned().fold(0.0_f32, f32::max);
             assert!(max > 0.0, "filter {k} is all-zero");
         }
@@ -399,7 +438,7 @@ mod tests {
     #[test]
     fn matrix_rows_are_non_negative() {
         let fb = MelFilterBank::new(64, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
-        for &w in fb.matrix() {
+        for w in fb.matrix() {
             assert!(w >= 0.0, "negative weight in mel matrix: {w}");
         }
     }

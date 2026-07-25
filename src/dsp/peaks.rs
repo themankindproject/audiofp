@@ -113,13 +113,14 @@ impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
+        let dq_cap = 2 * cfg.neighborhood_t.max(cfg.neighborhood_f) + 2;
         Self {
             cfg,
             max_buf: Vec::new(),
             temp_2d: Vec::new(),
             col_in: Vec::new(),
             col_out: Vec::new(),
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(dq_cap),
             candidates: Vec::new(),
         }
     }
@@ -463,7 +464,7 @@ impl IncrementalPeakDetector {
             n_pushed: 0,
             vert_deques,
             horiz_scratch: alloc::vec![0.0_f32; n_bins],
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(2 * kf + 2),
         }
     }
 
