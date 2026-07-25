@@ -270,39 +270,8 @@ impl ShortTimeFFT {
     /// ```
     #[must_use]
     pub fn power_flat(&mut self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
-        if samples.is_empty() {
-            return (Vec::new(), 0, 0);
-        }
-
-        let n_fft = self.cfg.n_fft;
-        let hop = self.cfg.hop;
-        let n_frames = self.n_frames(samples.len());
-        let n_bins = self.n_bins();
-
-        let center_off = if self.cfg.center {
-            (n_fft / 2) as isize
-        } else {
-            0
-        };
-
-        let mut out = vec![0.0_f32; n_frames * n_bins];
-
-        for f in 0..n_frames {
-            let start = (f * hop) as isize - center_off;
-            self.fill_windowed(samples, start);
-
-            self.fft
-                .process_with_scratch(
-                    &mut self.scratch_in,
-                    &mut self.scratch_out,
-                    &mut self.fft_scratch,
-                )
-                .expect("FFT process: input/output length mismatch");
-
-            let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            compute_power_wide(&self.scratch_out, row);
-        }
-
+        let mut out = Vec::new();
+        let (n_frames, n_bins) = self.power_flat_into(samples, &mut out);
         (out, n_frames, n_bins)
     }
 

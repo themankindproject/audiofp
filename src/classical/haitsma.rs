@@ -275,10 +275,16 @@ impl Fingerprinter for Haitsma {
 /// and frame `n−1`.
 #[inline]
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
+    // SIMD loop assumes 4 chunks × 8 lanes = 32 bits from 33 bands.
+    // If HAITSMA_N_BANDS ever changes, this function must be updated.
+    debug_assert_eq!(HAITSMA_N_BANDS, 4 * 8 + 1);
+
     let mut hash = 0_u32;
 
     // Vectorize the band-difference computation using f32x8.
     // Compute all 32 diffs in 4 SIMD iterations, then extract sign bits.
+    // Each iteration reads curr[off..off+8] and curr[off+1..off+9] to
+    // compute 8 adjacent-band differences from the 33-band array.
     use wide::f32x8;
 
     for chunk in 0..4 {

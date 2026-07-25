@@ -335,30 +335,10 @@ impl MelFilterBank {
 
 /// SIMD-accelerated dot product for mel band application.
 ///
-/// Computes `sum(weights[i] * power[i])` using `wide::f32x8`.
-/// Band widths are typically 10-50 bins — enough for 1-6 SIMD iterations.
+/// Delegates to the shared [`crate::dsp::dot_wide`] helper.
 #[inline]
 fn dot_mel_wide(weights: &[f32], power: &[f32]) -> f32 {
-    use wide::f32x8;
-
-    debug_assert_eq!(weights.len(), power.len());
-    let n = weights.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    let mut acc = f32x8::ZERO;
-    for i in 0..chunks {
-        let off = i * 8;
-        let w = f32x8::new(weights[off..off + 8].try_into().unwrap());
-        let p = f32x8::new(power[off..off + 8].try_into().unwrap());
-        acc = w.mul_add(p, acc);
-    }
-
-    let mut sum = acc.reduce_add();
-    for i in tail_start..n {
-        sum += weights[i] * power[i];
-    }
-    sum
+    super::dot_wide(weights, power)
 }
 
 #[cfg(test)]

@@ -67,3 +67,31 @@ pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
         *v = DB_LOG2_FACTOR * v.max(floor).log2();
     }
 }
+
+/// SIMD-accelerated dot product: `sum(a[i] * b[i])` via `wide::f32x8`.
+///
+/// Processes 8 elements at a time with fused multiply-add, then reduces.
+/// Used by the polyphase resampler and mel filterbank hot paths.
+#[inline]
+pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
+    use wide::f32x8;
+
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
+
+    let mut acc = f32x8::ZERO;
+    for i in 0..chunks {
+        let off = i * 8;
+        let va = f32x8::new(a[off..off + 8].try_into().unwrap());
+        let vb = f32x8::new(b[off..off + 8].try_into().unwrap());
+        acc = va.mul_add(vb, acc);
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in tail_start..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
