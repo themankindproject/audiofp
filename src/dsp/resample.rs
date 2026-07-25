@@ -114,12 +114,10 @@ pub struct SincResampler {
     from_sr: u32,
     to_sr: u32,
     quality: SincQuality,
-    /// Precomputed reciprocal of the kernel's DC gain; multiplied per
-    /// output sample to normalise constant signals to unity.
-    inv_dc_gain: f32,
     /// Precomputed polyphase kernel table: `[steps][2*half_taps+1]`.
     /// Each row holds the sinc·Kaiser coefficients for one fractional
-    /// offset, avoiding per-sample kernel evaluation in `process`.
+    /// offset, pre-multiplied by `1/dc_gain` so the hot loop is a
+    /// single dot product with no extra multiply.
     kernel_table: Vec<f32>,
 }
 
@@ -172,11 +170,16 @@ impl SincResampler {
         }
         let inv_dc_gain = 1.0 / dc_gain;
 
+        // Pre-multiply all kernel coefficients by inv_dc_gain so we don't
+        // need a per-sample multiply in the hot loop.
+        for v in kernel_table.iter_mut() {
+            *v *= inv_dc_gain;
+        }
+
         Self {
             from_sr,
             to_sr,
             quality,
-            inv_dc_gain,
             kernel_table,
         }
     }
@@ -277,7 +280,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc * self.inv_dc_gain);
+            out.push(acc);
         }
 
         // Middle: kernel is fully inside input — no bounds check.
@@ -294,7 +297,7 @@ impl SincResampler {
                 .zip(kernel.iter())
                 .map(|(&s, &k)| s * k)
                 .sum();
-            out.push(acc * self.inv_dc_gain);
+            out.push(acc);
         }
 
         // Right boundary: kernel may extend past the end of input.
@@ -313,7 +316,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc * self.inv_dc_gain);
+            out.push(acc);
         }
     }
 }
