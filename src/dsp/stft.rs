@@ -73,9 +73,10 @@ impl StftConfig {
 ///
 /// let mut stft = ShortTimeFFT::new(StftConfig::new(1024));
 /// let samples = vec![0.0_f32; 16_000];
-/// let spec = stft.magnitude(&samples);
-/// // (n_frames, n_bins) shape; default config gives n_bins = 1024/2 + 1.
-/// assert_eq!(spec[0].len(), 513);
+/// let (spec, n_frames, n_bins) = stft.magnitude_flat(&samples);
+/// // n_bins = n_fft/2 + 1 = 513 for n_fft=1024.
+/// assert_eq!(n_bins, 513);
+/// assert_eq!(spec.len(), n_frames * n_bins);
 /// ```
 pub struct ShortTimeFFT {
     cfg: StftConfig,
@@ -180,6 +181,10 @@ impl ShortTimeFFT {
     /// Result shape is `(n_frames, n_bins)` with `n_bins = n_fft/2 + 1`.
     /// Returns an empty `Vec` for empty input.
     #[must_use]
+    #[deprecated(
+        since = "0.3.9",
+        note = "use magnitude_flat() instead — same data, single allocation, better cache locality"
+    )]
     pub fn magnitude(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
         let (flat, n_frames, n_bins) = self.magnitude_flat(samples);
         if n_frames == 0 {
@@ -558,6 +563,7 @@ fn reflect(i: isize, len: usize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
