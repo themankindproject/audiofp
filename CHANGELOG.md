@@ -20,10 +20,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The per-frame `max(v, floor).log2() * factor` loop is now processed
   8 elements at a time via `f32x8::max()` + `f32x8::log2()`. Both
   offline `extract` and streaming `push` benefit.
+- **SIMD dot product in polyphase resampler (`resample.rs`).**
+  The 65-tap kernel convolution in the middle (safe) loop uses `f32x8`
+  fused multiply-add — 8 iterations + 1 scalar tail instead of 65
+  scalar multiply-adds.
+- **SIMD dot product in mel filterbank CSR application (`mel.rs`).**
+  `log_mel_from_power` accumulates band energies 8-wide via
+  `f32x8::mul_add`. Bands with 10-50 non-zero bins now run in 1-6
+  SIMD iterations.
+- **SIMD band-difference bit-packing in Haitsma (`haitsma.rs`).**
+  `pack_frame_bits` computes 32 band differences in 4 `f32x8`
+  iterations and extracts sign bits, replacing a 32-iteration scalar
+  loop.
 - **Folded `inv_dc_gain` into polyphase kernel table (`resample.rs`).**
   All kernel coefficients are pre-multiplied by `1/dc_gain` at
   construction, eliminating one `f32` multiply per output sample in the
   resampling hot loop.
+- **Removed dense `matrix` field from `MelFilterBank`.**
+  Saves ~256 KB heap per instance. The `matrix()` getter now
+  reconstructs on demand from the sparse CSR representation.
+  Hot path uses sparse representation exclusively.
+- **Pre-sized `VecDeque` in Lemire peak picker.**
+  Both `PeakPicker` and `IncrementalPeakDetector` allocate the
+  monotonic deque to its maximum capacity at construction, eliminating
+  capacity-check branches in the inner rolling-max loop.
 - **Crate package size reduced from 7.2 MiB to ~215 KiB.** Excluded
   `tests/assets/` (8 MiB of real audio) and `fuzz/` from the published
   crate. Downstream users don't need test audio.
@@ -37,6 +57,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **All `unsafe` SIMD code** (`apply_window_avx2`, `apply_window_neon`,
   `compute_power_avx2`) — replaced by safe `wide`-based equivalents.
+
+### Performance
+
+Offline extract (`cargo bench --bench extract`, 30 s synthetic audio,
+Intel i5-1135G7):
+
+| Algorithm | v0.3.8 (before) | This release | Improvement |
+|-----------|----------------:|-------------:|:-----------:|
+| Wang      | 99 ms           | 73 ms        | **-26%**    |
+| Panako    | 104 ms          | 77 ms        | **-26%**    |
+| Haitsma   | 47 ms           | 41 ms        | **-13%**    |
+
+Streaming push (small-chunk benchmarks):
+
+| Path            | Improvement vs v0.3.8 |
+|-----------------|-----------------------|
+| Wang (small)    | **-8%**               |
+| Wang (large)    | **-32%**              |
+| Panako (small)  | **-9%**               |
+| Haitsma (small) | **-7%**               |
+| Haitsma (large) | **-21%**              |
 
 ## [0.3.8] - 2026-07-24
 
