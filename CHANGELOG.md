@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Safe SIMD via `wide` crate (replaces all `unsafe` arch intrinsics).**
+  Window application (`apply_window_wide`), power-spectrum computation
+  (`compute_power_wide`), and dB log-magnitude conversion
+  (`power_to_db_wide`) now use `wide::f32x8` — portable safe SIMD that
+  auto-dispatches to AVX2/SSE/NEON without any `unsafe` code. Removes
+  all `#[target_feature]` functions and `core::arch` imports from
+  `stft.rs`. Bit-exact output preserved (golden tests unchanged).
+- **Vectorized dB conversion in Wang and Panako (offline + streaming).**
+  The per-frame `max(v, floor).log2() * factor` loop is now processed
+  8 elements at a time via `f32x8::max()` + `f32x8::log2()`. Both
+  offline `extract` and streaming `push` benefit.
+- **Folded `inv_dc_gain` into polyphase kernel table (`resample.rs`).**
+  All kernel coefficients are pre-multiplied by `1/dc_gain` at
+  construction, eliminating one `f32` multiply per output sample in the
+  resampling hot loop.
+- **Crate package size reduced from 7.2 MiB to ~215 KiB.** Excluded
+  `tests/assets/` (8 MiB of real audio) and `fuzz/` from the published
+  crate. Downstream users don't need test audio.
+
+### Added
+
+- **`wide` 1.5 dependency** (no_std compatible, zero `unsafe`). Provides
+  `f32x8` used across the DSP pipeline.
+
+### Removed
+
+- **All `unsafe` SIMD code** (`apply_window_avx2`, `apply_window_neon`,
+  `compute_power_avx2`) — replaced by safe `wide`-based equivalents.
+
 ## [0.3.8] - 2026-07-24
 
 ### Added
