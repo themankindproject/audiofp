@@ -233,9 +233,7 @@ impl ShortTimeFFT {
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
-                *o = c.re * c.re + c.im * c.im;
-            }
+            compute_power_wide(&self.scratch_out, row);
         }
 
         (n_frames, n_bins)
@@ -297,9 +295,7 @@ impl ShortTimeFFT {
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
-                *o = c.re * c.re + c.im * c.im;
-            }
+            compute_power_wide(&self.scratch_out, row);
         }
 
         (out, n_frames, n_bins)
@@ -395,9 +391,7 @@ impl ShortTimeFFT {
         assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
         assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
 
-        for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {
-            self.scratch_in[i] = s * w;
-        }
+        apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
         self.fft
             .process_with_scratch(
@@ -407,9 +401,7 @@ impl ShortTimeFFT {
             )
             .expect("FFT process: input/output length mismatch");
 
-        for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
-            *o = c.re * c.re + c.im * c.im;
-        }
+        compute_power_wide(&self.scratch_out, out);
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
@@ -422,9 +414,7 @@ impl ShortTimeFFT {
         assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
         assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
 
-        for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {
-            self.scratch_in[i] = s * w;
-        }
+        apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
         self.fft
             .process_with_scratch(
@@ -458,28 +448,7 @@ impl ShortTimeFFT {
             let win = &self.window[..n_fft];
             let dst = &mut self.scratch_in[..n_fft];
 
-            #[cfg(all(target_arch = "x86_64", feature = "std"))]
-            {
-                if std::arch::is_x86_feature_detected!("avx2") {
-                    // SAFETY: we just checked AVX2 support, and src/win/dst all
-                    // have length >= n_fft.
-                    unsafe { apply_window_avx2(src, win, dst) };
-                    return;
-                }
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                // SAFETY: NEON is always available on aarch64, and src/win/dst
-                // all have length >= n_fft.
-                unsafe { apply_window_neon(src, win, dst) };
-                return;
-            }
-
-            // Scalar fallback.
-            dst.iter_mut()
-                .zip(src.iter().zip(win.iter()))
-                .for_each(|(d, (s, w))| *d = s * w);
+            apply_window_wide(src, win, dst);
             return;
         }
 
@@ -498,92 +467,78 @@ impl ShortTimeFFT {
     }
 }
 
-/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` for all i.
+/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` using `wide`.
 ///
-/// # Safety
-///
-/// Caller must ensure:
-/// - AVX2 is available on the current CPU
-/// - `src`, `win`, and `dst` all have the same length
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2")]
-unsafe fn apply_window_avx2(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+/// Processes 8 elements at a time via `f32x8` (AVX2/SSE/NEON depending on
+/// target), with a scalar tail for the remainder. Entirely safe code.
+fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
+    use wide::f32x8;
 
     debug_assert_eq!(src.len(), win.len());
     debug_assert_eq!(src.len(), dst.len());
 
     let n = src.len();
     let chunks = n / 8;
-    let remainder = n % 8;
-
-    let src_ptr = src.as_ptr();
-    let win_ptr = win.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
+    let tail_start = chunks * 8;
 
     for i in 0..chunks {
-        let offset = i * 8;
-        // SAFETY: offset < n (since i < chunks = n/8), and all slices have length n.
-        // AVX2 availability is guaranteed by the caller.
-        unsafe {
-            let s = _mm256_loadu_ps(src_ptr.add(offset));
-            let w = _mm256_loadu_ps(win_ptr.add(offset));
-            let r = _mm256_mul_ps(s, w);
-            _mm256_storeu_ps(dst_ptr.add(offset), r);
-        }
+        let off = i * 8;
+        let s = f32x8::new(src[off..off + 8].try_into().unwrap());
+        let w = f32x8::new(win[off..off + 8].try_into().unwrap());
+        let r = s * w;
+        dst[off..off + 8].copy_from_slice(r.as_array());
     }
 
-    // Handle remaining elements with scalar ops.
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        // SAFETY: tail_start + i < n, and all slices have length n.
-        unsafe {
-            *dst_ptr.add(tail_start + i) =
-                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
-        }
+    for i in tail_start..n {
+        dst[i] = src[i] * win[i];
     }
 }
 
-/// SIMD-accelerated window application using ARM NEON.
+/// SIMD-accelerated power computation: `dst[i] = complex[i].re² + complex[i].im²`
+/// using `wide`.
 ///
-/// # Safety
-///
-/// Caller must ensure `src`, `win`, and `dst` all have the same length.
-/// NEON is always available on aarch64.
-#[cfg(target_arch = "aarch64")]
-unsafe fn apply_window_neon(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+/// Processes 8 power values at a time via `f32x8` by separately loading
+/// the real and imaginary parts, then computing `re * re + im * im`.
+fn compute_power_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
+    use wide::f32x8;
 
-    debug_assert_eq!(src.len(), win.len());
-    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(complex.len(), dst.len());
 
-    let n = src.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
-
-    let src_ptr = src.as_ptr();
-    let win_ptr = win.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
+    let n = complex.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
 
     for i in 0..chunks {
-        let offset = i * 4;
-        // SAFETY: offset < n (since i < chunks = n/4), and all slices have length n.
-        // NEON is always available on aarch64.
-        unsafe {
-            let s = vld1q_f32(src_ptr.add(offset));
-            let w = vld1q_f32(win_ptr.add(offset));
-            let r = vmulq_f32(s, w);
-            vst1q_f32(dst_ptr.add(offset), r);
-        }
+        let off = i * 8;
+        let re = f32x8::new([
+            complex[off].re,
+            complex[off + 1].re,
+            complex[off + 2].re,
+            complex[off + 3].re,
+            complex[off + 4].re,
+            complex[off + 5].re,
+            complex[off + 6].re,
+            complex[off + 7].re,
+        ]);
+        let im = f32x8::new([
+            complex[off].im,
+            complex[off + 1].im,
+            complex[off + 2].im,
+            complex[off + 3].im,
+            complex[off + 4].im,
+            complex[off + 5].im,
+            complex[off + 6].im,
+            complex[off + 7].im,
+        ]);
+        // re² + im² via fused multiply-add: re*re + im*im
+        let power = re.mul_add(re, im * im);
+        dst[off..off + 8].copy_from_slice(power.as_array());
     }
 
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        // SAFETY: tail_start + i < n, and all slices have length n.
-        unsafe {
-            *dst_ptr.add(tail_start + i) =
-                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
-        }
+    // Scalar tail.
+    for i in tail_start..n {
+        let c = &complex[i];
+        dst[i] = c.re * c.re + c.im * c.im;
     }
 }
 

@@ -116,7 +116,7 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 /// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
 /// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
 const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
-use crate::dsp::DB_LOG2_FACTOR;
+use crate::dsp::power_to_db_wide;
 
 /// Wang offline fingerprinter.
 ///
@@ -250,9 +250,7 @@ impl Fingerprinter for Wang {
 
         // Convert power → dB log-magnitude in-place.
         // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
-        for v in self.log_spec.iter_mut() {
-            *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
-        }
+        power_to_db_wide(&mut self.log_spec, WANG_LOG_FLOOR_POWER);
 
         let peaks = self
             .picker
@@ -797,9 +795,7 @@ impl StreamingWang {
                 &self.sample_carry[off..off + WANG_N_FFT],
                 &mut self.frame_scratch,
             );
-            for v in self.frame_scratch.iter_mut() {
-                *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
-            }
+            power_to_db_wide(&mut self.frame_scratch, WANG_LOG_FLOOR_POWER);
             self.append_frame_scratch_row();
 
             self.n_frames_total += 1;

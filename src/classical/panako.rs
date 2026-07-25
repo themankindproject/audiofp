@@ -145,7 +145,7 @@ const PANAKO_PEAK_NEIGHBOURHOOD: usize = 15;
 const PANAKO_LOG_FLOOR: f32 = 1e-6;
 /// Squared form of the magnitude floor — see Wang for rationale.
 const PANAKO_LOG_FLOOR_POWER: f32 = PANAKO_LOG_FLOOR * PANAKO_LOG_FLOOR;
-use crate::dsp::DB_LOG2_FACTOR;
+use crate::dsp::power_to_db_wide;
 
 /// Panako offline fingerprinter.
 ///
@@ -268,11 +268,8 @@ impl Fingerprinter for Panako {
         }
 
         // power → dB log-magnitude in-place (20·log10(sqrt(p)) ≡ 10·log10(p)).
-        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power). f32::log2 lowers to
-        // a single fyl2x instruction on x86-64, ~8× faster than libm's log10f.
-        for v in self.log_spec.iter_mut() {
-            *v = DB_LOG2_FACTOR * v.max(PANAKO_LOG_FLOOR_POWER).log2();
-        }
+        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power). Vectorized via wide.
+        power_to_db_wide(&mut self.log_spec, PANAKO_LOG_FLOOR_POWER);
 
         let peaks = self
             .picker
@@ -867,9 +864,7 @@ impl StreamingPanako {
                 &self.sample_carry[off..off + PANAKO_N_FFT],
                 &mut self.frame_scratch,
             );
-            for v in self.frame_scratch.iter_mut() {
-                *v = DB_LOG2_FACTOR * v.max(PANAKO_LOG_FLOOR_POWER).log2();
-            }
+            power_to_db_wide(&mut self.frame_scratch, PANAKO_LOG_FLOOR_POWER);
             self.append_frame_scratch_row();
 
             self.n_frames_total += 1;
