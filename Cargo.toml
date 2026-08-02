@@ -11,13 +11,40 @@ keywords     = ["audio", "fingerprint", "no-std", "shazam", "acoustid"]
 categories   = ["multimedia::audio", "algorithms"]
 readme       = "README.md"
 exclude      = [
-    # Personal prep / scratch files — useful in the repo, not on crates.io.
+    # Dev-only: CI, tooling, and repo metadata not needed by downstream.
+    ".github/",
+    ".claude/",
+    ".agents/",
+
+    # Test audio corpus (~8 MB) and golden snapshots.
+    "tests/assets/",
+    "tests/goldens/",
+
+    # Integration / property / E2E test sources (unit tests are in src/).
+    "tests/",
+
+    # Fuzz harnesses.
+    "fuzz/",
+
+    # Benchmarks (users run their own; bench code references test helpers).
+    "benches/",
+
+    # Dev config files — not needed to compile the library.
+    "clippy.toml",
+    "deny.toml",
+    "rustfmt.toml",
+    "rust-toolchain.toml",
+
+    # Contributor / governance docs.
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "context.md",
+
+    # Personal scratch files.
     "prep.md",
     "dsp.md",
-    ".github/",
-    ".agents/",
-    "tests/assets/",
-    "fuzz/",
 ]
 
 [features]
