@@ -29,8 +29,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `audiofp::Panako`, `audiofp::Haitsma`, configs, fingerprints, and
   streaming variants are re-exported at the crate root (the
   `classical` module remains canonical).
-- **Migration guide** — see `MIGRATING_0.4.md` for the full
-  old→new API mapping.
+
+### Migration (before → after)
+
+**#65 — `AudioBuffer` removed; `extract` takes `&[f32]` + `SampleRate`**
+
+```rust
+// before (0.3.x)
+let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+let fp = wang.extract(buf)?;
+
+// after (0.4.0)
+let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
+```
+
+**#66 — Hash timestamps are `TimestampMs` (milliseconds, not frames)**
+
+```rust
+// before (0.3.x) — t_anchor is a u32 STFT frame (62.5 fps → 16 ms/frame)
+println!("anchor frame {}", h.t_anchor);
+
+// after (0.4.0) — t_anchor is TimestampMs
+println!("anchor at {} ms", h.t_anchor.0);
+```
+
+Persisted fingerprints: the serialization format is now v2 and **v1
+blobs are rejected** — re-extract and re-serialize. Hash byte layout
+changed (Wang 8→12 bytes, Panako 16→28 bytes) and `name()` is
+`wang-v2`; matching behaviour is unchanged (matchers convert ms→frames
+internally).
+
+**#63 — `push` / `flush` return `Result`**
+
+```rust
+// before (0.3.x) — infallible; neural panicked on inference error
+let frames = s.push(&chunk);
+
+// after (0.4.0) — fallible
+let frames = s.push(&chunk)?;
+let tail = s.flush()?;
+```
+
+**#62 — `PeakPickerConfig::min_magnitude` → `min_magnitude_db`**
+
+```rust
+// before (0.3.x)
+PeakPickerConfig { min_magnitude: cfg.min_anchor_mag_db, .. }
+
+// after (0.4.0) — honest dB contract; optional linear floor
+PeakPickerConfig {
+    min_magnitude_db: cfg.min_anchor_mag_db,
+    min_magnitude_linear: None,
+    ..
+}
+```
+
+**#64 — Flat crate-root re-exports**
+
+```rust
+// before (0.3.x)
+use audiofp::classical::Wang;
+
+// after (0.4.0) — both work; classical stays canonical
+use audiofp::Wang;
+```
+
+Full guide: [`MIGRATING_0.4.md`](MIGRATING_0.4.md).
 
 ### Added
 
