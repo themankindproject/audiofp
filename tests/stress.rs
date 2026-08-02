@@ -17,7 +17,7 @@
 #![cfg(feature = "std")]
 
 use audiofp::classical::{Haitsma, HaitsmaConfig, Panako, PanakoConfig, Wang, WangConfig};
-use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{AfpError, Fingerprinter, SampleRate};
 
 // ───────────────────────────────────────────────────────────────────────
 // Helper: generate adversarial signals at a given sample rate
@@ -84,7 +84,7 @@ fn wang_rejects_input_exceeding_max_samples() {
     };
     let mut w = Wang::new(cfg);
     let samples = vec![0.0_f32; 2000];
-    let result = w.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000));
+    let result = w.extract(&samples, SampleRate::HZ_8000);
     assert!(
         matches!(result, Err(AfpError::InputTooLarge { .. })),
         "expected InputTooLarge, got {result:?}"
@@ -99,7 +99,7 @@ fn panako_rejects_input_exceeding_max_samples() {
     };
     let mut p = Panako::new(cfg);
     let samples = vec![0.0_f32; 2000];
-    let result = p.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000));
+    let result = p.extract(&samples, SampleRate::HZ_8000);
     assert!(
         matches!(result, Err(AfpError::InputTooLarge { .. })),
         "expected InputTooLarge, got {result:?}"
@@ -114,7 +114,7 @@ fn haitsma_rejects_input_exceeding_max_samples() {
     };
     let mut h = Haitsma::new(cfg);
     let samples = vec![0.0_f32; 2000];
-    let result = h.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000));
+    let result = h.extract(&samples, SampleRate::HZ_5000);
     assert!(
         matches!(result, Err(AfpError::InputTooLarge { .. })),
         "expected InputTooLarge, got {result:?}"
@@ -131,10 +131,10 @@ macro_rules! adversarial_test {
         fn $name() {
             let samples = $signal_fn;
             let mut fp = $algo::default();
-            let buf = AudioBuffer::new(&samples, $rate);
+            let rate = $rate;
             // Must not panic — result can be Ok (possibly 0 hashes) or
             // Err (AudioTooShort) depending on signal properties.
-            let result = fp.extract(buf);
+            let result = fp.extract(&samples, rate);
             match &result {
                 Ok(_) => {}                               // valid
                 Err(AfpError::AudioTooShort { .. }) => {} // acceptable
@@ -263,7 +263,7 @@ adversarial_test!(
 fn wang_rejects_nan_input() {
     let samples = nan_audio(8_000, 3.0);
     let mut w = Wang::default();
-    let result = w.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000));
+    let result = w.extract(&samples, SampleRate::HZ_8000);
     assert!(
         matches!(result, Err(AfpError::NonFiniteSample { .. })),
         "expected NonFiniteSample, got {result:?}"
@@ -274,7 +274,7 @@ fn wang_rejects_nan_input() {
 fn wang_rejects_inf_input() {
     let samples = inf_audio(8_000, 3.0);
     let mut w = Wang::default();
-    let result = w.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000));
+    let result = w.extract(&samples, SampleRate::HZ_8000);
     assert!(
         matches!(result, Err(AfpError::NonFiniteSample { .. })),
         "expected NonFiniteSample, got {result:?}"
@@ -285,7 +285,7 @@ fn wang_rejects_inf_input() {
 fn panako_rejects_nan_input() {
     let samples = nan_audio(8_000, 3.0);
     let mut p = Panako::default();
-    let result = p.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000));
+    let result = p.extract(&samples, SampleRate::HZ_8000);
     assert!(
         matches!(result, Err(AfpError::NonFiniteSample { .. })),
         "expected NonFiniteSample, got {result:?}"
@@ -296,7 +296,7 @@ fn panako_rejects_nan_input() {
 fn haitsma_rejects_nan_input() {
     let samples = nan_audio(5_000, 3.0);
     let mut h = Haitsma::default();
-    let result = h.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000));
+    let result = h.extract(&samples, SampleRate::HZ_5000);
     assert!(
         matches!(result, Err(AfpError::NonFiniteSample { .. })),
         "expected NonFiniteSample, got {result:?}"
@@ -337,7 +337,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
         let mut w = Wang::default();
         let fp = w
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         // ~16s clip @ default config produces ~1500-2500 hashes
         assert_count_in_range("wang/galway.flac", fp.hashes.len(), 1000, 3000);
@@ -348,7 +348,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
         let mut w = Wang::default();
         let fp = w
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         assert_count_in_range("wang/freak.flac", fp.hashes.len(), 1000, 3000);
     }
@@ -358,7 +358,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("piano.ogg"), 8_000).unwrap();
         let mut w = Wang::default();
         let fp = w
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         // Piano is sparser — fewer spectral peaks
         assert_count_in_range("wang/piano.ogg", fp.hashes.len(), 100, 2500);
@@ -369,7 +369,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("speech.ogg"), 8_000).unwrap();
         let mut w = Wang::default();
         let fp = w
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         // Speech has moderate spectral content
         assert_count_in_range("wang/speech.ogg", fp.hashes.len(), 200, 2500);
@@ -382,7 +382,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
         let mut p = Panako::default();
         let fp = p
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         // Panako with fan_out=5 produces fewer hashes than Wang
         assert_count_in_range("panako/galway.flac", fp.hashes.len(), 500, 2500);
@@ -393,7 +393,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
         let mut p = Panako::default();
         let fp = p
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         assert_count_in_range("panako/freak.flac", fp.hashes.len(), 500, 2500);
     }
@@ -405,7 +405,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("galway.flac"), 5_000).unwrap();
         let mut h = Haitsma::default();
         let fp = h
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+            .extract(&samples, SampleRate::HZ_5000)
             .unwrap();
         // ~16s × 78.125 fps ≈ 1250 frames; allow ±20%
         assert_count_in_range("haitsma/galway.flac", fp.frames.len(), 1000, 1600);
@@ -416,7 +416,7 @@ mod real_audio_snapshots {
         let samples = decode_to_mono_at(asset("freak.flac"), 5_000).unwrap();
         let mut h = Haitsma::default();
         let fp = h
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+            .extract(&samples, SampleRate::HZ_5000)
             .unwrap();
         assert_count_in_range("haitsma/freak.flac", fp.frames.len(), 1000, 1600);
     }
@@ -430,10 +430,10 @@ mod real_audio_snapshots {
 
         let mut w = Wang::default();
         let fp_flac = w
-            .extract(AudioBuffer::new(&flac, SampleRate::HZ_8000))
+            .extract(&flac, SampleRate::HZ_8000)
             .unwrap();
         let fp_mp3 = w
-            .extract(AudioBuffer::new(&mp3, SampleRate::HZ_8000))
+            .extract(&mp3, SampleRate::HZ_8000)
             .unwrap();
 
         // Compute hash overlap (Jaccard-style)
@@ -458,10 +458,10 @@ mod real_audio_snapshots {
 
         let mut w = Wang::default();
         let fp_galway = w
-            .extract(AudioBuffer::new(&galway, SampleRate::HZ_8000))
+            .extract(&galway, SampleRate::HZ_8000)
             .unwrap();
         let fp_freak = w
-            .extract(AudioBuffer::new(&freak, SampleRate::HZ_8000))
+            .extract(&freak, SampleRate::HZ_8000)
             .unwrap();
 
         use std::collections::HashSet;

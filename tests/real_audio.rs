@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use audiofp::classical::{Haitsma, Panako, StreamingHaitsma, StreamingPanako, StreamingWang, Wang};
 use audiofp::io::{decode_to_mono, decode_to_mono_at};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate, StreamingFingerprinter};
+use audiofp::{Fingerprinter, SampleRate, StreamingFingerprinter};
 
 // ---- Helper Functions ----
 
@@ -55,11 +55,7 @@ fn jaccard<T: std::hash::Hash + Eq>(a: &HashSet<T>, b: &HashSet<T>) -> f32 {
 
 fn wang_hash_set(samples: &[f32], sr: u32) -> HashSet<u32> {
     let mut wang = Wang::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::new(sr).unwrap(),
-    };
-    wang.extract(buf)
+    wang.extract(samples, SampleRate::new(sr).unwrap())
         .unwrap()
         .hashes
         .into_iter()
@@ -69,11 +65,7 @@ fn wang_hash_set(samples: &[f32], sr: u32) -> HashSet<u32> {
 
 fn panako_hash_set(samples: &[f32], sr: u32) -> HashSet<u32> {
     let mut p = Panako::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::new(sr).unwrap(),
-    };
-    p.extract(buf)
+    p.extract(samples, SampleRate::new(sr).unwrap())
         .unwrap()
         .hashes
         .into_iter()
@@ -83,11 +75,7 @@ fn panako_hash_set(samples: &[f32], sr: u32) -> HashSet<u32> {
 
 fn haitsma_frames(samples: &[f32], sr: u32) -> Vec<u32> {
     let mut h = Haitsma::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::new(sr).unwrap(),
-    };
-    h.extract(buf).unwrap().frames
+    h.extract(samples, SampleRate::new(sr).unwrap()).unwrap().frames
 }
 
 fn haitsma_similarity(clean: &[u32], dirty: &[u32]) -> f32 {
@@ -231,10 +219,8 @@ fn real_audio_streaming_equivalence() {
     // --- Wang ---
     let mut wang_offline = Wang::default();
     let off_wang = wang_offline
-        .extract(AudioBuffer {
-            samples: &samples_8k,
-            rate: SampleRate::HZ_8000,
-        })
+        .extract(&samples_8k, SampleRate::HZ_8000,
+        )
         .unwrap()
         .hashes;
 
@@ -248,13 +234,12 @@ fn real_audio_streaming_equivalence() {
         let end = cursor + chunk_len;
         online_wang.extend(
             wang_stream
-                .push(&samples_8k[cursor..end])
-                .into_iter()
+                .push(&samples_8k[cursor..end]).unwrap().into_iter()
                 .map(|(_, h)| h),
         );
         cursor = end;
     }
-    online_wang.extend(wang_stream.flush().into_iter().map(|(_, h)| h));
+    online_wang.extend(wang_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
     let mut a_wang = off_wang;
     let mut b_wang = online_wang;
@@ -265,10 +250,8 @@ fn real_audio_streaming_equivalence() {
     // --- Panako ---
     let mut panako_offline = Panako::default();
     let off_panako = panako_offline
-        .extract(AudioBuffer {
-            samples: &samples_8k,
-            rate: SampleRate::HZ_8000,
-        })
+        .extract(&samples_8k, SampleRate::HZ_8000,
+        )
         .unwrap()
         .hashes;
 
@@ -280,13 +263,12 @@ fn real_audio_streaming_equivalence() {
         let end = cursor + chunk_len;
         online_panako.extend(
             panako_stream
-                .push(&samples_8k[cursor..end])
-                .into_iter()
+                .push(&samples_8k[cursor..end]).unwrap().into_iter()
                 .map(|(_, h)| h),
         );
         cursor = end;
     }
-    online_panako.extend(panako_stream.flush().into_iter().map(|(_, h)| h));
+    online_panako.extend(panako_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
     let mut a_panako = off_panako;
     let mut b_panako = online_panako;
@@ -298,10 +280,8 @@ fn real_audio_streaming_equivalence() {
     let samples_5k = decode_to_mono_at(path, 5_000).expect("failed to decode at 5kHz");
     let mut haitsma_offline = Haitsma::default();
     let off_haitsma = haitsma_offline
-        .extract(AudioBuffer {
-            samples: &samples_5k,
-            rate: SampleRate::HZ_5000,
-        })
+        .extract(&samples_5k, SampleRate::HZ_5000,
+        )
         .unwrap()
         .frames;
 
@@ -313,13 +293,12 @@ fn real_audio_streaming_equivalence() {
         let end = cursor + chunk_len;
         online_haitsma.extend(
             haitsma_stream
-                .push(&samples_5k[cursor..end])
-                .into_iter()
+                .push(&samples_5k[cursor..end]).unwrap().into_iter()
                 .map(|(_, h)| h),
         );
         cursor = end;
     }
-    online_haitsma.extend(haitsma_stream.flush().into_iter().map(|(_, h)| h));
+    online_haitsma.extend(haitsma_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
     assert_eq!(off_haitsma, online_haitsma);
 }

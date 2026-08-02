@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ fn wang_hashes(path: &str) -> HashSet<u32> {
     let samples =
         decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut wang = Wang::default();
-    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+    wang.extract(&samples, SampleRate::HZ_8000)
         .unwrap()
         .hashes
         .into_iter()
@@ -33,7 +33,7 @@ fn panako_hashes(path: &str) -> HashSet<u32> {
         decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut panako = Panako::default();
     panako
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap()
         .hashes
         .into_iter()
@@ -45,7 +45,7 @@ fn haitsma_frames(path: &str) -> Vec<u32> {
     let samples =
         decode_to_mono_at(path, 5_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut h = Haitsma::default();
-    h.extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+    h.extract(&samples, SampleRate::HZ_5000)
         .unwrap()
         .frames
 }
@@ -225,7 +225,7 @@ fn all_galway_codecs_decode_and_fingerprint() {
         // Verify all three algorithms produce non-trivial output
         let mut wang = Wang::default();
         let wf = wang
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         assert!(
             wf.hashes.len() > 50,

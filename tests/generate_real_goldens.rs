@@ -3,7 +3,7 @@
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use std::fs;
 
 #[test]
@@ -13,7 +13,7 @@ fn generate_real_audio_goldens() {
     let samples = decode_to_mono_at("tests/assets/piano.ogg", 8_000).unwrap();
     let mut wang = Wang::default();
     let fp = wang
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let bytes: Vec<u8> = fp
         .hashes
@@ -26,7 +26,7 @@ fn generate_real_audio_goldens() {
     // Wang on speech
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 8_000).unwrap();
     let fp = wang
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let bytes: Vec<u8> = fp
         .hashes
@@ -40,7 +40,7 @@ fn generate_real_audio_goldens() {
     let samples = decode_to_mono_at("tests/assets/piano.ogg", 8_000).unwrap();
     let mut panako = Panako::default();
     let fp = panako
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let bytes: Vec<u8> = fp
         .hashes
@@ -53,7 +53,7 @@ fn generate_real_audio_goldens() {
     // Panako on speech
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 8_000).unwrap();
     let fp = panako
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let bytes: Vec<u8> = fp
         .hashes
@@ -67,7 +67,7 @@ fn generate_real_audio_goldens() {
     let samples = decode_to_mono_at("tests/assets/piano.ogg", 5_000).unwrap();
     let mut haitsma = Haitsma::default();
     let fp = haitsma
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+        .extract(&samples, SampleRate::HZ_5000)
         .unwrap();
     let bytes: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
     fs::write("tests/goldens/haitsma_v1_piano.bin", &bytes).unwrap();
@@ -76,7 +76,7 @@ fn generate_real_audio_goldens() {
     // Haitsma on speech
     let samples = decode_to_mono_at("tests/assets/speech.ogg", 5_000).unwrap();
     let fp = haitsma
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+        .extract(&samples, SampleRate::HZ_5000)
         .unwrap();
     let bytes: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
     fs::write("tests/goldens/haitsma_v1_speech.bin", &bytes).unwrap();

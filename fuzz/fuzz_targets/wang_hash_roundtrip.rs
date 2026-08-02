@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use audiofp::classical::{Wang, WangConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use bytemuck;
 use libfuzzer_sys::fuzz_target;
 
@@ -29,19 +29,16 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let samples = &input.samples[..min_len];
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
 
     let mut fp = Wang::new(cfg);
-    let Ok(fpr) = fp.extract(buf) else {
+    let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {
         return;
     };
 
     // Roundtrip: hash -> bytes -> hash
     for h in &fpr.hashes {
-        let bytes: [u8; 8] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
+        let bytes: [u8; 12] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
         let roundtripped: audiofp::classical::WangHash = bytemuck::pod_read_unaligned(&bytes);
         assert_eq!(*h, roundtripped);
     }

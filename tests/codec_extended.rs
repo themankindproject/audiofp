@@ -13,13 +13,13 @@ use std::collections::HashSet;
 
 use audiofp::classical::{Panako, Wang};
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn wang_hashes(path: &str) -> HashSet<u32> {
     let samples =
         decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut wang = Wang::default();
-    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+    wang.extract(&samples, SampleRate::HZ_8000)
         .unwrap()
         .hashes
         .into_iter()
@@ -153,7 +153,7 @@ fn sample_rate_ladder_all_produce_hashes() {
             .unwrap_or_else(|e| panic!("{path} (native {native_sr} Hz) decode failed: {e}"));
         let mut wang = Wang::default();
         let fp = wang
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap_or_else(|e| panic!("{path} extract failed: {e}"));
         assert!(
             fp.hashes.len() > 20,
@@ -197,7 +197,7 @@ fn panako_sample_rate_ladder() {
     let ref_samples = decode_to_mono_at("tests/assets/freak_44100hz.mp3", 8_000).unwrap();
     let mut panako = Panako::default();
     let ref_fp = panako
-        .extract(AudioBuffer::new(&ref_samples, SampleRate::HZ_8000))
+        .extract(&ref_samples, SampleRate::HZ_8000)
         .unwrap();
     let ref_set: HashSet<u32> = ref_fp.hashes.iter().map(|h| h.hash).collect();
 
@@ -210,7 +210,7 @@ fn panako_sample_rate_ladder() {
     for path in variants {
         let samples = decode_to_mono_at(path, 8_000).unwrap();
         let fp = panako
-            .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+            .extract(&samples, SampleRate::HZ_8000)
             .unwrap();
         let h: HashSet<u32> = fp.hashes.iter().map(|h| h.hash).collect();
         let j = jaccard(&ref_set, &h);

@@ -46,10 +46,10 @@ fn run_in_chunks<S: StreamingFingerprinter>(s: &mut S, audio: &[f32], chunk: usi
     let mut start = 0;
     while start < audio.len() {
         let end = (start + chunk).min(audio.len());
-        black_box(s.push(&audio[start..end]));
+        black_box(s.push(&audio[start..end]).unwrap());
         start = end;
     }
-    black_box(s.flush());
+    black_box(s.flush().unwrap());
 }
 
 fn bench_streaming_wang(c: &mut Criterion) {

@@ -57,8 +57,16 @@ pub struct PeakPickerConfig {
     pub neighborhood_t: usize,
     /// Half-width of the neighbourhood along the frequency axis.
     pub neighborhood_f: usize,
-    /// Floor on linear magnitude: cells below this are never candidates.
-    pub min_magnitude: f32,
+    /// Floor on log-magnitude (dB): cells below this are never
+    /// candidates. `audiofp`'s in-tree extractors (Wang, Panako) feed
+    /// `pick` a dB spectrogram and pass their `min_anchor_mag_db`
+    /// config here.
+    pub min_magnitude_db: f32,
+    /// Optional additional floor on **linear** magnitude, for callers
+    /// that feed `pick` a raw (pre-log) spectrogram. When `Some(lin)`,
+    /// cells must exceed both this linear floor and `min_magnitude_db`.
+    /// `None` (default) disables the linear floor.
+    pub min_magnitude_linear: Option<f32>,
     /// Per-second cap on emitted peaks. Set to `0` to disable.
     pub target_per_sec: usize,
 }
@@ -68,7 +76,8 @@ impl Default for PeakPickerConfig {
         Self {
             neighborhood_t: 7,
             neighborhood_f: 7,
-            min_magnitude: 1e-3,
+            min_magnitude_db: 1e-3,
+            min_magnitude_linear: None,
             target_per_sec: 30,
         }
     }
@@ -88,7 +97,8 @@ impl Default for PeakPickerConfig {
 /// let mut picker = PeakPicker::new(PeakPickerConfig {
 ///     neighborhood_t: 1,
 ///     neighborhood_f: 1,
-///     min_magnitude: 0.1,
+///     min_magnitude_db: f32::NEG_INFINITY,
+///     min_magnitude_linear: Some(0.1),
 ///     target_per_sec: 0, // disable adaptive thresholding
 /// });
 /// let peaks = picker.pick(&spec, 8, 8, 100.0);
@@ -177,7 +187,8 @@ impl PeakPicker {
             &mut self.dq,
         );
 
-        let min_mag = self.cfg.min_magnitude;
+        let min_mag = self.cfg.min_magnitude_db;
+        let min_mag_linear = self.cfg.min_magnitude_linear;
         let target_per_sec = self.cfg.target_per_sec;
 
         let upper = (frames_per_sec.ceil() as usize * target_per_sec)
@@ -196,7 +207,11 @@ impl PeakPicker {
             for f in 0..n_bins {
                 let idx = t * n_bins + f;
                 let v = spec[idx];
-                if v > min_mag && v >= self.max_buf[idx] {
+                let above_floor = v > min_mag
+                    && min_mag_linear
+                        .map(|lin| v > lin)
+                        .unwrap_or(true);
+                if above_floor && v >= self.max_buf[idx] {
                     self.candidates.push(Peak {
                         t_frame: t as u32,
                         f_bin: f as u16,
@@ -635,7 +650,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 2,
             neighborhood_f: 2,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 0,
         });
         let peaks = picker.pick(&spec, n_frames, n_bins, 100.0);
@@ -653,7 +669,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 0,
         });
         let peaks = picker.pick(&spec, 8, 8, 100.0);
@@ -674,7 +691,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 0,
         });
         let peaks = picker.pick(&spec, n_frames, n_bins, 100.0);
@@ -699,7 +717,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 2,
             neighborhood_f: 2,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 3,
         });
 
@@ -762,7 +781,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 1,
             neighborhood_f: 1,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 0,
         });
         let peaks = picker.pick(&spec, n_frames, n_bins, 100.0);
@@ -776,7 +796,8 @@ mod tests {
         let mut picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: 3,
             neighborhood_f: 3,
-            min_magnitude: 0.1,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: Some(0.1),
             target_per_sec: 0,
         });
         let peaks = picker.pick(&spec, 16, 16, 100.0);

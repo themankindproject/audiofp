@@ -9,7 +9,7 @@
 
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -27,11 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Extracting Wang fingerprint...");
     let mut wang = Wang::default();
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    let fp = wang.extract(buf)?;
+    
+    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 
     println!(
         "  {} hashes at {:.1} fps ({:.1} hashes/s)",
@@ -44,7 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let preview = fp.hashes.iter().take(8);
     println!("\nFirst 8 hashes (t_anchor, hash):");
     for h in preview {
-        println!("  {:>6}  {:08x}", h.t_anchor, h.hash);
+        let t = h.t_anchor; // copy out of packed struct
+        let hash = h.hash;
+        println!("  {:>6}  {:08x}", t.0, hash);
     }
 
     Ok(())

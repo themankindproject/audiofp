@@ -9,7 +9,7 @@
 //! output is a flat embedding vector (see `USAGE.md` → Neural Embedder).
 
 use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = std::env::args().nth(1).ok_or_else(|| {
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = vec![0.0_f32; n];
     let rate =
         SampleRate::new(emb.config().sample_rate).ok_or("model sample_rate must be non-zero")?;
-    let fp = emb.extract(AudioBuffer::new(&samples, rate))?;
+    let fp = emb.extract(&samples, rate)?;
 
     println!(
         "{} embedding(s), dim={}, frames_per_sec={:.3}",

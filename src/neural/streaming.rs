@@ -34,7 +34,7 @@ use super::embedder::{EmbedderCore, NeuralEmbedderConfig};
 /// let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 /// // Feed 16 kHz PCM in arbitrary-sized chunks.
 /// let chunk = vec![0.0_f32; 4_096];
-/// let frames = s.push(&chunk);
+/// let frames = s.push(&chunk)?;
 /// for (t, vector) in frames {
 ///     println!("t={} ms, dim={}", t.0, vector.len());
 /// }
@@ -220,22 +220,19 @@ impl StreamingFingerprinter for StreamingNeuralEmbedder {
 
     /// Feed PCM samples and return any embeddings that became available.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if ONNX inference fails. Use [`try_push`] if you need to
-    /// recover from inference errors.
-    ///
-    /// [`try_push`]: StreamingNeuralEmbedder::try_push
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
+    /// Returns `Err` if ONNX inference fails. The previous behaviour
+    /// panicked on inference errors; use the `Result` return to recover.
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         self.try_push(samples)
-            .unwrap_or_else(|e| panic!("neural inference failed during push: {e}"))
     }
 
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         // Non-centred framing means partial windows can't produce
         // embeddings — drop them.
         self.sample_carry.clear();
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn latency_ms(&self) -> u32 {
@@ -252,6 +249,7 @@ mod tests {
     use super::*;
     use crate::AfpError;
     use crate::Fingerprinter;
+    use crate::SampleRate;
     use crate::neural::test_support::{passthrough_streaming, small_cfg, synth_audio};
 
     // ---------- Error path coverage (no model needed) ----------
@@ -299,7 +297,7 @@ mod tests {
     #[test]
     fn empty_push_emits_nothing_and_does_not_buffer() {
         let mut s = fixture();
-        let out = s.push(&[]);
+        let out = s.push(&[]).unwrap();
         assert!(out.is_empty());
         assert_eq!(s.carry_len(), 0);
     }
@@ -309,7 +307,7 @@ mod tests {
         let mut s = fixture();
         let half = s.window_samples() / 2;
         let chunk = vec![0.0_f32; half];
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         assert!(out.is_empty(), "no embedding before window full");
         assert_eq!(s.carry_len(), half);
         assert_eq!(s.samples_consumed(), 0);
@@ -319,7 +317,7 @@ mod tests {
     fn one_full_window_emits_one_embedding() {
         let mut s = fixture();
         let chunk = synth_audio(1, s.window_samples(), 16_000);
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         assert_eq!(out.len(), 1);
         let (t, vec) = &out[0];
         assert_eq!(t.0, 0);
@@ -333,7 +331,7 @@ mod tests {
         // Push 4 windows worth of audio at once.
         let n = 4 * s.window_samples();
         let chunk = synth_audio(2, n, 16_000);
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         assert_eq!(out.len(), 4);
         for (i, (t, _)) in out.iter().enumerate() {
             // small_cfg hop_secs = 0.25 → 250 ms apart.
@@ -348,7 +346,7 @@ mod tests {
         // than window_samples after the loop drains complete windows.
         let n = 100 * s.window_samples() + 17;
         let chunk = synth_audio(3, n, 16_000);
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         assert_eq!(out.len(), 100);
         assert!(
             s.carry_len() < s.window_samples(),
@@ -366,7 +364,7 @@ mod tests {
         let chunk = vec![0.0_f32; s.window_samples() / 2];
         let _ = s.push(&chunk);
         assert!(s.carry_len() > 0);
-        let f = s.flush();
+        let f = s.flush().unwrap();
         assert!(f.is_empty());
         assert_eq!(s.carry_len(), 0);
     }
@@ -388,7 +386,7 @@ mod tests {
         let mut b = fixture();
         let chunk = synth_audio(5, 2 * a.window_samples(), 16_000);
 
-        let out_push = a.push(&chunk);
+        let out_push = a.push(&chunk).unwrap();
         let out_try = b.try_push(&chunk).expect("try_push ok");
 
         assert_eq!(out_push.len(), out_try.len());
@@ -408,15 +406,13 @@ mod tests {
 
         // Offline.
         let mut off = crate::neural::test_support::passthrough_embedder(cfg.clone()).unwrap();
-        let buf = crate::AudioBuffer {
-            samples: &audio,
-            rate: crate::SampleRate::HZ_16000,
-        };
-        let off_fp = off.extract(buf).unwrap();
+        let off_fp = off
+            .extract(&audio, SampleRate::new(cfg.sample_rate).unwrap())
+            .unwrap();
 
         // Streaming, single big push.
         let mut s = passthrough_streaming(cfg).unwrap();
-        let s_out = s.push(&audio);
+        let s_out = s.push(&audio).unwrap();
 
         assert_eq!(off_fp.embeddings.len(), s_out.len());
         for (e, (t, v)) in off_fp.embeddings.iter().zip(s_out.iter()) {
@@ -435,7 +431,7 @@ mod tests {
 
         let reference = {
             let mut s = passthrough_streaming(cfg.clone()).unwrap();
-            s.push(&audio)
+            s.push(&audio).unwrap()
         };
 
         for chunk_size in [1, 7, 17, 256, 1024, 8_191] {
@@ -444,7 +440,7 @@ mod tests {
             let mut start = 0;
             while start < audio.len() {
                 let end = (start + chunk_size).min(audio.len());
-                collected.extend(s.push(&audio[start..end]));
+                collected.extend(s.push(&audio[start..end]).unwrap());
                 start = end;
             }
             assert_eq!(
@@ -470,14 +466,12 @@ mod tests {
         let audio = synth_audio(13, n, cfg.sample_rate);
 
         let mut off = crate::neural::test_support::passthrough_embedder(cfg.clone()).unwrap();
-        let buf = crate::AudioBuffer {
-            samples: &audio,
-            rate: crate::SampleRate::HZ_16000,
-        };
-        let off_fp = off.extract(buf).unwrap();
+        let off_fp = off
+            .extract(&audio, SampleRate::new(cfg.sample_rate).unwrap())
+            .unwrap();
 
         let mut s = passthrough_streaming(cfg).unwrap();
-        let s_out = s.push(&audio);
+        let s_out = s.push(&audio).unwrap();
 
         assert_eq!(off_fp.embeddings.len(), s_out.len());
         for (e, (t, v)) in off_fp.embeddings.iter().zip(s_out.iter()) {
@@ -492,7 +486,7 @@ mod tests {
         cfg.l2_normalize = true;
         let mut s = passthrough_streaming(cfg.clone()).unwrap();
         let chunk = synth_audio(17, s.window_samples(), 16_000);
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         let v = &out[0].1;
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4, "expected L2 norm ~1, got {norm}",);
@@ -525,7 +519,7 @@ mod tests {
         cfg.l2_normalize = false;
         let mut s = passthrough_streaming(cfg.clone()).unwrap();
         let chunk = synth_audio(19, s.window_samples(), 16_000);
-        let out = s.push(&chunk);
+        let out = s.push(&chunk).unwrap();
         let v = &out[0].1;
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         // Log-mel of any non-trivial signal has |·| well away from 1.0.

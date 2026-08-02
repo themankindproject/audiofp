@@ -21,12 +21,12 @@
 //! extern crate alloc;
 //! use audiofp::classical::{Wang, WangFingerprint};
 //! use audiofp::matching::{WangMatcher, WangMatchConfig, Matcher, MatchResult};
-//! use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+//! use audiofp::{Fingerprinter, SampleRate};
 //!
 //! let samples: alloc::vec::Vec<f32> = alloc::vec![0.0_f32; 8_000 * 4];
 //! let mut wang = Wang::default();
-//! let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-//! let q = wang.extract(buf).unwrap();
+
+//! let q = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 //! let r = q.clone();
 //!
 //! let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -197,6 +197,32 @@ pub(crate) fn frames_per_sec_compatible(a: f32, b: f32) -> bool {
     }
     let scale = a.abs().max(b.abs());
     (a - b).abs() <= FPS_REL_EPS * scale
+}
+
+/// Convert a millisecond timestamp to STFT frame units at `fps`.
+///
+/// Matching internals operate in frame units (delta histograms, scale
+/// ratios, tolerances, RANSAC) for sub-frame precision. Hash
+/// timestamps are `TimestampMs`; matchers convert at the boundary.
+#[inline]
+#[must_use]
+pub(crate) fn ms_to_frames(ms: crate::TimestampMs, fps: f32) -> u32 {
+    if fps <= 0.0 {
+        return ms.0 as u32;
+    }
+    // round() matches `TimeOffset::from_frames` (frames → ms rounding).
+    (ms.0 as f64 * fps as f64 / 1000.0).round() as u32
+}
+
+/// Convert a frame index to a millisecond timestamp at `fps`.
+#[cfg(test)]
+#[inline]
+#[must_use]
+pub(crate) fn frames_to_ms(frames: u32, fps: f32) -> crate::TimestampMs {
+    if fps <= 0.0 {
+        return crate::TimestampMs(frames as u64);
+    }
+    crate::TimestampMs((frames as f64 * 1000.0 / fps as f64).round() as u64)
 }
 
 // ---------------------------------------------------------------------------

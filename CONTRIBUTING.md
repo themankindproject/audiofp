@@ -96,6 +96,26 @@ The project follows [Semantic Versioning](https://semver.org/) once it ships
   change to hash output will bump the algorithm's `name()` suffix
   (e.g. `"wang-v1"` → `"wang-v2"`) and roll the package major.
 
+### API stability policy (0.x)
+
+- **Breaking changes are batched** into `0.x.0` minor releases — never
+  shipped piecemeal in a patch. Each breaking release must include a
+  migration guide (`MIGRATING_*.md`) and a CHANGELOG entry listing every
+  break.
+- **Public API additions** (new types, methods, impls) are non-breaking
+  and may land in any release.
+- **Hash bytes** are part of the API contract: any change to produced
+  hash bytes requires bumping the fingerprinter's `name()` suffix
+  (`wang-v1` → `wang-v2`) in the same release, regenerating golden
+  files, and (if the serialized representation changes) bumping the
+  serialization `FORMAT_VERSION`.
+- **Removing or renaming public items** is always a breaking change for
+  `0.x.0`; prefer deprecation with a one-release grace period when
+  practical.
+- MSRV (currently 1.93.0, pinned in `rust-toolchain.toml`) is
+  non-breaking to raise; bump it in a `0.x.0` release and note it in the
+  changelog.
+
 ## Filing issues
 
 When filing a bug, please include:

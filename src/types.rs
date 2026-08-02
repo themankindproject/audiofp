@@ -76,56 +76,6 @@ impl SampleRate {
     }
 }
 
-/// A borrowed view of a mono PCM buffer in `[-1.0, 1.0]`.
-///
-/// Channel mixing is the caller's job — every public `audiofp` API takes mono
-/// `f32`. Multi-channel inputs must be downmixed (helpers will live in the
-/// streaming module once it lands).
-///
-/// # Example
-///
-/// ```
-/// use audiofp::{AudioBuffer, SampleRate};
-///
-/// let samples = vec![0.0_f32; 16_000];
-/// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
-/// assert_eq!(buf.samples.len(), 16_000);
-/// assert_eq!(buf.rate.hz(), 16_000);
-/// ```
-#[derive(Clone, Debug)]
-pub struct AudioBuffer<'a> {
-    /// Mono samples in `[-1.0, 1.0]`. Out-of-range values are not rejected
-    /// here; downstream code clips or normalises as needed.
-    pub samples: &'a [f32],
-
-    /// Sample rate the samples were captured at.
-    pub rate: SampleRate,
-}
-
-impl<'a> AudioBuffer<'a> {
-    /// Build an [`AudioBuffer`] from a borrowed sample slice and a rate.
-    ///
-    /// Equivalent to the struct literal form, but the field names are not
-    /// memorised on every call site. Prefer this constructor in new code;
-    /// the literal form is kept for backward compatibility.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use audiofp::{AudioBuffer, SampleRate};
-    ///
-    /// let samples = vec![0.0_f32; 16_000];
-    /// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
-    /// assert_eq!(buf.samples.len(), 16_000);
-    /// assert_eq!(buf.rate.hz(), 16_000);
-    /// ```
-    #[inline]
-    #[must_use]
-    pub const fn new(samples: &'a [f32], rate: SampleRate) -> Self {
-        Self { samples, rate }
-    }
-}
-
 /// A timestamp in milliseconds since the start of a stream.
 ///
 /// `u64` gives roughly 584 million years of headroom — long enough.
@@ -138,7 +88,8 @@ impl<'a> AudioBuffer<'a> {
 /// let t = TimestampMs(1_500);
 /// assert_eq!(t.0, 1_500);
 /// ```
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TimestampMs(pub u64);
 
 #[cfg(test)]
@@ -179,20 +130,5 @@ mod tests {
         assert_eq!(a.cmp(&b), core::cmp::Ordering::Less);
         assert_eq!(b.cmp(&a), core::cmp::Ordering::Greater);
         assert_eq!(a.cmp(&a), core::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn audio_buffer_borrow() {
-        let samples = alloc::vec![0.1_f32, 0.2, 0.3];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        // The buffer is a borrowed view — original samples still owned.
-        assert_eq!(buf.samples.len(), 3);
-        assert_eq!(buf.rate.hz(), 16_000);
-        // Vec still usable via the original binding after the buffer's
-        // last use.
-        assert_eq!(samples.len(), 3);
     }
 }

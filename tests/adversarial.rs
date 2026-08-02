@@ -4,7 +4,7 @@
 //! Goal: zero panics, clean errors, no OOM on hostile input.
 
 use audiofp::classical::{Haitsma, Panako, Wang};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 mod common;
 use common::audio_gen;
@@ -18,7 +18,7 @@ fn silence_5sec_wang() {
     let silence = vec![0.0f32; 8000 * 5];
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&silence, SampleRate::HZ_8000))
+        .extract(&silence, SampleRate::HZ_8000)
         .unwrap();
     // Silence should produce an empty or very sparse fingerprint — never panic.
     // Self-match of empty fingerprint → MatchResult::NONE (tested in unit tests).
@@ -33,7 +33,7 @@ fn silence_5sec_haitsma() {
     let silence = vec![0.0f32; 5000 * 5];
     let mut h = Haitsma::default();
     let fp = h
-        .extract(AudioBuffer::new(&silence, SampleRate::HZ_5000))
+        .extract(&silence, SampleRate::HZ_5000)
         .unwrap();
     // Haitsma silence → all-zero frames
     assert!(
@@ -47,7 +47,7 @@ fn silence_5sec_panako() {
     let silence = vec![0.0f32; 8000 * 5];
     let mut p = Panako::default();
     let fp = p
-        .extract(AudioBuffer::new(&silence, SampleRate::HZ_8000))
+        .extract(&silence, SampleRate::HZ_8000)
         .unwrap();
     assert!(
         fp.hashes.is_empty(),
@@ -61,7 +61,7 @@ fn white_noise_wang() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
     // Multi-instrument audio must produce landmarks
     assert!(!fp.hashes.is_empty());
@@ -73,7 +73,7 @@ fn dc_offset_no_panic() {
     let dc = vec![0.5f32; 8000 * 3];
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&dc, SampleRate::HZ_8000))
+        .extract(&dc, SampleRate::HZ_8000)
         .unwrap();
     // DC → flat spectrum → sparse or empty fingerprint. Both fine.
     // We just verify extraction doesn't panic.
@@ -90,7 +90,7 @@ fn wrong_sample_rate_wang() {
     // Wang expects 8 kHz; 16 kHz must fail.
     let mut w = Wang::default();
     let err = w
-        .extract(AudioBuffer::new(&audio, SampleRate::HZ_16000))
+        .extract(&audio, SampleRate::HZ_16000)
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -104,7 +104,7 @@ fn wrong_sample_rate_haitsma() {
     let audio = vec![0.0f32; 5000 * 3];
     let mut h = Haitsma::default();
     let err = h
-        .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
+        .extract(&audio, SampleRate::HZ_8000)
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -118,7 +118,7 @@ fn wrong_sample_rate_panako() {
     let audio = vec![0.0f32; 8000 * 3];
     let mut p = Panako::default();
     let err = p
-        .extract(AudioBuffer::new(&audio, SampleRate::HZ_16000))
+        .extract(&audio, SampleRate::HZ_16000)
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -136,7 +136,7 @@ fn very_short_input_wang() {
     let audio = vec![0.0f32; 128]; // less than minimum
     let mut w = Wang::default();
     let err = w
-        .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
+        .extract(&audio, SampleRate::HZ_8000)
         .unwrap_err();
     assert!(format!("{err}").contains("short"));
 }
@@ -146,7 +146,7 @@ fn very_short_input_panako() {
     let audio = vec![0.0f32; 128];
     let mut p = Panako::default();
     let err = p
-        .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
+        .extract(&audio, SampleRate::HZ_8000)
         .unwrap_err();
     assert!(format!("{err}").contains("short"));
 }
@@ -161,7 +161,7 @@ fn amplitude_clipping_no_nan() {
     let pcm = audio_gen::resample_48k_to_8k(&sig);
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
     // Verify no NaN in hash values
     for h in &fp.hashes {
@@ -174,16 +174,18 @@ fn deterministic_extraction() {
     // Same input twice → identical fingerprints.
     let sig = audio_gen::percussion(99, 5.0);
     let pcm = audio_gen::resample_48k_to_8k(&sig);
-    let buf1 = AudioBuffer::new(&pcm, SampleRate::HZ_8000);
-    let buf2 = AudioBuffer::new(&pcm, SampleRate::HZ_8000);
 
     let mut w = Wang::default();
-    let fp1 = w.extract(buf1).unwrap();
-    let fp2 = w.extract(buf2).unwrap();
+    let fp1 = w.extract(&pcm, SampleRate::HZ_8000).unwrap();
+    let fp2 = w.extract(&pcm, SampleRate::HZ_8000).unwrap();
     assert_eq!(fp1.hashes.len(), fp2.hashes.len());
     for (a, b) in fp1.hashes.iter().zip(fp2.hashes.iter()) {
-        assert_eq!(a.hash, b.hash);
-        assert_eq!(a.t_anchor, b.t_anchor);
+        let ha = a.hash; // copy out of packed struct
+        let hb = b.hash;
+        assert_eq!(ha, hb);
+        let ta = a.t_anchor;
+        let tb = b.t_anchor;
+        assert_eq!(ta, tb);
     }
 }
 
@@ -199,7 +201,7 @@ fn empty_catalog_query_returns_none() {
     let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(1, 3.0));
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .extract(&sig, SampleRate::HZ_8000)
         .unwrap();
 
     let index = WangIndex::build(&[], 100);
@@ -219,7 +221,7 @@ fn catalog_all_different_no_false_positive() {
     for i in 0..20u64 {
         let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(i + 100, 4.0));
         let fp = w
-            .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+            .extract(&sig, SampleRate::HZ_8000)
             .unwrap();
         refs.push(fp);
     }
@@ -227,7 +229,7 @@ fn catalog_all_different_no_false_positive() {
     // Query is a completely different piece (percussion vs multi-instrument)
     let query_sig = audio_gen::resample_48k_to_8k(&audio_gen::percussion(999, 4.0));
     let query = w
-        .extract(AudioBuffer::new(&query_sig, SampleRate::HZ_8000))
+        .extract(&query_sig, SampleRate::HZ_8000)
         .unwrap();
 
     let index = WangIndex::build(&refs, 100);
@@ -245,7 +247,7 @@ fn wang_match_mismatched_frames_per_sec_is_none() {
     let sig = audio_gen::resample_48k_to_8k(&audio_gen::multi_instrument(42, 3.0));
     let mut w = Wang::default();
     let mut q = w
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .extract(&sig, SampleRate::HZ_8000)
         .unwrap();
     let r = q.clone();
     q.frames_per_sec = r.frames_per_sec * 2.0;
@@ -278,19 +280,19 @@ fn extract_then_match_adversarial_pcm_no_panic() {
     let wang = WangMatcher::new(WangMatchConfig::default());
     let panako = PanakoMatcher::new(PanakoMatchConfig::default());
 
-    if let Ok(wang_fp) = w.extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000)) {
+    if let Ok(wang_fp) = w.extract(&pcm, SampleRate::HZ_8000) {
         let _ = wang.match_one(&wang_fp, &wang_fp);
     }
-    if let Ok(panako_fp) = p.extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000)) {
+    if let Ok(panako_fp) = p.extract(&pcm, SampleRate::HZ_8000) {
         let _ = panako.match_one(&panako_fp, &panako_fp);
     }
 
     // Finite path: matching empty/sparse fingerprints must stay well-formed.
     let silence = vec![0.0f32; 8000 * 2];
-    if let Ok(wang_fp) = w.extract(AudioBuffer::new(&silence, SampleRate::HZ_8000)) {
+    if let Ok(wang_fp) = w.extract(&silence, SampleRate::HZ_8000) {
         let _ = wang.match_one(&wang_fp, &wang_fp);
     }
-    if let Ok(panako_fp) = p.extract(AudioBuffer::new(&silence, SampleRate::HZ_8000)) {
+    if let Ok(panako_fp) = p.extract(&silence, SampleRate::HZ_8000) {
         let _ = panako.match_one(&panako_fp, &panako_fp);
     }
 }

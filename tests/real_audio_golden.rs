@@ -6,13 +6,13 @@
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn assert_golden_wang(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut wang = Wang::default();
     let fp = wang
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let actual: Vec<u8> = fp
         .hashes
@@ -34,7 +34,7 @@ fn assert_golden_panako(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut panako = Panako::default();
     let fp = panako
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     let actual: Vec<u8> = fp
         .hashes
@@ -50,7 +50,7 @@ fn assert_golden_haitsma(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 5_000).unwrap();
     let mut haitsma = Haitsma::default();
     let fp = haitsma
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_5000))
+        .extract(&samples, SampleRate::HZ_5000)
         .unwrap();
     let actual: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
     let expected = std::fs::read(golden_path)

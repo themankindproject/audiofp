@@ -12,7 +12,7 @@ use audiofp::matching::{
     HaitsmaIndex, HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher,
     WangIndex, WangMatchConfig, WangMatcher,
 };
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 mod common;
 
@@ -47,7 +47,7 @@ fn pipeline_self_match_wang() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut w = Wang::default();
     let fp = w
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
     assert!(!fp.hashes.is_empty(), "must have landmarks");
 
@@ -65,7 +65,7 @@ fn pipeline_self_match_haitsma() {
     let pcm = audio_gen::resample_48k_to_5k(&audio);
     let mut h = Haitsma::default();
     let fp = h
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_5000))
+        .extract(&pcm, SampleRate::HZ_5000)
         .unwrap();
     assert!(!fp.frames.is_empty(), "must have frames");
 
@@ -89,7 +89,7 @@ fn pipeline_self_match_panako() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut p = Panako::default();
     let fp = p
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
     assert!(!fp.hashes.is_empty(), "must have triplets");
 
@@ -114,13 +114,13 @@ fn pipeline_offset_recovery_wang() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut w = Wang::default();
     let reference = w
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
 
     // Query is the last 8 seconds → offset = 4s * 62.5 fps = 250 frames
     let query_pcm = &pcm[4 * 8000..];
     let query = w
-        .extract(AudioBuffer::new(query_pcm, SampleRate::HZ_8000))
+        .extract(query_pcm, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -140,13 +140,13 @@ fn pipeline_offset_recovery_haitsma() {
     let pcm = audio_gen::resample_48k_to_5k(&audio);
     let mut h = Haitsma::default();
     let reference = h
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_5000))
+        .extract(&pcm, SampleRate::HZ_5000)
         .unwrap();
 
     // Query is the last ~8 seconds
     let query_pcm = &pcm[4 * 5000..];
     let query = h
-        .extract(AudioBuffer::new(query_pcm, SampleRate::HZ_5000))
+        .extract(query_pcm, SampleRate::HZ_5000)
         .unwrap();
 
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig {
@@ -169,12 +169,12 @@ fn pipeline_offset_recovery_panako() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut p = Panako::default();
     let reference = p
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
 
     let query_pcm = &pcm[4 * 8000..];
     let query = p
-        .extract(AudioBuffer::new(query_pcm, SampleRate::HZ_8000))
+        .extract(query_pcm, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
@@ -200,7 +200,7 @@ fn pipeline_tempo_speedup_105x_panako() {
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut p = Panako::default();
     let reference = p
-        .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+        .extract(&pcm, SampleRate::HZ_8000)
         .unwrap();
 
     // 5% speed-up: resample at 1.05 ratio (pitch rises too, but Panako β
@@ -208,7 +208,7 @@ fn pipeline_tempo_speedup_105x_panako() {
     let speedup_pcm = audio_gen::resample_48k_to_8k(&audio);
     let fast = resample(&speedup_pcm, 1.05);
     let query = p
-        .extract(AudioBuffer::new(&fast, SampleRate::HZ_8000))
+        .extract(&fast, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = PanakoMatcher::new(PanakoMatchConfig {
@@ -242,20 +242,18 @@ fn pipeline_catalog_wang_identify() {
     let audio = audio_gen::multi_instrument(99, 6.0);
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut w = Wang::default();
-    let buf = AudioBuffer::new(&pcm, SampleRate::HZ_8000);
-
     // Build a catalog of 20 references: 19 synthetic + 1 real
     let mut refs = Vec::new();
     for i in 0..19 {
         let sig = audio_gen::percussion((100 + i) as u64, 6.0);
         let pcm = audio_gen::resample_48k_to_8k(&sig);
         let fp = w
-            .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+            .extract(&pcm, SampleRate::HZ_8000)
             .unwrap();
         refs.push(fp);
     }
     // The 20th reference (index 19) is the same audio as the query
-    let target = w.extract(buf).unwrap();
+    let target = w.extract(&pcm, SampleRate::HZ_8000).unwrap();
     refs.push(target.clone());
 
     let index = WangIndex::build(&refs, 100);
@@ -275,18 +273,16 @@ fn pipeline_catalog_haitsma_identify() {
     let audio = audio_gen::multi_instrument(99, 8.0);
     let pcm = audio_gen::resample_48k_to_5k(&audio);
     let mut h = Haitsma::default();
-    let buf = AudioBuffer::new(&pcm, SampleRate::HZ_5000);
-
     let mut refs = Vec::new();
     for i in 0..9 {
         let sig = audio_gen::percussion((100 + i) as u64, 8.0);
         let pcm = audio_gen::resample_48k_to_5k(&sig);
         let fp = h
-            .extract(AudioBuffer::new(&pcm, SampleRate::HZ_5000))
+            .extract(&pcm, SampleRate::HZ_5000)
             .unwrap();
         refs.push(fp);
     }
-    let target = h.extract(buf).unwrap();
+    let target = h.extract(&pcm, SampleRate::HZ_5000).unwrap();
     refs.push(target.clone());
 
     let index = HaitsmaIndex::build(&refs, 100);
@@ -308,18 +304,16 @@ fn pipeline_catalog_panako_identify() {
     let audio = audio_gen::percussion(42, 6.0);
     let pcm = audio_gen::resample_48k_to_8k(&audio);
     let mut p = Panako::default();
-    let buf = AudioBuffer::new(&pcm, SampleRate::HZ_8000);
-
     let mut refs = Vec::new();
     for i in 0..9 {
         let sig = audio_gen::multi_instrument((100 + i) as u64, 6.0);
         let pcm = audio_gen::resample_48k_to_8k(&sig);
         let fp = p
-            .extract(AudioBuffer::new(&pcm, SampleRate::HZ_8000))
+            .extract(&pcm, SampleRate::HZ_8000)
             .unwrap();
         refs.push(fp);
     }
-    let target = p.extract(buf).unwrap();
+    let target = p.extract(&pcm, SampleRate::HZ_8000).unwrap();
     refs.push(target.clone());
 
     let index = audiofp::matching::PanakoIndex::build(&refs, 100);
@@ -343,10 +337,10 @@ fn pipeline_unrelated_rejected_wang() {
     let b = audio_gen::resample_48k_to_8k(&audio_gen::percussion(2, 6.0));
     let mut w = Wang::default();
     let fa = w
-        .extract(AudioBuffer::new(&a, SampleRate::HZ_8000))
+        .extract(&a, SampleRate::HZ_8000)
         .unwrap();
     let fb = w
-        .extract(AudioBuffer::new(&b, SampleRate::HZ_8000))
+        .extract(&b, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -360,10 +354,10 @@ fn pipeline_unrelated_rejected_haitsma() {
     let b = audio_gen::resample_48k_to_5k(&audio_gen::percussion(2, 8.0));
     let mut h = Haitsma::default();
     let fa = h
-        .extract(AudioBuffer::new(&a, SampleRate::HZ_5000))
+        .extract(&a, SampleRate::HZ_5000)
         .unwrap();
     let fb = h
-        .extract(AudioBuffer::new(&b, SampleRate::HZ_5000))
+        .extract(&b, SampleRate::HZ_5000)
         .unwrap();
 
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
@@ -377,10 +371,10 @@ fn pipeline_unrelated_rejected_panako() {
     let b = audio_gen::resample_48k_to_8k(&audio_gen::percussion(4, 6.0));
     let mut p = Panako::default();
     let fa = p
-        .extract(AudioBuffer::new(&a, SampleRate::HZ_8000))
+        .extract(&a, SampleRate::HZ_8000)
         .unwrap();
     let fb = p
-        .extract(AudioBuffer::new(&b, SampleRate::HZ_8000))
+        .extract(&b, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
@@ -410,7 +404,7 @@ fn pipeline_all_generators_wang() {
         ),
     ] {
         let fp = w
-            .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
+            .extract(&audio, SampleRate::HZ_8000)
             .unwrap();
         assert!(!fp.hashes.is_empty(), "{name}: Wang must produce landmarks");
     }
@@ -434,7 +428,7 @@ fn pipeline_all_generators_haitsma() {
         ),
     ] {
         let fp = h
-            .extract(AudioBuffer::new(&audio, SampleRate::HZ_5000))
+            .extract(&audio, SampleRate::HZ_5000)
             .unwrap();
         assert!(!fp.frames.is_empty(), "{name}: Haitsma must produce frames");
     }
@@ -458,7 +452,7 @@ fn pipeline_all_generators_panako() {
         ),
     ] {
         let fp = p
-            .extract(AudioBuffer::new(&audio, SampleRate::HZ_8000))
+            .extract(&audio, SampleRate::HZ_8000)
             .unwrap();
         assert!(
             !fp.hashes.is_empty(),

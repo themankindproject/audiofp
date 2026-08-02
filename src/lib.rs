@@ -16,8 +16,10 @@
 //! - **Errors** — [`AfpError`] (`#[non_exhaustive]`) plus the
 //!   [`Result`] alias.
 //! - **Value types** — [`SampleRate`] (newtype around `NonZeroU32` with
-//!   `HZ_*` constants), [`AudioBuffer`] (borrowed mono PCM view), and
-//!   [`TimestampMs`] (ordered millisecond timestamp).
+//!   `HZ_*` constants) and [`TimestampMs`] (ordered millisecond
+//!   timestamp). Extraction takes `&[f32]` samples plus a
+//!   [`SampleRate`] directly (the old `AudioBuffer` wrapper was removed
+//!   in 0.4.0; see `MIGRATING_0.4.md`).
 //! - **Traits** — [`Fingerprinter`] for whole-buffer extraction,
 //!   [`StreamingFingerprinter`] for incremental extraction. Every
 //!   algorithm in the crate implements both.
@@ -60,7 +62,8 @@
 //!     hashes: (0..8u32)
 //!         .map(|i| WangHash {
 //!             hash: i,
-//!             t_anchor: i * 10,
+//!             // 10 STFT frames apart = 160 ms at 62.5 fps.
+//!             t_anchor: audiofp::TimestampMs(i as u64 * 160),
 //!         })
 //!         .collect(),
 //!     frames_per_sec: 62.5,
@@ -116,7 +119,16 @@ pub use error::IoError;
 pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
 pub use serial::FingerprintEnvelope;
-pub use types::{AudioBuffer, SampleRate, TimestampMs};
+pub use types::{SampleRate, TimestampMs};
+
+/// Convenience re-exports of the classical algorithm types at the crate
+/// root. The canonical location remains [`classical`]; these are aliases
+/// so `use audiofp::Wang;` works directly.
+pub use classical::{
+    Haitsma, HaitsmaConfig, HaitsmaFingerprint, Panako, PanakoConfig, PanakoFingerprint,
+    PanakoHash, StreamingHaitsma, StreamingPanako, StreamingWang, Wang, WangConfig,
+    WangFingerprint, WangHash,
+};
 
 /// Multi-threaded batch fingerprinting (requires the `rayon` feature).
 #[cfg(feature = "rayon")]

@@ -4,9 +4,8 @@
 //! use audiofp::prelude::*;
 //!
 //! let samples = vec![0.0_f32; 16_000];
-//! let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
 //! let mut wang = Wang::default();
-//! let fp = wang.extract(buf)?;
+//! let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 //! assert_eq!(fp.frames_per_sec, 62.5);
 //! ```
 //!
@@ -28,4 +27,4 @@ pub use crate::classical::{
 pub use crate::error::{AfpError, Result};
 pub use crate::fp::{Fingerprinter, StreamingFingerprinter};
 pub use crate::serial::FingerprintEnvelope;
-pub use crate::types::{AudioBuffer, SampleRate, TimestampMs};
+pub use crate::types::{SampleRate, TimestampMs};

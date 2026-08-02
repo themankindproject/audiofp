@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use audiofp::classical::{Panako, PanakoConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]
@@ -28,18 +28,15 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let samples = &input.samples[..min_len];
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
 
     let mut fp = Panako::new(cfg);
-    let Ok(fpr) = fp.extract(buf) else {
+    let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {
         return;
     };
 
     for h in &fpr.hashes {
-        let bytes: [u8; 16] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
+        let bytes: [u8; 28] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
         let roundtripped: audiofp::classical::PanakoHash = bytemuck::pod_read_unaligned(&bytes);
         assert_eq!(*h, roundtripped);
     }

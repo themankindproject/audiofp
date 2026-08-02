@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 
 use audiofp::classical::{Haitsma, Panako, Wang};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 const SECS: f32 = 10.0;
 
@@ -95,11 +95,7 @@ fn jaccard<T: std::hash::Hash + Eq>(a: &HashSet<T>, b: &HashSet<T>) -> f32 {
 
 fn wang_hash_set(samples: &[f32]) -> HashSet<u32> {
     let mut wang = Wang::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_8000,
-    };
-    wang.extract(buf)
+    wang.extract(samples, SampleRate::HZ_8000)
         .unwrap()
         .hashes
         .into_iter()
@@ -109,11 +105,7 @@ fn wang_hash_set(samples: &[f32]) -> HashSet<u32> {
 
 fn panako_hash_set(samples: &[f32]) -> HashSet<u32> {
     let mut p = Panako::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_8000,
-    };
-    p.extract(buf)
+    p.extract(samples, SampleRate::HZ_8000)
         .unwrap()
         .hashes
         .into_iter()
@@ -123,11 +115,7 @@ fn panako_hash_set(samples: &[f32]) -> HashSet<u32> {
 
 fn haitsma_frames(samples: &[f32]) -> Vec<u32> {
     let mut h = Haitsma::default();
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_5000,
-    };
-    h.extract(buf).unwrap().frames
+    h.extract(samples, SampleRate::HZ_5000).unwrap().frames
 }
 
 /// Bit-level Hamming similarity for Haitsma — frames are aligned 1-to-1

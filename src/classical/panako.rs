@@ -58,21 +58,26 @@ use alloc::vec::Vec;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{AfpError, AudioBuffer, Fingerprinter, Result, StreamingFingerprinter, TimestampMs};
+use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target-target triplet packed into a 32-bit hash plus the
-/// three frame indices.
-#[repr(C)]
+/// three ms timestamps.
+///
+/// `#[repr(C, packed)]` keeps the on-disk byte size at 28 bytes
+/// (u32 hash + 3×u64 ms timestamps) with no padding, preserving
+/// `bytemuck::Pod` for direct serialization.
+#[repr(C, packed)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PanakoHash {
     /// 32-bit hash; see module docs for the layout.
     pub hash: u32,
-    /// STFT frame index of the anchor peak.
-    pub t_anchor: u32,
-    /// STFT frame index of the first (closer) target.
-    pub t_b: u32,
-    /// STFT frame index of the second (farther) target.
-    pub t_c: u32,
+    /// Timestamp (ms) of the anchor peak. Panako extracts at 62.5 fps,
+    /// so 1 frame = 16 ms.
+    pub t_anchor: TimestampMs,
+    /// Timestamp (ms) of the first (closer) target.
+    pub t_b: TimestampMs,
+    /// Timestamp (ms) of the second (farther) target.
+    pub t_c: TimestampMs,
 }
 
 /// All triplet hashes produced by [`Panako`] over an audio buffer.
@@ -141,6 +146,14 @@ const PANAKO_N_FFT: usize = 1024;
 const PANAKO_HOP: usize = 128;
 const PANAKO_SR: u32 = 8_000;
 const PANAKO_FRAMES_PER_SEC: f32 = PANAKO_SR as f32 / PANAKO_HOP as f32;
+
+/// Convert a Panako STFT frame index to a millisecond timestamp.
+/// Frame rate is 62.5 fps (`SR / HOP`), so 1 frame = 16 ms. Uses the
+/// same integer floor-division formula as the streaming emit path.
+#[inline]
+fn panako_timestamp(frame: u32) -> TimestampMs {
+    TimestampMs((frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64)
+}
 const PANAKO_PEAK_NEIGHBOURHOOD: usize = 15;
 const PANAKO_LOG_FLOOR: f32 = 1e-6;
 /// Squared form of the magnitude floor — see Wang for rationale.
@@ -152,13 +165,13 @@ use crate::dsp::power_to_db_wide;
 /// # Example
 ///
 /// ```
-/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::{Fingerprinter, SampleRate};
 /// use audiofp::classical::Panako;
 ///
 /// let mut fp = Panako::default();
 /// let samples = vec![0.0_f32; 8_000 * 3];
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-/// let fpr = fp.extract(buf).unwrap();
+///
+/// let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
 /// assert_eq!(fpr.frames_per_sec, 62.5);
 /// assert!(fpr.hashes.is_empty());
 /// ```
@@ -207,7 +220,8 @@ impl Panako {
         let picker = PeakPicker::new(PeakPickerConfig {
             neighborhood_t: PANAKO_PEAK_NEIGHBOURHOOD,
             neighborhood_f: PANAKO_PEAK_NEIGHBOURHOOD,
-            min_magnitude: cfg.min_anchor_mag_db,
+            min_magnitude_db: cfg.min_anchor_mag_db,
+            min_magnitude_linear: None,
             target_per_sec: cfg.peaks_per_sec as usize,
         });
         Self {
@@ -236,31 +250,31 @@ impl Panako {
     /// Same as [`Fingerprinter::extract`].
     pub fn extract_with_progress<F: FnMut(f32)>(
         &mut self,
-        audio: AudioBuffer<'_>,
+        samples: &[f32], rate: SampleRate,
         mut progress: F,
     ) -> Result<PanakoFingerprint> {
-        crate::pcm::reject_non_finite(audio.samples)?;
+        crate::pcm::reject_non_finite(samples)?;
         if let Some(limit) = self.cfg.max_input_samples
-            && audio.samples.len() > limit
+            && samples.len() > limit
         {
             return Err(AfpError::InputTooLarge {
                 limit,
-                provided: audio.samples.len(),
+                provided: samples.len(),
             });
         }
-        if audio.rate.hz() != PANAKO_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        if rate.hz() != PANAKO_SR {
+            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
-        if audio.samples.len() < self.min_samples() {
+        if samples.len() < self.min_samples() {
             return Err(AfpError::AudioTooShort {
                 needed: self.min_samples(),
-                got: audio.samples.len(),
+                got: samples.len(),
             });
         }
 
         progress(0.0);
 
-        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
+        let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.log_spec);
         if n_frames == 0 {
             progress(1.0);
             return Ok(PanakoFingerprint {
@@ -333,8 +347,8 @@ impl Fingerprinter for Panako {
         PANAKO_SR as usize * 2
     }
 
-    fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        self.extract_with_progress(audio, |_| {})
+    fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
+        self.extract_with_progress(samples, rate, |_| {})
     }
 }
 
@@ -470,9 +484,9 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
             let hash = pack_triplet(anchor, b, c);
             hashes.push(PanakoHash {
                 hash,
-                t_anchor: anchor.t_frame,
-                t_b: b.t_frame,
-                t_c: c.t_frame,
+                t_anchor: panako_timestamp(anchor.t_frame),
+                t_b: panako_timestamp(b.t_frame),
+                t_c: panako_timestamp(c.t_frame),
             });
         }
     }
@@ -884,14 +898,14 @@ impl StreamingPanako {
         });
         for (b, c, _) in &self.triplet_scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
-            let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
+            let t_ms = panako_timestamp(anchor.peak.t_frame);
             out.push((
-                TimestampMs(t_ms),
+                t_ms,
                 PanakoHash {
                     hash,
-                    t_anchor: anchor.peak.t_frame,
-                    t_b: b.t_frame,
-                    t_c: c.t_frame,
+                    t_anchor: t_ms,
+                    t_b: panako_timestamp(b.t_frame),
+                    t_c: panako_timestamp(c.t_frame),
                 },
             ));
         }
@@ -988,13 +1002,13 @@ impl StreamingFingerprinter for StreamingPanako {
         PANAKO_SR
     }
 
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         self.emitted.clear();
         self.process_push_samples(samples);
-        core::mem::take(&mut self.emitted)
+        Ok(core::mem::take(&mut self.emitted))
     }
 
-    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
@@ -1005,16 +1019,16 @@ impl StreamingFingerprinter for StreamingPanako {
             callback(t, &frame);
             n += 1;
         }
-        n
+        Ok(n)
     }
 
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         self.emitted.clear();
         self.process_flush();
-        core::mem::take(&mut self.emitted)
+        Ok(core::mem::take(&mut self.emitted))
     }
 
-    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
@@ -1025,7 +1039,7 @@ impl StreamingFingerprinter for StreamingPanako {
             callback(t, &frame);
             n += 1;
         }
-        n
+        Ok(n)
     }
 
     fn latency_ms(&self) -> u32 {
@@ -1076,11 +1090,8 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 16_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        match fp.extract(buf) {
+        
+        match fp.extract(&samples, SampleRate::HZ_16000) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
@@ -1090,11 +1101,8 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        match fp.extract(buf) {
+        
+        match fp.extract(&samples, SampleRate::HZ_8000) {
             Err(AfpError::AudioTooShort {
                 needed: 16_000,
                 got: 8_000,
@@ -1107,11 +1115,8 @@ mod tests {
     fn silence_gives_empty_fingerprint() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000 * 3];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        let fpr = fp.extract(buf).unwrap();
+        
+        let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_eq!(fpr.frames_per_sec, 62.5);
         assert!(fpr.hashes.is_empty());
     }
@@ -1120,11 +1125,8 @@ mod tests {
     fn synthetic_signal_produces_hashes() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xC0FFEE, 8_000 * 5);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        let fpr = fp.extract(buf).unwrap();
+        
+        let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(
             (500..=900).contains(&fpr.hashes.len()),
             "expected 500..=900 hashes from a 5s tone, got {}",
@@ -1155,16 +1157,12 @@ mod tests {
         let mut a = Panako::default();
         let mut b = Panako::default();
         let fa = a
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
         let fb = b
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
         assert_eq!(fa.hashes, fb.hashes);
     }
@@ -1175,18 +1173,14 @@ mod tests {
 
         let mut fp1 = Panako::default();
         let f1 = fp1
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
 
         let mut fp2 = Panako::default();
         let f2 = fp2
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
 
         assert_eq!(f1.hashes, f2.hashes);
@@ -1199,16 +1193,12 @@ mod tests {
 
         let mut fp = Panako::default();
         let fa = fp
-            .extract(AudioBuffer {
-                samples: &a,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&a, SampleRate::HZ_8000,
+            )
             .unwrap();
         let fb = fp
-            .extract(AudioBuffer {
-                samples: &b,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&b, SampleRate::HZ_8000,
+            )
             .unwrap();
         assert_ne!(fa.hashes, fb.hashes);
     }
@@ -1294,8 +1284,8 @@ mod tests {
     fn streaming_silence_emits_nothing() {
         let mut s = StreamingPanako::default();
         let zeros = vec![0.0_f32; 8_000 * 4];
-        assert!(s.push(&zeros).is_empty());
-        assert!(s.flush().is_empty());
+        assert!(s.push(&zeros).unwrap().is_empty());
+        assert!(s.flush().unwrap().is_empty());
     }
 
     #[test]
@@ -1467,10 +1457,8 @@ mod tests {
 
         let mut offline = Panako::default();
         let off = offline
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
 
         let mut streaming = StreamingPanako::default();
@@ -1480,13 +1468,13 @@ mod tests {
             let end = cursor + n;
             online.extend(
                 streaming
-                    .push(&samples[cursor..end])
-                    .into_iter()
+                    .push(&samples[cursor..end]).unwrap()
+                .into_iter()
                     .map(|(_, h)| h),
             );
             cursor = end;
         }
-        online.extend(streaming.flush().into_iter().map(|(_, h)| h));
+        online.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
 
         let mut a = off.hashes;
         let mut b = online;
@@ -1515,7 +1503,7 @@ mod tests {
         let mut start = 0usize;
         while start < samples.len() {
             let end = (start + chunk).min(samples.len());
-            let _ = s.push(&samples[start..end]);
+            let _ = s.push(&samples[start..end]).unwrap();
             peak_carry = peak_carry.max(s.sample_carry.len());
             peak_spec_rows = peak_spec_rows.max(s.spec_n_rows);
             peak_bucket_pending = peak_bucket_pending.max(s.bucket_pending.len());
@@ -1539,7 +1527,7 @@ mod tests {
             "pending_anchors peaked at {peak_anchors} (expected ≤ 60)",
         );
 
-        let _ = s.flush();
+        let _ = s.flush().unwrap();
         assert_eq!(s.bucket_pending.len(), 0);
         assert_eq!(s.pending_anchors.len(), 0);
     }
@@ -1714,11 +1702,8 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 3);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        let fpr = fp.extract(buf).unwrap();
+        
+        let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(!fpr.hashes.is_empty());
     }
 
@@ -1749,12 +1734,12 @@ mod tests {
     fn streaming_reset_clears_all_state() {
         let mut s = StreamingPanako::default();
         let samples = synthetic_audio(0xFEED, 8_000 * 5);
-        let before = s.push(&samples);
+        let before = s.push(&samples).unwrap();
         assert!(!before.is_empty(), "should produce hashes");
 
         s.reset();
-        assert!(s.push(&[]).is_empty(), "reset should clear state");
-        let after_reset = s.push(&samples);
+        assert!(s.push(&[]).unwrap().is_empty(), "reset should clear state");
+        let after_reset = s.push(&samples).unwrap();
         assert!(!after_reset.is_empty());
         assert_eq!(
             before, after_reset,
@@ -1770,15 +1755,15 @@ mod tests {
         let mut b = StreamingPanako::default();
         let samples = synthetic_audio(0xABCD, 8_000 * 5);
 
-        let via_push = a.push(&samples);
+        let via_push = a.push(&samples).unwrap();
         let mut via_cb: Vec<(TimestampMs, PanakoHash)> = Vec::new();
-        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f)));
-        let via_flush = b.flush();
+        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f))).unwrap();
+        let via_flush = b.flush().unwrap();
         let flush_len = via_flush.len();
         via_cb.extend(via_flush);
 
         let mut all_via_push = via_push;
-        all_via_push.extend(a.flush());
+        all_via_push.extend(a.flush().unwrap());
 
         assert_eq!(n + flush_len, all_via_push.len());
         assert_eq!(
@@ -1792,12 +1777,12 @@ mod tests {
         let mut a = StreamingPanako::default();
         let mut b = StreamingPanako::default();
         let samples = synthetic_audio(0xF00D, 8_000 * 5);
-        let _ = a.push(&samples);
-        let _ = b.push(&samples);
+        let _ = a.push(&samples).unwrap();
+        let _ = b.push(&samples).unwrap();
 
-        let via_flush = a.flush();
+        let via_flush = a.flush().unwrap();
         let mut via_cb: Vec<(TimestampMs, PanakoHash)> = Vec::new();
-        let n = b.flush_with(|t, f| via_cb.push((t, *f)));
+        let n = b.flush_with(|t, f| via_cb.push((t, *f))).unwrap();
 
         assert_eq!(n, via_flush.len());
         assert_eq!(via_cb, via_flush);
@@ -1813,11 +1798,8 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = vec![0.0_f32; 2_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        let err = fp.extract(buf).unwrap_err();
+        
+        let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
 
@@ -1829,11 +1811,8 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = vec![0.0_f32; 16_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        fp.extract(buf).unwrap();
+        
+        fp.extract(&samples, SampleRate::HZ_8000).unwrap();
     }
 
     #[test]
@@ -1844,11 +1823,8 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
-        let err = fp.extract(buf).unwrap_err();
+        
+        let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
 
@@ -1860,8 +1836,8 @@ mod tests {
         };
         let mut s = StreamingPanako::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 20);
-        let mut hashes = s.push(&samples);
-        hashes.extend(s.flush());
+        let mut hashes = s.push(&samples).unwrap();
+        hashes.extend(s.flush().unwrap());
         assert!(s.config().max_pending_anchors.is_some());
         assert!(!hashes.is_empty(), "should produce hashes with cap=100");
     }
@@ -1875,8 +1851,8 @@ mod tests {
         let mut s = StreamingPanako::new(cfg);
         // One huge push must not panic; only the first 512 samples are kept.
         let samples = synthetic_audio(0xBEEF, 8_000 * 5);
-        let _ = s.push(&samples);
-        let _ = s.flush();
+        let _ = s.push(&samples).unwrap();
+        let _ = s.flush().unwrap();
         assert_eq!(s.config().max_push_samples, Some(512));
     }
 
@@ -1886,12 +1862,9 @@ mod tests {
     fn extract_with_progress_is_called_and_monotonic() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
+        
         let mut values: Vec<f32> = Vec::new();
-        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        let result = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert!(result.is_ok());
         // Must be called at least a few times.
         assert!(
@@ -1919,19 +1892,15 @@ mod tests {
 
         let mut fp1 = Panako::default();
         let result1 = fp1
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&samples, SampleRate::HZ_8000,
+            )
             .unwrap();
 
         let mut fp2 = Panako::default();
         let result2 = fp2
             .extract_with_progress(
-                AudioBuffer {
-                    samples: &samples,
-                    rate: SampleRate::HZ_8000,
-                },
+                &samples,
+                SampleRate::HZ_8000,
                 |_| {},
             )
             .unwrap();
@@ -1944,12 +1913,9 @@ mod tests {
     fn extract_with_progress_short_audio_still_reports_0_and_1() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xFACE, 8_000 * 2);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        };
+        
         let mut values: Vec<f32> = Vec::new();
-        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert_eq!(values[0], 0.0);
         assert_eq!(*values.last().unwrap(), 1.0);
     }

@@ -4,10 +4,10 @@
 //! via [`to_bytes`] / [`from_bytes`], and metadata about a fingerprint
 //! (without parsing the hash payload) is available through [`envelope`].
 //!
-//! # Wire format (v1)
+//! # Wire format (v2)
 //!
 //! ```text
-//! [magic: 8 bytes "AUDIOFP\0"] [version: u8 = 1] [algorithm_id: u8]
+//! [magic: 8 bytes "AUDIOFP\0"] [version: u8 = 2] [algorithm_id: u8]
 //! [hash_count: u32 LE] [fps: f32 LE] [hashes: Pod bytes]
 //! ```
 //!
@@ -38,7 +38,11 @@ use crate::{AfpError, Result};
 const MAGIC: [u8; 8] = *b"AUDIOFP\0";
 
 /// Current serialization format version.
-const FORMAT_VERSION: u8 = 1;
+///
+/// v2 (0.4.0): `WangHash` timestamps became `TimestampMs` (8 → 12
+/// bytes/hash), `PanakoHash` likewise (16 → 28 bytes/hash). v1 blobs
+/// are rejected with [`AfpError::UnsupportedVersion`].
+const FORMAT_VERSION: u8 = 2;
 
 /// Fixed-size header: magic (8) + version (1) + algorithm_id (1) +
 /// hash_count (4) + fps (4) = 18 bytes.
@@ -62,11 +66,11 @@ const ALG_HAITSMA: u8 = 2;
 ///
 /// ```
 /// use audiofp::classical::Wang;
-/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::{Fingerprinter, SampleRate};
 ///
 /// let samples = vec![0.0_f32; 8_000 * 3];
 /// let mut wang = Wang::default();
-/// let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+/// let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 /// let env = fp.envelope();
 /// assert_eq!(env.algorithm, "wang-v1");
 /// assert_eq!(env.sample_rate, 8_000);
@@ -315,6 +319,7 @@ impl HaitsmaFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TimestampMs;
     use alloc::vec;
 
     #[test]
@@ -335,17 +340,17 @@ mod tests {
             hashes: vec![
                 WangHash {
                     hash: 0xDEAD_BEEF,
-                    t_anchor: 42,
+                    t_anchor: TimestampMs(42),
                 },
                 WangHash {
                     hash: 0xCAFE_BABE,
-                    t_anchor: 100,
+                    t_anchor: TimestampMs(100),
                 },
             ],
             frames_per_sec: 62.5,
         };
         let bytes = fp.to_bytes();
-        assert_eq!(bytes.len(), HEADER_SIZE + 2 * 8); // 2 hashes × 8 bytes
+        assert_eq!(bytes.len(), HEADER_SIZE + 2 * 12); // 2 hashes × 12 bytes
         let fp2 = WangFingerprint::from_bytes(&bytes).unwrap();
         assert_eq!(fp.hashes, fp2.hashes);
         assert_eq!(fp.frames_per_sec, fp2.frames_per_sec);
@@ -356,14 +361,14 @@ mod tests {
         let fp = PanakoFingerprint {
             hashes: vec![PanakoHash {
                 hash: 0x1234_5678,
-                t_anchor: 10,
-                t_b: 15,
-                t_c: 20,
+                t_anchor: TimestampMs(10),
+                t_b: TimestampMs(15),
+                t_c: TimestampMs(20),
             }],
             frames_per_sec: 62.5,
         };
         let bytes = fp.to_bytes();
-        assert_eq!(bytes.len(), HEADER_SIZE + 16); // 1 hash × 16 bytes
+        assert_eq!(bytes.len(), HEADER_SIZE + 28); // 1 hash × 28 bytes
         let fp2 = PanakoFingerprint::from_bytes(&bytes).unwrap();
         assert_eq!(fp.hashes, fp2.hashes);
         assert_eq!(fp.frames_per_sec, fp2.frames_per_sec);
@@ -429,7 +434,7 @@ mod tests {
         let fp = WangFingerprint {
             hashes: vec![WangHash {
                 hash: 1,
-                t_anchor: 2,
+                t_anchor: TimestampMs(2),
             }],
             frames_per_sec: 62.5,
         };
@@ -445,11 +450,11 @@ mod tests {
             hashes: vec![
                 WangHash {
                     hash: 1,
-                    t_anchor: 0,
+                    t_anchor: TimestampMs(0),
                 },
                 WangHash {
                     hash: 2,
-                    t_anchor: 1,
+                    t_anchor: TimestampMs(1),
                 },
             ],
             frames_per_sec: 62.5,
@@ -504,7 +509,7 @@ mod tests {
         let fp = WangFingerprint {
             hashes: vec![WangHash {
                 hash: 0xFF,
-                t_anchor: 7,
+                t_anchor: TimestampMs(7),
             }],
             frames_per_sec: 62.5,
         };

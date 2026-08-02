@@ -48,7 +48,7 @@ fn main() {
 
     let mut total = 0usize;
     for (i, chunk) in samples.chunks(chunk_samples).enumerate() {
-        let emitted = s.push(chunk);
+        let emitted = s.push(chunk).unwrap();
         if !emitted.is_empty() {
             println!(
                 "chunk #{:>3}  push {:>4} samples  → {:>3} hashes",
@@ -60,7 +60,7 @@ fn main() {
         }
     }
 
-    let tail = s.flush();
+    let tail = s.flush().unwrap();
     if !tail.is_empty() {
         println!("flush                          → {:>3} hashes", tail.len());
         total += tail.len();

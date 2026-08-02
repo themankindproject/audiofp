@@ -23,13 +23,12 @@
 //!
 //! ```no_run
 //! use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-//! use audiofp::{AudioBuffer, SampleRate};
+//! use audiofp::{SampleRate};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut det = WatermarkDetector::new(WatermarkConfig::new("audioseal_v0.2.onnx"))?;
 //! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-//! let buf = AudioBuffer { samples: &samples, rate: SampleRate::new(16_000).unwrap() };
-//! let r = det.detect(buf)?;
+//! let r = det.detect(&samples, SampleRate::new(16_000).unwrap())?;
 //!
 //! if r.detected {
 //!     println!("watermarked, confidence {:.3}, message {:#018b}",

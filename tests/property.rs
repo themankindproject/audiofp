@@ -10,7 +10,7 @@
 //! ```
 
 use audiofp::classical::{Haitsma, Panako, StreamingHaitsma, StreamingPanako, StreamingWang, Wang};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate, StreamingFingerprinter};
+use audiofp::{Fingerprinter, SampleRate, StreamingFingerprinter};
 use proptest::prelude::*;
 
 const TONE_LO: f32 = 880.0;
@@ -71,7 +71,7 @@ proptest! {
 
         let mut offline = Wang::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(&samples, SampleRate::HZ_8000 )
             .unwrap();
 
         let mut stream = StreamingWang::default();
@@ -79,10 +79,10 @@ proptest! {
         let mut cursor = 0;
         for &n in &chunks {
             let end = cursor + n;
-            online.extend(stream.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(stream.push(&samples[cursor..end]).unwrap().into_iter().map(|(_, h)| h));
             cursor = end;
         }
-        online.extend(stream.flush().into_iter().map(|(_, h)| h));
+        online.extend(stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
         let mut a = off.hashes;
         let mut b = online;
@@ -102,7 +102,7 @@ proptest! {
 
         let mut offline = Panako::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(&samples, SampleRate::HZ_8000 )
             .unwrap();
 
         let mut stream = StreamingPanako::default();
@@ -110,10 +110,10 @@ proptest! {
         let mut cursor = 0;
         for &n in &chunks {
             let end = cursor + n;
-            online.extend(stream.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(stream.push(&samples[cursor..end]).unwrap().into_iter().map(|(_, h)| h));
             cursor = end;
         }
-        online.extend(stream.flush().into_iter().map(|(_, h)| h));
+        online.extend(stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
         let mut a = off.hashes;
         let mut b = online;
@@ -134,7 +134,7 @@ proptest! {
 
         let mut offline = Haitsma::default();
         let off = offline
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_5000 })
+            .extract(&samples, SampleRate::HZ_5000 )
             .unwrap();
 
         let mut stream = StreamingHaitsma::default();
@@ -142,10 +142,10 @@ proptest! {
         let mut cursor = 0;
         for &n in &chunks {
             let end = cursor + n;
-            online.extend(stream.push(&samples[cursor..end]).into_iter().map(|(_, h)| h));
+            online.extend(stream.push(&samples[cursor..end]).unwrap().into_iter().map(|(_, h)| h));
             cursor = end;
         }
-        online.extend(stream.flush().into_iter().map(|(_, h)| h));
+        online.extend(stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
         prop_assert_eq!(off.frames, online);
     }
@@ -158,11 +158,11 @@ proptest! {
 
         let mut w1 = Wang::default();
         let f1 = w1
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(&samples, SampleRate::HZ_8000 )
             .unwrap();
         let mut w2 = Wang::default();
         let f2 = w2
-            .extract(AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 })
+            .extract(&samples, SampleRate::HZ_8000 )
             .unwrap();
         prop_assert_eq!(f1.hashes, f2.hashes);
     }
@@ -196,56 +196,38 @@ fn inject_spikes(clean: &mut [f32], n_spikes: usize, seed: u32) {
 fn nan_audio_does_not_panic() {
     // All-NaN input.
     let samples = vec![f32::NAN; 8_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
     let mut wang = Wang::default();
-    let _ = wang.extract(buf);
+    let _ = wang.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::NAN; 8_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
     let mut panako = Panako::default();
-    let _ = panako.extract(buf);
+    let _ = panako.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::NAN; 5_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_5000,
-    };
+    
     let mut h = Haitsma::default();
-    let _ = h.extract(buf);
+    let _ = h.extract(&samples, SampleRate::HZ_8000);
 }
 
 #[test]
 fn infinity_audio_does_not_panic() {
     // All-inf input.
     let samples = vec![f32::INFINITY; 8_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
     let mut wang = Wang::default();
-    let _ = wang.extract(buf);
+    let _ = wang.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::INFINITY; 8_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
+    
     let mut panako = Panako::default();
-    let _ = panako.extract(buf);
+    let _ = panako.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::INFINITY; 5_000 * 3];
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_5000,
-    };
+    
     let mut h = Haitsma::default();
-    let _ = h.extract(buf);
+    let _ = h.extract(&samples, SampleRate::HZ_8000);
 }
 
 proptest! {
@@ -261,10 +243,8 @@ proptest! {
         let mut samples = synth(seed, 8_000, 8_000 * 3);
         inject_spikes(&mut samples, n_spikes, seed);
         let mut wang = Wang::default();
-        let _ = wang.extract(AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        });
+        let _ = wang.extract(&samples, SampleRate::HZ_8000,
+        );
     }
 
     #[test]
@@ -272,10 +252,8 @@ proptest! {
         let mut samples = synth(seed, 8_000, 8_000 * 3);
         inject_spikes(&mut samples, n_spikes, seed);
         let mut panako = Panako::default();
-        let _ = panako.extract(AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_8000,
-        });
+        let _ = panako.extract(&samples, SampleRate::HZ_8000,
+        );
     }
 
     #[test]
@@ -283,10 +261,8 @@ proptest! {
         let mut samples = synth(seed, 5_000, 5_000 * 3);
         inject_spikes(&mut samples, n_spikes, seed);
         let mut h = Haitsma::default();
-        let _ = h.extract(AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        });
+        let _ = h.extract(&samples, SampleRate::HZ_5000,
+        );
     }
 }
 
@@ -302,10 +278,8 @@ fn panako_tempo_robustness() {
 
     let mut panako_orig = Panako::default();
     let fp_orig = panako_orig
-        .extract(AudioBuffer {
-            samples: &original,
-            rate: SampleRate::HZ_8000,
-        })
+        .extract(&original, SampleRate::HZ_8000,
+        )
         .unwrap();
 
     // Time-stretch by linear interpolation (crude but sufficient for
@@ -325,10 +299,8 @@ fn panako_tempo_robustness() {
 
         let mut panako_s = Panako::default();
         let fp_stretched = panako_s
-            .extract(AudioBuffer {
-                samples: &stretched,
-                rate: SampleRate::HZ_8000,
-            })
+            .extract(&stretched, SampleRate::HZ_8000,
+            )
             .unwrap();
 
         // Collect hash values (ignoring timestamps, which shift).

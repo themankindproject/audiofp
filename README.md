@@ -75,7 +75,7 @@ audiofp = { version = "0.3", default-features = false }
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Decode any supported file format and resample to Wang's 8 kHz.
@@ -83,12 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
-    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
-    let fp = wang.extract(buf)?;
+    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 
     println!("{} hashes at {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
     for h in fp.hashes.iter().take(5) {
-        println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
+        println!("  t_anchor={.0} hash={:08x}", h.t_anchor, h.hash);
     }
 
     Ok(())
@@ -101,12 +100,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
 use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at("clip.wav", 8_000)?;
-    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-    let query = Wang::default().extract(buf)?;
+    let query = Wang::default().extract(&samples, SampleRate::HZ_8000)?;
     let reference = query.clone(); // same recording
 
     let m = WangMatcher::new(WangMatchConfig::default()).match_one(&query, &reference);
@@ -127,7 +125,7 @@ fn main() {
     // Synthetic 8 kHz mono chunks (16 ms ≈ 128 samples). Swap for mic/file chunks.
     let chunk = vec![0.0_f32; 128];
     for _ in 0..100 {
-        for (timestamp, hash) in s.push(&chunk) {
+        for (timestamp, hash) in s.push(&chunk).unwrap() {
             println!("{:?} {:08x}", timestamp, hash.hash);
         }
     }

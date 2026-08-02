@@ -6,7 +6,6 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use audiofp::AudioBuffer;
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
 use audiofp::classical::{Haitsma, Panako, Wang, WangFingerprint};
@@ -36,11 +35,8 @@ fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
 
 fn wang_fp(seed: u32, secs: usize) -> WangFingerprint {
     let samples = synth(seed, 8_000, secs);
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    Wang::default().extract(buf).expect("wang extract")
+    
+    Wang::default().extract(&samples, SampleRate::HZ_8000).expect("wang extract")
 }
 
 fn bench_wang_one(c: &mut Criterion) {
@@ -58,11 +54,8 @@ fn bench_wang_one(c: &mut Criterion) {
 
 fn bench_haitsma_one(c: &mut Criterion) {
     let samples = synth(2, 5_000, 5);
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_5000,
-    };
-    let fp = Haitsma::default().extract(buf).expect("haitsma extract");
+    
+    let fp = Haitsma::default().extract(&samples, SampleRate::HZ_8000).expect("haitsma extract");
     // Exact path: keep refs short enough that LUT is skipped, or force use_lut=false.
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig {
         use_lut: false,
@@ -80,11 +73,8 @@ fn bench_haitsma_one(c: &mut Criterion) {
 
 fn bench_panako_one(c: &mut Criterion) {
     let samples = synth(3, 8_000, 5);
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    let fp = Panako::default().extract(buf).expect("panako extract");
+    
+    let fp = Panako::default().extract(&samples, SampleRate::HZ_8000).expect("panako extract");
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
 
     let mut g = c.benchmark_group("matching/panako_1to1");

@@ -5,11 +5,12 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use std::path::Path;
+use crate::SampleRate;
 
 use tract_onnx::prelude::*;
 
 use crate::error::{map_model_load_err, map_model_open_io};
-use crate::{AfpError, AudioBuffer, Result};
+use crate::{AfpError, Result};
 
 /// Type alias for the compiled runnable plan produced by
 /// `TypedModel::into_runnable()`. Cached to avoid rebuilding the
@@ -80,7 +81,7 @@ pub struct WatermarkResult {
     ///   typically emit probabilities in `[0, 1]`).
     /// - **Length:** exactly the number of elements Tract yields when
     ///   flattening output `[0]`. This is **not** guaranteed equal to
-    ///   `audio.samples.len()`.
+    ///   `samples.len()`.
     /// - **Time base:** model-dependent. Some AudioSeal exports emit one
     ///   score per input sample at [`WatermarkConfig::sample_rate`]; others
     ///   emit coarser per-frame / pooled maps. Treat hop and alignment as
@@ -187,18 +188,18 @@ impl WatermarkDetector {
     ///
     /// # Errors
     ///
-    /// - [`AfpError::UnsupportedSampleRate`] — `audio.rate` differs from
+    /// - [`AfpError::UnsupportedSampleRate`] — `rate` differs from
     ///   `cfg.sample_rate`.
     /// - [`AfpError::AudioTooShort`] — empty input buffer.
     /// - [`AfpError::Inference`] — Tract failed at any of: shape inference,
     ///   typing, building the runnable plan, running inference, or extracting
     ///   the output tensors. The variant payload identifies which step.
-    pub fn detect(&mut self, audio: AudioBuffer<'_>) -> Result<WatermarkResult> {
-        crate::pcm::reject_non_finite(audio.samples)?;
-        if audio.rate.hz() != self.cfg.sample_rate {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+    pub fn detect(&mut self, samples: &[f32], rate: SampleRate) -> Result<WatermarkResult> {
+        crate::pcm::reject_non_finite(samples)?;
+        if rate.hz() != self.cfg.sample_rate {
+            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
-        let n = audio.samples.len();
+        let n = samples.len();
         if self.cfg.max_input_samples.is_some_and(|limit| n > limit) {
             return Err(AfpError::InputTooLarge {
                 limit: self.cfg.max_input_samples.unwrap(),
@@ -210,7 +211,7 @@ impl WatermarkDetector {
         }
 
         // Build [1, 1, T] f32 input tensor without going through ndarray.
-        let input_tensor = Tensor::from_shape(&[1, 1, n], audio.samples)
+        let input_tensor = Tensor::from_shape(&[1, 1, n], samples)
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
         // Concretise input shape and prepare a runnable plan.

@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use audiofp::classical::{Haitsma, HaitsmaConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]
@@ -21,13 +21,10 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let samples = &input.samples[..min_len];
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_5000,
-    };
+    
 
     let mut fp = Haitsma::new(HaitsmaConfig::default());
-    let Ok(fpr) = fp.extract(buf) else {
+    let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {
         return;
     };
 
@@ -42,11 +39,8 @@ fuzz_target!(|data: &[u8]| {
     // can be set; no bit is "reserved" in Haitsma). Verify that
     // extracting the same audio again produces identical output
     // (determinism).
-    let buf2 = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_5000,
-    };
+    
     let mut fp2 = Haitsma::new(HaitsmaConfig::default());
-    let fpr2 = fp2.extract(buf2).unwrap();
+    let fpr2 = fp2.extract(&samples, SampleRate::HZ_8000).unwrap();
     assert_eq!(fpr.frames, fpr2.frames, "determinism violation");
 });

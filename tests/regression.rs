@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use audiofp::classical::{Haitsma, Panako, PanakoHash, Wang, WangHash};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 const TONE_LO: f32 = 880.0;
 const TONE_HI: f32 = 1320.0;
@@ -129,11 +129,8 @@ fn assert_bytes_equal(actual: &[u8], expected: &[u8], label: &str) {
 fn wang_v1_golden() {
     let samples = synth(0xCAFE, 8_000);
     let mut wang = Wang::default();
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    let fp = wang.extract(buf).unwrap();
+    
+    let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 
     let bytes = bytemuck::cast_slice::<WangHash, u8>(&fp.hashes);
     let path = Path::new(GOLDEN_DIR).join("wang_v1.bin");
@@ -149,11 +146,8 @@ fn wang_v1_golden() {
 fn panako_v2_golden() {
     let samples = synth(0xCAFE, 8_000);
     let mut panako = Panako::default();
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    let fp = panako.extract(buf).unwrap();
+    
+    let fp = panako.extract(&samples, SampleRate::HZ_8000).unwrap();
 
     let bytes = bytemuck::cast_slice::<PanakoHash, u8>(&fp.hashes);
     let path = Path::new(GOLDEN_DIR).join("panako_v2.bin");
@@ -169,11 +163,7 @@ fn panako_v2_golden() {
 fn haitsma_v1_golden() {
     let samples = synth(0xCAFE, 5_000);
     let mut h = Haitsma::default();
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_5000,
-    };
-    let fp = h.extract(buf).unwrap();
+    let fp = h.extract(&samples, SampleRate::HZ_5000).unwrap();
 
     let bytes = bytemuck::cast_slice::<u32, u8>(&fp.frames);
     let path = Path::new(GOLDEN_DIR).join("haitsma_v1.bin");

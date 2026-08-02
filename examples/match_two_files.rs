@@ -12,15 +12,12 @@
 use audiofp::classical::{Wang, WangFingerprint};
 use audiofp::io::decode_to_mono_at;
 use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn fingerprint(wang: &mut Wang, path: &str) -> Result<WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
-    let buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_8000,
-    };
-    Ok(wang.extract(buf)?)
+    
+    Ok(wang.extract(&samples, SampleRate::HZ_8000)?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

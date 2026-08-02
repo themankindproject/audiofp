@@ -57,7 +57,8 @@ fn main() {
     let mut picker = PeakPicker::new(PeakPickerConfig {
         neighborhood_t: 2,
         neighborhood_f: 2,
-        min_magnitude: -20.0,
+        min_magnitude_db: -20.0,
+        min_magnitude_linear: None,
         target_per_sec: 40,
     });
     let peaks = picker.pick(&log_mel, n_frames, n_mels, frames_per_sec);

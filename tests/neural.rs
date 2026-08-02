@@ -8,7 +8,7 @@
 #![cfg(feature = "neural")]
 
 use audiofp::neural::{NeuralEmbedderConfig, StreamingNeuralEmbedder};
-use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{AfpError, Fingerprinter, SampleRate};
 
 #[test]
 fn config_constructor_documented_defaults() {
@@ -64,13 +64,9 @@ fn neural_fingerprinter_is_object_safe() {
     // just exercises the trait object surface and the public types.
     fn _assert_trait_object_compatible<F: Fingerprinter>(_: &F) {}
     let _ = _assert_trait_object_compatible::<audiofp::neural::NeuralEmbedder>;
-    // Construct a buffer just to exercise the public types; we never
-    // actually pass it because no model is available here.
-    let samples = vec![0.0_f32; 16];
-    let _buf = AudioBuffer {
-        samples: &samples,
-        rate: SampleRate::HZ_16000,
-    };
+    // Exercise the public `SampleRate` type (the extraction API takes
+    // `&[f32]` + `SampleRate` directly); no model is available here.
+    let _ = SampleRate::HZ_16000;
 }
 
 #[test]

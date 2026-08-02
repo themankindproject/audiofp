@@ -41,7 +41,7 @@ use libm::powf;
 
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{AfpError, AudioBuffer, Fingerprinter, Result, StreamingFingerprinter, TimestampMs};
+use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
 #[derive(Clone, Debug)]
@@ -98,17 +98,16 @@ const NO_BAND: u8 = u8::MAX;
 /// # Example
 ///
 /// ```
-/// use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::{Fingerprinter, SampleRate};
 /// use audiofp::classical::Haitsma;
 ///
 /// let mut fp = Haitsma::default();
 /// let samples = vec![0.0_f32; 5_000 * 3];
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-/// // Wrong rate is rejected immediately.
-/// assert!(fp.extract(buf).is_err());
 ///
-/// let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_5000 };
-/// let fpr = fp.extract(buf).unwrap();
+/// // Wrong rate is rejected immediately.
+/// assert!(fp.extract(&samples, SampleRate::HZ_8000).is_err());
+///
+/// let fpr = fp.extract(&samples, SampleRate::HZ_5000).unwrap();
 /// assert_eq!(fpr.frames_per_sec, 78.125);
 /// // Silence → all-zero hash frames (no band differences).
 /// for &h in &fpr.frames {
@@ -205,25 +204,25 @@ impl Haitsma {
     /// Same as [`Fingerprinter::extract`].
     pub fn extract_with_progress<F: FnMut(f32)>(
         &mut self,
-        audio: AudioBuffer<'_>,
+        samples: &[f32], rate: SampleRate,
         mut progress: F,
     ) -> Result<HaitsmaFingerprint> {
-        crate::pcm::reject_non_finite(audio.samples)?;
+        crate::pcm::reject_non_finite(samples)?;
         if let Some(limit) = self.cfg.max_input_samples
-            && audio.samples.len() > limit
+            && samples.len() > limit
         {
             return Err(AfpError::InputTooLarge {
                 limit,
-                provided: audio.samples.len(),
+                provided: samples.len(),
             });
         }
-        if audio.rate.hz() != HAITSMA_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        if rate.hz() != HAITSMA_SR {
+            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
-        if audio.samples.len() < self.min_samples() {
+        if samples.len() < self.min_samples() {
             return Err(AfpError::AudioTooShort {
                 needed: self.min_samples(),
-                got: audio.samples.len(),
+                got: samples.len(),
             });
         }
 
@@ -233,7 +232,7 @@ impl Haitsma {
         // path's `m * m` after a `sqrt(|X|²)` was redundant.
         let (n_frames, n_bins) = self
             .stft
-            .power_flat_into(audio.samples, &mut self.power_buf);
+            .power_flat_into(samples, &mut self.power_buf);
         let power_flat = &self.power_buf;
         if n_frames < 2 {
             progress(1.0);
@@ -315,8 +314,8 @@ impl Fingerprinter for Haitsma {
         HAITSMA_SR as usize * 2
     }
 
-    fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        self.extract_with_progress(audio, |_| {})
+    fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
+        self.extract_with_progress(samples, rate, |_| {})
     }
 }
 
@@ -570,12 +569,12 @@ impl StreamingFingerprinter for StreamingHaitsma {
         HAITSMA_SR
     }
 
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         self.process_push(samples);
-        core::mem::take(&mut self.pending)
+        Ok(core::mem::take(&mut self.pending))
     }
 
-    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
@@ -585,14 +584,14 @@ impl StreamingFingerprinter for StreamingHaitsma {
             callback(t, &frame);
             n += 1;
         }
-        n
+        Ok(n)
     }
 
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        core::mem::take(&mut self.pending)
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
+        Ok(core::mem::take(&mut self.pending))
     }
 
-    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
@@ -601,7 +600,7 @@ impl StreamingFingerprinter for StreamingHaitsma {
             callback(t, &frame);
             n += 1;
         }
-        n
+        Ok(n)
     }
 
     fn latency_ms(&self) -> u32 {
@@ -653,11 +652,8 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 10_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        match fp.extract(buf) {
+        
+        match fp.extract(&samples, SampleRate::HZ_16000) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
@@ -667,11 +663,8 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 5_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        match fp.extract(buf) {
+        
+        match fp.extract(&samples, SampleRate::HZ_5000) {
             Err(AfpError::AudioTooShort {
                 needed: 10_000,
                 got: 5_000,
@@ -684,11 +677,8 @@ mod tests {
     fn silence_gives_all_zero_frames() {
         let mut fp = Haitsma::default();
         let samples = vec![0.0_f32; 5_000 * 3];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        let fpr = fp.extract(buf).unwrap();
+        
+        let fpr = fp.extract(&samples, SampleRate::HZ_5000).unwrap();
         assert_eq!(fpr.frames_per_sec, 78.125);
         assert!(!fpr.frames.is_empty());
         for &h in &fpr.frames {
@@ -700,11 +690,8 @@ mod tests {
     fn synthetic_signal_produces_nonzero_hashes() {
         let mut fp = Haitsma::default();
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 4);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        let fpr = fp.extract(buf).unwrap();
+        
+        let fpr = fp.extract(&samples, SampleRate::HZ_5000).unwrap();
         assert!(
             (200..=400).contains(&fpr.frames.len()),
             "expected 200..=400 frames from a 4s tone @ 5 kHz, got {}",
@@ -731,16 +718,12 @@ mod tests {
         let mut a = Haitsma::default();
         let mut b = Haitsma::default();
         let fa = a
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
         let fb = b
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
         assert_eq!(fa.frames, fb.frames);
     }
@@ -751,18 +734,14 @@ mod tests {
 
         let mut fp1 = Haitsma::default();
         let f1 = fp1
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
 
         let mut fp2 = Haitsma::default();
         let f2 = fp2
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
 
         assert_eq!(f1.frames, f2.frames);
@@ -775,16 +754,12 @@ mod tests {
 
         let mut fp = Haitsma::default();
         let fa = fp
-            .extract(AudioBuffer {
-                samples: &a,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&a, SampleRate::HZ_5000,
+            )
             .unwrap();
         let fb = fp
-            .extract(AudioBuffer {
-                samples: &b,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&b, SampleRate::HZ_5000,
+            )
             .unwrap();
         assert_ne!(fa.frames, fb.frames);
     }
@@ -859,11 +834,8 @@ mod tests {
         };
         let mut h = Haitsma::new(cfg.clone());
         let samples = synthetic_audio(0xC0FFEE, 5_000 * 3);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        let f = h.extract(buf).unwrap();
+        
+        let f = h.extract(&samples, SampleRate::HZ_5000).unwrap();
         // Should still produce frames; band edges differ but algorithm runs.
         assert!(!f.frames.is_empty());
     }
@@ -910,10 +882,8 @@ mod tests {
 
         let mut offline = Haitsma::default();
         let off = offline
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
 
         let mut streaming = StreamingHaitsma::default();
@@ -923,13 +893,13 @@ mod tests {
             let end = cursor + n;
             online.extend(
                 streaming
-                    .push(&samples[cursor..end])
-                    .into_iter()
+                    .push(&samples[cursor..end]).unwrap()
+                .into_iter()
                     .map(|(_, h)| h),
             );
             cursor = end;
         }
-        online.extend(streaming.flush().into_iter().map(|(_, h)| h));
+        online.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
 
         assert_eq!(off.frames, online, "streaming != offline frame sequence");
     }
@@ -950,7 +920,7 @@ mod tests {
         let mut start = 0usize;
         while start < samples.len() {
             let end = (start + chunk).min(samples.len());
-            let _ = s.push(&samples[start..end]);
+            let _ = s.push(&samples[start..end]).unwrap();
             peak_carry = peak_carry.max(s.sample_carry.len());
 
             assert!(s.sample_carry.len() < HAITSMA_N_FFT);
@@ -968,7 +938,7 @@ mod tests {
             "expected the carry to fill close to N_FFT under continuous input, got {peak_carry}",
         );
 
-        let _ = s.flush();
+        let _ = s.flush().unwrap();
         assert_eq!(s.pending.len(), 0, "pending after flush");
     }
 
@@ -993,12 +963,12 @@ mod tests {
     fn streaming_reset_clears_all_state() {
         let mut s = StreamingHaitsma::default();
         let samples = synthetic_audio(0xFEED, 5_000 * 3);
-        let before = s.push(&samples);
+        let before = s.push(&samples).unwrap();
         assert!(!before.is_empty(), "should produce frames");
 
         s.reset();
-        assert!(s.push(&[]).is_empty(), "reset should clear state");
-        let after_reset = s.push(&samples);
+        assert!(s.push(&[]).unwrap().is_empty(), "reset should clear state");
+        let after_reset = s.push(&samples).unwrap();
         assert!(!after_reset.is_empty());
         assert_eq!(
             before, after_reset,
@@ -1053,9 +1023,9 @@ mod tests {
         let mut b = StreamingHaitsma::default();
         let samples = synthetic_audio(0xABCD, 5_000 * 4);
 
-        let via_push = a.push(&samples);
+        let via_push = a.push(&samples).unwrap();
         let mut via_cb: Vec<(TimestampMs, u32)> = Vec::new();
-        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f)));
+        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f))).unwrap();
 
         assert_eq!(n, via_push.len());
         assert_eq!(via_cb, via_push);
@@ -1066,12 +1036,12 @@ mod tests {
         let mut a = StreamingHaitsma::default();
         let mut b = StreamingHaitsma::default();
         let samples = synthetic_audio(0xF00D, 5_000 * 4);
-        let _ = a.push(&samples);
-        let _ = b.push(&samples);
+        let _ = a.push(&samples).unwrap();
+        let _ = b.push(&samples).unwrap();
 
-        let via_flush = a.flush();
+        let via_flush = a.flush().unwrap();
         let mut via_cb: Vec<(TimestampMs, u32)> = Vec::new();
-        let n = b.flush_with(|t, f| via_cb.push((t, *f)));
+        let n = b.flush_with(|t, f| via_cb.push((t, *f))).unwrap();
 
         assert_eq!(n, via_flush.len());
         assert_eq!(via_cb, via_flush);
@@ -1087,11 +1057,8 @@ mod tests {
         };
         let mut fp = Haitsma::new(cfg);
         let samples = vec![0.0_f32; 2_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        let err = fp.extract(buf).unwrap_err();
+        
+        let err = fp.extract(&samples, SampleRate::HZ_5000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
 
@@ -1103,11 +1070,8 @@ mod tests {
         };
         let mut fp = Haitsma::new(cfg);
         let samples = vec![0.0_f32; 10_000];
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
-        fp.extract(buf).unwrap();
+        
+        fp.extract(&samples, SampleRate::HZ_5000).unwrap();
     }
 
     // ── Progress callback tests ──
@@ -1116,12 +1080,9 @@ mod tests {
     fn extract_with_progress_is_called_and_monotonic() {
         let mut fp = Haitsma::default();
         let samples = synthetic_audio(0xCAFE, 5_000 * 5);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
+        
         let mut values: Vec<f32> = Vec::new();
-        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        let result = fp.extract_with_progress(&samples, SampleRate::HZ_5000, |v| values.push(v));
         assert!(result.is_ok());
         // Must be called at least a few times.
         assert!(
@@ -1149,19 +1110,15 @@ mod tests {
 
         let mut fp1 = Haitsma::default();
         let result1 = fp1
-            .extract(AudioBuffer {
-                samples: &samples,
-                rate: SampleRate::HZ_5000,
-            })
+            .extract(&samples, SampleRate::HZ_5000,
+            )
             .unwrap();
 
         let mut fp2 = Haitsma::default();
         let result2 = fp2
             .extract_with_progress(
-                AudioBuffer {
-                    samples: &samples,
-                    rate: SampleRate::HZ_5000,
-                },
+                &samples,
+                SampleRate::HZ_5000,
                 |_| {},
             )
             .unwrap();
@@ -1174,12 +1131,9 @@ mod tests {
     fn extract_with_progress_short_audio_still_reports_0_and_1() {
         let mut fp = Haitsma::default();
         let samples = synthetic_audio(0xFACE, 5_000 * 2);
-        let buf = AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_5000,
-        };
+        
         let mut values: Vec<f32> = Vec::new();
-        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        let _ = fp.extract_with_progress(&samples, SampleRate::HZ_5000, |v| values.push(v));
         assert_eq!(values[0], 0.0);
         assert_eq!(*values.last().unwrap(), 1.0);
     }

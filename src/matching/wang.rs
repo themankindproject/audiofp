@@ -92,29 +92,37 @@ impl Matcher for WangMatcher {
 
         let cfg = &self.cfg;
 
-        // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
-        let pairs: alloc::vec::Vec<(u32, u32)> = reference
+        // --- 0. Convert ms timestamps → frames at the matcher boundary ---
+        // Matching internals (δ histogram, tolerances, consolidation)
+        // operate in frame units for sub-frame precision.
+        let fps = reference.frames_per_sec;
+        let q_hashes: alloc::vec::Vec<(u32, u32)> = query
             .hashes
             .iter()
-            .map(|h| (h.hash, h.t_anchor))
+            .map(|h| (h.hash, super::ms_to_frames(h.t_anchor, fps)))
             .collect();
-        let index = match SortedPostings::build(&pairs, cfg.max_postings_per_hash) {
+        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
+            .hashes
+            .iter()
+            .map(|h| (h.hash, super::ms_to_frames(h.t_anchor, fps)))
+            .collect();
+
+        // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
+        let index = match SortedPostings::build(&r_hashes, cfg.max_postings_per_hash) {
             Some(sp) => sp,
             None => return MatchResult::NONE,
         };
 
         // --- 2. Vote into dense offset histogram ---
         // δ = t_ref − t_query ∈ [−q_max, r_max]
-        let q_max = query
-            .hashes
+        let q_max = q_hashes
             .iter()
-            .map(|h| h.t_anchor as i64)
+            .map(|&(_, t)| t as i64)
             .max()
             .unwrap_or(0);
-        let r_max = reference
-            .hashes
+        let r_max = r_hashes
             .iter()
-            .map(|h| h.t_anchor as i64)
+            .map(|&(_, t)| t as i64)
             .max()
             .unwrap_or(0);
 
@@ -126,9 +134,9 @@ impl Matcher for WangMatcher {
         let capped = range.min(MAX_HIST_BINS);
         let mut hist: Vec<u32> = vec![0u32; capped];
 
-        for h in &query.hashes {
-            for &tr in index.get(h.hash) {
-                let d = tr as i64 - h.t_anchor as i64;
+        for &(q_hash, q_t) in &q_hashes {
+            for &tr in index.get(q_hash) {
+                let d = tr as i64 - q_t as i64;
                 let idx = (d - dmin) as usize;
                 if idx < capped {
                     let bucket = &mut hist[idx];
@@ -184,9 +192,9 @@ impl Matcher for WangMatcher {
         let tol_i64 = cfg.offset_tolerance_frames as i64;
         let delta_star = peak_idx as i64 + dmin;
         let mut contrib_count: u32 = 0;
-        for h in &query.hashes {
-            for &tr in index.get(h.hash) {
-                let d = tr as i64 - h.t_anchor as i64;
+        for &(q_hash, q_t) in &q_hashes {
+            for &tr in index.get(q_hash) {
+                let d = tr as i64 - q_t as i64;
                 if (d - delta_star).abs() <= tol_i64 {
                     contrib_count += 1;
                     break;
@@ -230,6 +238,7 @@ mod tests {
     use crate::classical::WangHash;
 
     /// Build a synthetic Wang fingerprint with known anchor positions.
+    /// `anchors` are in STFT frame units (converted to ms internally).
     fn make_fp(anchors: &[u32], hash_offset: u32) -> WangFingerprint {
         WangFingerprint {
             hashes: anchors
@@ -237,7 +246,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, &t)| WangHash {
                     hash: (i as u32).wrapping_add(hash_offset),
-                    t_anchor: t,
+                    t_anchor: crate::matching::frames_to_ms(t, 62.5),
                 })
                 .collect(),
             frames_per_sec: 62.5,
@@ -383,7 +392,7 @@ mod tests {
             hashes: (0..50)
                 .map(|i| WangHash {
                     hash: (i / 5),
-                    t_anchor: i * 10,
+                    t_anchor: crate::matching::frames_to_ms(i * 10, 62.5),
                 })
                 .collect(),
             frames_per_sec: 62.5,
@@ -412,15 +421,15 @@ mod tests {
             hashes: alloc::vec![
                 WangHash {
                     hash: 0,
-                    t_anchor: 150
+                    t_anchor: crate::matching::frames_to_ms(150, 62.5)
                 },
                 WangHash {
                     hash: 1,
-                    t_anchor: 249
+                    t_anchor: crate::matching::frames_to_ms(249, 62.5)
                 },
                 WangHash {
                     hash: 2,
-                    t_anchor: 351
+                    t_anchor: crate::matching::frames_to_ms(351, 62.5)
                 },
             ],
             frames_per_sec: 62.5,

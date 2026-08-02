@@ -31,13 +31,13 @@
 //!
 //! ```no_run
 //! use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
-//! use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+//! use audiofp::{Fingerprinter, SampleRate};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 //! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-//! let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
-//! let fp = emb.extract(buf)?;
+
+//! let fp = emb.extract(&samples, SampleRate::HZ_8000)?;
 //! println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
 //! # Ok(()) }
 //! ```

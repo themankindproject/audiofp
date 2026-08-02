@@ -5,7 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-02
+
+### Breaking
+
+- **`AudioBuffer` removed** (#65) — `Fingerprinter::extract`,
+  `extract_with_progress`, watermark `detect`, and neural `extract` now
+  take `(&[f32], SampleRate)` directly. The `prelude` no longer
+  re-exports `AudioBuffer`.
+- **Hash timestamps are `TimestampMs`** (#66) — `WangHash::t_anchor` and
+  `PanakoHash::t_anchor`/`t_b`/`t_c` changed from raw `u32` STFT frames
+  to `TimestampMs` (ms). Hash byte layout changed (Wang 8→12 bytes,
+  Panako 16→28 bytes, `#[repr(C, packed)]`); `name()` bumped to
+  `wang-v2`; serialization `FORMAT_VERSION` bumped to 2 and **v1 blobs
+  are rejected**; golden files regenerated.
+- **`StreamingFingerprinter::push` / `flush` return `Result`** (#63) —
+  `push`/`flush`/`push_with`/`flush_with` are now fallible
+  (`Result<Vec<…>>` / `Result<usize>`); `StreamingNeuralEmbedder` no
+  longer panics on inference errors.
+- **`PeakPickerConfig::min_magnitude` renamed to `min_magnitude_db`**
+  (#62) — plus a new optional `min_magnitude_linear: Option<f32>` floor.
+- **Flat crate-root re-exports** (#64) — `audiofp::Wang`,
+  `audiofp::Panako`, `audiofp::Haitsma`, configs, fingerprints, and
+  streaming variants are re-exported at the crate root (the
+  `classical` module remains canonical).
+- **Migration guide** — see `MIGRATING_0.4.md` for the full
+  old→new API mapping.
 
 ### Added
 
@@ -1429,7 +1454,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.8...HEAD
+[0.4.0]: https://github.com/themankindproject/audiofp/compare/v0.3.9...v0.4.0
+[0.3.9]: https://github.com/themankindproject/audiofp/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/themankindproject/audiofp/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/themankindproject/audiofp/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/themankindproject/audiofp/compare/v0.3.5...v0.3.6

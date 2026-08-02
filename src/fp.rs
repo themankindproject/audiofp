@@ -2,20 +2,18 @@
 //!
 //! Two traits cover the two ways `audiofp` produces fingerprints:
 //!
-//! - [`Fingerprinter`] — feed a whole [`AudioBuffer`] and get its full
-//!   output. Suited to enrolment / batch jobs.
+//! - [`Fingerprinter`] — feed a whole sample buffer and its rate and get
+//!   the full output. Suited to enrolment / batch jobs.
 //! - [`StreamingFingerprinter`] — push samples as they arrive and receive
 //!   fingerprints whenever the algorithm has enough material. Suited to
 //!   live capture.
 //!
 //! Concrete implementations live in feature-gated modules
 //! (`fp_classical::Wang`, `neural::ResonaFp`, …).
-//!
-//! [`AudioBuffer`]: crate::AudioBuffer
 
 use alloc::vec::Vec;
 
-use crate::{AudioBuffer, Result, TimestampMs};
+use crate::{Result, SampleRate, TimestampMs};
 
 /// Offline (whole-buffer) fingerprinter.
 ///
@@ -26,7 +24,7 @@ use crate::{AudioBuffer, Result, TimestampMs};
 /// # Example
 ///
 /// ```
-/// use audiofp::{AudioBuffer, Fingerprinter, Result, SampleRate};
+/// use audiofp::{Fingerprinter, Result, SampleRate};
 ///
 /// /// A toy fingerprinter that just sums absolute samples.
 /// struct Energy;
@@ -39,15 +37,14 @@ use crate::{AudioBuffer, Result, TimestampMs};
 ///     fn config(&self) -> &Self::Config { &() }
 ///     fn required_sample_rate(&self) -> u32 { 16_000 }
 ///     fn min_samples(&self) -> usize { 16_000 }
-///     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-///         Ok(audio.samples.iter().map(|s| s.abs()).sum())
+///     fn extract(&mut self, samples: &[f32], _rate: SampleRate) -> Result<Self::Output> {
+///         Ok(samples.iter().map(|s| s.abs()).sum())
 ///     }
 /// }
 ///
 /// let mut fp = Energy;
 /// let samples = vec![0.0_f32; 16_000];
-/// let buf = AudioBuffer::new(&samples, SampleRate::HZ_16000);
-/// assert_eq!(fp.extract(buf).unwrap(), 0.0);
+/// assert_eq!(fp.extract(&samples, SampleRate::HZ_16000).unwrap(), 0.0);
 /// ```
 #[must_use]
 pub trait Fingerprinter {
@@ -82,8 +79,9 @@ pub trait Fingerprinter {
     /// [`AfpError::AudioTooShort`]: crate::AfpError::AudioTooShort
     fn min_samples(&self) -> usize;
 
-    /// Compute the fingerprint of `audio`.
-    fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output>;
+    /// Compute the fingerprint of `samples` (mono PCM in `[-1.0, 1.0]`)
+    /// captured at `rate`.
+    fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output>;
 }
 
 /// Streaming fingerprinter that emits zero-or-more frames per push.
@@ -103,7 +101,7 @@ pub trait Fingerprinter {
 ///
 /// impl StreamingFingerprinter for EveryThird {
 ///     type Frame = u32;
-///     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
+///     fn push(&mut self, samples: &[f32]) -> audiofp::Result<Vec<(TimestampMs, u32)>> {
 ///         let mut out = Vec::new();
 ///         for s in samples {
 ///             self.count += 1;
@@ -111,14 +109,14 @@ pub trait Fingerprinter {
 ///                 out.push((TimestampMs(self.count as u64), s.to_bits()));
 ///             }
 ///         }
-///         out
+///         Ok(out)
 ///     }
-///     fn flush(&mut self) -> Vec<(TimestampMs, u32)> { Vec::new() }
+///     fn flush(&mut self) -> audiofp::Result<Vec<(TimestampMs, u32)>> { Ok(Vec::new()) }
 ///     fn latency_ms(&self) -> u32 { 0 }
 /// }
 ///
 /// let mut fp = EveryThird { count: 0 };
-/// assert_eq!(fp.push(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).len(), 2);
+/// assert_eq!(fp.push(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().len(), 2);
 /// ```
 #[must_use]
 pub trait StreamingFingerprinter {
@@ -142,11 +140,12 @@ pub trait StreamingFingerprinter {
     /// during this push.
     ///
     /// Must not block and must not allocate beyond the per-instance
-    /// budget set at construction.
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)>;
+    /// budget set at construction. Returns `Err` if the stream cannot
+    /// process the samples (e.g. neural inference failure).
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Drain any pending fingerprint material at end-of-stream.
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)>;
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Conservative upper bound on emission latency: from the time a
     /// sample enters [`push`] to the time the fingerprint covering it
@@ -168,16 +167,16 @@ pub trait StreamingFingerprinter {
     /// genuine zero-allocation hot path must override this method.
     ///
     /// [`push`]: StreamingFingerprinter::push
-    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        let frames = self.push(samples);
+        let frames = self.push(samples)?;
         let n = frames.len();
         for (t, frame) in frames {
             callback(t, &frame);
         }
-        n
+        Ok(n)
     }
 
     /// Drain any pending fingerprint material at end-of-stream, invoking
@@ -192,16 +191,16 @@ pub trait StreamingFingerprinter {
     /// path must override this method.
     ///
     /// [`flush`]: StreamingFingerprinter::flush
-    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        let frames = self.flush();
+        let frames = self.flush()?;
         let n = frames.len();
         for (t, frame) in frames {
             callback(t, &frame);
         }
-        n
+        Ok(n)
     }
 }
 
@@ -216,7 +215,7 @@ pub trait StreamingFingerprinter {
 /// # Example
 ///
 /// ```
-/// use audiofp::{fingerprint_batch_parallel, AudioBuffer, Fingerprinter, SampleRate};
+/// use audiofp::{fingerprint_batch_parallel, Fingerprinter, SampleRate};
 ///
 /// struct Sum;
 /// impl Fingerprinter for Sum {
@@ -226,8 +225,8 @@ pub trait StreamingFingerprinter {
 ///     fn config(&self) -> &Self::Config { &() }
 ///     fn required_sample_rate(&self) -> u32 { 8_000 }
 ///     fn min_samples(&self) -> usize { 1 }
-///     fn extract(&mut self, audio: AudioBuffer<'_>) -> audiofp::Result<f32> {
-///         Ok(audio.samples.iter().sum())
+///     fn extract(&mut self, samples: &[f32], _rate: SampleRate) -> audiofp::Result<f32> {
+///         Ok(samples.iter().sum())
 ///     }
 /// }
 ///
@@ -259,8 +258,7 @@ where
         .into_par_iter()
         .map(|(tag, samples, rate)| {
             let mut fp = make_fingerprinter();
-            let buf = AudioBuffer::new(&samples, rate);
-            (tag, fp.extract(buf))
+            (tag, fp.extract(&samples, rate))
         })
         .collect()
 }
@@ -292,7 +290,7 @@ mod tests {
     impl StreamingFingerprinter for CountByThree {
         type Frame = u32;
 
-        fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, u32)> {
+        fn push(&mut self, samples: &[f32]) -> crate::Result<Vec<(TimestampMs, u32)>> {
             let mut out = Vec::new();
             for _ in samples {
                 self.count += 1;
@@ -301,16 +299,16 @@ mod tests {
                 }
             }
             self.buffered.extend(out.iter().map(|(_, f)| *f));
-            out
+            Ok(out)
         }
 
-        fn flush(&mut self) -> Vec<(TimestampMs, u32)> {
+        fn flush(&mut self) -> crate::Result<Vec<(TimestampMs, u32)>> {
             // Pretend there are 2 frames left buffered.
             let pending: Vec<u32> = self.buffered.drain(..).collect();
-            pending
+            Ok(pending
                 .into_iter()
                 .map(|v| (TimestampMs(v as u64 + 100), v))
-                .collect()
+                .collect())
         }
 
         fn latency_ms(&self) -> u32 {
@@ -325,14 +323,14 @@ mod tests {
         // Collect push() output.
         let mut fp = CountByThree::new();
         let mut a: Vec<(TimestampMs, u32)> = Vec::new();
-        a.extend(fp.push(&samples));
-        a.extend(fp.push(&[]));
+        a.extend(fp.push(&samples).unwrap());
+        a.extend(fp.push(&[]).unwrap());
 
         // Collect push_with() output (default impl delegates to push).
         let mut fp = CountByThree::new();
         let mut b: Vec<(TimestampMs, u32)> = Vec::new();
-        fp.push_with(&samples, |t, f| b.push((t, *f)));
-        fp.push_with(&[], |t, f| b.push((t, *f)));
+        let _ = fp.push_with(&samples, |t, f| b.push((t, *f)));
+        let _ = fp.push_with(&[], |t, f| b.push((t, *f)));
 
         assert_eq!(
             a.len(),
@@ -346,15 +344,15 @@ mod tests {
     fn flush_with_default_impl_matches_flush() {
         let mut fp = CountByThree::new();
         let samples = vec![0.0_f32; 9];
-        let _ = fp.push(&samples);
+        let _ = fp.push(&samples).unwrap();
         // 3 frames emitted (count=3,6,9), 0 buffered (the toy
         // implementation also keeps its own copy in `buffered`).
-        let pending: Vec<_> = fp.flush();
+        let pending: Vec<_> = fp.flush().unwrap();
 
         let mut fp = CountByThree::new();
-        let _ = fp.push(&samples);
+        let _ = fp.push(&samples).unwrap();
         let mut collected = Vec::new();
-        let n = fp.flush_with(|t, f| collected.push((t, *f)));
+        let n = fp.flush_with(|t, f| collected.push((t, *f))).unwrap();
 
         assert_eq!(n, pending.len());
         assert_eq!(collected, pending, "flush_with must mirror flush");
@@ -382,8 +380,8 @@ mod tests {
             fn min_samples(&self) -> usize {
                 1
             }
-            fn extract(&mut self, audio: AudioBuffer<'_>) -> crate::Result<f32> {
-                Ok(audio.samples.iter().sum())
+            fn extract(&mut self, samples: &[f32], _rate: SampleRate) -> crate::Result<f32> {
+                Ok(samples.iter().sum())
             }
         }
 
@@ -394,8 +392,7 @@ mod tests {
         let mut sequential = Vec::new();
         for (tag, samples, rate) in &items {
             let mut fp = Sum;
-            let buf = AudioBuffer::new(samples, *rate);
-            sequential.push((*tag, fp.extract(buf)));
+            sequential.push((*tag, fp.extract(samples, *rate)));
         }
 
         let parallel = fingerprint_batch_parallel(items, || Sum);
@@ -411,10 +408,10 @@ mod tests {
     fn push_with_reports_emitted_count() {
         let mut fp = CountByThree::new();
         // 9 samples → 3 emitted (count=3,6,9).
-        let n = fp.push_with(&[0.0_f32; 9], |_, _| {});
+        let n = fp.push_with(&[0.0_f32; 9], |_, _| {}).unwrap();
         assert_eq!(n, 3);
         // 2 more samples → 0 emitted (count was 9, not divisible by 3).
-        let n = fp.push_with(&[0.0_f32; 2], |_, _| {});
+        let n = fp.push_with(&[0.0_f32; 2], |_, _| {}).unwrap();
         assert_eq!(n, 0);
     }
 }

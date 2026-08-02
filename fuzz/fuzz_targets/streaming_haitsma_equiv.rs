@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use audiofp::classical::{Haitsma, HaitsmaConfig, StreamingHaitsma};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate, StreamingFingerprinter};
+use audiofp::{Fingerprinter, SampleRate, StreamingFingerprinter};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]
@@ -34,13 +34,10 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let samples = &input.samples[..min_len];
-    let buf = AudioBuffer {
-        samples,
-        rate: SampleRate::HZ_5000,
-    };
+    
 
     let mut offline = Haitsma::new(cfg.clone());
-    let Ok(off) = offline.extract(buf) else {
+    let Ok(off) = offline.extract(&samples, SampleRate::HZ_8000) else {
         return;
     };
 
@@ -48,9 +45,9 @@ fuzz_target!(|data: &[u8]| {
     let mut stream = StreamingHaitsma::new(cfg);
     let mut online: Vec<u32> = Vec::new();
     for c in samples.chunks(chunk) {
-        online.extend(stream.push(c).into_iter().map(|(_, h)| h));
+        online.extend(stream.push(c).unwrap().into_iter().map(|(_, h)| h));
     }
-    online.extend(stream.flush().into_iter().map(|(_, h)| h));
+    online.extend(stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
     assert_eq!(off.frames, online);
 });

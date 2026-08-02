@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -37,12 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wang
     {
         let mut wang = Wang::default();
-        let buf = AudioBuffer {
-            samples: &samples_8k,
-            rate: SampleRate::HZ_8000,
-        };
+        
         let t = Instant::now();
-        let fp = wang.extract(buf)?;
+        let fp = wang.extract(&samples_8k, SampleRate::HZ_8000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;
         let bytes = fp.hashes.len() * core::mem::size_of::<audiofp::classical::WangHash>();
         println!(
@@ -58,12 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Panako
     {
         let mut panako = Panako::default();
-        let buf = AudioBuffer {
-            samples: &samples_8k,
-            rate: SampleRate::HZ_8000,
-        };
+        
         let t = Instant::now();
-        let fp = panako.extract(buf)?;
+        let fp = panako.extract(&samples_8k, SampleRate::HZ_8000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;
         let bytes = fp.hashes.len() * core::mem::size_of::<audiofp::classical::PanakoHash>();
         println!(
@@ -79,12 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Haitsma
     {
         let mut h = Haitsma::default();
-        let buf = AudioBuffer {
-            samples: &samples_5k,
-            rate: SampleRate::HZ_5000,
-        };
+        
         let t = Instant::now();
-        let fp = h.extract(buf)?;
+        let fp = h.extract(&samples_5k, SampleRate::HZ_5000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;
         let bytes = fp.frames.len() * core::mem::size_of::<u32>();
         println!(

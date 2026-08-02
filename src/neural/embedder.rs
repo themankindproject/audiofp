@@ -5,6 +5,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use std::path::Path;
+use crate::SampleRate;
 
 use tract_onnx::prelude::*;
 
@@ -12,7 +13,7 @@ use crate::dsp::mel::{MelFilterBank, MelScale};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
 use crate::error::{map_model_load_err, map_model_open_io};
-use crate::{AfpError, AudioBuffer, Fingerprinter, Result, TimestampMs};
+use crate::{AfpError, Fingerprinter, Result, TimestampMs};
 
 use super::frontend::LogMelFrontend;
 
@@ -593,27 +594,27 @@ impl Fingerprinter for NeuralEmbedder {
         self.core.window_samples
     }
 
-    fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        crate::pcm::reject_non_finite(audio.samples)?;
+    fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
+        crate::pcm::reject_non_finite(samples)?;
         if let Some(limit) = self.core.cfg.max_input_samples
-            && audio.samples.len() > limit
+            && samples.len() > limit
         {
             return Err(AfpError::InputTooLarge {
                 limit,
-                provided: audio.samples.len(),
+                provided: samples.len(),
             });
         }
-        if audio.rate.hz() != self.core.cfg.sample_rate {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        if rate.hz() != self.core.cfg.sample_rate {
+            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
-        if audio.samples.len() < self.core.window_samples {
+        if samples.len() < self.core.window_samples {
             return Err(AfpError::AudioTooShort {
                 needed: self.core.window_samples,
-                got: audio.samples.len(),
+                got: samples.len(),
             });
         }
 
-        let sr = audio.rate.hz() as u64;
+        let sr = rate.hz() as u64;
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let embedding_dim = self.core.embedding_dim;
@@ -621,20 +622,20 @@ impl Fingerprinter for NeuralEmbedder {
 
         // Preallocate the output container — we know exactly how many
         // windows fit in the buffer.
-        let n_windows = (audio.samples.len() - window_samples) / hop_samples + 1;
+        let n_windows = (samples.len() - window_samples) / hop_samples + 1;
         let mut embeddings = Vec::with_capacity(n_windows);
 
         if batch_size > 1 && self.core.batch_runnable.is_some() {
             // --- Batched inference path --------------------------------
             let mut start = 0usize;
-            while start + window_samples <= audio.samples.len() {
+            while start + window_samples <= samples.len() {
                 // Collect up to `batch_size` windows.
                 let mut batch_windows: Vec<&[f32]> = Vec::with_capacity(batch_size);
                 let mut batch_timestamps: Vec<TimestampMs> = Vec::with_capacity(batch_size);
                 let mut s = start;
-                while batch_windows.len() < batch_size && s + window_samples <= audio.samples.len()
+                while batch_windows.len() < batch_size && s + window_samples <= samples.len()
                 {
-                    batch_windows.push(&audio.samples[s..s + window_samples]);
+                    batch_windows.push(&samples[s..s + window_samples]);
                     batch_timestamps.push(TimestampMs((s as u64) * 1000 / sr));
                     s += hop_samples;
                 }
@@ -663,8 +664,8 @@ impl Fingerprinter for NeuralEmbedder {
         } else {
             // --- Single-window inference path (original behaviour) ------
             let mut start = 0usize;
-            while start + window_samples <= audio.samples.len() {
-                let window = &audio.samples[start..start + window_samples];
+            while start + window_samples <= samples.len() {
+                let window = &samples[start..start + window_samples];
                 let mut vector = Vec::with_capacity(embedding_dim);
                 self.core.embed_window_into(window, &mut vector)?;
                 let t_start = TimestampMs((start as u64) * 1000 / sr);
@@ -856,12 +857,10 @@ mod tests {
         // 2 s of synthetic audio — 8 windows of cfg.window_secs (= 0.25 s)
         // each. Each window emits one embedding of length `n_mels * n_frames`.
         let samples = synth_audio(42, 2 * cfg.sample_rate as usize, cfg.sample_rate);
-        let audio = crate::AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
 
-        let fp_out = fp.extract(audio).expect("extract");
+        let fp_out = fp
+            .extract(&samples, SampleRate::new(cfg.sample_rate).unwrap())
+            .expect("extract");
         let expected_dim = fp.embedding_dim();
         let window_samples = fp.window_samples();
         let hop_samples = fp.hop_samples();
@@ -907,21 +906,17 @@ mod tests {
         // batch_size=4 gives 2 full batches + 2 remainder.
         let n_samples = (2.5 * cfg_single.sample_rate as f32) as usize;
         let samples = synth_audio(7, n_samples, cfg_single.sample_rate);
-        let audio_single = crate::AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        let out_single = fp_single.extract(audio_single).expect("extract single");
+        let out_single = fp_single
+            .extract(&samples, SampleRate::new(cfg_single.sample_rate).unwrap())
+            .expect("extract single");
 
         // Batched: batch_size=4.
         let mut cfg_batch = small_cfg();
         cfg_batch.batch_size = 4;
         let mut fp_batch = passthrough_embedder(cfg_batch).expect("batch embedder");
-        let audio_batch = crate::AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        let out_batch = fp_batch.extract(audio_batch).expect("extract batch");
+        let out_batch = fp_batch
+            .extract(&samples, SampleRate::new(cfg_single.sample_rate).unwrap())
+            .expect("extract batch");
 
         // Same number of embeddings.
         assert_eq!(
@@ -962,11 +957,9 @@ mod tests {
 
         // 1.0 s = 4 windows of 0.25 s each (non-overlapping).
         let samples = synth_audio(99, cfg.sample_rate as usize, cfg.sample_rate);
-        let audio = crate::AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        let out = fp.extract(audio).expect("extract");
+        let out = fp
+            .extract(&samples, SampleRate::new(cfg.sample_rate).unwrap())
+            .expect("extract");
         assert_eq!(out.embeddings.len(), 4);
         for e in &out.embeddings {
             assert_eq!(e.vector.len(), out.embedding_dim);
@@ -987,11 +980,9 @@ mod tests {
         // 0.5 s = 2 windows of 0.25 s.
         let n_samples = (cfg.sample_rate as f32 * 0.5) as usize;
         let samples = synth_audio(13, n_samples, cfg.sample_rate);
-        let audio = crate::AudioBuffer {
-            samples: &samples,
-            rate: SampleRate::HZ_16000,
-        };
-        let out = fp.extract(audio).expect("extract");
+        let out = fp
+            .extract(&samples, SampleRate::new(cfg.sample_rate).unwrap())
+            .expect("extract");
         assert_eq!(out.embeddings.len(), 2);
     }
 }

@@ -12,7 +12,7 @@ use audiofp::matching::{
     HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig,
     WangMatcher,
 };
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 const SECS: f32 = 8.0;
 
@@ -65,7 +65,7 @@ fn wang_self_match_end_to_end() {
     let mut w = Wang::default();
     let sig = synth_chirp(1, 8_000);
     let fp = w
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .extract(&sig, SampleRate::HZ_8000)
         .unwrap();
     assert!(!fp.hashes.is_empty(), "extraction must produce landmarks");
 
@@ -82,7 +82,7 @@ fn wang_offset_recovery_end_to_end() {
     let mut w = Wang::default();
     let sig = synth_chirp(2, 8_000);
     let reference = w
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .extract(&sig, SampleRate::HZ_8000)
         .unwrap();
 
     // Prepend exactly 2 s of silence = 125 Wang frames (8000*2 / 128 =
@@ -93,7 +93,7 @@ fn wang_offset_recovery_end_to_end() {
     let mut shifted = vec![0.0_f32; 2 * 8_000];
     shifted.extend_from_slice(&sig);
     let query = w
-        .extract(AudioBuffer::new(&shifted, SampleRate::HZ_8000))
+        .extract(&shifted, SampleRate::HZ_8000)
         .unwrap();
 
     let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -111,13 +111,10 @@ fn wang_offset_recovery_end_to_end() {
 fn wang_unrelated_no_match_end_to_end() {
     let mut w = Wang::default();
     let a = w
-        .extract(AudioBuffer::new(
-            &synth_chirp(3, 8_000),
-            SampleRate::HZ_8000,
-        ))
+        .extract(&synth_chirp(3, 8_000), SampleRate::HZ_8000)
         .unwrap();
     let b = w
-        .extract(AudioBuffer::new(&synth_tones(8_000), SampleRate::HZ_8000))
+        .extract(&synth_tones(8_000), SampleRate::HZ_8000)
         .unwrap();
     let matcher = WangMatcher::new(WangMatchConfig::default());
     let res = matcher.match_one(&a, &b);
@@ -132,7 +129,7 @@ fn haitsma_self_match_end_to_end() {
     let mut h = Haitsma::default();
     let sig = synth_chirp(5, 5_000);
     let fp = h
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_5000))
+        .extract(&sig, SampleRate::HZ_5000)
         .unwrap();
     assert!(!fp.frames.is_empty(), "extraction must produce frames");
     // 8 s @ 78.125 fps ≈ 625 frames → exercises the LUT path (> 512).
@@ -157,7 +154,7 @@ fn panako_self_match_end_to_end() {
     let mut p = Panako::default();
     let sig = synth_chirp(6, 8_000);
     let fp = p
-        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .extract(&sig, SampleRate::HZ_8000)
         .unwrap();
     assert!(
         !fp.hashes.is_empty(),
@@ -180,13 +177,10 @@ fn panako_self_match_end_to_end() {
 fn panako_unrelated_no_match_end_to_end() {
     let mut p = Panako::default();
     let a = p
-        .extract(AudioBuffer::new(
-            &synth_chirp(7, 8_000),
-            SampleRate::HZ_8000,
-        ))
+        .extract(&synth_chirp(7, 8_000), SampleRate::HZ_8000)
         .unwrap();
     let b = p
-        .extract(AudioBuffer::new(&synth_tones(8_000), SampleRate::HZ_8000))
+        .extract(&synth_tones(8_000), SampleRate::HZ_8000)
         .unwrap();
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
     let res = matcher.match_one(&a, &b);

@@ -8,8 +8,8 @@
 //! ```
 
 use audiofp::classical::{Haitsma, Panako, Wang};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use audiofp::{Fingerprinter, SampleRate};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Deterministic xorshift32 + two-tone synthetic input. Same generator as the
 /// regression-golden test so bench numbers are reproducible.
@@ -41,13 +41,7 @@ fn bench_wang(c: &mut Criterion) {
             &samples,
             |b, samples| {
                 let mut wang = Wang::default();
-                b.iter(|| {
-                    let buf = AudioBuffer {
-                        samples: black_box(samples),
-                        rate: SampleRate::HZ_8000,
-                    };
-                    wang.extract(buf).unwrap()
-                });
+                b.iter(|| wang.extract(samples, SampleRate::HZ_8000).unwrap());
             },
         );
     }
@@ -64,13 +58,7 @@ fn bench_panako(c: &mut Criterion) {
             &samples,
             |b, samples| {
                 let mut panako = Panako::default();
-                b.iter(|| {
-                    let buf = AudioBuffer {
-                        samples: black_box(samples),
-                        rate: SampleRate::HZ_8000,
-                    };
-                    panako.extract(buf).unwrap()
-                });
+                b.iter(|| panako.extract(samples, SampleRate::HZ_8000).unwrap());
             },
         );
     }
@@ -88,13 +76,7 @@ fn bench_haitsma(c: &mut Criterion) {
             &samples,
             |b, samples| {
                 let mut h = Haitsma::default();
-                b.iter(|| {
-                    let buf = AudioBuffer {
-                        samples: black_box(samples),
-                        rate: sr,
-                    };
-                    h.extract(buf).unwrap()
-                });
+                b.iter(|| h.extract(samples, sr).unwrap());
             },
         );
     }

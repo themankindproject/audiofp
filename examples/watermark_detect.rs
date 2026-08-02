@@ -10,7 +10,7 @@
 //! at 16 kHz (useful as a smoke test that the model loads).
 
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-use audiofp::{AudioBuffer, SampleRate};
+use audiofp::{SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (samples, rate)
     };
 
-    let r = det.detect(AudioBuffer::new(&samples, rate))?;
+    let r = det.detect(&samples, rate)?;
     println!(
         "detected={} confidence={:.4} message={:#018b}",
         r.detected, r.confidence, r.message

@@ -38,20 +38,20 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3"
+audiofp = "0.4"
 ```
 
 ### Basic example: fingerprint silence (zero deps)
 
 ```rust
 use audiofp::classical::Wang;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() {
     let samples = vec![0.0_f32; 8_000 * 3]; // 3 s @ 8 kHz
     let mut wang = Wang::default();
     let fp = wang
-        .extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        .extract(&samples, SampleRate::HZ_8000)
         .unwrap();
     println!("{} hashes", fp.hashes.len()); // silence → usually 0
 }
@@ -62,19 +62,18 @@ fn main() {
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Decode to mono f32 at the rate Wang requires.
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
-    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
-    let fp = wang.extract(buf)?;
+    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 
     println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
     for h in fp.hashes.iter().take(5) {
-        println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
+        println!("  t_anchor={.0} hash={:08x}", h.t_anchor.0, h.hash);
     }
     Ok(())
 }
@@ -85,14 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use std::collections::HashSet;
 
 fn fingerprint(path: &str) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
     let mut wang = Wang::default();
-    let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
-    Ok(wang.extract(buf)?.hashes.into_iter().map(|h| h.hash).collect())
+    Ok(wang.extract(&samples, SampleRate::HZ_8000)?.hashes.into_iter().map(|h| h.hash).collect())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,7 +152,7 @@ pub trait Fingerprinter {
     fn config(&self) -> &Self::Config;
     fn required_sample_rate(&self) -> u32;
     fn min_samples(&self) -> usize;
-    fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output>;
+    fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output>;
 }
 ```
 
@@ -177,8 +175,8 @@ pub trait StreamingFingerprinter {
     type Frame;
 
     fn required_sample_rate(&self) -> u32;
-    fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)>;
-    fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)>;
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>>;
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
     fn latency_ms(&self) -> u32;
 
     // Provided methods — zero-allocation callback variants:
@@ -226,17 +224,6 @@ assert!(SampleRate::new(0).is_none());
 | `HZ_22050`          | 22 050 |
 | `HZ_44100`          | 44 100 |
 | `HZ_48000`          | 48 000 |
-
-#### `AudioBuffer`
-
-A borrowed mono PCM view:
-
-```rust
-pub struct AudioBuffer<'a> {
-    pub samples: &'a [f32],
-    pub rate: SampleRate,
-}
-```
 
 #### `TimestampMs`
 
@@ -318,7 +305,7 @@ pub struct WangHash {
 
 ```rust
 use audiofp::classical::{Wang, WangConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), audiofp::AfpError> {
     let cfg = WangConfig {
@@ -329,7 +316,7 @@ fn main() -> Result<(), audiofp::AfpError> {
     let mut wang = Wang::new(cfg);
 
     let samples = vec![0.0_f32; 8_000 * 4];
-    let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
     println!("{} hashes", fp.hashes.len());
     Ok(())
 }
@@ -431,11 +418,11 @@ reporting extraction progress on long files (podcasts, DJ sets, etc.):
 
 ```rust
 use audiofp::classical::Wang;
-use audiofp::{AudioBuffer, SampleRate};
+use audiofp::{SampleRate};
 
 let samples = vec![0.0_f32; 8_000 * 60]; // 60 s
 let mut wang = Wang::default();
-let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
+
 
 let fp = wang.extract_with_progress(buf, |progress| {
     // progress is monotonically non-decreasing in [0.0, 1.0]
@@ -452,7 +439,7 @@ Signatures:
 ```rust
 impl Wang {
     pub fn extract_with_progress<F: FnMut(f32)>(
-        &mut self, audio: AudioBuffer<'_>, progress: F,
+        &mut self, samples: &[f32], rate: SampleRate, progress: F,
     ) -> Result<WangFingerprint>;
 }
 // Same on Panako and Haitsma.
@@ -477,12 +464,12 @@ impl Wang {
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
 use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 fn fingerprint(path: &str) -> Result<audiofp::classical::WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
-    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-    Ok(Wang::default().extract(buf)?)
+    
+    Ok(Wang::default().extract(&samples, SampleRate::HZ_8000)?)
 }
 
 let query = fingerprint("clip.wav")?;
@@ -541,7 +528,7 @@ fn main() {
     // Real capture: read from cpal / rodio / your own ring buffer.
     let chunk = vec![0.0_f32; 128]; // ~16 ms at 8 kHz
     for _ in 0..200 {
-        for (t, hash) in s.push(&chunk) {
+        for (t, hash) in s.push(&chunk).unwrap() {
             all.push((t, hash));
         }
     }
@@ -562,19 +549,19 @@ fn main() {
 
 ```rust
 use audiofp::classical::{StreamingWang, Wang};
-use audiofp::{AudioBuffer, Fingerprinter, StreamingFingerprinter, SampleRate};
+use audiofp::{Fingerprinter, StreamingFingerprinter, SampleRate};
 
 fn main() -> Result<(), audiofp::AfpError> {
     // Your decoded mono PCM at 8 kHz (≥ ~2 s). Silence is fine for the API path.
     let whole_song: Vec<f32> = vec![0.0; 16_000];
 
     let offline = Wang::default()
-        .extract(AudioBuffer::new(&whole_song, SampleRate::HZ_8000))?;
+        .extract(&whole_song, SampleRate::HZ_8000)?;
 
     let mut streaming = StreamingWang::default();
     let mut online = Vec::new();
     for chunk in whole_song.chunks(1024) {
-        online.extend(streaming.push(chunk).into_iter().map(|(_, h)| h));
+        online.extend(streaming.push(chunk).unwrap().into_iter().map(|(_, h)| h));
     }
     online.extend(streaming.flush().into_iter().map(|(_, h)| h));
 
@@ -608,11 +595,11 @@ Algorithm IDs: 0 = Wang, 1 = Panako, 2 = Haitsma.
 
 ```rust
 use audiofp::classical::Wang;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 let samples = vec![0.0_f32; 8_000 * 3];
 let mut wang = Wang::default();
-let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 
 // Serialize
 let bytes = fp.to_bytes();
@@ -795,7 +782,7 @@ Constructor with AudioSeal defaults:
 
 ```rust
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-use audiofp::{AudioBuffer, SampleRate};
+use audiofp::{SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = WatermarkConfig::new("audioseal_v0.2.onnx");
@@ -803,7 +790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut det = WatermarkDetector::new(cfg)?;
     let audio = vec![0.0_f32; 16_000]; // 1 s mono @ 16 kHz
-    let r = det.detect(AudioBuffer::new(&audio, SampleRate::HZ_16000))?;
+    let r = det.detect(&audio, SampleRate::HZ_16000)?;
 
     println!(
         "detected={} confidence={:.3} message={:#018b}",
@@ -948,7 +935,7 @@ inference. Output is bit-exact regardless of batch size.
 
 ```rust
 use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 
@@ -958,8 +945,8 @@ println!("window_samples={}", emb.window_samples());
 println!("hop_samples={}", emb.hop_samples());
 
 let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_16000 };
-let fp = emb.extract(buf)?;
+
+let fp = emb.extract(&samples, SampleRate::HZ_8000)?;
 
 println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
 for e in fp.embeddings.iter().take(3) {
@@ -1012,7 +999,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Method                                             | Allocates per emit         | Errors          |
 | -------------------------------------------------- | -------------------------- | --------------- |
-| `push(samples) -> Vec<(TimestampMs, Vec<f32>)>`    | One `Vec<f32>` per emit    | Panics on infer |
+| `push(samples) -> Result<Vec<(TimestampMs, Vec<f32>)>>` | One `Vec<f32>` per emit | `Result`        |
 | `try_push(samples) -> Result<Vec<…>>`              | One `Vec<f32>` per emit    | `Result`        |
 | `try_push_with(samples, |t, &[f32]| …) -> Result<usize>` | **Zero** (callback gets `&[f32]`) | `Result`        |
 
@@ -1165,7 +1152,8 @@ use audiofp::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 let picker = PeakPicker::new(PeakPickerConfig {
     neighborhood_t: 7,
     neighborhood_f: 7,
-    min_magnitude: 1e-3,
+    min_magnitude_db: f32::NEG_INFINITY,
+    min_magnitude_linear: Some(1e-3),
     target_per_sec: 30,
 });
 
@@ -1259,7 +1247,7 @@ CPU-heavy extract/decode onto a blocking pool:
 use std::sync::{Arc, Mutex};
 
 use audiofp::classical::Wang;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 
 async fn fingerprint_blocking(
     samples: Vec<f32>,
@@ -1267,7 +1255,7 @@ async fn fingerprint_blocking(
     let wang = Arc::new(Mutex::new(Wang::default()));
     tokio::task::spawn_blocking(move || {
         let mut wang = wang.lock().unwrap();
-        wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+        wang.extract(&samples, SampleRate::HZ_8000)
     })
     .await
     .expect("blocking task join")
@@ -1284,14 +1272,14 @@ Reuse one fingerprinter across paths (plans and scratch stay warm):
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use std::path::PathBuf;
 
 fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     let mut wang = Wang::default();
     for path in paths {
         let samples = decode_to_mono_at(path, 8_000)?;
-        let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+        let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
         println!("{} → {} hashes", path.display(), fp.hashes.len());
         // db.insert(track_id, &fp.hashes);
     }
@@ -1372,12 +1360,12 @@ pub enum AfpError {
 ### Typical error paths
 
 ```rust
-use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate, classical::Wang};
+use audiofp::{AfpError, Fingerprinter, SampleRate, classical::Wang};
 
 let mut wang = Wang::default();
-let buf = AudioBuffer { samples: &short_audio, rate: SampleRate::HZ_44100 };
 
-match wang.extract(buf) {
+
+match wang.extract(&samples, SampleRate::HZ_8000) {
     Ok(fp) => println!("{} hashes", fp.hashes.len()),
 
     Err(AfpError::UnsupportedSampleRate(hz)) => {
@@ -1402,7 +1390,7 @@ match wang.extract(buf) {
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate};
 use std::path::Path;
 
 fn enroll(paths: &[&Path]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1410,7 +1398,7 @@ fn enroll(paths: &[&Path]) -> Result<(), Box<dyn std::error::Error>> {
     let mut wang = Wang::default();
     for path in paths {
         let samples = decode_to_mono_at(path, 8_000)?;
-        let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))?;
+        let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
         let _ = fp.hashes.len();
     }
     Ok(())
@@ -1531,7 +1519,7 @@ In your crate root:
 #![no_std]
 extern crate alloc;
 
-use audiofp::{AudioBuffer, Fingerprinter, SampleRate, classical::Wang};
+use audiofp::{Fingerprinter, SampleRate, classical::Wang};
 // ... use audiofp APIs as usual.
 ```
 
