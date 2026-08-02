@@ -13,12 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `extract_with_progress`, watermark `detect`, and neural `extract` now
   take `(&[f32], SampleRate)` directly. The `prelude` no longer
   re-exports `AudioBuffer`.
-- **Hash timestamps are `TimestampMs`** (#66) — `WangHash::t_anchor` and
-  `PanakoHash::t_anchor`/`t_b`/`t_c` changed from raw `u32` STFT frames
-  to `TimestampMs` (ms). Hash byte layout changed (Wang 8→12 bytes,
-  Panako 16→28 bytes, `#[repr(C, packed)]`); `name()` bumped to
-  `wang-v2`; serialization `FORMAT_VERSION` bumped to 2 and **v1 blobs
-  are rejected**; golden files regenerated.
+- **Hash timestamps keep frame units** (#66, reverted) — the
+  originally-proposed conversion of `WangHash::t_anchor` and
+  `PanakoHash::t_anchor`/`t_b`/`t_c` from raw `u32` STFT frames to
+  `TimestampMs` was evaluated and **reverted before release**: it would
+  have grown the hash byte layout (Wang 8→12, Panako 16→28 bytes),
+  forced a serialization `FORMAT_VERSION` bump to 2 with v1-blob
+  rejection, and provided no algorithmic benefit (matching is
+  frame-native and would convert back at the boundary). Frame-index
+  timestamps and the 8/16-byte v1 layouts are preserved; `TimestampMs`
+  remains the unit of the streaming emit tuples, which were always ms.
 - **`StreamingFingerprinter::push` / `flush` return `Result`** (#63) —
   `push`/`flush`/`push_with`/`flush_with` are now fallible
   (`Result<Vec<…>>` / `Result<usize>`); `StreamingNeuralEmbedder` no
@@ -41,11 +45,10 @@ Quick reference:
 | Change | Old API | New API |
 |---|---|---|
 | [#65] Drop `AudioBuffer` | `fp.extract(buf)` | `fp.extract(&samples, rate)` |
-| [#66] Hash timestamps → `TimestampMs` | `h.t_anchor: u32` (frames) | `h.t_anchor: TimestampMs` (ms) |
+| [#66] Hash timestamps unchanged | `h.t_anchor: u32` (frames) | `h.t_anchor: u32` (frames) — **no change** |
 | [#63] `push`/`flush` return `Result` | `s.push(&x)` → `Vec` | `s.push(&x)?` → `Result<Vec>` |
 | [#62] `min_magnitude` → `min_magnitude_db` | `min_magnitude: f32` | `min_magnitude_db: f32` + `min_magnitude_linear` |
 | [#64] Flat crate-root re-exports | `use audiofp::classical::Wang` | `use audiofp::Wang` (alias) |
-| [#66] Serialization format v2 | `FORMAT_VERSION = 1` | `FORMAT_VERSION = 2` (v1 rejected) |
 
 [#62]: https://github.com/themankindproject/audiofp/issues/62
 [#63]: https://github.com/themankindproject/audiofp/issues/63
@@ -78,34 +81,32 @@ Mechanical migration:
 This removes the lifetime parameter from the public surface, simplifying
 generic code.
 
-#### 2. Hash timestamps are now `TimestampMs` (#66)
+#### 2. Hash timestamps: no change — kept as frame indices (#66)
 
-`WangHash::t_anchor` and `PanakoHash::t_anchor` / `t_b` / `t_c` changed
-from raw `u32` STFT-frame indices to `TimestampMs` (milliseconds since
-stream start):
+The proposed conversion of `WangHash::t_anchor` and
+`PanakoHash::t_anchor` / `t_b` / `t_c` from raw `u32` STFT-frame indices
+to `TimestampMs` was **evaluated and reverted before release**. Hash
+timestamp fields remain `u32` frame indices:
 
 ```rust
-// 0.3.x — frame units, 62.5 fps → 16 ms/frame
+// 0.3.x and 0.4.0 — identical
 println!("anchor frame {}", h.t_anchor);
-
-// 0.4.0 — milliseconds
-println!("anchor at {} ms", h.t_anchor.0);
 ```
 
-Notes:
+Why it was reverted:
 
-- `TimestampMs` is `#[repr(transparent)]` over `u64`, is `bytemuck::Pod`,
-  and implements `Ord` — sorting by `(t_anchor, hash)` still works.
-- The hash **byte layout** changed (Wang 8 → 12 bytes, Panako 16 → 28
-  bytes; structs are `#[repr(C, packed)]` with no padding). Persisted
-  fingerprints and golden files are invalidated and must be regenerated
-  (see §6 below).
-- `Fingerprint::name()` bumped: `wang-v1` → `wang-v2` (Panako was
-  already `panako-v2`; Haitsma unchanged at `haitsma-v1` — its frames
-  are dense per-frame codes, not timestamps).
-- Matching internals are unchanged: matchers convert `TimestampMs` →
-  frames at the boundary using `frames_per_sec`, so match behaviour is
-  identical.
+- The hash **byte layout** would have grown (Wang 8 → 12 bytes, Panako
+  16 → 28 bytes), invalidating persisted fingerprints and requiring a
+  serialization `FORMAT_VERSION` bump with v1-blob rejection.
+- Matching is frame-native (δ histograms, scale ratios, tolerances,
+  RANSAC) and would convert ms → frames at the boundary anyway — the
+  change was pure representation churn with no algorithmic benefit.
+- `TimestampMs` remains the unit of the **streaming emit tuples**,
+  which were already ms — no migration there either.
+
+`Fingerprint::name()` is unchanged (`wang-v1`, `panako-v2`,
+`haitsma-v1`), `FORMAT_VERSION` stays 1, and persisted v1 blobs and
+golden files remain valid.
 
 #### 3. `StreamingFingerprinter::push` / `flush` return `Result` (#63)
 
@@ -160,14 +161,12 @@ Re-exported: `Wang`, `WangConfig`, `WangFingerprint`, `WangHash`,
 `PanakoHash`, `StreamingPanako`, `Haitsma`, `HaitsmaConfig`,
 `HaitsmaFingerprint`, `StreamingHaitsma`.
 
-#### 6. Serialization format v2 (#66)
+#### 6. Serialization format: unchanged (v1) (#66)
 
-`FingerprintEnvelope::to_bytes` now writes `FORMAT_VERSION = 2`. Version
-1 blobs (0.3.x, 8/16-byte hashes) are **rejected** with
-`AfpError::UnsupportedVersion` — there is no read-and-migrate path.
-Re-extract and re-serialize any persisted fingerprints.
-
-Golden regression files were regenerated with `UPDATE_GOLDENS=1`.
+`FingerprintEnvelope::to_bytes` still writes `FORMAT_VERSION = 1`, and
+the 8-byte (Wang) / 16-byte (Panako) / 4-byte-per-frame (Haitsma) hash
+layouts are preserved. Persisted 0.3.x fingerprints and golden files
+remain valid — no re-extraction needed.
 
 #### How to verify your migration
 

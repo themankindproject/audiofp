@@ -122,11 +122,8 @@ impl WangIndex {
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
-            let fps = fp.frames_per_sec;
             for h in &fp.hashes {
-                map.entry(h.hash)
-                    .or_default()
-                    .push((ref_id, super::ms_to_frames(h.t_anchor, fps)));
+                map.entry(h.hash).or_default().push((ref_id, h.t_anchor));
             }
         }
 
@@ -165,17 +162,14 @@ impl WangIndex {
 
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
-        // Convert query ms timestamps → frames at the query's own fps so δ
-        // arithmetic is in frame units (matches WangMatcher).
-        let q_fps = query.frames_per_sec;
         let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
             super::maps::hashmap_with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
-            let q_t = super::ms_to_frames(h.t_anchor, q_fps);
-            let hh = h.hash; // copy out of packed struct (unaligned refs are UB)
+            let q_t = h.t_anchor as i64;
+            let hh = h.hash;
             if let Some(list) = self.map.get(&hh) {
                 for &(ref_id, tr) in list {
-                    let d = tr as i64 - q_t as i64;
+                    let d = tr as i64 - q_t;
                     let entry = per_ref.entry(ref_id).or_default();
                     if entry.len() < MAX_VOTES_PER_REF {
                         entry.push((d, qi as u32));
@@ -502,13 +496,12 @@ impl PanakoIndex {
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
-            let fps = fp.frames_per_sec;
             for h in &fp.hashes {
                 map.entry(h.hash).or_default().push((
                     ref_id,
-                    super::ms_to_frames(h.t_anchor, fps),
-                    super::ms_to_frames(h.t_b, fps),
-                    super::ms_to_frames(h.t_c, fps),
+                    h.t_anchor,
+                    h.t_b,
+                    h.t_c,
                 ));
             }
         }
@@ -548,14 +541,12 @@ impl PanakoIndex {
         let q_len = query.hashes.len().max(1) as f32;
 
         // Build per-reference sparse accumulator across ALL query hashes.
-        // Convert query ms timestamps → frames at the query's own fps so
-        // span/scale arithmetic is in frame units (matches PanakoMatcher).
         let mut acc: HashMap<usize, HashMap<(u32, i64), u32>> = HashMap::new();
 
         for h in &query.hashes {
             let hh = h.hash; // copy out of packed struct (unaligned refs are UB)
-            let q_ta = super::ms_to_frames(h.t_anchor, query.frames_per_sec);
-            let q_tc = super::ms_to_frames(h.t_c, query.frames_per_sec);
+            let q_ta = h.t_anchor;
+            let q_tc = h.t_c;
             if let Some(list) = self.map.get(&hh) {
                 for &(ref_id, tr_a, _tr_b, tr_c) in list {
                     let q_span = (q_tc - q_ta).max(1) as f64;
@@ -778,7 +769,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, &t)| WangHash {
                     hash: (i as u32).wrapping_add(hash_offset),
-                    t_anchor: crate::matching::frames_to_ms(t, 62.5),
+                    t_anchor: t,
                 })
                 .collect(),
             frames_per_sec: 62.5,
@@ -970,9 +961,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, &(ta, tb, tc))| PanakoHash {
                     hash: (i as u32).wrapping_add(hash_offset),
-                    t_anchor: crate::matching::frames_to_ms(ta, 62.5),
-                    t_b: crate::matching::frames_to_ms(tb, 62.5),
-                    t_c: crate::matching::frames_to_ms(tc, 62.5),
+                    t_anchor: ta,
+                    t_b: tb,
+                    t_c: tc,
                 })
                 .collect(),
             frames_per_sec: 62.5,

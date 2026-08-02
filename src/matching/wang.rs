@@ -92,22 +92,11 @@ impl Matcher for WangMatcher {
 
         let cfg = &self.cfg;
 
-        // --- 0. Convert ms timestamps → frames at the matcher boundary ---
-        // Matching internals (δ histogram, tolerances, consolidation)
-        // operate in frame units for sub-frame precision.
-        let fps = reference.frames_per_sec;
-        let q_hashes: alloc::vec::Vec<(u32, u32)> = query
-            .hashes
-            .iter()
-            .map(|h| (h.hash, super::ms_to_frames(h.t_anchor, fps)))
-            .collect();
-        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
-            .hashes
-            .iter()
-            .map(|h| (h.hash, super::ms_to_frames(h.t_anchor, fps)))
-            .collect();
-
         // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
+        let q_hashes: alloc::vec::Vec<(u32, u32)> =
+            query.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
+        let r_hashes: alloc::vec::Vec<(u32, u32)> =
+            reference.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
         let index = match SortedPostings::build(&r_hashes, cfg.max_postings_per_hash) {
             Some(sp) => sp,
             None => return MatchResult::NONE,
@@ -230,7 +219,6 @@ mod tests {
     use crate::classical::WangHash;
 
     /// Build a synthetic Wang fingerprint with known anchor positions.
-    /// `anchors` are in STFT frame units (converted to ms internally).
     fn make_fp(anchors: &[u32], hash_offset: u32) -> WangFingerprint {
         WangFingerprint {
             hashes: anchors
@@ -238,7 +226,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, &t)| WangHash {
                     hash: (i as u32).wrapping_add(hash_offset),
-                    t_anchor: crate::matching::frames_to_ms(t, 62.5),
+                    t_anchor: t,
                 })
                 .collect(),
             frames_per_sec: 62.5,
@@ -384,7 +372,7 @@ mod tests {
             hashes: (0..50)
                 .map(|i| WangHash {
                     hash: (i / 5),
-                    t_anchor: crate::matching::frames_to_ms(i * 10, 62.5),
+                    t_anchor: i * 10,
                 })
                 .collect(),
             frames_per_sec: 62.5,
@@ -413,15 +401,15 @@ mod tests {
             hashes: alloc::vec![
                 WangHash {
                     hash: 0,
-                    t_anchor: crate::matching::frames_to_ms(150, 62.5)
+                    t_anchor: 150,
                 },
                 WangHash {
                     hash: 1,
-                    t_anchor: crate::matching::frames_to_ms(249, 62.5)
+                    t_anchor: 249
                 },
                 WangHash {
                     hash: 2,
-                    t_anchor: crate::matching::frames_to_ms(351, 62.5)
+                    t_anchor: 351
                 },
             ],
             frames_per_sec: 62.5,

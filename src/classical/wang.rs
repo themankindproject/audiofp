@@ -31,18 +31,13 @@ use crate::dsp::windows::WindowKind;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target landmark pair packed into a 32-bit hash.
-///
-/// `#[repr(C, packed)]` keeps the on-disk byte size at 12 bytes
-/// (u32 hash + u64 ms timestamp) with no padding, preserving
-/// `bytemuck::Pod` for direct serialization.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WangHash {
     /// 32-bit hash: `f_a_q (9) | f_b_q (9) | Δt (14)`, MSB first.
     pub hash: u32,
-    /// Timestamp (milliseconds since stream start) of the anchor peak.
-    /// Wang extracts at 62.5 fps, so 1 frame = 16 ms.
-    pub t_anchor: TimestampMs,
+    /// STFT frame index of the anchor peak.
+    pub t_anchor: u32,
 }
 
 /// All hashes produced by [`Wang`] over an audio buffer.
@@ -50,7 +45,7 @@ pub struct WangHash {
 pub struct WangFingerprint {
     /// Hashes sorted by `(t_anchor, hash)`.
     pub hashes: Vec<WangHash>,
-    /// Frame rate of the underlying STFT — always 62.5 for `wang-v2`
+    /// Frame rate of the underlying STFT — always 62.5 for `wang-v1`
     /// (`8000 / 128`).
     pub frames_per_sec: f32,
 }
@@ -114,13 +109,6 @@ const WANG_HOP: usize = 128;
 const WANG_SR: u32 = 8_000;
 const WANG_FRAMES_PER_SEC: f32 = WANG_SR as f32 / WANG_HOP as f32;
 
-/// Convert a Wang STFT frame index to a millisecond timestamp.
-/// Frame rate is 62.5 fps (`SR / HOP`), so 1 frame = 16 ms. Uses the
-/// same integer floor-division formula as the streaming emit path.
-#[inline]
-fn wang_timestamp(frame: u32) -> TimestampMs {
-    TimestampMs((frame as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64)
-}
 /// Quantisation buckets for the 9-bit frequency field.
 const WANG_FREQ_BUCKETS: u32 = 512;
 const WANG_PEAK_NEIGHBOURHOOD: usize = 15;
@@ -317,7 +305,7 @@ impl Fingerprinter for Wang {
     type Config = WangConfig;
 
     fn name(&self) -> &'static str {
-        "wang-v2"
+        "wang-v1"
     }
 
     fn config(&self) -> &Self::Config {
@@ -411,7 +399,7 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
             hashes.push(WangHash {
                 hash,
-                t_anchor: wang_timestamp(anchor.t_frame),
+                t_anchor: anchor.t_frame,
             });
         }
     }
@@ -830,12 +818,12 @@ impl StreamingWang {
             let f_b_q = quantise_freq(target.f_bin);
             let dt = (target.t_frame - anchor.peak.t_frame).clamp(1, 0x3FFF);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
-            let t_ms = wang_timestamp(anchor.peak.t_frame);
+            let t_ms = (anchor.peak.t_frame as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
             out.push((
-                t_ms,
+                TimestampMs(t_ms),
                 WangHash {
                     hash,
-                    t_anchor: t_ms,
+                    t_anchor: anchor.peak.t_frame,
                 },
             ));
         }
@@ -1140,8 +1128,8 @@ mod tests {
         assert_eq!(f_a_q, quantise_freq(50));
         assert_eq!(f_b_q, quantise_freq(70));
         assert_eq!(dt, 10);
-        let ta = hashes[0].t_anchor; // copy out of packed struct
-        assert_eq!(ta, TimestampMs(1600)); // 100 frames × 16 ms
+        let ta = hashes[0].t_anchor;
+        assert_eq!(ta, 100);
     }
 
     #[test]
@@ -1442,8 +1430,8 @@ mod tests {
         // (|Δf|=100 > 64). Neither fits → no hash from anchor (0,200).
         // From (5,110) onwards, no later peaks fit any anchor.
         assert_eq!(hashes.len(), 1);
-        let ta = hashes[0].t_anchor; // copy out of packed struct
-        assert_eq!(ta, TimestampMs(0)); // anchor at frame 0
+        let ta = hashes[0].t_anchor;
+        assert_eq!(ta, 0);
     }
 
     // -----------------------------------------------------------------
@@ -1574,7 +1562,7 @@ mod tests {
     #[test]
     fn public_api_name_and_config_match_documented_values() {
         let fp = Wang::default();
-        assert_eq!(fp.name(), "wang-v2");
+        assert_eq!(fp.name(), "wang-v1");
         assert_eq!(fp.required_sample_rate(), 8_000);
         assert_eq!(fp.min_samples(), 16_000);
 

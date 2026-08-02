@@ -61,23 +61,18 @@ use crate::dsp::windows::WindowKind;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target-target triplet packed into a 32-bit hash plus the
-/// three ms timestamps.
-///
-/// `#[repr(C, packed)]` keeps the on-disk byte size at 28 bytes
-/// (u32 hash + 3×u64 ms timestamps) with no padding, preserving
-/// `bytemuck::Pod` for direct serialization.
-#[repr(C, packed)]
+/// three STFT frame indices.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PanakoHash {
     /// 32-bit hash; see module docs for the layout.
     pub hash: u32,
-    /// Timestamp (ms) of the anchor peak. Panako extracts at 62.5 fps,
-    /// so 1 frame = 16 ms.
-    pub t_anchor: TimestampMs,
-    /// Timestamp (ms) of the first (closer) target.
-    pub t_b: TimestampMs,
-    /// Timestamp (ms) of the second (farther) target.
-    pub t_c: TimestampMs,
+    /// STFT frame index of the anchor peak.
+    pub t_anchor: u32,
+    /// STFT frame index of the first (closer) target.
+    pub t_b: u32,
+    /// STFT frame index of the second (farther) target.
+    pub t_c: u32,
 }
 
 /// All triplet hashes produced by [`Panako`] over an audio buffer.
@@ -147,13 +142,6 @@ const PANAKO_HOP: usize = 128;
 const PANAKO_SR: u32 = 8_000;
 const PANAKO_FRAMES_PER_SEC: f32 = PANAKO_SR as f32 / PANAKO_HOP as f32;
 
-/// Convert a Panako STFT frame index to a millisecond timestamp.
-/// Frame rate is 62.5 fps (`SR / HOP`), so 1 frame = 16 ms. Uses the
-/// same integer floor-division formula as the streaming emit path.
-#[inline]
-fn panako_timestamp(frame: u32) -> TimestampMs {
-    TimestampMs((frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64)
-}
 const PANAKO_PEAK_NEIGHBOURHOOD: usize = 15;
 const PANAKO_LOG_FLOOR: f32 = 1e-6;
 /// Squared form of the magnitude floor — see Wang for rationale.
@@ -485,9 +473,9 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
             let hash = pack_triplet(anchor, b, c);
             hashes.push(PanakoHash {
                 hash,
-                t_anchor: panako_timestamp(anchor.t_frame),
-                t_b: panako_timestamp(b.t_frame),
-                t_c: panako_timestamp(c.t_frame),
+                t_anchor: anchor.t_frame,
+                t_b: b.t_frame,
+                t_c: c.t_frame,
             });
         }
     }
@@ -899,14 +887,14 @@ impl StreamingPanako {
         });
         for (b, c, _) in &self.triplet_scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
-            let t_ms = panako_timestamp(anchor.peak.t_frame);
+            let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
             out.push((
-                t_ms,
+                TimestampMs(t_ms),
                 PanakoHash {
                     hash,
-                    t_anchor: t_ms,
-                    t_b: panako_timestamp(b.t_frame),
-                    t_c: panako_timestamp(c.t_frame),
+                    t_anchor: anchor.peak.t_frame,
+                    t_b: b.t_frame,
+                    t_c: c.t_frame,
                 },
             ));
         }

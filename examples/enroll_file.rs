@@ -41,9 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let preview = fp.hashes.iter().take(8);
     println!("\nFirst 8 hashes (t_anchor, hash):");
     for h in preview {
-        let t = h.t_anchor; // copy out of packed struct
+        let t = h.t_anchor;
         let hash = h.hash;
-        println!("  {:>6}  {:08x}", t.0, hash);
+        println!("  {:>6}  {:08x}", t, hash);
     }
 
     Ok(())

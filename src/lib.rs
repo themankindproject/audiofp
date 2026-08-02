@@ -62,8 +62,8 @@
 //!     hashes: (0..8u32)
 //!         .map(|i| WangHash {
 //!             hash: i,
-//!             // 10 STFT frames apart = 160 ms at 62.5 fps.
-//!             t_anchor: audiofp::TimestampMs(i as u64 * 160),
+//!             // 10 STFT frames apart (frame index in t_anchor).
+//!             t_anchor: i * 10,
 //!         })
 //!         .collect(),
 //!     frames_per_sec: 62.5,

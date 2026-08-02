@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     for h in &fpr.hashes {
-        let bytes: [u8; 28] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
+        let bytes: [u8; 16] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
         let roundtripped: audiofp::classical::PanakoHash = bytemuck::pod_read_unaligned(&bytes);
         assert_eq!(*h, roundtripped);
     }

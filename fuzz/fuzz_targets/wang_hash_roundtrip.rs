@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Roundtrip: hash -> bytes -> hash
     for h in &fpr.hashes {
-        let bytes: [u8; 12] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
+        let bytes: [u8; 8] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
         let roundtripped: audiofp::classical::WangHash = bytemuck::pod_read_unaligned(&bytes);
         assert_eq!(*h, roundtripped);
     }

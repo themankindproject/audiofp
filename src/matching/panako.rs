@@ -128,40 +128,14 @@ impl Matcher for PanakoMatcher {
 
         let cfg = &self.cfg;
 
-        // --- 0. Convert ms timestamps → frames at the matcher boundary ---
-        // Matching internals (spans, scale ratios, offsets, RANSAC)
-        // operate in frame units for sub-frame precision.
-        let fps = reference.frames_per_sec;
-        let q_triples: alloc::vec::Vec<(u32, u32, u32, u32)> = query
-            .hashes
-            .iter()
-            .map(|h| {
-                (
-                    h.hash,
-                    super::ms_to_frames(h.t_anchor, fps),
-                    super::ms_to_frames(h.t_b, fps),
-                    super::ms_to_frames(h.t_c, fps),
-                )
-            })
-            .collect();
-        let r_triples: alloc::vec::Vec<(u32, u32, u32, u32)> = reference
-            .hashes
-            .iter()
-            .map(|h| {
-                (
-                    h.hash,
-                    super::ms_to_frames(h.t_anchor, fps),
-                    super::ms_to_frames(h.t_b, fps),
-                    super::ms_to_frames(h.t_c, fps),
-                )
-            })
-            .collect();
-
         // --- 1. Index reference hashes ---
         // Keyed by hash; each posting stores the full triplet timestamps.
         let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = HashMap::new();
-        for &(hash, ta, tb, tc) in &r_triples {
-            index.entry(hash).or_default().push((ta, tb, tc));
+        for h in &reference.hashes {
+            index
+                .entry(h.hash)
+                .or_default()
+                .push((h.t_anchor, h.t_b, h.t_c));
         }
         index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
 
@@ -189,7 +163,10 @@ impl Matcher for PanakoMatcher {
         let mut pairs: Vec<(f64, f64)> = Vec::new();
         let tol = cfg.offset_tolerance_frames as i64;
 
-        for &(hash, q_ta, _q_tb, q_tc) in &q_triples {
+        for h in &query.hashes {
+            let hash = h.hash;
+            let q_ta = h.t_anchor;
+            let q_tc = h.t_c;
             if let Some(list) = index.get(&hash) {
                 for &(tr_a, _tr_b, tr_c) in list {
                     let q_span = (q_tc - q_ta).max(1) as f64;
@@ -466,9 +443,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, &(ta, tb, tc))| PanakoHash {
                     hash: (i as u32).wrapping_add(hash_offset),
-                    t_anchor: crate::matching::frames_to_ms(ta, 62.5),
-                    t_b: crate::matching::frames_to_ms(tb, 62.5),
-                    t_c: crate::matching::frames_to_ms(tc, 62.5),
+                    t_anchor: ta,
+                    t_b: tb,
+                    t_c: tc,
                 })
                 .collect(),
             frames_per_sec: 62.5,
