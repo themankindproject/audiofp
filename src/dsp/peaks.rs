@@ -113,13 +113,14 @@ impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
+        let dq_cap = 2 * cfg.neighborhood_t.max(cfg.neighborhood_f) + 2;
         Self {
             cfg,
             max_buf: Vec::new(),
             temp_2d: Vec::new(),
             col_in: Vec::new(),
             col_out: Vec::new(),
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(dq_cap),
             candidates: Vec::new(),
         }
     }
@@ -151,15 +152,17 @@ impl PeakPicker {
         }
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
 
+        #[inline]
+        fn prepare_vec(v: &mut Vec<f32>, new_len: usize) {
+            v.clear();
+            v.resize(new_len, 0.0);
+        }
+
         // Resize pooled scratch (no-op when capacity already covers it).
-        self.max_buf.clear();
-        self.max_buf.resize(spec.len(), 0.0);
-        self.temp_2d.clear();
-        self.temp_2d.resize(spec.len(), 0.0);
-        self.col_in.clear();
-        self.col_in.resize(n_frames, 0.0);
-        self.col_out.clear();
-        self.col_out.resize(n_frames, 0.0);
+        prepare_vec(&mut self.max_buf, spec.len());
+        prepare_vec(&mut self.temp_2d, spec.len());
+        prepare_vec(&mut self.col_in, n_frames);
+        prepare_vec(&mut self.col_out, n_frames);
 
         rolling_max_2d_pooled(
             spec,
@@ -215,9 +218,7 @@ impl PeakPicker {
 
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        let result = self.candidates.clone();
-        self.candidates.clear();
-        result
+        core::mem::take(&mut self.candidates)
     }
 }
 
@@ -461,7 +462,7 @@ impl IncrementalPeakDetector {
             n_pushed: 0,
             vert_deques,
             horiz_scratch: alloc::vec![0.0_f32; n_bins],
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(2 * kf + 2),
         }
     }
 

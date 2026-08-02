@@ -114,12 +114,10 @@ pub struct SincResampler {
     from_sr: u32,
     to_sr: u32,
     quality: SincQuality,
-    /// Precomputed reciprocal of the kernel's DC gain; multiplied per
-    /// output sample to normalise constant signals to unity.
-    inv_dc_gain: f32,
     /// Precomputed polyphase kernel table: `[steps][2*half_taps+1]`.
     /// Each row holds the sinc·Kaiser coefficients for one fractional
-    /// offset, avoiding per-sample kernel evaluation in `process`.
+    /// offset, pre-multiplied by `1/dc_gain` so the hot loop is a
+    /// single dot product with no extra multiply.
     kernel_table: Vec<f32>,
 }
 
@@ -137,9 +135,36 @@ impl SincResampler {
     /// Panics if `from_sr == 0`, `to_sr == 0`, or `quality.half_taps == 0`.
     #[must_use]
     pub fn with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> Self {
-        assert!(from_sr > 0 && to_sr > 0, "sample rates must be non-zero");
-        assert!(quality.half_taps > 0, "half_taps must be > 0");
-        assert!(quality.polyphase_steps > 0, "polyphase_steps must be > 0");
+        Self::try_with_quality(from_sr, to_sr, quality).expect("invalid SincResampler config")
+    }
+
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
+    /// parameters instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// - `from_sr` or `to_sr` is zero
+    /// - `quality.half_taps` is zero
+    /// - `quality.polyphase_steps` is zero
+    pub fn try_new(from_sr: u32, to_sr: u32) -> crate::Result<Self> {
+        Self::try_with_quality(from_sr, to_sr, SincQuality::default())
+    }
+
+    /// Fallible version of [`with_quality`](Self::with_quality).
+    pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
+        if from_sr == 0 || to_sr == 0 {
+            return Err(crate::AfpError::Config(
+                "sample rates must be non-zero".into(),
+            ));
+        }
+        if quality.half_taps == 0 {
+            return Err(crate::AfpError::Config("half_taps must be > 0".into()));
+        }
+        if quality.polyphase_steps == 0 {
+            return Err(crate::AfpError::Config(
+                "polyphase_steps must be > 0".into(),
+            ));
+        }
 
         let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
         let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
@@ -172,13 +197,18 @@ impl SincResampler {
         }
         let inv_dc_gain = 1.0 / dc_gain;
 
-        Self {
+        // Pre-multiply all kernel coefficients by inv_dc_gain so we don't
+        // need a per-sample multiply in the hot loop.
+        for v in kernel_table.iter_mut() {
+            *v *= inv_dc_gain;
+        }
+
+        Ok(Self {
             from_sr,
             to_sr,
             quality,
-            inv_dc_gain,
             kernel_table,
-        }
+        })
     }
 
     /// Borrow the quality knobs this resampler was built with.
@@ -247,7 +277,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc * self.inv_dc_gain);
+            out.push(acc);
         }
 
         // Middle: kernel is fully inside input — no bounds check.
@@ -259,12 +289,8 @@ impl SincResampler {
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let base = i_centre.wrapping_sub(half);
-            let acc: f32 = input[base..base + taps]
-                .iter()
-                .zip(kernel.iter())
-                .map(|(&s, &k)| s * k)
-                .sum();
-            out.push(acc * self.inv_dc_gain);
+            let acc = super::dot_wide(&input[base..base + taps], kernel);
+            out.push(acc);
         }
 
         // Right boundary: kernel may extend past the end of input.
@@ -283,7 +309,7 @@ impl SincResampler {
                 }
                 acc += input[idx as usize] * coeff;
             }
-            out.push(acc * self.inv_dc_gain);
+            out.push(acc);
         }
     }
 }

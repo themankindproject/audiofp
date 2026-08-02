@@ -25,7 +25,13 @@ fuzz_target!(|data: &[u8]| {
 
     let fmin = input.fmin.abs().max(1.0).min(1000.0);
     let fmax = input.fmax.abs().max(fmin + 100.0).min(2000.0);
-    let cfg = HaitsmaConfig { fmin, fmax };
+    let cfg = {
+        let mut c = HaitsmaConfig::default();
+        c.fmin = fmin;
+        c.fmax = fmax;
+        c.max_input_samples = None;
+        c
+    };
 
     let samples = &input.samples[..min_len];
     let buf = AudioBuffer {

@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose an enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Check [PROD_GRADE.md](https://github.com/themankindproject/audiofp/blob/main/PROD_GRADE.md) and open issues before filing duplicates.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: dropdown
+    id: semver
+    attributes:
+      label: Semver impact
+      options:
+        - non-breaking (additive / internal)
+        - breaking (0.4.0+)
+        - unknown
+    validations:
+      required: true
+  - type: checkboxes
+    id: labels_hint
+    attributes:
+      label: Suggested labels (maintainers will apply)
+      options:
+        - label: security
+        - label: performance
+        - label: matching
+        - label: bindings
+        - label: ci / tests
+        - label: documentation

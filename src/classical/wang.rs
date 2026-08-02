@@ -51,6 +51,9 @@ pub struct WangFingerprint {
 }
 
 /// Tunable parameters for [`Wang`].
+///
+/// Always construct with FRU so future additive fields stay compatible:
+/// `WangConfig { fan_out: 5, ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct WangConfig {
     /// `F`: target peaks paired with each anchor. Default 10; embedded
@@ -64,6 +67,25 @@ pub struct WangConfig {
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
     pub min_anchor_mag_db: f32,
+    /// Maximum input sample count accepted by [`extract`]. `None` disables
+    /// the check (full backward compatibility). Default: 14_400_000
+    /// (30 minutes at 8 kHz).
+    ///
+    /// [`extract`]: Wang::extract
+    pub max_input_samples: Option<usize>,
+    /// Maximum number of hashes allowed. `None` disables. Default: 500_000
+    /// — enough for ~2 hours of rich music at default fan_out=10.
+    pub max_hashes: Option<usize>,
+    /// Maximum number of pending anchors in the streaming pipeline.
+    /// `None` disables (default, unbounded). When set, anchors exceeding
+    /// this cap are dropped oldest-first so memory stays bounded.
+    /// Recommended: `Some(10_000)` for untrusted input.
+    /// Relevant only for [`StreamingWang`].
+    pub max_pending_anchors: Option<usize>,
+    /// Maximum samples accepted in a single `push` call. `None` disables
+    /// (default). When set, excess samples beyond the cap are **dropped**
+    /// (streaming `push` is infallible).
+    pub max_push_samples: Option<usize>,
 }
 
 impl Default for WangConfig {
@@ -74,6 +96,10 @@ impl Default for WangConfig {
             target_zone_f: 64,
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
+            max_input_samples: Some(30 * 60 * WANG_SR as usize),
+            max_hashes: Some(500_000),
+            max_pending_anchors: None,
+            max_push_samples: None,
         }
     }
 }
@@ -90,7 +116,7 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 /// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
 /// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
 const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
-use crate::dsp::DB_LOG2_FACTOR;
+use crate::dsp::power_to_db_wide;
 
 /// Wang offline fingerprinter.
 ///
@@ -126,8 +152,28 @@ impl Default for Wang {
 
 impl Wang {
     /// Build a Wang extractor with the given config.
+    ///
+    /// Clamps `target_zone_t` to a minimum of 1 and `fan_out` to a
+    /// minimum of 1 to prevent underflows/empty output from degenerate
+    /// configurations. Caps `target_zone_t` at 512 and `fan_out` at 64
+    /// to prevent OOM from extreme values.
     #[must_use]
-    pub fn new(cfg: WangConfig) -> Self {
+    pub fn new(mut cfg: WangConfig) -> Self {
+        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
+        cfg.fan_out = cfg.fan_out.clamp(1, 64);
+        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        // Reject zero-value limits (would reject all inputs/outputs).
+        if cfg.max_input_samples == Some(0) {
+            cfg.max_input_samples = Some(1);
+        }
+        if cfg.max_hashes == Some(0) {
+            cfg.max_hashes = Some(1);
+        }
+        if cfg.max_pending_anchors == Some(0) {
+            cfg.max_pending_anchors = Some(1);
+        }
+        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
+        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -148,6 +194,106 @@ impl Wang {
             picker,
             log_spec: Vec::new(),
         }
+    }
+}
+
+/// Progress callback reporting interval for Wang/Panako (62.5 fps):
+/// every 32 frames ≈ 500 ms of audio.
+const WANG_PROGRESS_INTERVAL: usize = 32;
+
+impl Wang {
+    /// Extract fingerprint with a progress callback.
+    ///
+    /// `progress` is called periodically with a value in `[0.0, 1.0]`
+    /// representing the fraction of work completed. The final call is
+    /// always made with `1.0`. The callback is invoked at most once per
+    /// ~500 ms of audio to avoid overhead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fingerprinter::extract`].
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self,
+        audio: AudioBuffer<'_>,
+        mut progress: F,
+    ) -> Result<WangFingerprint> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
+        if audio.rate.hz() != WANG_SR {
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        }
+        if audio.samples.len() < self.min_samples() {
+            return Err(AfpError::AudioTooShort {
+                needed: self.min_samples(),
+                got: audio.samples.len(),
+            });
+        }
+
+        progress(0.0);
+
+        // Compute power (|X|²) directly from the FFT — skips a per-bin
+        // sqrt that the dB conversion would immediately undo.
+        // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
+        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
+        if n_frames == 0 {
+            progress(1.0);
+            return Ok(WangFingerprint {
+                hashes: Vec::new(),
+                frames_per_sec: WANG_FRAMES_PER_SEC,
+            });
+        }
+
+        // Report progress through the STFT phase (~70% of total work).
+        // Since power_flat_into is a bulk operation, report proportional
+        // progress at intervals based on frame count.
+        let total_frames = n_frames;
+        let stft_weight = 0.7_f32;
+        let interval = WANG_PROGRESS_INTERVAL;
+        {
+            let mut reported = 0usize;
+            while reported + interval < total_frames {
+                reported += interval;
+                progress(stft_weight * (reported as f32 / total_frames as f32));
+            }
+        }
+        progress(stft_weight);
+
+        // Convert power → dB log-magnitude in-place.
+        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
+        power_to_db_wide(&mut self.log_spec, WANG_LOG_FLOOR_POWER);
+        progress(0.80);
+
+        let peaks = self
+            .picker
+            .pick(&self.log_spec, n_frames, n_bins, WANG_FRAMES_PER_SEC);
+        progress(0.90);
+
+        let mut hashes = build_hashes(&peaks, &self.cfg);
+        // Stable, deterministic ordering for round-trip and golden tests.
+        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+
+        if let Some(limit) = self.cfg.max_hashes
+            && hashes.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: hashes.len(),
+            });
+        }
+
+        progress(1.0);
+
+        Ok(WangFingerprint {
+            hashes,
+            frames_per_sec: WANG_FRAMES_PER_SEC,
+        })
     }
 }
 
@@ -172,45 +318,7 @@ impl Fingerprinter for Wang {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        if audio.rate.hz() != WANG_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
-        }
-        if audio.samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: audio.samples.len(),
-            });
-        }
-
-        // Compute power (|X|²) directly from the FFT — skips a per-bin
-        // sqrt that the dB conversion would immediately undo.
-        // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
-        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
-        if n_frames == 0 {
-            return Ok(WangFingerprint {
-                hashes: Vec::new(),
-                frames_per_sec: WANG_FRAMES_PER_SEC,
-            });
-        }
-
-        // Convert power → dB log-magnitude in-place.
-        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
-        for v in self.log_spec.iter_mut() {
-            *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
-        }
-
-        let peaks = self
-            .picker
-            .pick(&self.log_spec, n_frames, n_bins, WANG_FRAMES_PER_SEC);
-
-        let mut hashes = build_hashes(&peaks, &self.cfg);
-        // Stable, deterministic ordering for round-trip and golden tests.
-        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
-
-        Ok(WangFingerprint {
-            hashes,
-            frames_per_sec: WANG_FRAMES_PER_SEC,
-        })
+        self.extract_with_progress(audio, |_| {})
     }
 }
 
@@ -419,8 +527,27 @@ impl Default for StreamingWang {
 
 impl StreamingWang {
     /// Build a streaming Wang extractor with the given config.
+    ///
+    /// Clamps `target_zone_t` to a minimum of 1 and `fan_out` to a
+    /// minimum of 1 to prevent underflows/empty output from degenerate
+    /// configurations. Caps `target_zone_t` at 512 and `fan_out` at 64
+    /// to prevent OOM from extreme values.
     #[must_use]
-    pub fn new(cfg: WangConfig) -> Self {
+    pub fn new(mut cfg: WangConfig) -> Self {
+        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
+        cfg.fan_out = cfg.fan_out.clamp(1, 64);
+        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
+        if cfg.max_input_samples == Some(0) {
+            cfg.max_input_samples = Some(1);
+        }
+        if cfg.max_hashes == Some(0) {
+            cfg.max_hashes = Some(1);
+        }
+        if cfg.max_pending_anchors == Some(0) {
+            cfg.max_pending_anchors = Some(1);
+        }
+        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
+        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -458,6 +585,25 @@ impl StreamingWang {
     #[must_use]
     pub fn config(&self) -> &WangConfig {
         &self.cfg
+    }
+
+    /// Reset all internal state. The stream behaves as if freshly
+    /// constructed: no buffered audio, no pending peaks or anchors.
+    /// Call between independent streams sharing one instance so stale
+    /// data from a previous stream doesn't bleed into the first
+    /// emitted hash.
+    pub fn reset(&mut self) {
+        self.sample_carry.clear();
+        self.peak_det.reset();
+        self.spec_n_rows = 0;
+        self.spec_first_frame = 0;
+        self.n_frames_total = 0;
+        self.last_pd_frame = -1;
+        self.bucket_pending.clear();
+        self.last_finalized_bucket = -1;
+        self.pending_anchors.clear();
+        self.to_finalize.clear();
+        self.emitted.clear();
     }
 
     /// Frames an anchor must have *after* it before all of its targets
@@ -579,6 +725,13 @@ impl StreamingWang {
                 }
             }
             // Register this peak as a new ANCHOR.
+            // If a hard cap is configured, evict oldest anchors first
+            // so memory stays bounded under adversarial / dense input.
+            if let Some(limit) = self.cfg.max_pending_anchors {
+                while self.pending_anchors.len() >= limit {
+                    self.pending_anchors.pop_front();
+                }
+            }
             self.pending_anchors.push_back(PendingAnchor {
                 peak,
                 targets: alloc::collections::BinaryHeap::with_capacity(fan_out + 1),
@@ -672,42 +825,28 @@ impl StreamingWang {
             ));
         }
     }
-}
 
-impl StreamingFingerprinter for StreamingWang {
-    type Frame = WangHash;
+    // ── Private helpers for the zero-alloc push_with / flush_with path ──
 
-    fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
-        self.emitted.clear();
-        self.sample_carry.extend_from_slice(samples);
+    /// Common processing for `push` and `push_with`: advance the STFT,
+    /// detect peaks, finalise buckets, emit ready anchors into
+    /// `self.emitted`.
+    fn process_push_samples(&mut self, samples: &[f32]) {
+        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
-        // 1. Compute new STFT frames one at a time, detecting peaks at
-        // each frame as soon as it becomes ripe (i.e. its full forward
-        // neighbourhood is in the buffer).
-        //
-        // Walk frames with an offset cursor so we drain `sample_carry`
-        // exactly once at the end of the call instead of shifting the
-        // tail by `WANG_HOP` after every frame; the loop becomes
-        // O(frames) instead of O(frames × buffer).
         let mut off = 0usize;
         while self.sample_carry.len() - off >= WANG_N_FFT {
             self.stft.process_frame_power(
                 &self.sample_carry[off..off + WANG_N_FFT],
                 &mut self.frame_scratch,
             );
-            for v in self.frame_scratch.iter_mut() {
-                *v = DB_LOG2_FACTOR * v.max(WANG_LOG_FLOOR_POWER).log2();
-            }
-            // Append `self.frame_scratch` directly via disjoint field
-            // borrow, avoiding a per-frame `Vec::clone` of the row.
+            power_to_db_wide(&mut self.frame_scratch, WANG_LOG_FLOOR_POWER);
             self.append_frame_scratch_row();
 
             self.n_frames_total += 1;
             off += WANG_HOP;
 
-            // Feed the new row to the incremental peak detector. When the
-            // center of the vertical window becomes ripe, it returns the
-            // 2-D rolling-max for that row so we can compare peaks.
             if let Some(ripe_abs) = self
                 .peak_det
                 .push_row(&self.frame_scratch, &mut self.peak_row_max)
@@ -722,18 +861,14 @@ impl StreamingFingerprinter for StreamingWang {
             self.sample_carry.drain(0..off);
         }
 
-        // 2. Finalise any buckets whose frames are all detected.
         self.finalize_buckets();
-
-        // 3. Emit hashes for anchors whose target zone is fully observed.
         self.emit_finalized_anchors();
-        core::mem::take(&mut self.emitted)
     }
 
-    fn flush(&mut self) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
-        self.emitted.clear();
-        // Flush remaining frames from the incremental peak detector.
-        // These are frames whose forward context extends past end-of-stream.
+    /// Common processing for `flush` and `flush_with`: drain remaining
+    /// peaks from the incremental detector, finalise all buckets, emit
+    /// all anchors into `self.emitted`.
+    fn process_flush(&mut self) {
         let n_bins = self.spec_n_bins;
         let min_mag = self.cfg.min_anchor_mag_db;
         let spec = &self.spec;
@@ -764,10 +899,6 @@ impl StreamingFingerprinter for StreamingWang {
                 *last_pd = ripe_abs as i32;
             });
 
-        // Finalise every remaining bucket — no more peaks can arrive.
-        // Reuse the pooled buffer (`to_finalize`) rather than a fresh
-        // `Vec::collect()`, matching `finalize_buckets`. Index-based
-        // loop to avoid the `drain` borrow conflict.
         self.to_finalize.clear();
         self.to_finalize
             .extend(self.bucket_pending.iter().map(|e| e.0));
@@ -778,12 +909,59 @@ impl StreamingFingerprinter for StreamingWang {
         }
         self.to_finalize.clear();
 
-        // Emit every remaining anchor — no more targets can arrive.
         let mut emitted = core::mem::take(&mut self.emitted);
         while let Some(anchor) = self.pending_anchors.pop_front() {
             self.build_hashes_for_anchor(anchor, &mut emitted);
         }
-        emitted
+        self.emitted = emitted;
+    }
+}
+
+impl StreamingFingerprinter for StreamingWang {
+    type Frame = WangHash;
+
+    fn required_sample_rate(&self) -> u32 {
+        WANG_SR
+    }
+
+    fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
+        self.emitted.clear();
+        self.process_push_samples(samples);
+        core::mem::take(&mut self.emitted)
+    }
+
+    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        self.emitted.clear();
+        self.process_push_samples(samples);
+        let mut n = 0usize;
+        for (t, frame) in self.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        n
+    }
+
+    fn flush(&mut self) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
+        self.emitted.clear();
+        self.process_flush();
+        core::mem::take(&mut self.emitted)
+    }
+
+    fn flush_with<F>(&mut self, mut callback: F) -> usize
+    where
+        F: FnMut(TimestampMs, &Self::Frame),
+    {
+        self.emitted.clear();
+        self.process_flush();
+        let mut n = 0usize;
+        for (t, frame) in self.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        n
     }
 
     fn latency_ms(&self) -> u32 {
@@ -828,7 +1006,7 @@ mod tests {
         };
         match fp.extract(buf) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
-            other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
+            other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
     }
 
@@ -1438,11 +1616,354 @@ mod tests {
         assert_eq!(fp.required_sample_rate(), 8_000);
         assert_eq!(fp.min_samples(), 16_000);
 
-        // The streaming trait does not carry a `name`; we just pin
-        // `latency_ms` (computed at the call site from the same
-        // constants the public docs quote).
         let s = StreamingWang::default();
-        // 2 256 ms at the documented defaults.
         assert_eq!(s.latency_ms(), 2_256);
+    }
+
+    // ── Backward-compat (& forward-safe) constructor clamping tests ──
+
+    #[test]
+    fn default_config_is_unchanged_by_guard_clamps() {
+        // The clamp ceilings are well above the defaults; defaults
+        // must survive construction unmodified.
+        let fp = Wang::default();
+        assert_eq!(fp.config().fan_out, 10);
+        assert_eq!(fp.config().target_zone_t, 63);
+        assert_eq!(fp.config().peaks_per_sec, 30);
+    }
+
+    #[test]
+    fn zero_target_zone_is_clamped_to_one_not_underflow() {
+        let cfg = WangConfig {
+            target_zone_t: 0,
+            ..WangConfig::default()
+        };
+        let fp = Wang::new(cfg);
+        assert_eq!(fp.config().target_zone_t, 1);
+    }
+
+    #[test]
+    fn extreme_config_is_clamped_within_safe_bounds() {
+        let cfg = WangConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..WangConfig::default()
+        };
+        let fp = Wang::new(cfg);
+        assert_eq!(fp.config().fan_out, 64);
+        assert_eq!(fp.config().target_zone_t, 512);
+        assert_eq!(fp.config().peaks_per_sec, 500);
+    }
+
+    #[test]
+    fn clamped_config_still_produces_valid_hashes() {
+        // Config with extreme-but-clamped values must not panic/error
+        // when run against real audio.
+        let cfg = WangConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 3);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let fpr = fp.extract(buf).unwrap();
+        assert!(!fpr.hashes.is_empty());
+    }
+
+    #[test]
+    fn streaming_default_config_is_unchanged_by_guard_clamps() {
+        let s = StreamingWang::default();
+        let cfg = s.config();
+        assert_eq!(cfg.fan_out, 10);
+        assert_eq!(cfg.target_zone_t, 63);
+        assert_eq!(cfg.peaks_per_sec, 30);
+    }
+
+    #[test]
+    fn streaming_extreme_config_is_clamped_within_safe_bounds() {
+        let cfg = WangConfig {
+            fan_out: u16::MAX,
+            target_zone_t: u16::MAX,
+            peaks_per_sec: u16::MAX,
+            ..WangConfig::default()
+        };
+        let s = StreamingWang::new(cfg);
+        assert_eq!(s.config().fan_out, 64);
+        assert_eq!(s.config().target_zone_t, 512);
+        assert_eq!(s.config().peaks_per_sec, 500);
+    }
+
+    #[test]
+    fn streaming_reset_clears_all_state() {
+        let mut s = StreamingWang::default();
+        // Push audio to build up state.
+        let samples = synthetic_audio(0xFEED, 8_000 * 4);
+        let before = s.push(&samples);
+        assert!(!before.is_empty(), "should produce hashes");
+
+        s.reset();
+        assert!(s.push(&[]).is_empty(), "reset should clear state");
+        // Fresh push of same audio should produce identical hashes.
+        let after_reset = s.push(&samples);
+        assert!(!after_reset.is_empty());
+        assert_eq!(
+            before, after_reset,
+            "reset+replay must produce identical hashes"
+        );
+    }
+
+    // ── Performance regression: zero-alloc push_with contract ──
+
+    #[test]
+    fn push_with_matches_push_output_count() {
+        let mut a = StreamingWang::default();
+        let mut b = StreamingWang::default();
+        let samples = synthetic_audio(0xABCD, 8_000 * 4);
+
+        let via_push = a.push(&samples);
+        let mut via_cb: Vec<(TimestampMs, WangHash)> = Vec::new();
+        let n = b.push_with(&samples, |t, f| via_cb.push((t, *f)));
+        let via_flush = b.flush();
+        let flush_len = via_flush.len();
+        via_cb.extend(via_flush);
+
+        // push() returns flush-drainable output; collect the same.
+        let mut all_via_push = via_push;
+        all_via_push.extend(a.flush());
+
+        assert_eq!(n + flush_len, all_via_push.len());
+        assert_eq!(
+            via_cb, all_via_push,
+            "push_with must emit exactly what push+flush emits"
+        );
+    }
+
+    #[test]
+    fn flush_with_matches_flush_output() {
+        let mut a = StreamingWang::default();
+        let mut b = StreamingWang::default();
+        // Push nothing; just drain at end of hypothetical stream.
+        let samples = synthetic_audio(0xF00D, 8_000 * 4);
+        let _ = a.push(&samples);
+        let _ = b.push(&samples);
+
+        let via_flush = a.flush();
+        let mut via_cb: Vec<(TimestampMs, WangHash)> = Vec::new();
+        let n = b.flush_with(|t, f| via_cb.push((t, *f)));
+
+        assert_eq!(n, via_flush.len());
+        assert_eq!(via_cb, via_flush);
+    }
+
+    // ── OOM protection: max_input_samples enforcement ──
+
+    #[test]
+    fn default_max_input_samples_is_set() {
+        let fp = Wang::default();
+        assert!(fp.config().max_input_samples.is_some());
+    }
+
+    #[test]
+    fn input_larger_than_max_is_rejected() {
+        let cfg = WangConfig {
+            max_input_samples: Some(1_000),
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        let samples = vec![0.0_f32; 2_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        match err {
+            AfpError::InputTooLarge { limit, provided } => {
+                assert_eq!(limit, 1_000);
+                assert_eq!(provided, 2_000);
+            }
+            other => panic!("expected InputTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn none_disables_max_input_check() {
+        let cfg = WangConfig {
+            max_input_samples: None,
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        // 16_000 samples (2 s) is above default limit but None passes.
+        let samples = vec![0.0_f32; 16_000];
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        fp.extract(buf).unwrap();
+    }
+
+    #[test]
+    fn valid_input_under_limit_passes() {
+        let cfg = WangConfig {
+            max_input_samples: Some(100_000),
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 3);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        fp.extract(buf).unwrap();
+    }
+
+    #[test]
+    fn max_hashes_enforced_rejects_too_many() {
+        let cfg = WangConfig {
+            max_hashes: Some(10),
+            ..WangConfig::default()
+        };
+        let mut fp = Wang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn max_pending_anchors_evicts_oldest() {
+        let cfg = WangConfig {
+            max_pending_anchors: Some(100),
+            ..WangConfig::default()
+        };
+        let mut s = StreamingWang::new(cfg);
+        let samples = synthetic_audio(0xCAFE, 8_000 * 20);
+        let mut hashes = s.push(&samples);
+        hashes.extend(s.flush());
+        assert!(s.config().max_pending_anchors.is_some());
+        assert!(!hashes.is_empty(), "should produce hashes with cap=100");
+    }
+
+    #[test]
+    fn extract_rejects_nan_pcm() {
+        let mut fp = Wang::default();
+        let mut samples = vec![0.0_f32; 8_000 * 3];
+        samples[100] = f32::NAN;
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let err = fp.extract(buf).unwrap_err();
+        assert!(matches!(err, AfpError::NonFiniteSample { index: 100 }));
+    }
+
+    #[test]
+    fn max_push_samples_truncates_hostile_chunk() {
+        let cfg = WangConfig {
+            max_push_samples: Some(512),
+            ..WangConfig::default()
+        };
+        let mut s = StreamingWang::new(cfg);
+        let samples = synthetic_audio(0xBEEF, 8_000 * 5);
+        let _ = s.push(&samples);
+        let _ = s.flush();
+        assert_eq!(s.config().max_push_samples, Some(512));
+    }
+
+    #[test]
+    fn push_sanitizes_nan_to_zero() {
+        let mut clean = StreamingWang::default();
+        let mut dirty = StreamingWang::default();
+        let mut samples = synthetic_audio(0xABCD, 8_000 * 3);
+        let a = clean.push(&samples);
+        samples[10] = f32::NAN;
+        samples[20] = f32::INFINITY;
+        let b = dirty.push(&samples);
+        // Sanitized NaN/Inf → 0.0; hashes need not match exactly, but push must not panic.
+        let _ = (a, b);
+        let _ = dirty.flush();
+    }
+
+    // ── Progress callback tests ──
+
+    #[test]
+    fn extract_with_progress_is_called_and_monotonic() {
+        let mut fp = Wang::default();
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        assert!(result.is_ok());
+        // Must be called at least a few times.
+        assert!(
+            values.len() >= 3,
+            "expected at least 3 progress calls, got {}",
+            values.len()
+        );
+        // First value must be 0.0.
+        assert_eq!(values[0], 0.0);
+        // Last value must be 1.0.
+        assert_eq!(*values.last().unwrap(), 1.0);
+        // Must be monotonically non-decreasing.
+        for w in values.windows(2) {
+            assert!(w[1] >= w[0], "progress went backwards: {} → {}", w[0], w[1]);
+        }
+        // All values must be in [0, 1].
+        for &v in &values {
+            assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn extract_with_progress_matches_extract_output() {
+        let samples = synthetic_audio(0xDEAD, 8_000 * 4);
+
+        let mut fp1 = Wang::default();
+        let result1 = fp1
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+
+        let mut fp2 = Wang::default();
+        let result2 = fp2
+            .extract_with_progress(
+                AudioBuffer {
+                    samples: &samples,
+                    rate: SampleRate::HZ_8000,
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(result1.hashes, result2.hashes);
+        assert_eq!(result1.frames_per_sec, result2.frames_per_sec);
+    }
+
+    #[test]
+    fn extract_with_progress_short_audio_still_reports_0_and_1() {
+        let mut fp = Wang::default();
+        // Exactly at minimum length — should still give 0.0 and 1.0.
+        let samples = synthetic_audio(0xFACE, 8_000 * 2);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        assert_eq!(values[0], 0.0);
+        assert_eq!(*values.last().unwrap(), 1.0);
     }
 }

@@ -125,6 +125,19 @@ pub trait StreamingFingerprinter {
     /// One unit of fingerprint material the stream emits.
     type Frame;
 
+    /// Sample rate, in hertz, the stream expects its input at.
+    ///
+    /// Callers **must** feed samples at this rate — the streaming API
+    /// accepts raw `&[f32]` with no embedded rate tag, so there is no
+    /// runtime check. Feeding the wrong rate produces garbage hashes
+    /// silently.
+    ///
+    /// The default implementation returns `0` (unspecified). All built-in
+    /// streaming fingerprinters override this with their actual rate.
+    fn required_sample_rate(&self) -> u32 {
+        0
+    }
+
     /// Feed PCM samples and return any fingerprints that became available
     /// during this push.
     ///

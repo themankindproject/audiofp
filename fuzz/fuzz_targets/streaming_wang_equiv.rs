@@ -24,11 +24,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let cfg = WangConfig {
-        fan_out: input.fan_out.max(1).min(20),
-        target_zone_t: input.target_zone_t.max(1).min(128),
-        peaks_per_sec: input.peaks_per_sec.max(1).min(60),
-        ..Default::default()
+    let cfg = {
+        let mut c = WangConfig::default();
+        c.fan_out = input.fan_out.max(1).min(20);
+        c.target_zone_t = input.target_zone_t.max(1).min(128);
+        c.peaks_per_sec = input.peaks_per_sec.max(1).min(60);
+        c
     };
 
     let samples = &input.samples[..min_len];

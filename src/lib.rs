@@ -98,17 +98,23 @@ pub mod io;
 pub mod matching;
 #[cfg(feature = "neural")]
 pub mod neural;
+/// Convenience re-exports of the most commonly used types. See
+/// [`prelude`] for details.
+pub mod prelude;
+pub mod serial;
 #[cfg(feature = "watermark")]
 pub mod watermark;
 
 mod error;
 mod fp;
+mod pcm;
 mod types;
 
 #[cfg(feature = "std")]
 pub use error::IoError;
 pub use error::{AfpError, Result};
 pub use fp::{Fingerprinter, StreamingFingerprinter};
+pub use serial::FingerprintEnvelope;
 pub use types::{AudioBuffer, SampleRate, TimestampMs};
 
 /// Multi-threaded batch fingerprinting (requires the `rayon` feature).

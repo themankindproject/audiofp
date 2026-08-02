@@ -17,6 +17,19 @@ pub(crate) use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::collections::BTreeMap as HashMap;
 
+/// Create a map with pre-allocated capacity (HashMap) or just empty (BTreeMap).
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn hashmap_with_capacity<K: core::hash::Hash + Eq, V>(cap: usize) -> HashMap<K, V> {
+    HashMap::with_capacity(cap)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn hashmap_with_capacity<K: Ord, V>(_cap: usize) -> HashMap<K, V> {
+    HashMap::new()
+}
+
 use alloc::vec;
 use alloc::vec::Vec;
 

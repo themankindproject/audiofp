@@ -116,8 +116,9 @@ impl WangIndex {
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32)>> =
-            HashMap::with_capacity(refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2);
+        let mut map: HashMap<u32, Vec<(usize, u32)>> = super::maps::hashmap_with_capacity(
+            refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
+        );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -162,7 +163,7 @@ impl WangIndex {
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
         let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
-            HashMap::with_capacity(self.fps.len().min(256));
+            super::maps::hashmap_with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
@@ -322,8 +323,9 @@ impl HaitsmaIndex {
         refs: &[crate::classical::HaitsmaFingerprint],
         max_postings_per_hash: u32,
     ) -> Self {
-        let mut lut: HashMap<u32, Vec<(usize, u32)>> =
-            HashMap::with_capacity(refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2);
+        let mut lut: HashMap<u32, Vec<(usize, u32)>> = super::maps::hashmap_with_capacity(
+            refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2,
+        );
         let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 

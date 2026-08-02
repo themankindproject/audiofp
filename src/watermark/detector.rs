@@ -8,6 +8,7 @@ use std::path::Path;
 
 use tract_onnx::prelude::*;
 
+use crate::error::{map_model_load_err, map_model_open_io};
 use crate::{AfpError, AudioBuffer, Result};
 
 /// Type alias for the compiled runnable plan produced by
@@ -36,6 +37,12 @@ pub struct WatermarkConfig {
     pub threshold: f32,
     /// Sample rate the model expects, in Hz. Default 16 000 (AudioSeal).
     pub sample_rate: u32,
+    /// Maximum input sample count accepted by [`detect`]. `None` disables
+    /// the check (default). When set, inputs exceeding this cap are
+    /// rejected with [`AfpError::InputTooLarge`] before any inference.
+    ///
+    /// [`detect`]: WatermarkDetector::detect
+    pub max_input_samples: Option<usize>,
 }
 
 impl WatermarkConfig {
@@ -48,6 +55,7 @@ impl WatermarkConfig {
             message_bits: 16,
             threshold: 0.5,
             sample_rate: 16_000,
+            max_input_samples: None,
         }
     }
 }
@@ -63,8 +71,30 @@ pub struct WatermarkResult {
     /// `message_bits` are populated; bits at or above `message_bits` are
     /// zero. Zero when the model returned fewer logits than requested.
     pub message: u32,
-    /// Raw per-output detection scores, exactly as the model emitted
-    /// them (no resampling). Length depends on the specific model.
+    /// Raw detection scores from the model's first ONNX output, **flattened**
+    /// with no resampling or time-axis remapping by `audiofp`.
+    ///
+    /// # Contract
+    ///
+    /// - **Values:** model-emitted `f32` scores (AudioSeal-style detectors
+    ///   typically emit probabilities in `[0, 1]`).
+    /// - **Length:** exactly the number of elements Tract yields when
+    ///   flattening output `[0]`. This is **not** guaranteed equal to
+    ///   `audio.samples.len()`.
+    /// - **Time base:** model-dependent. Some AudioSeal exports emit one
+    ///   score per input sample at [`WatermarkConfig::sample_rate`]; others
+    ///   emit coarser per-frame / pooled maps. Treat hop and alignment as
+    ///   part of the **model card**, not as a stable `audiofp` API promise.
+    /// - **Aggregation:** [`Self::confidence`] is the arithmetic mean of
+    ///   these scores (or `0.0` if empty); [`Self::detected`] compares that
+    ///   mean to [`WatermarkConfig::threshold`].
+    /// - **Stability:** tensor shape is **not** semver-guaranteed across
+    ///   model versions — only that this field forwards whatever output
+    ///   `[0]` contains.
+    ///
+    /// For “where is the watermark?”, threshold or plot this vector against
+    /// the model's documented time base. Do not assume index `i` maps to
+    /// sample `i` unless your specific ONNX export says so.
     pub localization: Vec<f32>,
 }
 
@@ -128,13 +158,12 @@ impl WatermarkDetector {
         }
 
         let path = Path::new(&cfg.model_path);
-        if !path.exists() {
-            return Err(AfpError::ModelNotFound(cfg.model_path.clone()));
+        if let Err(e) = std::fs::File::open(path) {
+            return Err(map_model_open_io(&cfg.model_path, e));
         }
-
         let model = tract_onnx::onnx()
             .model_for_path(path)
-            .map_err(|e| AfpError::ModelLoad(format!("load: {e}")))?;
+            .map_err(map_model_load_err)?;
 
         Ok(Self {
             cfg,
@@ -165,10 +194,17 @@ impl WatermarkDetector {
     ///   typing, building the runnable plan, running inference, or extracting
     ///   the output tensors. The variant payload identifies which step.
     pub fn detect(&mut self, audio: AudioBuffer<'_>) -> Result<WatermarkResult> {
+        crate::pcm::reject_non_finite(audio.samples)?;
         if audio.rate.hz() != self.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
         let n = audio.samples.len();
+        if self.cfg.max_input_samples.is_some_and(|limit| n > limit) {
+            return Err(AfpError::InputTooLarge {
+                limit: self.cfg.max_input_samples.unwrap(),
+                provided: n,
+            });
+        }
         if n == 0 {
             return Err(AfpError::AudioTooShort { needed: 1, got: 0 });
         }

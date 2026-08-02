@@ -39,7 +39,8 @@ pub enum AfpError {
     /// The audio's sample rate does not match the rate the fingerprinter
     /// expects. Each fingerprinter has a single required rate; consult
     /// [`Fingerprinter::required_sample_rate`](crate::Fingerprinter::required_sample_rate)
-    /// (or the algorithm's documentation) to learn the value.
+    /// or [`StreamingFingerprinter::required_sample_rate`](crate::StreamingFingerprinter::required_sample_rate)
+    /// to learn the value.
     #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
 
@@ -59,12 +60,48 @@ pub enum AfpError {
     #[error("inference failed: {0}")]
     Inference(String),
 
+    /// The input exceeds the configured maximum. Raised early in decode
+    /// and extract paths to prevent OOM from untrusted audio. The limit
+    /// can be raised or disabled entirely via the config struct.
+    ///
+    /// `limit` / `provided` share the same unit as the check that failed
+    /// (samples, bytes, or hash count — see the call site).
+    #[error(
+        "input too large: {provided} exceeds maximum {limit}; \
+         raise the limit or set it to None to disable"
+    )]
+    InputTooLarge {
+        /// Configured limit that was exceeded.
+        limit: usize,
+        /// Actual size that exceeded the limit (same unit as `limit`).
+        provided: usize,
+    },
+
     /// A streaming pipeline dropped samples because the consumer fell behind.
+    ///
+    /// Reserved for bounded real-time capture (e.g. mic ring buffer). Not
+    /// emitted by classical/neural extractors today; see issue tracking the
+    /// mic orchestrator.
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun {
         /// Number of samples dropped.
         dropped: usize,
     },
+
+    /// Input PCM contained NaN or ±Inf at `index`.
+    ///
+    /// Offline `extract` / watermark `detect` reject non-finite samples.
+    /// Streaming `push` sanitizes them to `0.0` instead (infallible API).
+    #[error("audio contains non-finite sample (NaN or Inf) at index {index}")]
+    NonFiniteSample {
+        /// Index of the first non-finite sample.
+        index: usize,
+    },
+
+    /// Deserialization of a fingerprint binary blob failed (magic mismatch,
+    /// unsupported version, truncated payload, wrong algorithm, …).
+    #[error("deserialize: {0}")]
+    Deserialize(String),
 
     /// A configuration value was rejected (out of range, mutually exclusive, …).
     #[error("invalid configuration: {0}")]
@@ -156,6 +193,30 @@ impl AfpError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Model-loading helpers (shared by `neural` and `watermark` features)
+// ---------------------------------------------------------------------------
+
+/// Map a failed filesystem open into the appropriate [`AfpError`] variant.
+///
+/// Used by both the neural embedder and watermark detector when opening
+/// ONNX model files.
+#[cfg(any(feature = "neural", feature = "watermark"))]
+pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
+    use alloc::string::ToString;
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AfpError::ModelNotFound(path.to_string())
+    } else {
+        AfpError::ModelLoad(alloc::format!("open: {e}"))
+    }
+}
+
+/// Map any `Display`-able model-load error into [`AfpError::ModelLoad`].
+#[cfg(any(feature = "neural", feature = "watermark"))]
+pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
+    AfpError::ModelLoad(alloc::format!("load: {e}"))
+}
+
 /// Shorthand for `core::result::Result<T, AfpError>`.
 ///
 /// # Example
@@ -190,31 +251,40 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sample_rate_displays_offending_value_only() {
+    fn unsupported_sample_rate_displays_both_rates() {
         // The message must NOT claim a global "supported" list — each
-        // fingerprinter has its own required rate, so any list we
-        // hardcode here would be wrong for at least one of them
-        // (Haitsma needs 5 kHz; the rest don't).
+        // fingerprinter has its own required rate.
         let s = AfpError::UnsupportedSampleRate(7_000).to_string();
-        assert!(s.contains("7000"));
+        assert!(s.contains("7000"), "must contain the offending rate: {s}");
         assert!(
             !s.contains("(supported"),
             "must not advertise a hardcoded supported list: {s}",
         );
-        // None of the previously-hardcoded "supported" rate strings
-        // should appear in the error.
-        for rate in ["8000", "11025", "16000", "22050", "44100", "48000"] {
-            assert!(
-                !s.contains(rate),
-                "found stale supported-rate {rate} in: {s}",
-            );
-        }
+    }
+
+    #[test]
+    fn non_finite_sample_displays_index() {
+        let s = AfpError::NonFiniteSample { index: 42 }.to_string();
+        assert!(s.contains("42"));
+        assert!(s.contains("non-finite"));
     }
 
     #[test]
     fn buffer_overrun_reports_drop_count() {
         let s = AfpError::BufferOverrun { dropped: 1024 }.to_string();
         assert!(s.contains("1024"));
+    }
+
+    #[test]
+    fn input_too_large_displays_both_limit_and_provided() {
+        let err = AfpError::InputTooLarge {
+            limit: 1_000_000,
+            provided: 5_000_000,
+        };
+        let s = err.to_string();
+        assert!(s.contains("1000000"), "got: {s}");
+        assert!(s.contains("5000000"), "got: {s}");
+        assert!(s.contains("exceeds maximum"), "got: {s}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name         = "audiofp"
-version      = "0.3.7"
+version      = "0.3.9"
 edition      = "2024"
 rust-version = "1.93.0"
 license      = "MIT"
@@ -11,11 +11,48 @@ keywords     = ["audio", "fingerprint", "no-std", "shazam", "acoustid"]
 categories   = ["multimedia::audio", "algorithms"]
 readme       = "README.md"
 exclude      = [
-    # Personal prep / scratch files — useful in the repo, not on crates.io.
+    # Dev-only: CI, tooling, and repo metadata not needed by downstream.
+    ".github/",
+    ".claude/",
+    ".agents/",
+
+    # Test audio corpus (~8 MB) and golden snapshots.
+    "tests/assets/",
+    "tests/goldens/",
+
+    # Integration / property / E2E test sources (unit tests are in src/).
+    "tests/",
+
+    # Fuzz harnesses.
+    "fuzz/",
+
+    # Benchmarks (users run their own; bench code references test helpers).
+    "benches/",
+
+    # Dev config files — not needed to compile the library.
+    "clippy.toml",
+    "deny.toml",
+    "rustfmt.toml",
+    "rust-toolchain.toml",
+
+    # Contributor / governance docs.
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "context.md",
+
+    # Personal scratch files.
     "prep.md",
     "dsp.md",
-    ".github/",
-    ".agents/",
+
+    # Long-form docs — available on GitHub, not needed to compile.
+    "USAGE.md",
+    "ROBUSTNESS.md",
+    "scripts/",
+
+    # Examples — available on GitHub; not needed for library usage.
+    "examples/",
 ]
 
 [features]
@@ -51,8 +88,9 @@ libm        = "0.2.16"
 num-traits  = { version = "0.2.19", default-features = false }
 num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
+wide        = { version = "1.5.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive"] }
-symphonia   = { version = "0.6", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm"], optional = true }
+symphonia   = { version = "0.6", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm", "adpcm", "alac", "mkv", "aiff"], optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }
 
@@ -101,6 +139,17 @@ required-features = ["std"]
 
 [[example]]
 name = "stream_buffer"
+
+[[example]]
+name = "dsp_starter"
+
+[[example]]
+name = "neural_embed"
+required-features = ["neural"]
+
+[[example]]
+name = "watermark_detect"
+required-features = ["watermark"]
 
 [profile.release]
 lto           = "fat"

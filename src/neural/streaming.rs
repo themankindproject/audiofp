@@ -135,7 +135,8 @@ impl StreamingNeuralEmbedder {
         samples: &[f32],
         mut callback: F,
     ) -> Result<usize> {
-        self.sample_carry.extend_from_slice(samples);
+        let samples = crate::pcm::truncate_push(samples, self.core.cfg.max_push_samples);
+        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let sr = self.core.cfg.sample_rate as u64;
@@ -212,6 +213,10 @@ impl StreamingNeuralEmbedder {
 
 impl StreamingFingerprinter for StreamingNeuralEmbedder {
     type Frame = Vec<f32>;
+
+    fn required_sample_rate(&self) -> u32 {
+        self.core.cfg.sample_rate
+    }
 
     /// Feed PCM samples and return any embeddings that became available.
     ///

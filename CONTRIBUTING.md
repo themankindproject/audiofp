@@ -20,17 +20,21 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 ```
 
-The MSRV is **1.85.0** (pinned in `rust-toolchain.toml`).
+The MSRV is **1.93.0** (pinned in `rust-toolchain.toml`).
+
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Security reports go
+through [SECURITY.md](SECURITY.md), not public issues.
 
 ## Project layout
 
 ```
 audiofp/
 ├── Cargo.toml
-├── rust-toolchain.toml      # MSRV 1.85.0
+├── rust-toolchain.toml      # MSRV 1.93.0
 ├── rustfmt.toml, clippy.toml, deny.toml
 ├── .github/workflows/ci.yml # parallel fmt + clippy + test jobs
-├── README.md, USAGE.md, CHANGELOG.md
+├── .github/ISSUE_TEMPLATE/  # bug + feature forms
+├── README.md, USAGE.md, CHANGELOG.md, SECURITY.md, CODE_OF_CONDUCT.md
 └── src/
     ├── lib.rs
     ├── error.rs             # AfpError + Result
