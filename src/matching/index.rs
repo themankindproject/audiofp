@@ -74,7 +74,8 @@ impl WangIndex {
     /// kept (TF-IDF-style stop-hash removal applied globally).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
         let total_hashes: usize = refs.iter().map(|r| r.hashes.len()).sum();
-        let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::with_capacity(total_hashes / 2);
+        let mut map: HashMap<u32, Vec<(usize, u32)>> =
+            super::maps::hashmap_with_capacity(total_hashes / 2);
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -118,7 +119,7 @@ impl WangIndex {
         // Tracking the query-hash index lets us count *distinct* query
         // landmarks that align (contrib), mirroring `WangMatcher`.
         let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
-            HashMap::with_capacity(self.fps.len().min(256));
+            super::maps::hashmap_with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {

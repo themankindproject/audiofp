@@ -91,7 +91,8 @@ impl Matcher for WangMatcher {
         let cfg = &self.cfg;
 
         // --- 1. Index the reference ---
-        let mut index: HashMap<u32, Vec<u32>> = HashMap::with_capacity(reference.hashes.len());
+        let mut index: HashMap<u32, Vec<u32>> =
+            super::maps::hashmap_with_capacity(reference.hashes.len());
         for h in &reference.hashes {
             index.entry(h.hash).or_default().push(h.t_anchor);
         }
