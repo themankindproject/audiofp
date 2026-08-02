@@ -388,6 +388,12 @@ fn build_result(
 // Tests
 // ---------------------------------------------------------------------------
 
+impl Default for HaitsmaMatcher {
+    fn default() -> Self {
+        Self::new(HaitsmaMatchConfig::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -91,7 +91,7 @@ impl Matcher for WangMatcher {
         let cfg = &self.cfg;
 
         // --- 1. Index the reference ---
-        let mut index: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut index: HashMap<u32, Vec<u32>> = HashMap::with_capacity(reference.hashes.len());
         for h in &reference.hashes {
             index.entry(h.hash).or_default().push(h.t_anchor);
         }
@@ -159,7 +159,8 @@ impl Matcher for WangMatcher {
             }
             out
         } else {
-            hist.clone()
+            // Zero tolerance: histogram IS the consolidated view — avoid clone.
+            core::mem::take(&mut hist)
         };
 
         // --- 4. Find peak (use consolidated for robustness, but pick
@@ -224,6 +225,12 @@ impl Matcher for WangMatcher {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+impl Default for WangMatcher {
+    fn default() -> Self {
+        Self::new(WangMatchConfig::default())
+    }
+}
 
 #[cfg(test)]
 mod tests {

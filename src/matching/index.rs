@@ -73,7 +73,8 @@ impl WangIndex {
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        let total_hashes: usize = refs.iter().map(|r| r.hashes.len()).sum();
+        let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::with_capacity(total_hashes / 2);
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -116,7 +117,8 @@ impl WangIndex {
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Tracking the query-hash index lets us count *distinct* query
         // landmarks that align (contrib), mirroring `WangMatcher`.
-        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> = HashMap::new();
+        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
+            HashMap::with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
@@ -136,21 +138,39 @@ impl WangIndex {
             for &(d, _) in votes {
                 *bins.entry(d).or_insert(0) += 1;
             }
-            let bin_vec: Vec<(i64, u32)> = bins.iter().map(|(&d, &c)| (d, c)).collect();
+            let mut bin_vec: Vec<(i64, u32)> = bins.iter().map(|(&d, &c)| (d, c)).collect();
 
-            // Consolidated peak: for each candidate offset sum bins within ±tol.
+            // Consolidated peak via sorted sliding window — O(B log B).
+            bin_vec.sort_unstable_by_key(|(d, _)| *d);
             let mut peak_votes = 0u32;
             let mut peak_off = 0i64;
-            for &(d0, _) in &bin_vec {
-                let mut s = 0u32;
+
+            if tol == 0 {
+                // No consolidation: just find the max bin directly.
                 for &(d, c) in &bin_vec {
-                    if (d - d0).abs() <= tol {
-                        s += c;
+                    if c > peak_votes {
+                        peak_votes = c;
+                        peak_off = d;
                     }
                 }
-                if s > peak_votes {
-                    peak_votes = s;
-                    peak_off = d0;
+            } else {
+                // Sliding window of width 2*tol: sum bins within [d - tol, d + tol].
+                let mut right = 0usize;
+                let mut window_sum = 0u32;
+                for left in 0..bin_vec.len() {
+                    // Expand right edge while within tolerance of bin_vec[left]
+                    while right < bin_vec.len() && bin_vec[right].0 <= bin_vec[left].0 + 2 * tol {
+                        window_sum += bin_vec[right].1;
+                        right += 1;
+                    }
+                    if window_sum > peak_votes {
+                        peak_votes = window_sum;
+                        // Pick centre of the window as the peak offset.
+                        let mid = (left + right.saturating_sub(1)) / 2;
+                        peak_off = bin_vec[mid].0;
+                    }
+                    // Shrink left edge
+                    window_sum -= bin_vec[left].1;
                 }
             }
             if peak_votes < cfg.min_votes {
@@ -172,13 +192,14 @@ impl WangIndex {
             }
 
             // Contrib: distinct query-hash indices voting within ±tol of peak.
-            let mut contrib_bits: HashMap<u32, ()> = HashMap::new();
-            for &(d, qi) in votes {
-                if (d - peak_off).abs() <= tol {
-                    contrib_bits.insert(qi, ());
-                }
-            }
-            let score = clamp_score(contrib_bits.len() as f32 / q_len);
+            let mut contrib_indices: Vec<u32> = votes
+                .iter()
+                .filter(|(d, _)| (*d - peak_off).abs() <= tol)
+                .map(|(_, qi)| *qi)
+                .collect();
+            contrib_indices.sort_unstable();
+            contrib_indices.dedup();
+            let score = clamp_score(contrib_indices.len() as f32 / q_len);
             if score < cfg.min_score {
                 continue;
             }
