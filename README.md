@@ -151,17 +151,6 @@ Haitsma offline
 └──────────────────────────┘
 ```
 
-### Algorithm Pipeline
-
-1. **Decode** — Parse any supported format (MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, PCM) via Symphonia and downmix to mono `f32`
-2. **Resample** — Built-in windowed-sinc Kaiser resampler (default 32 taps, β=8.6) brings the audio to the algorithm's required rate
-3. **STFT** — `realfft`-backed real-input transform with reusable scratch; Hann window, configurable hop and `n_fft`
-4. **Algorithm-specific extraction**:
-   - **Wang**: dB log-mag → 31×31 peak picker (capped at 30/s) → anchor-target landmark pairs in `Δt ∈ [1, 63], |Δf| ≤ 64`
-   - **Panako**: same front-end → triplet enumeration in cone `Δt < 96, |Δf| < 96` → tempo-invariant β packing
-   - **Haitsma**: 33 log-spaced bands (300–2000 Hz) → 32 sign bits per frame from band-difference deltas
-5. **Streaming variants** emit hashes incrementally with bit-exact parity to offline `extract`.
-
 ## Performance
 
 Offline extract (`cargo bench --bench extract`, 30 s of synthetic audio):
