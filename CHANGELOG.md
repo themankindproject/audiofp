@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **In-memory matching subsystem** (`audiofp::matching`) — `WangMatcher`,
+  `HaitsmaMatcher`, `NeuralMatcher` (feature-gated), plus `match_best` /
+  `match_ranked` and a transient `WangIndex` for 1:N Wang queries. Purely
+  in-memory: no persistence, wire format, or DB adapters. See `USAGE.md`
+  and `plan.md`.
+- **`benches/matching.rs`** — Criterion benches for Wang/Haitsma 1:1 and
+  small `WangIndex` (N=100) queries (`cargo bench --bench matching`).
 - **`wide` 1.5 dependency** (no_std compatible, zero `unsafe`). Provides
   `f32x8` used across the DSP pipeline.
 - **Lightweight fingerprint serialization (`serial` module) (#117).**
@@ -237,8 +244,14 @@ depth (measured 2-4× on small embedding models).
   `max_pending_anchors` = `Some(0)`) are silently clamped to `Some(1)`.
 - **`native-tls` banned in `deny.toml`** (pulls openssl transitively).
 
-### Fixed
+### Changed
 
+- **Matching hot path uses `HashMap` under `std`** (default). Without
+  `std`, the same code paths fall back to `BTreeMap` via an internal
+  alias so `no_std + alloc` builds keep working.
+- **`PanakoMatcher` / `PanakoIndex` documented as stubs** — they always
+  return non-match / empty until Phase 3 (2-D Hough) lands. Prefer
+  `WangMatcher` for constant-tempo identification today.
 - **UB in `PeakPicker` scratch buffers.** `prepare_vec_uninit` used
   `unsafe { v.set_len(new_len) }` leaving uninitialized `f32`s that
   could be read before overwrite under aggressive LLVM optimizations.

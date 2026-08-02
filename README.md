@@ -7,17 +7,18 @@
 ![Crates.io Downloads](https://img.shields.io/crates/d/audiofp)
 ![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 
-Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **streaming extraction**, **file decoding**, and **AudioSeal-compatible watermark detection**.
+Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, and **AudioSeal-compatible watermark detection**.
 
 ## Overview
 
-`audiofp` provides three complementary classical fingerprinters for music identification, each with offline and streaming variants:
+`audiofp` provides three complementary classical fingerprinters for music identification, each with offline and streaming variants, plus an in-memory matching layer for identification:
 
 | Method | Use Case | Sample Rate | Frame Rate | Output Size |
 |--------|----------|-------------|------------|-------------|
 | **Wang** | Music ID, Shazam-style matching | 8 kHz | 62.5 fps | ~2.4 KB/s (fan-out 10) |
 | **Panako** | Music ID with ±5 % tempo robustness | 8 kHz | 62.5 fps | ~2.0 KB/s (fan-out 5) |
 | **Haitsma** | Compact dense IDs, fastest extraction | 5 kHz | 78.125 fps | 312 B/s |
+| **Matching** | In-memory ID (`WangMatcher`, `HaitsmaMatcher`, …) | — | — | — |
 | **Streaming** | Real-time hash emission | (per algorithm) | (per algorithm) | Bit-exact offline parity |
 | **Watermark** | AudioSeal detection (BYO ONNX) | 16 kHz | (per model) | Detection + 16-bit message |
 
@@ -31,6 +32,7 @@ Perfect for:
 ## Features
 
 - **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
+- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex`. Panako matcher is a documented stub until tempo-invariant Hough lands. No persistence or DB adapters.
 - **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` (verified by the test suite at every chunk size).
 - **Bit-Exact Determinism** - Same input always produces the same hashes; verified down to 1-sample-per-push streaming chunks
 - **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization
@@ -89,6 +91,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
     }
 
+    Ok(())
+}
+```
+
+### Match two fingerprints (Wang)
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::io::decode_to_mono_at;
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let samples = decode_to_mono_at("clip.wav", 8_000)?;
+    let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
+    let query = Wang::default().extract(buf)?;
+    let reference = query.clone(); // same recording
+
+    let m = WangMatcher::new(WangMatchConfig::default()).match_one(&query, &reference);
+    println!("is_match={} score={:.3} offset={} ms", m.is_match, m.score, m.offset.ms);
     Ok(())
 }
 ```
@@ -219,6 +241,7 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 | `no_std + alloc` capable | Yes (host) | No | N/A |
 | `bytemuck::Pod` hash types | Yes | No | N/A |
 | Built-in resampler | Yes | No | No |
+| In-memory matcher (Wang/Haitsma) | Yes | No | Yes (Dejavu) |
 
 ## Examples
 

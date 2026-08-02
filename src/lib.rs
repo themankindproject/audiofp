@@ -25,6 +25,9 @@
 //!   landmark pairs), [`classical::Panako`] (tempo-invariant triplets),
 //!   [`classical::Haitsma`] (Philips robust hash bands), each with a
 //!   streaming sibling.
+//! - **Matching** — [`matching`] identifies recordings from fingerprints
+//!   in memory (`WangMatcher`, `HaitsmaMatcher`, optional neural cosine;
+//!   `PanakoMatcher` is a stub until tempo-invariant Hough lands).
 //! - **DSP primitives** — [`dsp`] exposes STFT, mel filterbank, peak
 //!   picker, resampler, and tapered windows for users building their
 //!   own pipelines on top of `audiofp`.
@@ -45,21 +48,27 @@
 //!
 //! # Example
 //!
-//! Identify a song by counting Wang hash collisions between two files:
+//! Match two Wang fingerprints with the offset-histogram voter:
 //!
 //! ```
 //! extern crate alloc;
-//! use audiofp::classical::Wang;
-//! use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+//! use audiofp::classical::{WangFingerprint, WangHash};
+//! use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 //!
-//! let samples: alloc::vec::Vec<f32> = alloc::vec![0.0_f32; 8_000 * 4];
-//! let mut wang = Wang::default();
-//! let buf = AudioBuffer { samples: &samples, rate: SampleRate::HZ_8000 };
-//! let fp = wang.extract(buf).unwrap();
+//! let fp = WangFingerprint {
+//!     hashes: (0..8u32)
+//!         .map(|i| WangHash {
+//!             hash: i,
+//!             t_anchor: i * 10,
+//!         })
+//!         .collect(),
+//!     frames_per_sec: 62.5,
+//! };
 //!
-//! let unique: alloc::collections::BTreeSet<u32> =
-//!     fp.hashes.into_iter().map(|h| h.hash).collect();
-//! println!("{} unique landmark hashes", unique.len());
+//! let matcher = WangMatcher::new(WangMatchConfig::default());
+//! let m = matcher.match_one(&fp, &fp);
+//! assert!(m.is_match);
+//! assert_eq!(m.offset.frames, 0);
 //! ```
 //!
 //! # Cargo features
@@ -86,6 +95,7 @@ pub mod classical;
 pub mod dsp;
 #[cfg(feature = "std")]
 pub mod io;
+pub mod matching;
 #[cfg(feature = "neural")]
 pub mod neural;
 /// Convenience re-exports of the most commonly used types. See
