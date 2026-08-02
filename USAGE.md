@@ -17,6 +17,7 @@
   - [Panako (triplet hashes)](#panako-triplet-hashes)
   - [Haitsma–Kalker (band-power sign bits)](#haitsmakalker-band-power-sign-bits)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
+- [Fingerprint Serialization](#fingerprint-serialization)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
 - [Neural Embedder](#neural-embedder)
@@ -36,7 +37,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.7"
+audiofp = "0.3"
 ```
 
 ### Basic example: fingerprint silence (zero deps)
@@ -420,6 +421,40 @@ pub struct HaitsmaFingerprint {
 
 > Frame 0 has no hash (the algorithm needs frame n−1 for the delta). Frame indexing in `frames` is therefore offset by one relative to the spectrogram.
 
+### Progress Callbacks
+
+All three classical fingerprinters expose `extract_with_progress` for
+reporting extraction progress on long files (podcasts, DJ sets, etc.):
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, SampleRate};
+
+let samples = vec![0.0_f32; 8_000 * 60]; // 60 s
+let mut wang = Wang::default();
+let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
+
+let fp = wang.extract_with_progress(buf, |progress| {
+    // progress is monotonically non-decreasing in [0.0, 1.0]
+    println!("{:.0}%", progress * 100.0);
+}).unwrap();
+```
+
+The callback fires every ~500 ms of processed audio (every 32 frames for
+Wang/Panako at 62.5 fps, every 39 frames for Haitsma at 78 fps). The plain
+`extract()` delegates to `extract_with_progress` with a no-op closure — zero
+overhead when progress isn't needed.
+
+Signatures:
+```rust
+impl Wang {
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self, audio: AudioBuffer<'_>, progress: F,
+    ) -> Result<WangFingerprint>;
+}
+// Same on Panako and Haitsma.
+```
+
 ---
 
 ## Streaming Fingerprinters
@@ -496,6 +531,70 @@ fn main() -> Result<(), audiofp::AfpError> {
 
 ---
 
+## Fingerprint Serialization
+
+`audiofp` ships a lightweight binary format for persisting fingerprints to
+disk or wire without relying on the full matching wire format (planned for
+v0.4.0). Available on all three fingerprint types via `to_bytes` /
+`from_bytes`.
+
+### Binary Format
+
+```text
+[magic: 8 bytes "AUDIOFP\0"] [version: u8 = 1] [alg_id: u8] [hash_count: u32 LE] [fps: f32 LE] [Pod hashes]
+```
+
+Algorithm IDs: 0 = Wang, 1 = Panako, 2 = Haitsma.
+
+### Usage
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+let samples = vec![0.0_f32; 8_000 * 3];
+let mut wang = Wang::default();
+let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+
+// Serialize
+let bytes = fp.to_bytes();
+
+// Deserialize (validates magic, version, algorithm)
+let restored = audiofp::classical::WangFingerprint::from_bytes(&bytes).unwrap();
+assert_eq!(fp.hashes.len(), restored.hashes.len());
+
+// Inspect metadata without full deserialization
+let envelope = fp.envelope();
+println!("algorithm: {}", envelope.algorithm);    // "wang-v1"
+println!("version: {}", envelope.crate_version);  // audiofp::VERSION
+println!("hashes: {}", envelope.hash_count);
+```
+
+### `FingerprintEnvelope`
+
+```rust
+pub struct FingerprintEnvelope {
+    pub algorithm: &'static str,     // Fingerprinter::name()
+    pub crate_version: &'static str, // audiofp::VERSION
+    pub sample_rate: u32,            // algorithm's native rate
+    pub frames_per_sec: f32,         // STFT frame rate
+    pub hash_count: usize,           // number of hashes/frames
+}
+```
+
+### Methods (all three types)
+
+| Type | `to_bytes()` | `from_bytes(&[u8])` | `envelope()` |
+|------|:------------:|:-------------------:|:------------:|
+| `WangFingerprint` | ✓ | ✓ | ✓ |
+| `PanakoFingerprint` | ✓ | ✓ | ✓ |
+| `HaitsmaFingerprint` | ✓ | ✓ | ✓ |
+
+`from_bytes` returns `AfpError::Deserialize` on magic mismatch, unsupported
+version, wrong algorithm ID, or truncated payload.
+
+---
+
 ## Audio File Decoding
 
 Available with the default `std` feature, exposed as `audiofp::io`.
@@ -534,6 +633,7 @@ let samples = decode_to_mono_at("song.mp3", 8_000)?;
 pub struct DecodeLimits {
     pub max_bytes: u64,              // 0 = unlimited
     pub max_samples: Option<usize>,  // None = unlimited
+    pub integrity_mode: bool,        // default false; true = fail on corrupt packets
 }
 
 pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
@@ -557,6 +657,25 @@ let (samples, sr) = decode_to_mono_limited("user_upload.mp3", DecodeLimits::byte
 let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
 let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
 ```
+
+### Integrity Mode (strict decoding)
+
+By default, recoverable per-packet decode errors are silently skipped so a
+single corrupt block doesn't kill a whole-file decode. For forensic or
+compliance use cases where incomplete fingerprints are unacceptable, enable
+**integrity mode** via the `strict()` builder:
+
+```rust
+use audiofp::io::{decode_to_mono_limited, DecodeLimits};
+
+let limits = DecodeLimits::both(50_000_000, 10_000_000).strict();
+let result = decode_to_mono_limited("suspect.mp3", limits);
+// If ANY packet fails to decode → returns Err(AfpError::Io(...))
+```
+
+When `integrity_mode` is `true`, any per-packet `DecodeError` or `IoError`
+from Symphonia becomes a fatal `AfpError::Io` with message prefix
+`"decode integrity: ..."`. Default is `false` (backwards-compatible skip).
 
 ### Supported formats
 
@@ -739,6 +858,7 @@ pub struct NeuralEmbedderConfig {
     pub l2_normalize: bool,      // default true
     pub max_input_samples: Option<usize>, // default None
     pub max_push_samples: Option<usize>,  // default None; streaming truncate
+    pub batch_size: usize,       // default 1; >1 batches offline inference
 }
 ```
 
@@ -749,6 +869,22 @@ use audiofp::neural::NeuralEmbedderConfig;
 
 let cfg = NeuralEmbedderConfig::new("my_model.onnx");
 ```
+
+#### Batched Inference (`batch_size`)
+
+When processing long audio offline, set `batch_size > 1` to amortise ONNX
+runtime per-run overhead. The model is invoked once per batch with a
+`[batch_size, n_mels, n_frames]` tensor instead of one call per window:
+
+```rust
+let mut cfg = NeuralEmbedderConfig::new("model.onnx");
+cfg.batch_size = 8; // process 8 windows per model invocation
+```
+
+A dedicated `batch_runnable` plan is built at construction for the configured
+batch size. The streaming path always uses `batch_size = 1`. Partial tail
+batches (fewer windows remaining than `batch_size`) fall back to single-window
+inference. Output is bit-exact regardless of batch size.
 
 ### `NeuralEmbedder` (offline)
 
@@ -1162,6 +1298,9 @@ pub enum AfpError {
 
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    #[error("deserialization failed: {0}")]
+    Deserialize(String),
 
     #[error("io: {0}")]
     Io(String),
