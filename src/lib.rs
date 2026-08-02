@@ -26,8 +26,9 @@
 //!   [`classical::Haitsma`] (Philips robust hash bands), each with a
 //!   streaming sibling.
 //! - **Matching** — [`matching`] identifies recordings from fingerprints
-//!   in memory (`WangMatcher`, `HaitsmaMatcher`, optional neural cosine;
-//!   `PanakoMatcher` is a stub until tempo-invariant Hough lands).
+//!   in memory (`WangMatcher`, `HaitsmaMatcher`, `PanakoMatcher` with
+//!   tempo-invariant 2-D Hough + RANSAC, optional neural cosine), plus
+//!   `WangIndex` / `HaitsmaIndex` / `PanakoIndex` 1:N accelerators.
 //! - **DSP primitives** — [`dsp`] exposes STFT, mel filterbank, peak
 //!   picker, resampler, and tapered windows for users building their
 //!   own pipelines on top of `audiofp`.

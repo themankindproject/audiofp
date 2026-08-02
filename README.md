@@ -32,7 +32,7 @@ Perfect for:
 ## Features
 
 - **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
-- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex`. Panako matcher is a documented stub until tempo-invariant Hough lands. No persistence or DB adapters.
+- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC) / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` accelerators for 1:N identification. No persistence or DB adapters.
 - **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` (verified by the test suite at every chunk size).
 - **Bit-Exact Determinism** - Same input always produces the same hashes; verified down to 1-sample-per-push streaming chunks
 - **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization

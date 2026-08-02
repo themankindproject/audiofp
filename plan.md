@@ -1,9 +1,12 @@
 # audiofp — Matching Subsystem Plan
 
-**Status:** implemented on `feat/matching-subsystem` (Phases 0–2, 4–6);
-**Phase 3 (Panako 2-D Hough) is still a stub** — `PanakoMatcher` /
-`PanakoIndex` always return non-match / empty. Hot-path maps use
-`HashMap` under `std` (`BTreeMap` without `std`).
+**Status:** fully implemented (Phases 0–6). All matchers and indexes are
+complete: `WangMatcher` (offset-histogram voter), `HaitsmaMatcher`
+(BER + LUT), `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC),
+`NeuralMatcher` (cosine), and the 1:N accelerators `WangIndex`,
+`HaitsmaIndex`, `PanakoIndex`. Hot-path maps use `HashMap` under `std`
+(`BTreeMap` without `std`), with `SortedPostings` flat arrays in the
+`WangMatcher` hot path.
 **Scope:** add an in-memory **matching / identification** layer on top of the
 existing fingerprinters.
 **Explicit constraint:** *matching only* — **no storage, no persistence, no

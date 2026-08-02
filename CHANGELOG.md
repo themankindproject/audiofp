@@ -10,21 +10,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **In-memory matching subsystem (`audiofp::matching`).**
-  `WangMatcher`, `HaitsmaMatcher`, `NeuralMatcher` (feature-gated),
-  plus `match_best` / `match_ranked` convenience functions and a
-  transient `WangIndex` for 1:N Wang queries. Purely in-memory — no
-  persistence, wire format, or DB adapters.
+  `WangMatcher`, `HaitsmaMatcher`, `PanakoMatcher`, `NeuralMatcher`
+  (feature-gated), plus `match_best` / `match_ranked` convenience
+  functions and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex`
+  accelerators for 1:N queries. Purely in-memory — no persistence, wire
+  format, or DB adapters.
+- **`PanakoMatcher` — full 2-D Hough + RANSAC.** Tempo-invariant
+  matching with a sparse `(scale, offset)` accumulator, neighbourhood
+  consolidation, and optional deterministic RANSAC line-fitting; reports
+  a meaningful `MatchResult::time_scale` (reciprocal of the fitted
+  scale, clamped to `[0.5, 2.0]`).
+- **`HaitsmaIndex` — 1:N sub-fingerprint LUT accelerator.** Probes each
+  query frame against a combined `u32 → (ref_id, frame_pos)` LUT and
+  verifies the best per-reference alignment with the exact-BER path.
+- **`PanakoIndex` — 1:N 2-D Hough accelerator.** Per-reference sparse
+  accumulator over a shared inverted index of Panako triplets.
 - **`WangMatcher` / `HaitsmaMatcher` implement `Default`.**
-- **`benches/matching.rs`** — Criterion benchmarks for Wang/Haitsma 1:1
-  and small `WangIndex` (N=100) queries.
+- **`benches/matching.rs`** — Criterion benchmarks for Wang/Haitsma/
+  Panako 1:1 and small `WangIndex` (N=100) queries.
+- **Pipeline E2E + adversarial test suites (30 tests).**
+  `tests/pipeline.rs` (self-match, offset recovery, tempo speed-up,
+  1:N catalog identification, unrelated rejection for all three
+  algorithms) and `tests/adversarial.rs` (silence/DC, wrong sample
+  rate, short input, clipping, determinism, empty catalog, no false
+  positives), backed by four deterministic audio generators in
+  `tests/common/audio_gen.rs`.
 
 ### Changed
 
 - **Matching hot path uses `HashMap` under `std`** (default). Without
   `std`, the same code paths fall back to `BTreeMap` via an internal
   alias so `no_std + alloc` builds keep working.
-- **`PanakoMatcher` / `PanakoIndex` documented as stubs** — they always
-  return non-match / empty until tempo-invariant Hough lands.
+- **`WangMatcher` hot path uses `SortedPostings`** — a flat sorted array
+  (`hashes` / `starts` / `anchors`) with binary-search lookup replaces
+  `HashMap<u32, Vec<u32>>`, eliminating per-unique-hash allocations and
+  pointer chasing.
+- **`match_best` early-exits** when a reference scores 1.0.
+- **`PanakoMatcher` soft-fails on frame-rate mismatch** instead of
+  silently converting offsets with the reference rate.
 
 ### Performance
 
@@ -34,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sliding window (10–100× faster for dense collision scenarios).
 - **`mem::take` instead of `hist.clone()`** when offset tolerance is 0.
 - **Sorted Vec + dedup** replaces `HashMap<u32, ()>` for contrib counting.
+- **`SortedPostings`** — Wang 1:1 self-match on 5 s audio: ~107 µs
+  (single allocation vs N+1 per unique hash).
 
 ## [0.3.9] - 2026-08-02
 
