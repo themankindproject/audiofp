@@ -95,8 +95,11 @@ impl Matcher for WangMatcher {
         // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
         let q_hashes: alloc::vec::Vec<(u32, u32)> =
             query.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
-        let r_hashes: alloc::vec::Vec<(u32, u32)> =
-            reference.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
+        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
+            .hashes
+            .iter()
+            .map(|h| (h.hash, h.t_anchor))
+            .collect();
         let index = match SortedPostings::build(&r_hashes, cfg.max_postings_per_hash) {
             Some(sp) => sp,
             None => return MatchResult::NONE,

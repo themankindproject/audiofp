@@ -497,12 +497,9 @@ impl PanakoIndex {
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for h in &fp.hashes {
-                map.entry(h.hash).or_default().push((
-                    ref_id,
-                    h.t_anchor,
-                    h.t_b,
-                    h.t_c,
-                ));
+                map.entry(h.hash)
+                    .or_default()
+                    .push((ref_id, h.t_anchor, h.t_b, h.t_c));
             }
         }
 
