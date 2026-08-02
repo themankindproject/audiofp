@@ -38,6 +38,22 @@ fn build_passthrough_runnable(n_mels: usize, n_frames: usize) -> Runnable {
         .expect("runnable")
 }
 
+/// Build a batched tract `Runnable` whose single output equals its input.
+fn build_passthrough_runnable_batched(batch: usize, n_mels: usize, n_frames: usize) -> Runnable {
+    let mut model = TypedModel::default();
+    let input = model
+        .add_source("x", f32::fact([batch, n_mels, n_frames]))
+        .expect("add_source");
+    model
+        .select_output_outlets(&[input])
+        .expect("set_output_outlets");
+    model
+        .into_optimized()
+        .expect("optimize")
+        .into_runnable()
+        .expect("runnable")
+}
+
 /// Build a `NeuralEmbedder` backed by a passthrough model. Skips ONNX
 /// load + probe entirely — useful for exercising the front-end +
 /// windowing in tests.
@@ -87,6 +103,15 @@ fn passthrough_core(cfg: NeuralEmbedderConfig) -> Result<EmbedderCore> {
     let n_frames = (window_samples - cfg.n_fft) / cfg.hop + 1;
 
     let runnable = build_passthrough_runnable(cfg.n_mels, n_frames);
+    let batch_runnable = if cfg.batch_size > 1 {
+        Some(build_passthrough_runnable_batched(
+            cfg.batch_size,
+            cfg.n_mels,
+            n_frames,
+        ))
+    } else {
+        None
+    };
     let stft = ShortTimeFFT::new(StftConfig {
         n_fft: cfg.n_fft,
         hop: cfg.hop,
@@ -108,6 +133,7 @@ fn passthrough_core(cfg: NeuralEmbedderConfig) -> Result<EmbedderCore> {
         cfg,
         frontend,
         runnable,
+        batch_runnable,
         window_samples,
         hop_samples,
         n_frames,
@@ -152,5 +178,6 @@ pub(crate) fn small_cfg() -> NeuralEmbedderConfig {
         l2_normalize: true,
         max_input_samples: None,
         max_push_samples: None,
+        batch_size: 1,
     }
 }

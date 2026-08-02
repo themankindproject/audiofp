@@ -214,6 +214,10 @@ impl StreamingNeuralEmbedder {
 impl StreamingFingerprinter for StreamingNeuralEmbedder {
     type Frame = Vec<f32>;
 
+    fn required_sample_rate(&self) -> u32 {
+        self.core.cfg.sample_rate
+    }
+
     /// Feed PCM samples and return any embeddings that became available.
     ///
     /// # Panics

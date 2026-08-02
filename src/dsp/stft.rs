@@ -73,9 +73,10 @@ impl StftConfig {
 ///
 /// let mut stft = ShortTimeFFT::new(StftConfig::new(1024));
 /// let samples = vec![0.0_f32; 16_000];
-/// let spec = stft.magnitude(&samples);
-/// // (n_frames, n_bins) shape; default config gives n_bins = 1024/2 + 1.
-/// assert_eq!(spec[0].len(), 513);
+/// let (spec, n_frames, n_bins) = stft.magnitude_flat(&samples);
+/// // n_bins = n_fft/2 + 1 = 513 for n_fft=1024.
+/// assert_eq!(n_bins, 513);
+/// assert_eq!(spec.len(), n_frames * n_bins);
 /// ```
 pub struct ShortTimeFFT {
     cfg: StftConfig,
@@ -95,17 +96,30 @@ impl ShortTimeFFT {
     /// `cfg.hop` is zero or larger than `cfg.n_fft`.
     #[must_use]
     pub fn new(cfg: StftConfig) -> Self {
-        assert!(
-            cfg.n_fft > 0 && cfg.n_fft.is_power_of_two(),
-            "n_fft must be a non-zero power of two, got {}",
-            cfg.n_fft
-        );
-        assert!(
-            cfg.hop > 0 && cfg.hop <= cfg.n_fft,
-            "hop must be in (0, n_fft], got hop={} n_fft={}",
-            cfg.hop,
-            cfg.n_fft
-        );
+        Self::try_new(cfg).expect("invalid StftConfig")
+    }
+
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
+    /// parameters instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// - `n_fft` is zero or not a power of two
+    /// - `hop` is zero or larger than `n_fft`
+    pub fn try_new(cfg: StftConfig) -> crate::Result<Self> {
+        if cfg.n_fft == 0 || !cfg.n_fft.is_power_of_two() {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "n_fft must be a non-zero power of two, got {}",
+                cfg.n_fft
+            )));
+        }
+        if cfg.hop == 0 || cfg.hop > cfg.n_fft {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "hop must be in (0, n_fft], got hop={} n_fft={}",
+                cfg.hop,
+                cfg.n_fft
+            )));
+        }
 
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(cfg.n_fft);
@@ -114,14 +128,14 @@ impl ShortTimeFFT {
         let scratch_out = fft.make_output_vec();
         let fft_scratch = fft.make_scratch_vec();
 
-        Self {
+        Ok(Self {
             cfg,
             fft,
             window,
             scratch_in,
             scratch_out,
             fft_scratch,
-        }
+        })
     }
 
     /// Borrow the configuration this instance was built with.
@@ -156,6 +170,10 @@ impl ShortTimeFFT {
     /// Result shape is `(n_frames, n_bins)` with `n_bins = n_fft/2 + 1`.
     /// Returns an empty `Vec` for empty input.
     #[must_use]
+    #[deprecated(
+        since = "0.3.9",
+        note = "use magnitude_flat() instead — same data, single allocation, better cache locality"
+    )]
     pub fn magnitude(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
         let (flat, n_frames, n_bins) = self.magnitude_flat(samples);
         if n_frames == 0 {
@@ -209,9 +227,7 @@ impl ShortTimeFFT {
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
-                *o = c.re * c.re + c.im * c.im;
-            }
+            compute_power_wide(&self.scratch_out, row);
         }
 
         (n_frames, n_bins)
@@ -243,41 +259,8 @@ impl ShortTimeFFT {
     /// ```
     #[must_use]
     pub fn power_flat(&mut self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
-        if samples.is_empty() {
-            return (Vec::new(), 0, 0);
-        }
-
-        let n_fft = self.cfg.n_fft;
-        let hop = self.cfg.hop;
-        let n_frames = self.n_frames(samples.len());
-        let n_bins = self.n_bins();
-
-        let center_off = if self.cfg.center {
-            (n_fft / 2) as isize
-        } else {
-            0
-        };
-
-        let mut out = vec![0.0_f32; n_frames * n_bins];
-
-        for f in 0..n_frames {
-            let start = (f * hop) as isize - center_off;
-            self.fill_windowed(samples, start);
-
-            self.fft
-                .process_with_scratch(
-                    &mut self.scratch_in,
-                    &mut self.scratch_out,
-                    &mut self.fft_scratch,
-                )
-                .expect("FFT process: input/output length mismatch");
-
-            let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
-                *o = c.re * c.re + c.im * c.im;
-            }
-        }
-
+        let mut out = Vec::new();
+        let (n_frames, n_bins) = self.power_flat_into(samples, &mut out);
         (out, n_frames, n_bins)
     }
 
@@ -371,9 +354,7 @@ impl ShortTimeFFT {
         assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
         assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
 
-        for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {
-            self.scratch_in[i] = s * w;
-        }
+        apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
         self.fft
             .process_with_scratch(
@@ -383,9 +364,7 @@ impl ShortTimeFFT {
             )
             .expect("FFT process: input/output length mismatch");
 
-        for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
-            *o = c.re * c.re + c.im * c.im;
-        }
+        compute_power_wide(&self.scratch_out, out);
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
@@ -398,9 +377,7 @@ impl ShortTimeFFT {
         assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
         assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
 
-        for (i, (s, w)) in frame.iter().zip(self.window.iter()).enumerate() {
-            self.scratch_in[i] = s * w;
-        }
+        apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
         self.fft
             .process_with_scratch(
@@ -434,28 +411,7 @@ impl ShortTimeFFT {
             let win = &self.window[..n_fft];
             let dst = &mut self.scratch_in[..n_fft];
 
-            #[cfg(all(target_arch = "x86_64", feature = "std"))]
-            {
-                if std::arch::is_x86_feature_detected!("avx2") {
-                    // SAFETY: we just checked AVX2 support, and src/win/dst all
-                    // have length >= n_fft.
-                    unsafe { apply_window_avx2(src, win, dst) };
-                    return;
-                }
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                // SAFETY: NEON is always available on aarch64, and src/win/dst
-                // all have length >= n_fft.
-                unsafe { apply_window_neon(src, win, dst) };
-                return;
-            }
-
-            // Scalar fallback.
-            dst.iter_mut()
-                .zip(src.iter().zip(win.iter()))
-                .for_each(|(d, (s, w))| *d = s * w);
+            apply_window_wide(src, win, dst);
             return;
         }
 
@@ -474,92 +430,78 @@ impl ShortTimeFFT {
     }
 }
 
-/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` for all i.
+/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` using `wide`.
 ///
-/// # Safety
-///
-/// Caller must ensure:
-/// - AVX2 is available on the current CPU
-/// - `src`, `win`, and `dst` all have the same length
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2")]
-unsafe fn apply_window_avx2(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+/// Processes 8 elements at a time via `f32x8` (AVX2/SSE/NEON depending on
+/// target), with a scalar tail for the remainder. Entirely safe code.
+fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
+    use wide::f32x8;
 
     debug_assert_eq!(src.len(), win.len());
     debug_assert_eq!(src.len(), dst.len());
 
     let n = src.len();
     let chunks = n / 8;
-    let remainder = n % 8;
-
-    let src_ptr = src.as_ptr();
-    let win_ptr = win.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
+    let tail_start = chunks * 8;
 
     for i in 0..chunks {
-        let offset = i * 8;
-        // SAFETY: offset < n (since i < chunks = n/8), and all slices have length n.
-        // AVX2 availability is guaranteed by the caller.
-        unsafe {
-            let s = _mm256_loadu_ps(src_ptr.add(offset));
-            let w = _mm256_loadu_ps(win_ptr.add(offset));
-            let r = _mm256_mul_ps(s, w);
-            _mm256_storeu_ps(dst_ptr.add(offset), r);
-        }
+        let off = i * 8;
+        let s = f32x8::new(src[off..off + 8].try_into().unwrap());
+        let w = f32x8::new(win[off..off + 8].try_into().unwrap());
+        let r = s * w;
+        dst[off..off + 8].copy_from_slice(r.as_array());
     }
 
-    // Handle remaining elements with scalar ops.
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        // SAFETY: tail_start + i < n, and all slices have length n.
-        unsafe {
-            *dst_ptr.add(tail_start + i) =
-                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
-        }
+    for i in tail_start..n {
+        dst[i] = src[i] * win[i];
     }
 }
 
-/// SIMD-accelerated window application using ARM NEON.
+/// SIMD-accelerated power computation: `dst[i] = complex[i].re² + complex[i].im²`
+/// using `wide`.
 ///
-/// # Safety
-///
-/// Caller must ensure `src`, `win`, and `dst` all have the same length.
-/// NEON is always available on aarch64.
-#[cfg(target_arch = "aarch64")]
-unsafe fn apply_window_neon(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+/// Processes 8 power values at a time via `f32x8` by separately loading
+/// the real and imaginary parts, then computing `re * re + im * im`.
+fn compute_power_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
+    use wide::f32x8;
 
-    debug_assert_eq!(src.len(), win.len());
-    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(complex.len(), dst.len());
 
-    let n = src.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
-
-    let src_ptr = src.as_ptr();
-    let win_ptr = win.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
+    let n = complex.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
 
     for i in 0..chunks {
-        let offset = i * 4;
-        // SAFETY: offset < n (since i < chunks = n/4), and all slices have length n.
-        // NEON is always available on aarch64.
-        unsafe {
-            let s = vld1q_f32(src_ptr.add(offset));
-            let w = vld1q_f32(win_ptr.add(offset));
-            let r = vmulq_f32(s, w);
-            vst1q_f32(dst_ptr.add(offset), r);
-        }
+        let off = i * 8;
+        let re = f32x8::new([
+            complex[off].re,
+            complex[off + 1].re,
+            complex[off + 2].re,
+            complex[off + 3].re,
+            complex[off + 4].re,
+            complex[off + 5].re,
+            complex[off + 6].re,
+            complex[off + 7].re,
+        ]);
+        let im = f32x8::new([
+            complex[off].im,
+            complex[off + 1].im,
+            complex[off + 2].im,
+            complex[off + 3].im,
+            complex[off + 4].im,
+            complex[off + 5].im,
+            complex[off + 6].im,
+            complex[off + 7].im,
+        ]);
+        // re² + im² via fused multiply-add: re*re + im*im
+        let power = re.mul_add(re, im * im);
+        dst[off..off + 8].copy_from_slice(power.as_array());
     }
 
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        // SAFETY: tail_start + i < n, and all slices have length n.
-        unsafe {
-            *dst_ptr.add(tail_start + i) =
-                *src_ptr.add(tail_start + i) * *win_ptr.add(tail_start + i);
-        }
+    // Scalar tail.
+    for i in tail_start..n {
+        let c = &complex[i];
+        dst[i] = c.re * c.re + c.im * c.im;
     }
 }
 
@@ -579,6 +521,7 @@ fn reflect(i: isize, len: usize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;

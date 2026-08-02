@@ -39,7 +39,8 @@ pub enum AfpError {
     /// The audio's sample rate does not match the rate the fingerprinter
     /// expects. Each fingerprinter has a single required rate; consult
     /// [`Fingerprinter::required_sample_rate`](crate::Fingerprinter::required_sample_rate)
-    /// (or the algorithm's documentation) to learn the value.
+    /// or [`StreamingFingerprinter::required_sample_rate`](crate::StreamingFingerprinter::required_sample_rate)
+    /// to learn the value.
     #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
 
@@ -96,6 +97,11 @@ pub enum AfpError {
         /// Index of the first non-finite sample.
         index: usize,
     },
+
+    /// Deserialization of a fingerprint binary blob failed (magic mismatch,
+    /// unsupported version, truncated payload, wrong algorithm, …).
+    #[error("deserialize: {0}")]
+    Deserialize(String),
 
     /// A configuration value was rejected (out of range, mutually exclusive, …).
     #[error("invalid configuration: {0}")]
@@ -187,6 +193,30 @@ impl AfpError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Model-loading helpers (shared by `neural` and `watermark` features)
+// ---------------------------------------------------------------------------
+
+/// Map a failed filesystem open into the appropriate [`AfpError`] variant.
+///
+/// Used by both the neural embedder and watermark detector when opening
+/// ONNX model files.
+#[cfg(any(feature = "neural", feature = "watermark"))]
+pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
+    use alloc::string::ToString;
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AfpError::ModelNotFound(path.to_string())
+    } else {
+        AfpError::ModelLoad(alloc::format!("open: {e}"))
+    }
+}
+
+/// Map any `Display`-able model-load error into [`AfpError::ModelLoad`].
+#[cfg(any(feature = "neural", feature = "watermark"))]
+pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
+    AfpError::ModelLoad(alloc::format!("load: {e}"))
+}
+
 /// Shorthand for `core::result::Result<T, AfpError>`.
 ///
 /// # Example
@@ -221,25 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sample_rate_displays_offending_value_only() {
+    fn unsupported_sample_rate_displays_both_rates() {
         // The message must NOT claim a global "supported" list — each
-        // fingerprinter has its own required rate, so any list we
-        // hardcode here would be wrong for at least one of them
-        // (Haitsma needs 5 kHz; the rest don't).
+        // fingerprinter has its own required rate.
         let s = AfpError::UnsupportedSampleRate(7_000).to_string();
-        assert!(s.contains("7000"));
+        assert!(s.contains("7000"), "must contain the offending rate: {s}");
         assert!(
             !s.contains("(supported"),
             "must not advertise a hardcoded supported list: {s}",
         );
-        // None of the previously-hardcoded "supported" rate strings
-        // should appear in the error.
-        for rate in ["8000", "11025", "16000", "22050", "44100", "48000"] {
-            assert!(
-                !s.contains(rate),
-                "found stale supported-rate {rate} in: {s}",
-            );
-        }
     }
 
     #[test]

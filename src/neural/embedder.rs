@@ -11,21 +11,24 @@ use tract_onnx::prelude::*;
 use crate::dsp::mel::{MelFilterBank, MelScale};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
+use crate::error::{map_model_load_err, map_model_open_io};
 use crate::{AfpError, AudioBuffer, Fingerprinter, Result, TimestampMs};
 
 use super::frontend::LogMelFrontend;
 
-/// Map a failed filesystem open of a model path.
-fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        AfpError::ModelNotFound(path.to_string())
-    } else {
-        AfpError::ModelLoad(format!("open: {e}"))
+/// In-place L2 normalisation: scales `v` so its Euclidean norm is 1.
+/// Leaves the vector unchanged if its norm is below `1e-12` (effectively
+/// zero).
+#[inline]
+fn l2_normalize_inplace(v: &mut [f32]) {
+    let sumsq: f32 = v.iter().map(|x| x * x).sum();
+    let norm = sumsq.sqrt();
+    if norm > 1e-12 {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
     }
-}
-
-fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
-    AfpError::ModelLoad(format!("load: {e}"))
 }
 
 /// Tunable parameters for [`NeuralEmbedder`] / [`super::StreamingNeuralEmbedder`].
@@ -73,6 +76,16 @@ pub struct NeuralEmbedderConfig {
     /// Maximum samples accepted in a single streaming `push`. `None`
     /// disables (default). Excess samples are dropped (push is infallible).
     pub max_push_samples: Option<usize>,
+    /// Number of analysis windows to batch into a single model call
+    /// during offline [`extract`](NeuralEmbedder::extract). Default 1
+    /// (one inference call per window — original behaviour).
+    ///
+    /// Higher values amortise the fixed per-call overhead of the ONNX
+    /// runtime across multiple windows. The streaming path always uses
+    /// single-window inference regardless of this setting.
+    ///
+    /// Must be ≥ 1.
+    pub batch_size: usize,
 }
 
 impl NeuralEmbedderConfig {
@@ -97,6 +110,7 @@ impl NeuralEmbedderConfig {
             l2_normalize: true,
             max_input_samples: None,
             max_push_samples: None,
+            batch_size: 1,
         }
     }
 }
@@ -133,6 +147,11 @@ pub(crate) struct EmbedderCore {
     pub(crate) cfg: NeuralEmbedderConfig,
     pub(crate) frontend: LogMelFrontend,
     pub(crate) runnable: Runnable,
+
+    /// Batched runnable for offline inference when `batch_size > 1`.
+    /// Accepts input shape `[batch_size, n_mels, n_frames]`. `None`
+    /// when `batch_size == 1` (streaming also always uses `runnable`).
+    pub(crate) batch_runnable: Option<Runnable>,
 
     /// Total samples in one analysis window (`round(window_secs · sr)`).
     pub(crate) window_samples: usize,
@@ -221,14 +240,101 @@ impl EmbedderCore {
         out.extend(view.iter().copied());
 
         if self.cfg.l2_normalize {
-            let sumsq: f32 = out.iter().map(|x| x * x).sum();
-            let norm = sumsq.sqrt();
-            if norm > 1e-12 {
-                let inv = 1.0 / norm;
-                for v in out.iter_mut() {
-                    *v *= inv;
-                }
+            l2_normalize_inplace(out);
+        }
+
+        Ok(())
+    }
+
+    /// Compute embeddings for a batch of windows in a single model call.
+    ///
+    /// `windows` is a slice of PCM slices, each of length
+    /// `self.window_samples`. Results are appended to `out` in order.
+    /// Requires `self.batch_runnable` to be `Some` and `windows.len()`
+    /// to equal the batch size that runnable was built for.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any window has the wrong length, if `batch_runnable` is
+    /// `None`, or if `windows.len()` != configured batch size.
+    pub(crate) fn embed_batch_into(
+        &mut self,
+        windows: &[&[f32]],
+        out: &mut Vec<NeuralEmbedding>,
+        timestamps: &[TimestampMs],
+    ) -> Result<()> {
+        let batch = windows.len();
+        assert!(batch > 0, "embed_batch_into requires at least one window");
+        let batch_runnable = self
+            .batch_runnable
+            .as_ref()
+            .expect("embed_batch_into requires batch_runnable");
+
+        let n_mels = self.frontend.n_mels();
+        let n_frames = self.n_frames;
+        let embedding_dim = self.embedding_dim;
+        let window_stride = n_mels * n_frames; // elements per batch item
+
+        // Allocate input tensor [batch, n_mels, n_frames].
+        // SAFETY: we will fill every element before run() reads it.
+        let mut tensor = unsafe {
+            Tensor::uninitialized::<f32>(&[batch, n_mels, n_frames])
+                .map_err(|e| AfpError::Inference(format!("batch input alloc: {e}")))?
+        };
+
+        {
+            let dst = unsafe { tensor.as_slice_mut_unchecked::<f32>() };
+            for (b, window) in windows.iter().enumerate() {
+                assert_eq!(
+                    window.len(),
+                    self.window_samples,
+                    "embed_batch_into: window {b} has wrong length"
+                );
+                let base = b * window_stride;
+                self.frontend.for_each_frame(window, |f, mel_row| {
+                    for m in 0..n_mels {
+                        dst[base + m * n_frames + f] = mel_row[m];
+                    }
+                });
             }
+        }
+
+        let outputs = batch_runnable
+            .run(tvec!(tensor.into()))
+            .map_err(|e| AfpError::Inference(format!("batch run: {e}")))?;
+        if outputs.is_empty() {
+            return Err(AfpError::Inference(
+                "batch model produced no outputs".to_string(),
+            ));
+        }
+
+        let view = outputs[0]
+            .to_plain_array_view::<f32>()
+            .map_err(|e| AfpError::Inference(format!("batch output view: {e}")))?;
+        let expected_len = batch * embedding_dim;
+        if view.len() != expected_len {
+            return Err(AfpError::Inference(format!(
+                "expected batch output of {} elements ({}×{}), got {}",
+                expected_len,
+                batch,
+                embedding_dim,
+                view.len(),
+            )));
+        }
+
+        for (b, ts) in timestamps.iter().enumerate().take(batch) {
+            let slice = &view.as_slice().unwrap()[b * embedding_dim..(b + 1) * embedding_dim];
+            let mut vector = Vec::with_capacity(embedding_dim);
+            vector.extend_from_slice(slice);
+
+            if self.cfg.l2_normalize {
+                l2_normalize_inplace(&mut vector);
+            }
+
+            out.push(NeuralEmbedding {
+                vector,
+                t_start: *ts,
+            });
         }
 
         Ok(())
@@ -302,6 +408,9 @@ impl NeuralEmbedder {
                 "hop_secs must be a positive finite number (got {})",
                 cfg.hop_secs,
             )));
+        }
+        if cfg.batch_size == 0 {
+            return Err(AfpError::Config("batch_size must be >= 1".to_string()));
         }
 
         let window_samples = (cfg.window_secs * cfg.sample_rate as f32).round() as usize;
@@ -404,6 +513,31 @@ impl NeuralEmbedder {
             ));
         }
 
+        // --- Build batch runnable (when batch_size > 1) ---------------
+        let batch_runnable = if cfg.batch_size > 1 {
+            let batch_model = tract_onnx::onnx()
+                .model_for_path(path)
+                .map_err(map_model_load_err)?;
+            let plan: Runnable = batch_model
+                .with_input_fact(
+                    0,
+                    InferenceFact::dt_shape(
+                        f32::datum_type(),
+                        tvec!(cfg.batch_size, cfg.n_mels, n_frames),
+                    ),
+                )
+                .map_err(|e| AfpError::Inference(format!("batch input fact: {e}")))?
+                .into_typed()
+                .map_err(|e| AfpError::Inference(format!("batch type: {e}")))?
+                .into_optimized()
+                .map_err(|e| AfpError::Inference(format!("batch optimize: {e}")))?
+                .into_runnable()
+                .map_err(|e| AfpError::Inference(format!("batch runnable: {e}")))?;
+            Some(plan)
+        } else {
+            None
+        };
+
         let frontend = LogMelFrontend::new(stft, mel, window_samples);
 
         Ok(Self {
@@ -411,6 +545,7 @@ impl NeuralEmbedder {
                 cfg,
                 frontend,
                 runnable,
+                batch_runnable,
                 window_samples,
                 hop_samples,
                 n_frames,
@@ -482,22 +617,60 @@ impl Fingerprinter for NeuralEmbedder {
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let embedding_dim = self.core.embedding_dim;
+        let batch_size = self.core.cfg.batch_size;
 
         // Preallocate the output container — we know exactly how many
         // windows fit in the buffer.
         let n_windows = (audio.samples.len() - window_samples) / hop_samples + 1;
         let mut embeddings = Vec::with_capacity(n_windows);
 
-        let mut start = 0usize;
-        while start + window_samples <= audio.samples.len() {
-            let window = &audio.samples[start..start + window_samples];
-            // Pre-size the per-embedding Vec to embedding_dim so it doesn't
-            // grow during the L2-norm + extend in embed_window_into.
-            let mut vector = Vec::with_capacity(embedding_dim);
-            self.core.embed_window_into(window, &mut vector)?;
-            let t_start = TimestampMs((start as u64) * 1000 / sr);
-            embeddings.push(NeuralEmbedding { vector, t_start });
-            start += hop_samples;
+        if batch_size > 1 && self.core.batch_runnable.is_some() {
+            // --- Batched inference path --------------------------------
+            let mut start = 0usize;
+            while start + window_samples <= audio.samples.len() {
+                // Collect up to `batch_size` windows.
+                let mut batch_windows: Vec<&[f32]> = Vec::with_capacity(batch_size);
+                let mut batch_timestamps: Vec<TimestampMs> = Vec::with_capacity(batch_size);
+                let mut s = start;
+                while batch_windows.len() < batch_size && s + window_samples <= audio.samples.len()
+                {
+                    batch_windows.push(&audio.samples[s..s + window_samples]);
+                    batch_timestamps.push(TimestampMs((s as u64) * 1000 / sr));
+                    s += hop_samples;
+                }
+
+                if batch_windows.len() == batch_size {
+                    // Full batch — single model call.
+                    self.core.embed_batch_into(
+                        &batch_windows,
+                        &mut embeddings,
+                        &batch_timestamps,
+                    )?;
+                } else {
+                    // Partial final batch — fall back to single-window inference.
+                    for (window, ts) in batch_windows.iter().zip(batch_timestamps.iter()) {
+                        let mut vector = Vec::with_capacity(embedding_dim);
+                        self.core.embed_window_into(window, &mut vector)?;
+                        embeddings.push(NeuralEmbedding {
+                            vector,
+                            t_start: *ts,
+                        });
+                    }
+                }
+
+                start = s;
+            }
+        } else {
+            // --- Single-window inference path (original behaviour) ------
+            let mut start = 0usize;
+            while start + window_samples <= audio.samples.len() {
+                let window = &audio.samples[start..start + window_samples];
+                let mut vector = Vec::with_capacity(embedding_dim);
+                self.core.embed_window_into(window, &mut vector)?;
+                let t_start = TimestampMs((start as u64) * 1000 / sr);
+                embeddings.push(NeuralEmbedding { vector, t_start });
+                start += hop_samples;
+            }
         }
 
         Ok(NeuralFingerprint {
@@ -639,6 +812,7 @@ mod tests {
         assert_eq!(cfg.window_secs, 1.0);
         assert_eq!(cfg.hop_secs, 1.0);
         assert!(cfg.l2_normalize);
+        assert_eq!(cfg.batch_size, 1);
     }
 
     // -----------------------------------------------------------------
@@ -707,5 +881,117 @@ mod tests {
             let expected_t = (i * hop_samples * 1000) as u64 / cfg.sample_rate as u64;
             assert_eq!(e.t_start.0, expected_t, "window {i} t_start");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Batched inference tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn zero_batch_size_is_rejected() {
+        let mut cfg = NeuralEmbedderConfig::new("any.onnx");
+        cfg.batch_size = 0;
+        assert_config_err(cfg, |msg| assert!(msg.contains("batch_size")));
+    }
+
+    #[test]
+    fn batched_extract_matches_single_window_extract() {
+        use crate::SampleRate;
+        use crate::neural::test_support::{passthrough_embedder, small_cfg, synth_audio};
+
+        // Baseline: single-window (batch_size=1).
+        let cfg_single = small_cfg();
+        let mut fp_single = passthrough_embedder(cfg_single.clone()).expect("single embedder");
+
+        // 2.5 s audio → 10 windows (at 0.25 s each).
+        // batch_size=4 gives 2 full batches + 2 remainder.
+        let n_samples = (2.5 * cfg_single.sample_rate as f32) as usize;
+        let samples = synth_audio(7, n_samples, cfg_single.sample_rate);
+        let audio_single = crate::AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
+        let out_single = fp_single.extract(audio_single).expect("extract single");
+
+        // Batched: batch_size=4.
+        let mut cfg_batch = small_cfg();
+        cfg_batch.batch_size = 4;
+        let mut fp_batch = passthrough_embedder(cfg_batch).expect("batch embedder");
+        let audio_batch = crate::AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
+        let out_batch = fp_batch.extract(audio_batch).expect("extract batch");
+
+        // Same number of embeddings.
+        assert_eq!(
+            out_batch.embeddings.len(),
+            out_single.embeddings.len(),
+            "embedding count mismatch: batch={} vs single={}",
+            out_batch.embeddings.len(),
+            out_single.embeddings.len(),
+        );
+
+        // Each embedding must be bit-exact (same front-end, same model).
+        for (i, (a, b)) in out_single
+            .embeddings
+            .iter()
+            .zip(out_batch.embeddings.iter())
+            .enumerate()
+        {
+            assert_eq!(a.t_start, b.t_start, "window {i} timestamp mismatch");
+            assert_eq!(a.vector.len(), b.vector.len(), "window {i} dim mismatch");
+            for (j, (va, vb)) in a.vector.iter().zip(b.vector.iter()).enumerate() {
+                assert!(
+                    (va - vb).abs() < 1e-6,
+                    "window {i} dim {j} differs: single={va} batch={vb}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_extract_works_with_exact_multiple_of_batch_size() {
+        use crate::SampleRate;
+        use crate::neural::test_support::{passthrough_embedder, small_cfg, synth_audio};
+
+        // Exactly 4 windows with batch_size=4 → one full batch, no remainder.
+        let mut cfg = small_cfg();
+        cfg.batch_size = 4;
+        let mut fp = passthrough_embedder(cfg.clone()).expect("batch embedder");
+
+        // 1.0 s = 4 windows of 0.25 s each (non-overlapping).
+        let samples = synth_audio(99, cfg.sample_rate as usize, cfg.sample_rate);
+        let audio = crate::AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
+        let out = fp.extract(audio).expect("extract");
+        assert_eq!(out.embeddings.len(), 4);
+        for e in &out.embeddings {
+            assert_eq!(e.vector.len(), out.embedding_dim);
+        }
+    }
+
+    #[test]
+    fn batched_extract_works_with_fewer_windows_than_batch_size() {
+        use crate::SampleRate;
+        use crate::neural::test_support::{passthrough_embedder, small_cfg, synth_audio};
+
+        // batch_size=8 but only 2 windows worth of audio → all
+        // handled by single-window fallback (partial batch).
+        let mut cfg = small_cfg();
+        cfg.batch_size = 8;
+        let mut fp = passthrough_embedder(cfg.clone()).expect("batch embedder");
+
+        // 0.5 s = 2 windows of 0.25 s.
+        let n_samples = (cfg.sample_rate as f32 * 0.5) as usize;
+        let samples = synth_audio(13, n_samples, cfg.sample_rate);
+        let audio = crate::AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_16000,
+        };
+        let out = fp.extract(audio).expect("extract");
+        assert_eq!(out.embeddings.len(), 2);
     }
 }

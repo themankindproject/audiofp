@@ -142,16 +142,30 @@ impl Haitsma {
     /// # Panics
     ///
     /// Panics if `cfg.fmin <= 0`, `cfg.fmax <= cfg.fmin`, or
-    /// `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist).
+    /// `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist). Use [`try_new`]
+    /// for a fallible alternative.
+    ///
+    /// [`try_new`]: Haitsma::try_new
     #[must_use]
     pub fn new(cfg: HaitsmaConfig) -> Self {
-        assert!(cfg.fmin > 0.0, "fmin must be positive");
-        assert!(cfg.fmax > cfg.fmin, "fmax must exceed fmin");
-        assert!(
-            cfg.fmax < HAITSMA_SR as f32 / 2.0,
-            "fmax must be below Nyquist ({} Hz)",
-            HAITSMA_SR / 2
-        );
+        Self::try_new(cfg).expect("invalid HaitsmaConfig (see AfpError::Config)")
+    }
+
+    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// `fmin`/`fmax`/Nyquist instead of panicking.
+    pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
+        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
+            return Err(crate::AfpError::Config("fmin must be positive".into()));
+        }
+        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
+            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
+        }
+        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "fmax must be below Nyquist ({} Hz)",
+                HAITSMA_SR / 2
+            )));
+        }
 
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: HAITSMA_N_FFT,
@@ -163,14 +177,121 @@ impl Haitsma {
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
         let band_ranges = build_band_ranges(&bin_to_band);
 
-        Self {
+        Ok(Self {
             cfg,
             stft,
             band_ranges,
             energies_buf: Vec::new(),
             frames_buf: Vec::new(),
             power_buf: Vec::new(),
+        })
+    }
+}
+
+/// Progress callback reporting interval for Haitsma (78.125 fps):
+/// every 39 frames ≈ 500 ms of audio.
+const HAITSMA_PROGRESS_INTERVAL: usize = 39;
+
+impl Haitsma {
+    /// Extract fingerprint with a progress callback.
+    ///
+    /// `progress` is called periodically with a value in `[0.0, 1.0]`
+    /// representing the fraction of work completed. The final call is
+    /// always made with `1.0`. The callback is invoked at most once per
+    /// ~500 ms of audio to avoid overhead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fingerprinter::extract`].
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self,
+        audio: AudioBuffer<'_>,
+        mut progress: F,
+    ) -> Result<HaitsmaFingerprint> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
         }
+        if audio.rate.hz() != HAITSMA_SR {
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        }
+        if audio.samples.len() < self.min_samples() {
+            return Err(AfpError::AudioTooShort {
+                needed: self.min_samples(),
+                got: audio.samples.len(),
+            });
+        }
+
+        progress(0.0);
+
+        // Pull power directly — band energy is `Σ |X|²`, so the previous
+        // path's `m * m` after a `sqrt(|X|²)` was redundant.
+        let (n_frames, n_bins) = self
+            .stft
+            .power_flat_into(audio.samples, &mut self.power_buf);
+        let power_flat = &self.power_buf;
+        if n_frames < 2 {
+            progress(1.0);
+            return Ok(HaitsmaFingerprint {
+                frames: Vec::new(),
+                frames_per_sec: HAITSMA_FRAMES_PER_SEC,
+            });
+        }
+
+        // Report STFT phase progress (~50% of total work for Haitsma).
+        let total_frames = n_frames;
+        let stft_weight = 0.50_f32;
+        let interval = HAITSMA_PROGRESS_INTERVAL;
+        {
+            let mut reported = 0usize;
+            while reported + interval < total_frames {
+                reported += interval;
+                progress(stft_weight * (reported as f32 / total_frames as f32));
+            }
+        }
+        progress(stft_weight);
+
+        // Compute per-frame band energies.
+        self.energies_buf.clear();
+        self.energies_buf.reserve(n_frames);
+        for f in 0..n_frames {
+            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
+            let mut e = [0.0_f32; HAITSMA_N_BANDS];
+            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
+                e[b] = row[start..end].iter().sum();
+            }
+            self.energies_buf.push(e);
+
+            // Report progress during band energy computation (~30% of work).
+            if (f + 1) % interval == 0 {
+                let band_progress = stft_weight + 0.30 * ((f + 1) as f32 / total_frames as f32);
+                progress(band_progress);
+            }
+        }
+        progress(0.80);
+
+        // For each frame n >= 1, compute the 32-bit hash.
+        self.frames_buf.clear();
+        self.frames_buf.reserve(self.energies_buf.len() - 1);
+        for n in 1..self.energies_buf.len() {
+            self.frames_buf.push(pack_frame_bits(
+                &self.energies_buf[n],
+                &self.energies_buf[n - 1],
+            ));
+        }
+
+        progress(1.0);
+
+        // Move ownership into the return value; the struct keeps capacity.
+        Ok(HaitsmaFingerprint {
+            frames: core::mem::take(&mut self.frames_buf),
+            frames_per_sec: HAITSMA_FRAMES_PER_SEC,
+        })
     }
 }
 
@@ -195,65 +316,7 @@ impl Fingerprinter for Haitsma {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        crate::pcm::reject_non_finite(audio.samples)?;
-        if let Some(limit) = self.cfg.max_input_samples
-            && audio.samples.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: audio.samples.len(),
-            });
-        }
-        if audio.rate.hz() != HAITSMA_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
-        }
-        if audio.samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: audio.samples.len(),
-            });
-        }
-
-        // Pull power directly — band energy is `Σ |X|²`, so the previous
-        // path's `m * m` after a `sqrt(|X|²)` was redundant.
-        let (n_frames, n_bins) = self
-            .stft
-            .power_flat_into(audio.samples, &mut self.power_buf);
-        let power_flat = &self.power_buf;
-        if n_frames < 2 {
-            return Ok(HaitsmaFingerprint {
-                frames: Vec::new(),
-                frames_per_sec: HAITSMA_FRAMES_PER_SEC,
-            });
-        }
-
-        // Compute per-frame band energies.
-        self.energies_buf.clear();
-        self.energies_buf.reserve(n_frames);
-        for f in 0..n_frames {
-            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
-            let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
-                e[b] = row[start..end].iter().sum();
-            }
-            self.energies_buf.push(e);
-        }
-
-        // For each frame n >= 1, compute the 32-bit hash.
-        self.frames_buf.clear();
-        self.frames_buf.reserve(self.energies_buf.len() - 1);
-        for n in 1..self.energies_buf.len() {
-            self.frames_buf.push(pack_frame_bits(
-                &self.energies_buf[n],
-                &self.energies_buf[n - 1],
-            ));
-        }
-
-        // Move ownership into the return value; the struct keeps capacity.
-        Ok(HaitsmaFingerprint {
-            frames: core::mem::take(&mut self.frames_buf),
-            frames_per_sec: HAITSMA_FRAMES_PER_SEC,
-        })
+        self.extract_with_progress(audio, |_| {})
     }
 }
 
@@ -261,13 +324,35 @@ impl Fingerprinter for Haitsma {
 /// and frame `n−1`.
 #[inline]
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
+    // SIMD loop assumes 4 chunks × 8 lanes = 32 bits from 33 bands.
+    // If HAITSMA_N_BANDS ever changes, this function must be updated.
+    debug_assert_eq!(HAITSMA_N_BANDS, 4 * 8 + 1);
+
     let mut hash = 0_u32;
-    for b in 0..32 {
-        let diff = (curr[b] - curr[b + 1]) - (prev[b] - prev[b + 1]);
-        // Branchless: `(diff > 0.0) as u32` compiles to `fcmp + setg`
-        // without a branch, enabling LLVM to vectorize groups of bands.
-        hash |= ((diff > 0.0) as u32) << (31 - b);
+
+    // Vectorize the band-difference computation using f32x8.
+    // Compute all 32 diffs in 4 SIMD iterations, then extract sign bits.
+    // Each iteration reads curr[off..off+8] and curr[off+1..off+9] to
+    // compute 8 adjacent-band differences from the 33-band array.
+    use wide::f32x8;
+
+    for chunk in 0..4 {
+        let off = chunk * 8;
+        let curr_lo = f32x8::new(curr[off..off + 8].try_into().unwrap());
+        let curr_hi = f32x8::new(curr[off + 1..off + 9].try_into().unwrap());
+        let prev_lo = f32x8::new(prev[off..off + 8].try_into().unwrap());
+        let prev_hi = f32x8::new(prev[off + 1..off + 9].try_into().unwrap());
+
+        // diff[i] = (curr[i] - curr[i+1]) - (prev[i] - prev[i+1])
+        let diff = (curr_lo - curr_hi) - (prev_lo - prev_hi);
+        let arr = diff.to_array();
+
+        // Pack sign bits: band at offset+i maps to bit (31 - offset - i).
+        for (i, &d) in arr.iter().enumerate() {
+            hash |= ((d > 0.0) as u32) << (31 - off - i);
+        }
     }
+
     hash
 }
 
@@ -374,8 +459,35 @@ impl Default for StreamingHaitsma {
 
 impl StreamingHaitsma {
     /// Build a streaming Haitsma extractor with the given config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cfg.fmin <= 0`, `cfg.fmax <= cfg.fmin`, or
+    /// `cfg.fmax >= HAITSMA_SR / 2` (above Nyquist). Use [`try_new`]
+    /// for a fallible alternative.
+    ///
+    /// [`try_new`]: StreamingHaitsma::try_new
     #[must_use]
     pub fn new(cfg: HaitsmaConfig) -> Self {
+        Self::try_new(cfg).expect("invalid HaitsmaConfig (see AfpError::Config)")
+    }
+
+    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// `fmin`/`fmax`/Nyquist instead of panicking.
+    pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
+        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
+            return Err(crate::AfpError::Config("fmin must be positive".into()));
+        }
+        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
+            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
+        }
+        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "fmax must be below Nyquist ({} Hz)",
+                HAITSMA_SR / 2
+            )));
+        }
+
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: HAITSMA_N_FFT,
             hop: HAITSMA_HOP,
@@ -385,7 +497,7 @@ impl StreamingHaitsma {
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
         let band_ranges = build_band_ranges(&bin_to_band);
         let n_bins = stft.n_bins();
-        Self {
+        Ok(Self {
             cfg,
             stft,
             sample_carry: Vec::new(),
@@ -395,7 +507,7 @@ impl StreamingHaitsma {
             prev_energy: [0.0_f32; HAITSMA_N_BANDS],
             next_frame_idx: 1,
             pending: Vec::new(),
-        }
+        })
     }
 
     /// Borrow the configuration this stream was built with.
@@ -454,11 +566,13 @@ impl StreamingHaitsma {
 impl StreamingFingerprinter for StreamingHaitsma {
     type Frame = u32;
 
+    fn required_sample_rate(&self) -> u32 {
+        HAITSMA_SR
+    }
+
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.process_push(samples);
-        let mut out = Vec::new();
-        out.append(&mut self.pending);
-        out
+        core::mem::take(&mut self.pending)
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
@@ -475,9 +589,7 @@ impl StreamingFingerprinter for StreamingHaitsma {
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        let mut out = Vec::new();
-        out.append(&mut self.pending);
-        out
+        core::mem::take(&mut self.pending)
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> usize
@@ -547,7 +659,7 @@ mod tests {
         };
         match fp.extract(buf) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
-            other => panic!("expected UnsupportedSampleRate(16000), got {other:?}"),
+            other => panic!("expected UnsupportedSampleRate, got {other:?}"),
         }
     }
 
@@ -757,25 +869,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "fmax must exceed fmin")]
-    fn invalid_band_range_panics() {
-        let _ = Haitsma::new(HaitsmaConfig {
+    fn invalid_band_range_returns_config_error() {
+        let result = Haitsma::try_new(HaitsmaConfig {
             fmin: 1000.0,
             fmax: 1000.0,
             max_input_samples: None,
             max_push_samples: None,
         });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmax must exceed fmin")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "below Nyquist")]
-    fn fmax_above_nyquist_panics() {
-        let _ = Haitsma::new(HaitsmaConfig {
+    fn fmax_above_nyquist_returns_config_error() {
+        let result = Haitsma::try_new(HaitsmaConfig {
             fmin: 300.0,
             fmax: 3_000.0,
             max_input_samples: None,
             max_push_samples: None,
         });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("Nyquist")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -883,30 +1009,40 @@ mod tests {
     // -----------------------------------------------------------------
     // Constructor panic coverage.
     //
-    // `Haitsma::new` (used by the `Haitsma` extractor) asserts
+    // `Haitsma::new` (used by the `Haitsma` extractor) validates
     // `fmin > 0`, `fmax > fmin`, and `fmax < Nyquist`. The latter two
-    // are already covered by `invalid_band_range_panics` and
-    // `fmax_above_nyquist_panics`. The fmin>0 case is the gap.
+    // are already covered by `invalid_band_range_returns_config_error`
+    // and `fmax_above_nyquist_returns_config_error`. The fmin>0 case:
     // -----------------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "fmin must be positive")]
-    fn haitsma_new_panics_on_zero_fmin() {
+    fn haitsma_new_rejects_zero_fmin() {
         let cfg = HaitsmaConfig {
             fmin: 0.0,
             ..HaitsmaConfig::default()
         };
-        let _ = Haitsma::new(cfg);
+        let err = match Haitsma::try_new(cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmin must be positive"))
+        );
     }
 
     #[test]
-    #[should_panic(expected = "fmin must be positive")]
-    fn haitsma_new_panics_on_negative_fmin() {
+    fn haitsma_new_rejects_negative_fmin() {
         let cfg = HaitsmaConfig {
             fmin: -10.0,
             ..HaitsmaConfig::default()
         };
-        let _ = Haitsma::new(cfg);
+        let err = match Haitsma::try_new(cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Config error"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmin must be positive"))
+        );
     }
 
     // ── Performance regression: zero-alloc push_with contract ──
@@ -972,5 +1108,79 @@ mod tests {
             rate: SampleRate::HZ_5000,
         };
         fp.extract(buf).unwrap();
+    }
+
+    // ── Progress callback tests ──
+
+    #[test]
+    fn extract_with_progress_is_called_and_monotonic() {
+        let mut fp = Haitsma::default();
+        let samples = synthetic_audio(0xCAFE, 5_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        assert!(result.is_ok());
+        // Must be called at least a few times.
+        assert!(
+            values.len() >= 3,
+            "expected at least 3 progress calls, got {}",
+            values.len()
+        );
+        // First value must be 0.0.
+        assert_eq!(values[0], 0.0);
+        // Last value must be 1.0.
+        assert_eq!(*values.last().unwrap(), 1.0);
+        // Must be monotonically non-decreasing.
+        for w in values.windows(2) {
+            assert!(w[1] >= w[0], "progress went backwards: {} → {}", w[0], w[1]);
+        }
+        // All values must be in [0, 1].
+        for &v in &values {
+            assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn extract_with_progress_matches_extract_output() {
+        let samples = synthetic_audio(0xDEAD, 5_000 * 4);
+
+        let mut fp1 = Haitsma::default();
+        let result1 = fp1
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_5000,
+            })
+            .unwrap();
+
+        let mut fp2 = Haitsma::default();
+        let result2 = fp2
+            .extract_with_progress(
+                AudioBuffer {
+                    samples: &samples,
+                    rate: SampleRate::HZ_5000,
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(result1.frames, result2.frames);
+        assert_eq!(result1.frames_per_sec, result2.frames_per_sec);
+    }
+
+    #[test]
+    fn extract_with_progress_short_audio_still_reports_0_and_1() {
+        let mut fp = Haitsma::default();
+        let samples = synthetic_audio(0xFACE, 5_000 * 2);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        assert_eq!(values[0], 0.0);
+        assert_eq!(*values.last().unwrap(), 1.0);
     }
 }

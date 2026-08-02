@@ -36,8 +36,12 @@ jobs:
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
@@ -108,8 +112,12 @@ jobs:
         run: cargo check --no-default-features
 
   no-std-test:
-    name: test (no default features)
-    runs-on: ubuntu-latest
+    name: test no_std (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
@@ -138,9 +146,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
-      - name: fuzz smoke test (all 7 targets, 30s each)
+      - name: fuzz smoke test (all 9 targets, 30s each)
         run: |
-          for target in streaming_wang_equiv streaming_panako_equiv streaming_haitsma_equiv wang_hash_roundtrip panako_hash_roundtrip haitsma_hash_roundtrip sinc_resampler; do
+          for target in streaming_wang_equiv streaming_panako_equiv streaming_haitsma_equiv wang_hash_roundtrip panako_hash_roundtrip haitsma_hash_roundtrip sinc_resampler decode_bytes decode_resample; do
             echo "=== Fuzzing $target ==="
             cargo +nightly fuzz run --sanitizer=none "$target" -- -max_total_time=30 -runs=1000
           done

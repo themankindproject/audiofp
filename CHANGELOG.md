@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-08-02
+
+### Changed
+
+- **Safe SIMD via `wide` crate (replaces all `unsafe` arch intrinsics).**
+  Window application (`apply_window_wide`), power-spectrum computation
+  (`compute_power_wide`), and dB log-magnitude conversion
+  (`power_to_db_wide`) now use `wide::f32x8` — portable safe SIMD that
+  auto-dispatches to AVX2/SSE/NEON without any `unsafe` code. Removes
+  all `#[target_feature]` functions and `core::arch` imports from
+  `stft.rs`. Bit-exact output preserved (golden tests unchanged).
+- **Vectorized dB conversion in Wang and Panako (offline + streaming).**
+  The per-frame `max(v, floor).log2() * factor` loop is now processed
+  8 elements at a time via `f32x8::max()` + `f32x8::log2()`. Both
+  offline `extract` and streaming `push` benefit.
+- **SIMD dot product in polyphase resampler (`resample.rs`).**
+  The 65-tap kernel convolution in the middle (safe) loop uses `f32x8`
+  fused multiply-add — 8 iterations + 1 scalar tail instead of 65
+  scalar multiply-adds.
+- **SIMD dot product in mel filterbank CSR application (`mel.rs`).**
+  `log_mel_from_power` accumulates band energies 8-wide via
+  `f32x8::mul_add`. Bands with 10-50 non-zero bins now run in 1-6
+  SIMD iterations.
+- **SIMD band-difference bit-packing in Haitsma (`haitsma.rs`).**
+  `pack_frame_bits` computes 32 band differences in 4 `f32x8`
+  iterations and extracts sign bits, replacing a 32-iteration scalar
+  loop.
+- **Folded `inv_dc_gain` into polyphase kernel table (`resample.rs`).**
+  All kernel coefficients are pre-multiplied by `1/dc_gain` at
+  construction, eliminating one `f32` multiply per output sample in the
+  resampling hot loop.
+- **Removed dense `matrix` field from `MelFilterBank`.**
+  Saves ~256 KB heap per instance. The `matrix()` getter now
+  reconstructs on demand from the sparse CSR representation.
+  Hot path uses sparse representation exclusively.
+- **Pre-sized `VecDeque` in Lemire peak picker.**
+  Both `PeakPicker` and `IncrementalPeakDetector` allocate the
+  monotonic deque to its maximum capacity at construction, eliminating
+  capacity-check branches in the inner rolling-max loop.
+- **Crate package size reduced from 7.2 MiB to ~215 KiB.** Excluded
+  `tests/assets/` (8 MiB of real audio) and `fuzz/` from the published
+  crate. Downstream users don't need test audio.
+- **`MelFilterBank::new()` no longer allocates a dense matrix.**
+  The sparse CSR representation is now built directly by computing
+  analytical bin bounds per mel band (`first_bin`/`last_bin` from Hz
+  values), eliminating a temporary `n_mels × n_bins` allocation
+  (~512 KB for 128-mel / 2048-FFT configs). Bit-exact output preserved.
+- **`PeakPicker::pick()` uses `mem::take` instead of `clone` + `clear`.**
+  Eliminates a full Vec clone on every offline peak-pick call.
+- **`new()` delegates to `try_new().expect()` in `MelFilterBank`,
+  `ShortTimeFFT`, and `SincResampler`.**  Validation logic lives in one
+  place per type; `new()` is a one-liner. No API change — same panics
+  on invalid config.
+- **Extracted `l2_normalize_inplace` helper in neural embedder.**
+  Deduplicates the L2-norm logic that appeared in both
+  `embed_window_into` and `embed_batch_into`.
+- **Shared `map_model_open_io` / `map_model_load_err` helpers in
+  `error.rs`.**  Eliminates duplicate model-loading error mappers
+  between `neural/embedder.rs` and `watermark/detector.rs`.
+- **Streaming `push()` / `flush()` use `mem::take` instead of
+  `Vec::new()` + `append`.**  All three streaming fingerprinters
+  (Wang, Panako, Haitsma) now return the internal buffer with O(1)
+  pointer swap rather than allocating + copying.
+- **Removed redundant `.clear()` after `.drain(..)` in Wang/Panako
+  streaming `push_with` / `flush_with`.**
+- **Removed trivial SIMD wrappers** (`dot_mel_wide`, `dot_mel_sq_wide`,
+  `dot_f32_wide`) — call sites now invoke `dsp::dot_wide` /
+  `dsp::dot_sq_wide` directly.
+
 ### Added
 
 - **In-memory matching subsystem** (`audiofp::matching`) — `WangMatcher`,
@@ -16,6 +85,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `plan.md`.
 - **`benches/matching.rs`** — Criterion benches for Wang/Haitsma 1:1 and
   small `WangIndex` (N=100) queries (`cargo bench --bench matching`).
+- **`wide` 1.5 dependency** (no_std compatible, zero `unsafe`). Provides
+  `f32x8` used across the DSP pipeline.
+- **Lightweight fingerprint serialization (`serial` module) (#117).**
+  `WangFingerprint::to_bytes()` / `from_bytes()`,
+  `PanakoFingerprint::to_bytes()` / `from_bytes()`,
+  `HaitsmaFingerprint::to_bytes()` / `from_bytes()` — compact binary
+  wire format with 8-byte magic, version byte, algorithm ID, and Pod
+  hash payload. `FingerprintEnvelope` struct for metadata inspection.
+  New `AfpError::Deserialize` variant for format errors.
+- **Extraction progress callback (#122).**
+  `Wang::extract_with_progress`, `Panako::extract_with_progress`,
+  `Haitsma::extract_with_progress` — callback receives monotonic
+  `f32` in `[0.0, 1.0]`. Called every ~500 ms of audio. Plain
+  `extract()` delegates with a no-op closure (no overhead).
+- **Decoder integrity mode (#76).**
+  `DecodeLimits::strict()` builder sets `integrity_mode: true` — any
+  per-packet decode error (corrupt frame, I/O glitch) becomes fatal
+  instead of being silently skipped. Default remains `false`
+  (backwards-compatible skip behavior).
+- **Fuzz harnesses for decoder wrappers (#84).**
+  `fuzz/fuzz_targets/decode_bytes.rs` (raw bytes → decode pipeline),
+  `fuzz/fuzz_targets/decode_resample.rs` (arbitrary bytes + target
+  sample rate → decode + resample). Both wired into CI fuzz smoke job
+  (now 9 targets total).
+- **macOS and Windows in CI test matrix (#29).**
+  `test` and `no-std-test` jobs now run on `ubuntu-latest`,
+  `macos-latest`, and `windows-latest` with `fail-fast: false`.
+- **Codec robustness documentation (#87).**
+  `ROBUSTNESS.md` documents the CC-BY corpus, overlap methodology,
+  published numbers, and local reproduction commands.
+  `scripts/codec_robustness.sh` helper to run and format results.
+- **SIMD `dot_sq_wide` for `MelFilterBank::log_mel` (#97).**
+  Added `dot_sq_wide(a, b)` to `dsp/mod.rs` — computes `sum(a[i] *
+  b[i]²)` via `f32x8` (square + fused multiply-add, 8 elements per
+  iteration). `log_mel` (magnitude input) now runs through this
+  vectorised path instead of a scalar loop. Bit-exact output preserved
+  (verified by the existing `log_mel_from_power_matches_log_mel` test).
+- **Batched neural ONNX inference (`batch_size`) (#96).**
+  `NeuralEmbedderConfig` gains `batch_size: usize` (default 1 —
+  existing behaviour unchanged). When `batch_size > 1`, offline
+  `extract()` fills a `[batch, n_mels, n_frames]` tensor and invokes
+  the ONNX runtime once per batch, amortising per-run overhead across
+  multiple windows. A dedicated `batch_runnable` plan is built at
+  construction for the configured batch size; streaming continues to
+  use the single-window plan. Falls back to single-window inference
+  for partial tail batches. Verified parity with single-window output
+  at 1e-6 tolerance.
+
+### Removed
+
+- **All `unsafe` SIMD code** (`apply_window_avx2`, `apply_window_neon`,
+  `compute_power_avx2`) — replaced by safe `wide`-based equivalents.
+
+### Performance
+
+Offline extract (`cargo bench --bench extract`, 30 s synthetic audio,
+Intel i5-1135G7):
+
+| Algorithm | v0.3.8 (before) | This release | Improvement |
+|-----------|----------------:|-------------:|:-----------:|
+| Wang      | 99 ms           | 73 ms        | **-26%**    |
+| Panako    | 104 ms          | 77 ms        | **-26%**    |
+| Haitsma   | 47 ms           | 41 ms        | **-13%**    |
+
+Streaming push (small-chunk benchmarks):
+
+| Path            | Improvement vs v0.3.8 |
+|-----------------|-----------------------|
+| Wang (small)    | **-8%**               |
+| Wang (large)    | **-32%**              |
+| Panako (small)  | **-9%**               |
+| Haitsma (small) | **-7%**               |
+| Haitsma (large) | **-21%**              |
+
+Neural front-end (`cargo bench --features neural --bench neural_frontend`):
+
+| Path                          | Improvement |
+|-------------------------------|:-----------:|
+| `log_mel_pipeline_1s_window`  | **~-9%**    |
+
+The `dot_sq_wide` SIMD path in `log_mel` eliminates per-element scalar
+squaring + accumulation in favour of 8-wide fused multiply-add. Batched
+inference (`batch_size > 1`) additionally amortises ONNX runtime
+per-run overhead — improvement factor depends on model size and batch
+depth (measured 2-4× on small embedding models).
+
+## [0.3.8] - 2026-07-24
+
+### Added
+
+- **`try_new()` on `MelFilterBank`, `ShortTimeFFT`, `SincResampler` (#86).**
+  Fallible constructors returning `Result<Self, AfpError::Config>` for
+  callers who prefer error handling over panics. The existing `new()`
+  methods remain unchanged (panic on invalid params).
+- **`WatermarkConfig::max_input_samples` (#81).** When set, `detect()`
+  rejects inputs exceeding the cap with `AfpError::InputTooLarge` before
+  any inference. Default `None` (unbounded). Matches the pattern on
+  classical fingerprinter configs.
+- **Expanded Symphonia codec/format support (#112).** Enabled `adpcm`,
+  `alac` (Apple Lossless), and `mkv` (Matroska/WebM) features. Files in
+  these formats now decode out-of-the-box without user feature-flag work.
+- **`SECURITY.md` + threat model (#74).** Documents responsible disclosure,
+  trust boundaries (untrusted audio vs trusted ONNX), and production
+  defaults (`DecodeLimits`). Linked from README.
+- **`CODE_OF_CONDUCT.md`, issue/PR templates, CONTRIBUTING MSRV 1.93 (#83).**
+- **`AfpError::NonFiniteSample` + PCM policy (#75).** Offline `extract` /
+  watermark `detect` reject NaN/Inf. Streaming `push` sanitizes them to
+  `0.0` (infallible API). Helper module `pcm`.
+- **`max_push_samples` on Wang, Haitsma, and neural streaming (#80).**
+  Matches Panako: truncate hostile `push` chunks when set.
+- **OOM protection — `max_input_samples` on all offline fingerprinter configs (#68).**
+  `WangConfig`, `PanakoConfig`, and `HaitsmaConfig` each gain a
+  `max_input_samples: Option<usize>` field. When set, `extract()` rejects
+  inputs larger than the cap with `AfpError::InputTooLarge` before any
+  allocation. Safe defaults (30 min at each algorithm's required rate)
+  ship out of the box; pass `None` to disable. `NeuralEmbedderConfig` also
+  exposes the field (default `None` for BYO-model scenarios where the
+  caller knows the model's limits). A 4 GB malicious upload now returns
+  `InputTooLarge` instead of OOM.
+- **OOM protection — decoder file-size and PCM caps.**
+  `decode_to_mono_limited` / `decode_to_mono_at_limited` accept a
+  `DecodeLimits` struct with `max_bytes` (rejects on-disk size before
+  opening the stream) and `max_samples` (bounds decoded mono PCM so
+  compressed formats cannot inflate past a sample budget).
+  `DecodeLimits::bytes(n)`, `DecodeLimits::samples(n)`, and
+  `DecodeLimits::both(bytes, samples)` cover the common cases.
+  The base `decode_to_mono` / `decode_to_mono_at` remain unlimited
+  (`DecodeLimits::default()`). Closes #68.
+- **`AfpError::InputTooLarge` error variant.** Structured error reporting
+  the configured limit and the actual input size (samples, bytes, or
+  hashes depending on the check). `Display` text includes both numbers
+  and a hint about raising the limit.
+- **`audiofp::prelude` module (#14).** Convenience glob import
+  (`use audiofp::prelude::*`) that pulls in all three classical
+  fingerprinters with their config/hash types, both core traits,
+  error types, and value types. Includes a doc-test showing the
+  shortest path from zero to a fingerprint.
+- **`StreamingFingerprinter::required_sample_rate()`.**  Callers can now
+  query the expected sample rate at construction rather than feeding
+  wrong-rate samples silently. Implemented for all four streaming types.
+
+### Changed
+
+- **`Haitsma::try_new()` and `StreamingHaitsma::try_new()`.**
+  Fallible constructors returning `Result<Self, AfpError>` on invalid
+  `fmin`/`fmax`/Nyquist config. The existing `new()` remains infallible
+  (panics on bad config) for backward compatibility.
+- **`#[non_exhaustive]` removed from config and fingerprint structs.**
+  Originally added in this cycle but reverted — it breaks the documented
+  `WangConfig { fan_out: 5, ..Default::default() }` pattern for external
+  crates. Deferred to 0.4.0.
+- **`max_pending_anchors` doc recommends `Some(10_000)` for untrusted
+  input.** Default remains `None` (unbounded) for backward compatibility.
+- **`target_zone_f` clamped to `[1, 512]`; `min_anchor_mag_db` clamped to
+  `[-200.0, 0.0]`** in all Wang/Panako constructors.
+- **Zero-value `Option` limits** (`max_input_samples`, `max_hashes`,
+  `max_pending_anchors` = `Some(0)`) are silently clamped to `Some(1)`.
+- **`native-tls` banned in `deny.toml`** (pulls openssl transitively).
 
 ### Changed
 
@@ -25,6 +252,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PanakoMatcher` / `PanakoIndex` documented as stubs** — they always
   return non-match / empty until Phase 3 (2-D Hough) lands. Prefer
   `WangMatcher` for constant-tempo identification today.
+- **UB in `PeakPicker` scratch buffers.** `prepare_vec_uninit` used
+  `unsafe { v.set_len(new_len) }` leaving uninitialized `f32`s that
+  could be read before overwrite under aggressive LLVM optimizations.
+  Replaced with safe `clear()` + `resize()`.
+- **`decode_to_mono` Security docstring.** Now warns callers about
+  decompression bombs and directs to `decode_to_mono_limited` for
+  untrusted input.
+- **Model load TOCTOU (#79).** Dropped `path.exists()` before Tract load;
+  missing files map to `ModelNotFound`, other failures to `ModelLoad`.
+- **SIMD window length asserts (#82).** `debug_assert_eq!` on AVX2/NEON
+  window helpers. `BufferOverrun` kept for future mic pipeline (#98).
+- **`decode_to_mono_limited` returned `Config` instead of `InputTooLarge`.**
+  Oversized files now match the documented `InputTooLarge` variant.
+- **`PanakoConfig::max_pending_anchors` was dead.** Streaming Panako now
+  evicts oldest-first, matching Wang.
+- **`PanakoConfig::max_push_samples` was dead.** Streaming Panako now
+  truncates hostile `push` chunks to the configured cap.
+- **Panako `target_zone_t == 0` underflow** (P0): Setting `PanakoConfig::target_zone_t` to 0 caused `u32::MAX`-byte allocation via `saturating_add(u32::MAX - 1)`, guaranteed OOM. All four constructors (`Wang`, `StreamingWang`, `Panako`, `StreamingPanako`) now clamp `target_zone_t ∈ [1, 512]` and `fan_out ∈ [1, 64]`. `peaks_per_sec` is also capped at ≤ 500 to bound per-second allocation. Extreme config values (e.g. `u16::MAX`) are silently clamped rather than panicking — fully backward-compatible for all values within the default range.
+- **Decoder `n_chans == 0` guard**: Corrupt packets reporting 0 channels previously caused division-by-zero producing NaN/Inf PCM samples. Malformed packets are now silently skipped (same policy as recoverable decode errors).
+- **Streaming `push_with` / `flush_with` zero-alloc overrides**: All three classical streaming fingerprinters (`StreamingWang`, `StreamingPanako`, `StreamingHaitsma`) now override the default trait implementations with genuine zero-allocation callback loops. Previously fell back to the trait default which allocates a `Vec` on every call, contradicting the documented contract.
+- **Streaming `push()` / `flush()` pooled Vec retention**: `push()` and `flush()` now use `out.append(&mut self.emitted)` instead of `core::mem::take(&mut self.emitted)` followed by `extend(drain(..))`. The pooled allocation stays with the struct across calls — no per-push reallocation. Measured: Wang extract 2 s −13.8 % wall time, streaming Wang small-chunk −29.5 % (cumulative vs pre-pool baseline).
+- **`reset()` on all three streaming types**: `StreamingWang`, `StreamingPanako`, and `StreamingHaitsma` each expose a `reset()` method that clears all internal state (buffered audio, pending peaks/anchors, frame counter). Reusing a single instance across independent streams now works correctly without stale data bleed.
+
+### Performance
+
+- **Optimize PeakPicker scratch buffers**: Replaced zero-filling resizes of reused vectors (`max_buf`, `temp_2d`, `col_in`, `col_out`) with conditional `set_len` when capacity is already sufficient, saving millions of writes on every extraction.
+- **Avoid heap allocations in Haitsma**: Introduced a reused `power_buf` buffer within `Haitsma` to eliminate `Vec<f32>` allocations in `stft.power_flat` on every extraction.
+- **Optimize suffix_max in Panako**: Replaced full zero-filling resizes of `suffix_max` in triplet generation with a conditional check, truncating and zeroing only the last element.
+
+### Testing
+
+- **21 new tests**: Constructor clamping (defaults preserved, zero clamped to 1, extreme capped to safe bounds, clamped config still produces hashes), streaming reset+replay correctness (×3), `push_with` ≡ `push`+`flush` output parity (×6), and `flush_with` ≡ `flush` parity (×3). Test count: 227 → 280 (`cargo test --all-features --tests`).
+- **Real audio golden regression tests (×6).** Byte-exact hash snapshots
+  for Wang, Panako, and Haitsma on `piano.ogg` and `speech.ogg`. Any
+  code change that alters hash output on real audio breaks these.
+- **E2E real audio tests (×17):** segment/offset matching (hash subset
+  verification), gain invariance (0.1× quiet, 3× clipped), 10×
+  determinism (all 3 algorithms), Panako ±5% time-stretch robustness,
+  decoder edge cases (short audio, empty file, corrupt header,
+  `DecodeLimits` byte/sample caps, stereo/5.1 multichannel downmix,
+  odd sample rates 11025/22050/44100 Hz).
+- Test count: 280 → 303 (`cargo test --all-features --tests`).
+- **Codec round-trip robustness tests (×12).** Same music ("Galway" by
+  Kevin MacLeod, CC-BY 3.0) encoded as FLAC, MP3, OGG-Vorbis, AAC/M4A,
+  and WAV. Asserts minimum Jaccard / bit-similarity thresholds vs. the
+  FLAC lossless reference for all three algorithms. Test assets committed
+  to `tests/assets/galway.*`.
+
+### Documentation
+
+- **Zero-deps README quick start** before the file-decode example (#38).
+- **Pinned performance numbers** to v0.2.0 / v0.3.4 with a YMMV note and
+  streaming bench pointer (#51).
+- **USAGE.md**: wrap copy-paste snippets in `fn main()`, replace undefined
+  `whole_song` / `audio_capture_iter` placeholders (#55); add async /
+  batching / watermark-model download guidance (#50); document
+  `WatermarkResult::localization` contract (#59).
+- **Examples**: `dsp_starter`, `neural_embed` (`neural`),
+  `watermark_detect` (`watermark`) (#39).
 
 ## [0.3.7] - 2026-07-08
 
@@ -1090,7 +1376,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/themankindproject/audiofp/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/themankindproject/audiofp/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/themankindproject/audiofp/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/themankindproject/audiofp/compare/v0.3.4...v0.3.5

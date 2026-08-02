@@ -113,13 +113,14 @@ impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
+        let dq_cap = 2 * cfg.neighborhood_t.max(cfg.neighborhood_f) + 2;
         Self {
             cfg,
             max_buf: Vec::new(),
             temp_2d: Vec::new(),
             col_in: Vec::new(),
             col_out: Vec::new(),
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(dq_cap),
             candidates: Vec::new(),
         }
     }
@@ -152,21 +153,16 @@ impl PeakPicker {
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
 
         #[inline]
-        fn prepare_vec_uninit(v: &mut Vec<f32>, new_len: usize) {
-            if v.capacity() < new_len {
-                v.resize(new_len, 0.0);
-            } else {
-                unsafe {
-                    v.set_len(new_len);
-                }
-            }
+        fn prepare_vec(v: &mut Vec<f32>, new_len: usize) {
+            v.clear();
+            v.resize(new_len, 0.0);
         }
 
         // Resize pooled scratch (no-op when capacity already covers it).
-        prepare_vec_uninit(&mut self.max_buf, spec.len());
-        prepare_vec_uninit(&mut self.temp_2d, spec.len());
-        prepare_vec_uninit(&mut self.col_in, n_frames);
-        prepare_vec_uninit(&mut self.col_out, n_frames);
+        prepare_vec(&mut self.max_buf, spec.len());
+        prepare_vec(&mut self.temp_2d, spec.len());
+        prepare_vec(&mut self.col_in, n_frames);
+        prepare_vec(&mut self.col_out, n_frames);
 
         rolling_max_2d_pooled(
             spec,
@@ -222,9 +218,7 @@ impl PeakPicker {
 
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        let result = self.candidates.clone();
-        self.candidates.clear();
-        result
+        core::mem::take(&mut self.candidates)
     }
 }
 
@@ -468,7 +462,7 @@ impl IncrementalPeakDetector {
             n_pushed: 0,
             vert_deques,
             horiz_scratch: alloc::vec![0.0_f32; n_bins],
-            dq: VecDeque::new(),
+            dq: VecDeque::with_capacity(2 * kf + 2),
         }
     }
 

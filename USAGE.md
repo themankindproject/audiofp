@@ -18,6 +18,7 @@
   - [Haitsma–Kalker (band-power sign bits)](#haitsmakalker-band-power-sign-bits)
 - [Matching / Identification](#matching--identification)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
+- [Fingerprint Serialization](#fingerprint-serialization)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
 - [Neural Embedder](#neural-embedder)
@@ -37,7 +38,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.3.7"
+audiofp = "0.3"
 ```
 
 ### Basic example: fingerprint silence (zero deps)
@@ -78,25 +79,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
-### One-liner with `fingerprint_file` and the `prelude`
-
-```rust
-use audiofp::prelude::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut wang = Wang::default();
-    let fp = audiofp::fingerprint_file(&mut wang, "song.mp3")?;
-    println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
-    Ok(())
-}
-```
-
-The [`prelude`] module pulls in all three classical fingerprinters, both
-core traits, error types, and value types with one glob import.
-[`fingerprint_file`] handles decode → resample → extract in one call
-(requires `std`). For untrusted uploads prefer
-`fingerprint_file_capped` with `io::DecodeLimits::both(...)`.
 
 ### Detect duplicate songs across re-encodings
 
@@ -194,6 +176,7 @@ Incremental, low-latency extraction.
 pub trait StreamingFingerprinter {
     type Frame;
 
+    fn required_sample_rate(&self) -> u32;
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)>;
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)>;
     fn latency_ms(&self) -> u32;
@@ -205,6 +188,8 @@ pub trait StreamingFingerprinter {
     where F: FnMut(TimestampMs, &Self::Frame);
 }
 ```
+
+`required_sample_rate()` returns the sample rate (Hz) the stream expects. Feed wrong-rate samples and you'll get garbage hashes silently — there's no runtime check on `push`, so callers should assert or resample upfront.
 
 `push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
 
@@ -426,7 +411,7 @@ pub struct HaitsmaConfig {
 }
 ```
 
-`Haitsma::new` panics if `fmin >= fmax` or `fmax >= sr / 2` (above Nyquist for the fixed 5 kHz operating rate).
+`Haitsma::new` returns `Err(AfpError::Config(...))` if `fmin <= 0`, `fmin >= fmax`, or `fmax >= sr / 2` (above Nyquist for the fixed 5 kHz operating rate). `StreamingHaitsma::new` performs the same validation.
 
 #### Output: `HaitsmaFingerprint`
 
@@ -438,6 +423,40 @@ pub struct HaitsmaFingerprint {
 ```
 
 > Frame 0 has no hash (the algorithm needs frame n−1 for the delta). Frame indexing in `frames` is therefore offset by one relative to the spectrogram.
+
+### Progress Callbacks
+
+All three classical fingerprinters expose `extract_with_progress` for
+reporting extraction progress on long files (podcasts, DJ sets, etc.):
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, SampleRate};
+
+let samples = vec![0.0_f32; 8_000 * 60]; // 60 s
+let mut wang = Wang::default();
+let buf = AudioBuffer::new(&samples, SampleRate::HZ_8000);
+
+let fp = wang.extract_with_progress(buf, |progress| {
+    // progress is monotonically non-decreasing in [0.0, 1.0]
+    println!("{:.0}%", progress * 100.0);
+}).unwrap();
+```
+
+The callback fires every ~500 ms of processed audio (every 32 frames for
+Wang/Panako at 62.5 fps, every 39 frames for Haitsma at 78 fps). The plain
+`extract()` delegates to `extract_with_progress` with a no-op closure — zero
+overhead when progress isn't needed.
+
+Signatures:
+```rust
+impl Wang {
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self, audio: AudioBuffer<'_>, progress: F,
+    ) -> Result<WangFingerprint>;
+}
+// Same on Panako and Haitsma.
+```
 
 ---
 
@@ -568,6 +587,70 @@ fn main() -> Result<(), audiofp::AfpError> {
 
 ---
 
+## Fingerprint Serialization
+
+`audiofp` ships a lightweight binary format for persisting fingerprints to
+disk or wire without relying on the full matching wire format (planned for
+v0.4.0). Available on all three fingerprint types via `to_bytes` /
+`from_bytes`.
+
+### Binary Format
+
+```text
+[magic: 8 bytes "AUDIOFP\0"] [version: u8 = 1] [alg_id: u8] [hash_count: u32 LE] [fps: f32 LE] [Pod hashes]
+```
+
+Algorithm IDs: 0 = Wang, 1 = Panako, 2 = Haitsma.
+
+### Usage
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
+
+let samples = vec![0.0_f32; 8_000 * 3];
+let mut wang = Wang::default();
+let fp = wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000)).unwrap();
+
+// Serialize
+let bytes = fp.to_bytes();
+
+// Deserialize (validates magic, version, algorithm)
+let restored = audiofp::classical::WangFingerprint::from_bytes(&bytes).unwrap();
+assert_eq!(fp.hashes.len(), restored.hashes.len());
+
+// Inspect metadata without full deserialization
+let envelope = fp.envelope();
+println!("algorithm: {}", envelope.algorithm);    // "wang-v1"
+println!("version: {}", envelope.crate_version);  // audiofp::VERSION
+println!("hashes: {}", envelope.hash_count);
+```
+
+### `FingerprintEnvelope`
+
+```rust
+pub struct FingerprintEnvelope {
+    pub algorithm: &'static str,     // Fingerprinter::name()
+    pub crate_version: &'static str, // audiofp::VERSION
+    pub sample_rate: u32,            // algorithm's native rate
+    pub frames_per_sec: f32,         // STFT frame rate
+    pub hash_count: usize,           // number of hashes/frames
+}
+```
+
+### Methods (all three types)
+
+| Type | `to_bytes()` | `from_bytes(&[u8])` | `envelope()` |
+|------|:------------:|:-------------------:|:------------:|
+| `WangFingerprint` | ✓ | ✓ | ✓ |
+| `PanakoFingerprint` | ✓ | ✓ | ✓ |
+| `HaitsmaFingerprint` | ✓ | ✓ | ✓ |
+
+`from_bytes` returns `AfpError::Deserialize` on magic mismatch, unsupported
+version, wrong algorithm ID, or truncated payload.
+
+---
+
 ## Audio File Decoding
 
 Available with the default `std` feature, exposed as `audiofp::io`.
@@ -600,17 +683,16 @@ Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::
 let samples = decode_to_mono_at("song.mp3", 8_000)?;
 ```
 
-### `decode_to_mono_capped` / `decode_to_mono_limited` (OOM protection)
+### `decode_to_mono_limited` / `decode_to_mono_at_limited` (OOM protection)
 
 ```rust
 pub struct DecodeLimits {
     pub max_bytes: u64,              // 0 = unlimited
     pub max_samples: Option<usize>,  // None = unlimited
+    pub integrity_mode: bool,        // default false; true = fail on corrupt packets
 }
 
-pub fn decode_to_mono_capped<P: AsRef<Path>>(path: P, max_bytes: u64) -> Result<(Vec<f32>, u32)>;
 pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
-pub fn decode_to_mono_at_capped<P: AsRef<Path>>(path: P, target_sr: u32, max_bytes: u64) -> Result<Vec<f32>>;
 pub fn decode_to_mono_at_limited<P: AsRef<Path>>(path: P, target_sr: u32, limits: DecodeLimits) -> Result<Vec<f32>>;
 ```
 
@@ -622,18 +704,34 @@ For **compressed** uploads, also set `max_samples` (use
 `DecodeLimits::both`) — on-disk size does not bound decoded PCM.
 
 ```rust
-use audiofp::io::{decode_to_mono_capped, decode_to_mono_limited, DecodeLimits};
+use audiofp::io::{decode_to_mono_limited, DecodeLimits};
 
 // Byte cap only:
-let (samples, sr) = decode_to_mono_capped("user_upload.mp3", 50 * 1024 * 1024)?;
+let (samples, sr) = decode_to_mono_limited("user_upload.mp3", DecodeLimits::bytes(50 * 1024 * 1024))?;
 
 // Production: byte + sample caps:
 let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
 let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
 ```
 
-`fingerprint_file` is for trusted paths. For uploads use
-`fingerprint_file_capped(&mut fp, path, limits)`.
+### Integrity Mode (strict decoding)
+
+By default, recoverable per-packet decode errors are silently skipped so a
+single corrupt block doesn't kill a whole-file decode. For forensic or
+compliance use cases where incomplete fingerprints are unacceptable, enable
+**integrity mode** via the `strict()` builder:
+
+```rust
+use audiofp::io::{decode_to_mono_limited, DecodeLimits};
+
+let limits = DecodeLimits::both(50_000_000, 10_000_000).strict();
+let result = decode_to_mono_limited("suspect.mp3", limits);
+// If ANY packet fails to decode → returns Err(AfpError::Io(...))
+```
+
+When `integrity_mode` is `true`, any per-packet `DecodeError` or `IoError`
+from Symphonia becomes a fatal `AfpError::Io` with message prefix
+`"decode integrity: ..."`. Default is `false` (backwards-compatible skip).
 
 ### Supported formats
 
@@ -677,10 +775,18 @@ audiofp = { version = "0.3.7", features = ["watermark"] }
 ```rust
 pub struct WatermarkConfig {
     pub model_path: String,
-    pub message_bits: u8,    // ≤ 32, default 16
-    pub threshold: f32,      // [0, 1], default 0.5
-    pub sample_rate: u32,    // default 16_000
+    pub message_bits: u8,          // ≤ 32, default 16
+    pub threshold: f32,            // [0, 1], default 0.5
+    pub sample_rate: u32,          // default 16_000
+    pub max_input_samples: Option<usize>,  // None = unlimited (default)
 }
+```
+
+Set `max_input_samples` to bound inference cost for untrusted uploads:
+
+```rust
+let mut cfg = WatermarkConfig::new("model.onnx");
+cfg.max_input_samples = Some(30 * 60 * 16_000); // 30 min at 16 kHz
 ```
 
 Constructor with AudioSeal defaults:
@@ -808,6 +914,7 @@ pub struct NeuralEmbedderConfig {
     pub l2_normalize: bool,      // default true
     pub max_input_samples: Option<usize>, // default None
     pub max_push_samples: Option<usize>,  // default None; streaming truncate
+    pub batch_size: usize,       // default 1; >1 batches offline inference
 }
 ```
 
@@ -818,6 +925,22 @@ use audiofp::neural::NeuralEmbedderConfig;
 
 let cfg = NeuralEmbedderConfig::new("my_model.onnx");
 ```
+
+#### Batched Inference (`batch_size`)
+
+When processing long audio offline, set `batch_size > 1` to amortise ONNX
+runtime per-run overhead. The model is invoked once per batch with a
+`[batch_size, n_mels, n_frames]` tensor instead of one call per window:
+
+```rust
+let mut cfg = NeuralEmbedderConfig::new("model.onnx");
+cfg.batch_size = 8; // process 8 windows per model invocation
+```
+
+A dedicated `batch_runnable` plan is built at construction for the configured
+batch size. The streaming path always uses `batch_size = 1`. Partial tail
+batches (fewer windows remaining than `batch_size`) fall back to single-window
+inference. Output is bit-exact regardless of batch size.
 
 ### `NeuralEmbedder` (offline)
 
@@ -1006,6 +1129,15 @@ let fb = MelFilterBank::new(
 
 let mut log_mel = vec![0.0_f32; 128];
 fb.log_mel(&magnitude_spectrum, &mut log_mel);
+```
+
+All DSP constructors (`MelFilterBank`, `ShortTimeFFT`, `SincResampler`) also provide a **`try_new()`** variant that returns `Result<Self, AfpError::Config>` instead of panicking on invalid parameters:
+
+```rust
+// Fallible — returns Err on bad params:
+let fb = MelFilterBank::try_new(128, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney)?;
+let stft = ShortTimeFFT::try_new(StftConfig { n_fft: 1024, hop: 128, .. })?;
+let resampler = SincResampler::try_new(44_100, 8_000)?;
 ```
 
 Slaney-normalised triangular filters; matches librosa's `feature.melspectrogram` defaults. Internally stores a compressed sparse row (CSR) representation so `log_mel` and `log_mel_from_power` iterate only the ~20–40 non-zero bins per mel band instead of all `n_bins`.
@@ -1222,6 +1354,9 @@ pub enum AfpError {
 
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    #[error("deserialization failed: {0}")]
+    Deserialize(String),
 
     #[error("io: {0}")]
     Io(String),

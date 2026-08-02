@@ -35,6 +35,7 @@ wildcards         = "deny"
 deny = [
     # Crates with known problematic licenses or security issues.
     { name = "openssl", reason = "prefer rustls-based alternatives" },
+    { name = "native-tls", reason = "pulls openssl transitively; prefer rustls" },
 ]
 
 [sources]

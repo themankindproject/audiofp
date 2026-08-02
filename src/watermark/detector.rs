@@ -8,20 +8,8 @@ use std::path::Path;
 
 use tract_onnx::prelude::*;
 
+use crate::error::{map_model_load_err, map_model_open_io};
 use crate::{AfpError, AudioBuffer, Result};
-
-/// Map a failed filesystem open of a model path.
-fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        AfpError::ModelNotFound(path.to_string())
-    } else {
-        AfpError::ModelLoad(format!("open: {e}"))
-    }
-}
-
-fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
-    AfpError::ModelLoad(format!("load: {e}"))
-}
 
 /// Type alias for the compiled runnable plan produced by
 /// `TypedModel::into_runnable()`. Cached to avoid rebuilding the
@@ -49,6 +37,12 @@ pub struct WatermarkConfig {
     pub threshold: f32,
     /// Sample rate the model expects, in Hz. Default 16 000 (AudioSeal).
     pub sample_rate: u32,
+    /// Maximum input sample count accepted by [`detect`]. `None` disables
+    /// the check (default). When set, inputs exceeding this cap are
+    /// rejected with [`AfpError::InputTooLarge`] before any inference.
+    ///
+    /// [`detect`]: WatermarkDetector::detect
+    pub max_input_samples: Option<usize>,
 }
 
 impl WatermarkConfig {
@@ -61,6 +55,7 @@ impl WatermarkConfig {
             message_bits: 16,
             threshold: 0.5,
             sample_rate: 16_000,
+            max_input_samples: None,
         }
     }
 }
@@ -204,6 +199,12 @@ impl WatermarkDetector {
             return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
         }
         let n = audio.samples.len();
+        if self.cfg.max_input_samples.is_some_and(|limit| n > limit) {
+            return Err(AfpError::InputTooLarge {
+                limit: self.cfg.max_input_samples.unwrap(),
+                provided: n,
+            });
+        }
         if n == 0 {
             return Err(AfpError::AudioTooShort { needed: 1, got: 0 });
         }
