@@ -28,7 +28,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score};
+use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 use crate::neural::{NeuralEmbedding, NeuralFingerprint};
 
 /// Aggregation strategy for comparing two embedding sequences.
@@ -81,10 +81,10 @@ impl Matcher for NeuralMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
-        debug_assert_eq!(
-            query.frames_per_sec, reference.frames_per_sec,
-            "query and reference must use the same frame rate"
-        );
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
 
         let q = &query.embeddings;
         let r = &reference.embeddings;
@@ -224,8 +224,11 @@ impl NeuralMatcher {
         }
 
         let total_cost = prev[n];
-        // Normalise by the longest possible warp path so the mean step
-        // cost is comparable to `1 − cos`; recover an effective cosine.
+        // Normalise by the shortest possible warp path (`max(m, n)`) so
+        // the mean step cost is comparable to `1 − cos`; recover an
+        // effective cosine. (The longest warp path would be
+        // `m + n − 1`; using the shortest keeps the normaliser tight
+        // and the score in a sensible range — audit 67-4.)
         let path_len = m.max(n) as f32;
         let mean_dist = if path_len > 0.0 {
             total_cost / path_len
@@ -241,8 +244,18 @@ impl NeuralMatcher {
     }
 
     /// Assemble a [`MatchResult`] from a cosine score.
+    ///
+    /// Both `cos` and `prominence` are sanitised to finite values so the
+    /// public API can never leak Inf/NaN (audit 67-3). `prominence` is
+    /// floored at 0 — negative prominence has no useful meaning and a
+    /// degenerate `mean_others == -1` could otherwise produce Inf.
     fn build(&self, cos: f32, prominence: f32, offset: TimeOffset, votes: u32) -> MatchResult {
         let cos = if cos.is_finite() { cos } else { 0.0 };
+        let prominence = if prominence.is_finite() && prominence >= 0.0 {
+            prominence
+        } else {
+            0.0
+        };
         MatchResult {
             is_match: cos >= self.cfg.min_cosine,
             score: clamp_score(cos),

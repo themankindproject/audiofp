@@ -22,8 +22,8 @@
 //!
 //! - Time: `O(R + Q + range)` — sub-millisecond for song-length inputs.
 //! - Memory: dense histogram ≈ 4 bytes/frame → ~60 KB for 4 min @ 62.5 fps.
-//! - Index: [`HashMap`](std::collections::HashMap) under `std` (default);
-//!   `BTreeMap` fallback when built without `std`.
+//! - Index: sorted flat arrays with binary search
+//!   ([`SortedPostings`](super::maps::SortedPostings)).
 
 extern crate alloc;
 
@@ -31,8 +31,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::classical::WangFingerprint;
-use crate::matching::maps::HashMap;
-use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence};
+use crate::matching::maps::SortedPostings;
+use crate::matching::{
+    MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence, frames_per_sec_compatible,
+};
 
 /// Configuration for [`WangMatcher`].
 #[derive(Clone, Debug)]
@@ -79,10 +81,10 @@ impl Matcher for WangMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
-        debug_assert_eq!(
-            query.frames_per_sec, reference.frames_per_sec,
-            "query and reference must use the same frame rate"
-        );
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
 
         if query.hashes.is_empty() || reference.hashes.is_empty() {
             return MatchResult::NONE;
@@ -90,25 +92,19 @@ impl Matcher for WangMatcher {
 
         let cfg = &self.cfg;
 
-        // --- 1. Index the reference ---
-        let mut index: HashMap<u32, Vec<u32>> =
-            super::maps::hashmap_with_capacity(reference.hashes.len());
-        for h in &reference.hashes {
-            index.entry(h.hash).or_default().push(h.t_anchor);
-        }
-        // Remove stop-hashes (appear in too many positions)
-        index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
-
-        if index.is_empty() {
-            return MatchResult::NONE;
-        }
+        // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
+        let pairs: alloc::vec::Vec<(u32, u32)> = reference
+            .hashes
+            .iter()
+            .map(|h| (h.hash, h.t_anchor))
+            .collect();
+        let index = match SortedPostings::build(&pairs, cfg.max_postings_per_hash) {
+            Some(sp) => sp,
+            None => return MatchResult::NONE,
+        };
 
         // --- 2. Vote into dense offset histogram ---
-        //
-        // Offset semantics (matches `TimeOffset` docs and the Haitsma
-        // matcher): δ = t_reference − t_query. Self-match → δ = 0. A
-        // positive δ means the query aligns later into the reference,
-        // i.e. the query starts *after* the reference.
+        // δ = t_ref − t_query ∈ [−q_max, r_max]
         let q_max = query
             .hashes
             .iter()
@@ -122,24 +118,21 @@ impl Matcher for WangMatcher {
             .max()
             .unwrap_or(0);
 
-        // δ = t_ref − t_query ∈ [−q_max, r_max]
         let dmin: i64 = -q_max;
         let dmax: i64 = r_max;
         let range = (dmax - dmin + 1) as usize;
 
-        // Cap histogram size to avoid huge allocations on pathological inputs.
         const MAX_HIST_BINS: usize = 10_000_000;
         let capped = range.min(MAX_HIST_BINS);
         let mut hist: Vec<u32> = vec![0u32; capped];
 
         for h in &query.hashes {
-            if let Some(list) = index.get(&h.hash) {
-                for &tr in list {
-                    let d = tr as i64 - h.t_anchor as i64;
-                    let idx = (d - dmin) as usize;
-                    if idx < capped {
-                        hist[idx] += 1;
-                    }
+            for &tr in index.get(h.hash) {
+                let d = tr as i64 - h.t_anchor as i64;
+                let idx = (d - dmin) as usize;
+                if idx < capped {
+                    let bucket = &mut hist[idx];
+                    *bucket = bucket.wrapping_add(1);
                 }
             }
         }
@@ -192,13 +185,11 @@ impl Matcher for WangMatcher {
         let delta_star = peak_idx as i64 + dmin;
         let mut contrib_count: u32 = 0;
         for h in &query.hashes {
-            if let Some(list) = index.get(&h.hash) {
-                for &tr in list {
-                    let d = tr as i64 - h.t_anchor as i64;
-                    if (d - delta_star).abs() <= tol_i64 {
-                        contrib_count += 1;
-                        break;
-                    }
+            for &tr in index.get(h.hash) {
+                let d = tr as i64 - h.t_anchor as i64;
+                if (d - delta_star).abs() <= tol_i64 {
+                    contrib_count += 1;
+                    break;
                 }
             }
         }
