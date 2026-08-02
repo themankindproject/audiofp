@@ -523,9 +523,7 @@ impl StreamingFingerprinter for StreamingHaitsma {
 
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.process_push(samples);
-        let mut out = Vec::new();
-        out.append(&mut self.pending);
-        out
+        core::mem::take(&mut self.pending)
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
@@ -542,9 +540,7 @@ impl StreamingFingerprinter for StreamingHaitsma {
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
-        let mut out = Vec::new();
-        out.append(&mut self.pending);
-        out
+        core::mem::take(&mut self.pending)
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> usize

@@ -188,6 +188,30 @@ impl AfpError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Model-loading helpers (shared by `neural` and `watermark` features)
+// ---------------------------------------------------------------------------
+
+/// Map a failed filesystem open into the appropriate [`AfpError`] variant.
+///
+/// Used by both the neural embedder and watermark detector when opening
+/// ONNX model files.
+#[cfg(feature = "std")]
+pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
+    use alloc::string::ToString;
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AfpError::ModelNotFound(path.to_string())
+    } else {
+        AfpError::ModelLoad(alloc::format!("open: {e}"))
+    }
+}
+
+/// Map any `Display`-able model-load error into [`AfpError::ModelLoad`].
+#[cfg(feature = "std")]
+pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
+    AfpError::ModelLoad(alloc::format!("load: {e}"))
+}
+
 /// Shorthand for `core::result::Result<T, AfpError>`.
 ///
 /// # Example

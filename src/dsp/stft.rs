@@ -96,33 +96,7 @@ impl ShortTimeFFT {
     /// `cfg.hop` is zero or larger than `cfg.n_fft`.
     #[must_use]
     pub fn new(cfg: StftConfig) -> Self {
-        assert!(
-            cfg.n_fft > 0 && cfg.n_fft.is_power_of_two(),
-            "n_fft must be a non-zero power of two, got {}",
-            cfg.n_fft
-        );
-        assert!(
-            cfg.hop > 0 && cfg.hop <= cfg.n_fft,
-            "hop must be in (0, n_fft], got hop={} n_fft={}",
-            cfg.hop,
-            cfg.n_fft
-        );
-
-        let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(cfg.n_fft);
-        let window = make_window(cfg.window, cfg.n_fft);
-        let scratch_in = fft.make_input_vec();
-        let scratch_out = fft.make_output_vec();
-        let fft_scratch = fft.make_scratch_vec();
-
-        Self {
-            cfg,
-            fft,
-            window,
-            scratch_in,
-            scratch_out,
-            fft_scratch,
-        }
+        Self::try_new(cfg).expect("invalid StftConfig")
     }
 
     /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
@@ -146,7 +120,22 @@ impl ShortTimeFFT {
                 cfg.n_fft
             )));
         }
-        Ok(Self::new(cfg))
+
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(cfg.n_fft);
+        let window = make_window(cfg.window, cfg.n_fft);
+        let scratch_in = fft.make_input_vec();
+        let scratch_out = fft.make_output_vec();
+        let fft_scratch = fft.make_scratch_vec();
+
+        Ok(Self {
+            cfg,
+            fft,
+            window,
+            scratch_in,
+            scratch_out,
+            fft_scratch,
+        })
     }
 
     /// Borrow the configuration this instance was built with.

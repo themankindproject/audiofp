@@ -47,6 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Crate package size reduced from 7.2 MiB to ~215 KiB.** Excluded
   `tests/assets/` (8 MiB of real audio) and `fuzz/` from the published
   crate. Downstream users don't need test audio.
+- **`MelFilterBank::new()` no longer allocates a dense matrix.**
+  The sparse CSR representation is now built directly by computing
+  analytical bin bounds per mel band (`first_bin`/`last_bin` from Hz
+  values), eliminating a temporary `n_mels × n_bins` allocation
+  (~512 KB for 128-mel / 2048-FFT configs). Bit-exact output preserved.
+- **`PeakPicker::pick()` uses `mem::take` instead of `clone` + `clear`.**
+  Eliminates a full Vec clone on every offline peak-pick call.
+- **`new()` delegates to `try_new().expect()` in `MelFilterBank`,
+  `ShortTimeFFT`, and `SincResampler`.**  Validation logic lives in one
+  place per type; `new()` is a one-liner. No API change — same panics
+  on invalid config.
+- **Extracted `l2_normalize_inplace` helper in neural embedder.**
+  Deduplicates the L2-norm logic that appeared in both
+  `embed_window_into` and `embed_batch_into`.
+- **Shared `map_model_open_io` / `map_model_load_err` helpers in
+  `error.rs`.**  Eliminates duplicate model-loading error mappers
+  between `neural/embedder.rs` and `watermark/detector.rs`.
+- **Streaming `push()` / `flush()` use `mem::take` instead of
+  `Vec::new()` + `append`.**  All three streaming fingerprinters
+  (Wang, Panako, Haitsma) now return the internal buffer with O(1)
+  pointer swap rather than allocating + copying.
+- **Removed redundant `.clear()` after `.drain(..)` in Wang/Panako
+  streaming `push_with` / `flush_with`.**
+- **Removed trivial SIMD wrappers** (`dot_mel_wide`, `dot_mel_sq_wide`,
+  `dot_f32_wide`) — call sites now invoke `dsp::dot_wide` /
+  `dsp::dot_sq_wide` directly.
 
 ### Added
 

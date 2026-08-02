@@ -881,9 +881,7 @@ impl StreamingFingerprinter for StreamingWang {
     fn push(&mut self, samples: &[f32]) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();
         self.process_push_samples(samples);
-        let mut out = alloc::vec::Vec::new();
-        out.append(&mut self.emitted);
-        out
+        core::mem::take(&mut self.emitted)
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
@@ -897,16 +895,13 @@ impl StreamingFingerprinter for StreamingWang {
             callback(t, &frame);
             n += 1;
         }
-        self.emitted.clear();
         n
     }
 
     fn flush(&mut self) -> alloc::vec::Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();
         self.process_flush();
-        let mut out = alloc::vec::Vec::new();
-        out.append(&mut self.emitted);
-        out
+        core::mem::take(&mut self.emitted)
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> usize
@@ -920,7 +915,6 @@ impl StreamingFingerprinter for StreamingWang {
             callback(t, &frame);
             n += 1;
         }
-        self.emitted.clear();
         n
     }
 

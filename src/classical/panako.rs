@@ -947,9 +947,7 @@ impl StreamingFingerprinter for StreamingPanako {
     fn push(&mut self, samples: &[f32]) -> Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();
         self.process_push_samples(samples);
-        let mut out = Vec::new();
-        out.append(&mut self.emitted);
-        out
+        core::mem::take(&mut self.emitted)
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> usize
@@ -963,16 +961,13 @@ impl StreamingFingerprinter for StreamingPanako {
             callback(t, &frame);
             n += 1;
         }
-        self.emitted.clear();
         n
     }
 
     fn flush(&mut self) -> Vec<(TimestampMs, Self::Frame)> {
         self.emitted.clear();
         self.process_flush();
-        let mut out = Vec::new();
-        out.append(&mut self.emitted);
-        out
+        core::mem::take(&mut self.emitted)
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> usize
@@ -986,7 +981,6 @@ impl StreamingFingerprinter for StreamingPanako {
             callback(t, &frame);
             n += 1;
         }
-        self.emitted.clear();
         n
     }
 

@@ -11,21 +11,24 @@ use tract_onnx::prelude::*;
 use crate::dsp::mel::{MelFilterBank, MelScale};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
+use crate::error::{map_model_load_err, map_model_open_io};
 use crate::{AfpError, AudioBuffer, Fingerprinter, Result, TimestampMs};
 
 use super::frontend::LogMelFrontend;
 
-/// Map a failed filesystem open of a model path.
-fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        AfpError::ModelNotFound(path.to_string())
-    } else {
-        AfpError::ModelLoad(format!("open: {e}"))
+/// In-place L2 normalisation: scales `v` so its Euclidean norm is 1.
+/// Leaves the vector unchanged if its norm is below `1e-12` (effectively
+/// zero).
+#[inline]
+fn l2_normalize_inplace(v: &mut [f32]) {
+    let sumsq: f32 = v.iter().map(|x| x * x).sum();
+    let norm = sumsq.sqrt();
+    if norm > 1e-12 {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
     }
-}
-
-fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
-    AfpError::ModelLoad(format!("load: {e}"))
 }
 
 /// Tunable parameters for [`NeuralEmbedder`] / [`super::StreamingNeuralEmbedder`].
@@ -237,14 +240,7 @@ impl EmbedderCore {
         out.extend(view.iter().copied());
 
         if self.cfg.l2_normalize {
-            let sumsq: f32 = out.iter().map(|x| x * x).sum();
-            let norm = sumsq.sqrt();
-            if norm > 1e-12 {
-                let inv = 1.0 / norm;
-                for v in out.iter_mut() {
-                    *v *= inv;
-                }
-            }
+            l2_normalize_inplace(out);
         }
 
         Ok(())
@@ -332,14 +328,7 @@ impl EmbedderCore {
             vector.extend_from_slice(slice);
 
             if self.cfg.l2_normalize {
-                let sumsq: f32 = vector.iter().map(|x| x * x).sum();
-                let norm = sumsq.sqrt();
-                if norm > 1e-12 {
-                    let inv = 1.0 / norm;
-                    for v in vector.iter_mut() {
-                        *v *= inv;
-                    }
-                }
+                l2_normalize_inplace(&mut vector);
             }
 
             out.push(NeuralEmbedding {

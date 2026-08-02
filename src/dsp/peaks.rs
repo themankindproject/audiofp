@@ -218,9 +218,7 @@ impl PeakPicker {
 
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        let result = self.candidates.clone();
-        self.candidates.clear();
-        result
+        core::mem::take(&mut self.candidates)
     }
 }
 

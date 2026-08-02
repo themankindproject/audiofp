@@ -135,9 +135,36 @@ impl SincResampler {
     /// Panics if `from_sr == 0`, `to_sr == 0`, or `quality.half_taps == 0`.
     #[must_use]
     pub fn with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> Self {
-        assert!(from_sr > 0 && to_sr > 0, "sample rates must be non-zero");
-        assert!(quality.half_taps > 0, "half_taps must be > 0");
-        assert!(quality.polyphase_steps > 0, "polyphase_steps must be > 0");
+        Self::try_with_quality(from_sr, to_sr, quality).expect("invalid SincResampler config")
+    }
+
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
+    /// parameters instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// - `from_sr` or `to_sr` is zero
+    /// - `quality.half_taps` is zero
+    /// - `quality.polyphase_steps` is zero
+    pub fn try_new(from_sr: u32, to_sr: u32) -> crate::Result<Self> {
+        Self::try_with_quality(from_sr, to_sr, SincQuality::default())
+    }
+
+    /// Fallible version of [`with_quality`](Self::with_quality).
+    pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
+        if from_sr == 0 || to_sr == 0 {
+            return Err(crate::AfpError::Config(
+                "sample rates must be non-zero".into(),
+            ));
+        }
+        if quality.half_taps == 0 {
+            return Err(crate::AfpError::Config("half_taps must be > 0".into()));
+        }
+        if quality.polyphase_steps == 0 {
+            return Err(crate::AfpError::Config(
+                "polyphase_steps must be > 0".into(),
+            ));
+        }
 
         let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
         let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
@@ -176,42 +203,12 @@ impl SincResampler {
             *v *= inv_dc_gain;
         }
 
-        Self {
+        Ok(Self {
             from_sr,
             to_sr,
             quality,
             kernel_table,
-        }
-    }
-
-    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
-    /// parameters instead of panicking.
-    ///
-    /// # Errors
-    ///
-    /// - `from_sr` or `to_sr` is zero
-    /// - `quality.half_taps` is zero
-    /// - `quality.polyphase_steps` is zero
-    pub fn try_new(from_sr: u32, to_sr: u32) -> crate::Result<Self> {
-        Self::try_with_quality(from_sr, to_sr, SincQuality::default())
-    }
-
-    /// Fallible version of [`with_quality`](Self::with_quality).
-    pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
-        if from_sr == 0 || to_sr == 0 {
-            return Err(crate::AfpError::Config(
-                "sample rates must be non-zero".into(),
-            ));
-        }
-        if quality.half_taps == 0 {
-            return Err(crate::AfpError::Config("half_taps must be > 0".into()));
-        }
-        if quality.polyphase_steps == 0 {
-            return Err(crate::AfpError::Config(
-                "polyphase_steps must be > 0".into(),
-            ));
-        }
-        Ok(Self::with_quality(from_sr, to_sr, quality))
+        })
     }
 
     /// Borrow the quality knobs this resampler was built with.
@@ -292,7 +289,7 @@ impl SincResampler {
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
             let base = i_centre.wrapping_sub(half);
-            let acc = dot_f32_wide(&input[base..base + taps], kernel);
+            let acc = super::dot_wide(&input[base..base + taps], kernel);
             out.push(acc);
         }
 
@@ -315,14 +312,6 @@ impl SincResampler {
             out.push(acc);
         }
     }
-}
-
-/// SIMD-accelerated dot product for the polyphase resampler.
-///
-/// Delegates to the shared [`crate::dsp::dot_wide`] helper.
-#[inline]
-fn dot_f32_wide(a: &[f32], b: &[f32]) -> f32 {
-    super::dot_wide(a, b)
 }
 
 /// Normalised sinc: `sin(π·x) / (π·x)`, with `sinc(0) = 1`.

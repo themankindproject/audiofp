@@ -8,20 +8,8 @@ use std::path::Path;
 
 use tract_onnx::prelude::*;
 
+use crate::error::{map_model_load_err, map_model_open_io};
 use crate::{AfpError, AudioBuffer, Result};
-
-/// Map a failed filesystem open of a model path.
-fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        AfpError::ModelNotFound(path.to_string())
-    } else {
-        AfpError::ModelLoad(format!("open: {e}"))
-    }
-}
-
-fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
-    AfpError::ModelLoad(format!("load: {e}"))
-}
 
 /// Type alias for the compiled runnable plan produced by
 /// `TypedModel::into_runnable()`. Cached to avoid rebuilding the

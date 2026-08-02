@@ -135,82 +135,7 @@ impl MelFilterBank {
         fmax: f32,
         scale: MelScale,
     ) -> Self {
-        assert!(n_mels > 0, "n_mels must be > 0");
-        assert!(
-            n_fft >= 2 && n_fft.is_multiple_of(2),
-            "n_fft must be even and >= 2"
-        );
-        assert!(fmin >= 0.0, "fmin must be >= 0");
-        assert!(fmin < fmax, "fmin must be strictly less than fmax");
-
-        let n_bins = n_fft / 2 + 1;
-        let mut matrix = vec![0.0_f32; n_mels * n_bins];
-
-        // Mel-spaced centre points, including the left and right "skirts".
-        let mel_min = scale.hz_to_mel(fmin);
-        let mel_max = scale.hz_to_mel(fmax);
-        let n_points = n_mels + 2;
-        let mut hz_points = Vec::with_capacity(n_points);
-        for k in 0..n_points {
-            let mel = mel_min + (mel_max - mel_min) * k as f32 / (n_points - 1) as f32;
-            hz_points.push(scale.mel_to_hz(mel));
-        }
-
-        // FFT bin frequencies in Hz: bin b corresponds to b * sr / n_fft.
-        let bin_hz = sr as f32 / n_fft as f32;
-
-        for k in 0..n_mels {
-            let left = hz_points[k];
-            let centre = hz_points[k + 1];
-            let right = hz_points[k + 2];
-            // Slaney normalisation: unit area in linear frequency.
-            let norm = 2.0 / (right - left).max(1e-10);
-
-            let row = &mut matrix[k * n_bins..(k + 1) * n_bins];
-            for (b, w) in row.iter_mut().enumerate() {
-                let f = b as f32 * bin_hz;
-                *w = if f <= left || f >= right {
-                    0.0
-                } else if f <= centre {
-                    norm * (f - left) / (centre - left).max(1e-10)
-                } else {
-                    norm * (right - f) / (right - centre).max(1e-10)
-                };
-            }
-        }
-
-        // Build CSR (sparse) representation: for each band, find the
-        // contiguous range of non-zero bins and store only those weights.
-        // Each triangular filter is non-zero only in (left_hz, right_hz),
-        // so the sparse representation skips all zero-tail bins.
-        let mut sparse = Vec::with_capacity(n_mels);
-        for k in 0..n_mels {
-            let row = &matrix[k * n_bins..(k + 1) * n_bins];
-            // Find first and last non-zero bin.
-            let first = row.iter().position(|&w| w != 0.0).unwrap_or(n_bins);
-            let last = row.iter().rposition(|&w| w != 0.0).unwrap_or(0);
-            if first <= last {
-                sparse.push(MelBand {
-                    start_bin: first,
-                    weights: row[first..=last].to_vec(),
-                });
-            } else {
-                sparse.push(MelBand {
-                    start_bin: 0,
-                    weights: Vec::new(),
-                });
-            }
-        }
-
-        Self {
-            n_mels,
-            n_fft,
-            sr,
-            fmin,
-            fmax,
-            scale,
-            sparse,
-        }
+        Self::try_new(n_mels, n_fft, sr, fmin, fmax, scale).expect("invalid MelFilterBank config")
     }
 
     /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
@@ -246,7 +171,103 @@ impl MelFilterBank {
                 "fmin must be strictly less than fmax".into(),
             ));
         }
-        Ok(Self::new(n_mels, n_fft, sr, fmin, fmax, scale))
+
+        let n_bins = n_fft / 2 + 1;
+
+        // Mel-spaced centre points, including the left and right "skirts".
+        let mel_min = scale.hz_to_mel(fmin);
+        let mel_max = scale.hz_to_mel(fmax);
+        let n_points = n_mels + 2;
+        let mut hz_points = Vec::with_capacity(n_points);
+        for k in 0..n_points {
+            let mel = mel_min + (mel_max - mel_min) * k as f32 / (n_points - 1) as f32;
+            hz_points.push(scale.mel_to_hz(mel));
+        }
+
+        // FFT bin frequencies in Hz: bin b corresponds to b * sr / n_fft.
+        let bin_hz = sr as f32 / n_fft as f32;
+
+        // Build CSR (sparse) representation directly: for each band,
+        // analytically determine the non-zero bin range and compute only
+        // those weights. This avoids allocating the full dense matrix
+        // (n_mels × n_bins, e.g. 512 KB for typical configs).
+        let mut sparse = Vec::with_capacity(n_mels);
+        for k in 0..n_mels {
+            let left = hz_points[k];
+            let centre = hz_points[k + 1];
+            let right = hz_points[k + 2];
+            // Slaney normalisation: unit area in linear frequency.
+            let norm = 2.0 / (right - left).max(1e-10);
+
+            // Analytical bin range where the triangle is non-zero:
+            // weight > 0 iff left < f < right (strictly), with f = b * bin_hz.
+            //
+            // first_bin: smallest b such that b * bin_hz > left
+            //   → b > left / bin_hz → b = floor(left / bin_hz) + 1
+            //   (clamped to [0, n_bins) to avoid out-of-bounds)
+            //
+            // last_bin: largest b such that b * bin_hz < right
+            //   → b < right / bin_hz → b = ceil(right / bin_hz) - 1
+            //   (clamped to n_bins - 1)
+            let first_bin = ((left / bin_hz).floor() as usize + 1).min(n_bins);
+            let last_bin_raw = (right / bin_hz).ceil() as usize;
+            let last_bin = if last_bin_raw == 0 {
+                0
+            } else {
+                (last_bin_raw - 1).min(n_bins - 1)
+            };
+
+            if first_bin <= last_bin && first_bin < n_bins {
+                let mut weights = Vec::with_capacity(last_bin - first_bin + 1);
+                for b in first_bin..=last_bin {
+                    let f = b as f32 * bin_hz;
+                    // Guard: floating-point edge cases where the analytical
+                    // bound slightly overshoots. The original code would
+                    // produce 0.0 for f <= left or f >= right.
+                    let w = if f <= left || f >= right {
+                        0.0
+                    } else if f <= centre {
+                        norm * (f - left) / (centre - left).max(1e-10)
+                    } else {
+                        norm * (right - f) / (right - centre).max(1e-10)
+                    };
+                    weights.push(w);
+                }
+                // Trim leading/trailing zeros from float edge cases to
+                // match the original scan-based CSR construction exactly.
+                let first_nz = weights.iter().position(|&w| w != 0.0);
+                let last_nz = weights.iter().rposition(|&w| w != 0.0);
+                match (first_nz, last_nz) {
+                    (Some(f), Some(l)) => {
+                        sparse.push(MelBand {
+                            start_bin: first_bin + f,
+                            weights: weights[f..=l].to_vec(),
+                        });
+                    }
+                    _ => {
+                        sparse.push(MelBand {
+                            start_bin: 0,
+                            weights: Vec::new(),
+                        });
+                    }
+                }
+            } else {
+                sparse.push(MelBand {
+                    start_bin: 0,
+                    weights: Vec::new(),
+                });
+            }
+        }
+
+        Ok(Self {
+            n_mels,
+            n_fft,
+            sr,
+            fmin,
+            fmax,
+            scale,
+            sparse,
+        })
     }
 
     /// Number of FFT bins each filter spans (`n_fft / 2 + 1`).
@@ -293,7 +314,7 @@ impl MelFilterBank {
         // Square magnitude to power inline while accumulating via SIMD.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
-            let acc = dot_mel_sq_wide(
+            let acc = super::dot_sq_wide(
                 &band.weights,
                 &magnitude[band.start_bin..band.start_bin + band.weights.len()],
             );
@@ -324,31 +345,13 @@ impl MelFilterBank {
         // The dot product is vectorized 8-wide via `wide::f32x8`.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
-            let acc = dot_mel_wide(
+            let acc = super::dot_wide(
                 &band.weights,
                 &power[band.start_bin..band.start_bin + band.weights.len()],
             );
             *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
     }
-}
-
-/// SIMD-accelerated dot product for mel band application.
-///
-/// Delegates to the shared [`crate::dsp::dot_wide`] helper.
-#[inline]
-fn dot_mel_wide(weights: &[f32], power: &[f32]) -> f32 {
-    super::dot_wide(weights, power)
-}
-
-/// SIMD-accelerated squared dot product for mel band application.
-///
-/// Computes `sum(weights[i] * mag[i]²)` — delegates to
-/// [`crate::dsp::dot_sq_wide`] so `log_mel` avoids a separate
-/// power-spectrum allocation.
-#[inline]
-fn dot_mel_sq_wide(weights: &[f32], mag: &[f32]) -> f32 {
-    super::dot_sq_wide(weights, mag)
 }
 
 #[cfg(test)]
