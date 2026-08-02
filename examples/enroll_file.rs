@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Extracting Wang fingerprint...");
     let mut wang = Wang::default();
-    
+
     let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 
     println!(

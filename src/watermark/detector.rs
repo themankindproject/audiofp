@@ -1,11 +1,11 @@
 //! AudioSeal-compatible ONNX watermark detector.
 
+use crate::SampleRate;
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use std::path::Path;
-use crate::SampleRate;
 
 use tract_onnx::prelude::*;
 

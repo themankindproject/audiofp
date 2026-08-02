@@ -28,7 +28,6 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let samples = &input.samples[..min_len];
-    
 
     let mut fp = Panako::new(cfg);
     let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {

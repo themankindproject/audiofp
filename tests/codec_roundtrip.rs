@@ -45,9 +45,7 @@ fn haitsma_frames(path: &str) -> Vec<u32> {
     let samples =
         decode_to_mono_at(path, 5_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
     let mut h = Haitsma::default();
-    h.extract(&samples, SampleRate::HZ_5000)
-        .unwrap()
-        .frames
+    h.extract(&samples, SampleRate::HZ_5000).unwrap().frames
 }
 
 fn jaccard(a: &HashSet<u32>, b: &HashSet<u32>) -> f32 {
@@ -224,9 +222,7 @@ fn all_galway_codecs_decode_and_fingerprint() {
 
         // Verify all three algorithms produce non-trivial output
         let mut wang = Wang::default();
-        let wf = wang
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let wf = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(
             wf.hashes.len() > 50,
             "{path}: Wang produced only {} hashes",

@@ -207,10 +207,7 @@ impl PeakPicker {
             for f in 0..n_bins {
                 let idx = t * n_bins + f;
                 let v = spec[idx];
-                let above_floor = v > min_mag
-                    && min_mag_linear
-                        .map(|lin| v > lin)
-                        .unwrap_or(true);
+                let above_floor = v > min_mag && min_mag_linear.map(|lin| v > lin).unwrap_or(true);
                 if above_floor && v >= self.max_buf[idx] {
                     self.candidates.push(Peak {
                         t_frame: t as u32,

@@ -34,7 +34,6 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let samples = &input.samples[..min_len];
-    
 
     let mut offline = Haitsma::new(cfg.clone());
     let Ok(off) = offline.extract(&samples, SampleRate::HZ_8000) else {

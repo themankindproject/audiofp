@@ -1015,7 +1015,7 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Wang::default();
         let samples = vec![0.0_f32; 16_000];
-        
+
         match fp.extract(&samples, SampleRate::HZ_16000) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate, got {other:?}"),
@@ -1026,7 +1026,7 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Wang::default();
         let samples = vec![0.0_f32; 8_000]; // 1 second, need 2
-        
+
         match fp.extract(&samples, SampleRate::HZ_8000) {
             Err(AfpError::AudioTooShort {
                 needed: 16_000,
@@ -1040,7 +1040,7 @@ mod tests {
     fn silence_gives_empty_fingerprint() {
         let mut fp = Wang::default();
         let samples = vec![0.0_f32; 8_000 * 3];
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_eq!(fpr.frames_per_sec, 62.5);
         assert!(fpr.hashes.is_empty());
@@ -1050,7 +1050,7 @@ mod tests {
     fn synthetic_signal_produces_hashes() {
         let mut fp = Wang::default();
         let samples = synthetic_audio(0xC0FFEE, 8_000 * 5);
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(
             (650..=1100).contains(&fpr.hashes.len()),
@@ -1076,14 +1076,8 @@ mod tests {
         let samples = synthetic_audio(0xBEEF, 8_000 * 3);
         let mut a = Wang::default();
         let mut b = Wang::default();
-        let fa = a
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
-        let fb = b
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let fa = a.extract(&samples, SampleRate::HZ_8000).unwrap();
+        let fb = b.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_eq!(fa.hashes, fb.hashes);
     }
 
@@ -1092,11 +1086,11 @@ mod tests {
         let samples = synthetic_audio(0xDEAD, 8_000 * 4);
 
         let mut fp1 = Wang::default();
-        
+
         let f1 = fp1.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut fp2 = Wang::default();
-        
+
         let f2 = fp2.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         assert_eq!(f1.hashes.len(), f2.hashes.len());
@@ -1111,14 +1105,8 @@ mod tests {
         let samples_b = synthetic_audio(0x2222, 8_000 * 3);
 
         let mut fp = Wang::default();
-        let fa = fp
-            .extract(&samples_a, SampleRate::HZ_8000,
-            )
-            .unwrap();
-        let fb = fp
-            .extract(&samples_b, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let fa = fp.extract(&samples_a, SampleRate::HZ_8000).unwrap();
+        let fb = fp.extract(&samples_b, SampleRate::HZ_8000).unwrap();
         // Different noise streams must yield non-identical hash sequences.
         assert_ne!(fa.hashes, fb.hashes);
     }
@@ -1259,10 +1247,7 @@ mod tests {
 
         // Offline reference.
         let mut offline = Wang::default();
-        let off = offline
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         // Streaming with random chunks.
         let mut streaming = StreamingWang::default();
@@ -1272,8 +1257,9 @@ mod tests {
             let end = cursor + n;
             online.extend(
                 streaming
-                    .push(&samples[cursor..end]).unwrap()
-                .into_iter()
+                    .push(&samples[cursor..end])
+                    .unwrap()
+                    .into_iter()
                     .map(|(_, h)| h),
             );
             cursor = end;
@@ -1292,8 +1278,6 @@ mod tests {
     #[test]
     fn smaller_fan_out_yields_fewer_hashes() {
         let samples = synthetic_audio(0xFEED, 8_000 * 4);
-        
-        
 
         let mut wide = Wang::new(WangConfig {
             fan_out: 10,
@@ -1332,10 +1316,7 @@ mod tests {
     fn streaming_with_one_sample_chunks_still_matches_offline() {
         let samples = synthetic_audio(0xABCD, 8_000 * 3);
         let mut offline = Wang::default();
-        let off = offline
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut s = StreamingWang::default();
         let mut online = Vec::new();
@@ -1649,7 +1630,7 @@ mod tests {
         };
         let mut fp = Wang::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 3);
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(!fpr.hashes.is_empty());
     }
@@ -1755,7 +1736,7 @@ mod tests {
         };
         let mut fp = Wang::new(cfg);
         let samples = vec![0.0_f32; 2_000];
-        
+
         let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         match err {
             AfpError::InputTooLarge { limit, provided } => {
@@ -1775,7 +1756,7 @@ mod tests {
         let mut fp = Wang::new(cfg);
         // 16_000 samples (2 s) is above default limit but None passes.
         let samples = vec![0.0_f32; 16_000];
-        
+
         fp.extract(&samples, SampleRate::HZ_8000).unwrap();
     }
 
@@ -1787,7 +1768,7 @@ mod tests {
         };
         let mut fp = Wang::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 3);
-        
+
         fp.extract(&samples, SampleRate::HZ_8000).unwrap();
     }
 
@@ -1799,7 +1780,7 @@ mod tests {
         };
         let mut fp = Wang::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        
+
         let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
@@ -1823,7 +1804,7 @@ mod tests {
         let mut fp = Wang::default();
         let mut samples = vec![0.0_f32; 8_000 * 3];
         samples[100] = f32::NAN;
-        
+
         let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::NonFiniteSample { index: 100 }));
     }
@@ -1861,7 +1842,7 @@ mod tests {
     fn extract_with_progress_is_called_and_monotonic() {
         let mut fp = Wang::default();
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        
+
         let mut values: Vec<f32> = Vec::new();
         let result = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert!(result.is_ok());
@@ -1890,18 +1871,11 @@ mod tests {
         let samples = synthetic_audio(0xDEAD, 8_000 * 4);
 
         let mut fp1 = Wang::default();
-        let result1 = fp1
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let result1 = fp1.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut fp2 = Wang::default();
         let result2 = fp2
-            .extract_with_progress(
-                &samples,
-                SampleRate::HZ_8000,
-                |_| {},
-            )
+            .extract_with_progress(&samples, SampleRate::HZ_8000, |_| {})
             .unwrap();
 
         assert_eq!(result1.hashes, result2.hashes);
@@ -1913,7 +1887,7 @@ mod tests {
         let mut fp = Wang::default();
         // Exactly at minimum length — should still give 0.0 and 1.0.
         let samples = synthetic_audio(0xFACE, 8_000 * 2);
-        
+
         let mut values: Vec<f32> = Vec::new();
         let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert_eq!(values[0], 0.0);

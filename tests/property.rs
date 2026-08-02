@@ -196,17 +196,17 @@ fn inject_spikes(clean: &mut [f32], n_spikes: usize, seed: u32) {
 fn nan_audio_does_not_panic() {
     // All-NaN input.
     let samples = vec![f32::NAN; 8_000 * 3];
-    
+
     let mut wang = Wang::default();
     let _ = wang.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::NAN; 8_000 * 3];
-    
+
     let mut panako = Panako::default();
     let _ = panako.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::NAN; 5_000 * 3];
-    
+
     let mut h = Haitsma::default();
     let _ = h.extract(&samples, SampleRate::HZ_8000);
 }
@@ -215,17 +215,17 @@ fn nan_audio_does_not_panic() {
 fn infinity_audio_does_not_panic() {
     // All-inf input.
     let samples = vec![f32::INFINITY; 8_000 * 3];
-    
+
     let mut wang = Wang::default();
     let _ = wang.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::INFINITY; 8_000 * 3];
-    
+
     let mut panako = Panako::default();
     let _ = panako.extract(&samples, SampleRate::HZ_8000);
 
     let samples = vec![f32::INFINITY; 5_000 * 3];
-    
+
     let mut h = Haitsma::default();
     let _ = h.extract(&samples, SampleRate::HZ_8000);
 }
@@ -277,10 +277,7 @@ fn panako_tempo_robustness() {
     let original = synth(42, sr, n);
 
     let mut panako_orig = Panako::default();
-    let fp_orig = panako_orig
-        .extract(&original, SampleRate::HZ_8000,
-        )
-        .unwrap();
+    let fp_orig = panako_orig.extract(&original, SampleRate::HZ_8000).unwrap();
 
     // Time-stretch by linear interpolation (crude but sufficient for
     // this invariant test — it doesn't introduce spectral artifacts
@@ -298,10 +295,7 @@ fn panako_tempo_robustness() {
         }
 
         let mut panako_s = Panako::default();
-        let fp_stretched = panako_s
-            .extract(&stretched, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let fp_stretched = panako_s.extract(&stretched, SampleRate::HZ_8000).unwrap();
 
         // Collect hash values (ignoring timestamps, which shift).
         let orig_hashes: std::collections::HashSet<u32> =

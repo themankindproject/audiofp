@@ -64,9 +64,7 @@ fn synth_tones(sr: u32) -> Vec<f32> {
 fn wang_self_match_end_to_end() {
     let mut w = Wang::default();
     let sig = synth_chirp(1, 8_000);
-    let fp = w
-        .extract(&sig, SampleRate::HZ_8000)
-        .unwrap();
+    let fp = w.extract(&sig, SampleRate::HZ_8000).unwrap();
     assert!(!fp.hashes.is_empty(), "extraction must produce landmarks");
 
     let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -81,9 +79,7 @@ fn wang_self_match_end_to_end() {
 fn wang_offset_recovery_end_to_end() {
     let mut w = Wang::default();
     let sig = synth_chirp(2, 8_000);
-    let reference = w
-        .extract(&sig, SampleRate::HZ_8000)
-        .unwrap();
+    let reference = w.extract(&sig, SampleRate::HZ_8000).unwrap();
 
     // Prepend exactly 2 s of silence = 125 Wang frames (8000*2 / 128 =
     // 125, integer) so the per-second peak buckets stay aligned. The
@@ -92,9 +88,7 @@ fn wang_offset_recovery_end_to_end() {
     const K_FRAMES: i64 = 125;
     let mut shifted = vec![0.0_f32; 2 * 8_000];
     shifted.extend_from_slice(&sig);
-    let query = w
-        .extract(&shifted, SampleRate::HZ_8000)
-        .unwrap();
+    let query = w.extract(&shifted, SampleRate::HZ_8000).unwrap();
 
     let matcher = WangMatcher::new(WangMatchConfig::default());
     let res = matcher.match_one(&query, &reference);
@@ -113,9 +107,7 @@ fn wang_unrelated_no_match_end_to_end() {
     let a = w
         .extract(&synth_chirp(3, 8_000), SampleRate::HZ_8000)
         .unwrap();
-    let b = w
-        .extract(&synth_tones(8_000), SampleRate::HZ_8000)
-        .unwrap();
+    let b = w.extract(&synth_tones(8_000), SampleRate::HZ_8000).unwrap();
     let matcher = WangMatcher::new(WangMatchConfig::default());
     let res = matcher.match_one(&a, &b);
     assert!(
@@ -128,9 +120,7 @@ fn wang_unrelated_no_match_end_to_end() {
 fn haitsma_self_match_end_to_end() {
     let mut h = Haitsma::default();
     let sig = synth_chirp(5, 5_000);
-    let fp = h
-        .extract(&sig, SampleRate::HZ_5000)
-        .unwrap();
+    let fp = h.extract(&sig, SampleRate::HZ_5000).unwrap();
     assert!(!fp.frames.is_empty(), "extraction must produce frames");
     // 8 s @ 78.125 fps ≈ 625 frames → exercises the LUT path (> 512).
     assert!(fp.frames.len() > 512);
@@ -153,9 +143,7 @@ fn haitsma_self_match_end_to_end() {
 fn panako_self_match_end_to_end() {
     let mut p = Panako::default();
     let sig = synth_chirp(6, 8_000);
-    let fp = p
-        .extract(&sig, SampleRate::HZ_8000)
-        .unwrap();
+    let fp = p.extract(&sig, SampleRate::HZ_8000).unwrap();
     assert!(
         !fp.hashes.is_empty(),
         "Panako extraction must produce triplets"
@@ -179,9 +167,7 @@ fn panako_unrelated_no_match_end_to_end() {
     let a = p
         .extract(&synth_chirp(7, 8_000), SampleRate::HZ_8000)
         .unwrap();
-    let b = p
-        .extract(&synth_tones(8_000), SampleRate::HZ_8000)
-        .unwrap();
+    let b = p.extract(&synth_tones(8_000), SampleRate::HZ_8000).unwrap();
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
     let res = matcher.match_one(&a, &b);
     assert!(

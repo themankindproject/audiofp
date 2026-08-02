@@ -250,7 +250,8 @@ impl Panako {
     /// Same as [`Fingerprinter::extract`].
     pub fn extract_with_progress<F: FnMut(f32)>(
         &mut self,
-        samples: &[f32], rate: SampleRate,
+        samples: &[f32],
+        rate: SampleRate,
         mut progress: F,
     ) -> Result<PanakoFingerprint> {
         crate::pcm::reject_non_finite(samples)?;
@@ -1090,7 +1091,7 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 16_000];
-        
+
         match fp.extract(&samples, SampleRate::HZ_16000) {
             Err(AfpError::UnsupportedSampleRate(16_000)) => {}
             other => panic!("expected UnsupportedSampleRate, got {other:?}"),
@@ -1101,7 +1102,7 @@ mod tests {
     fn rejects_short_audio() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000];
-        
+
         match fp.extract(&samples, SampleRate::HZ_8000) {
             Err(AfpError::AudioTooShort {
                 needed: 16_000,
@@ -1115,7 +1116,7 @@ mod tests {
     fn silence_gives_empty_fingerprint() {
         let mut fp = Panako::default();
         let samples = vec![0.0_f32; 8_000 * 3];
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_eq!(fpr.frames_per_sec, 62.5);
         assert!(fpr.hashes.is_empty());
@@ -1125,7 +1126,7 @@ mod tests {
     fn synthetic_signal_produces_hashes() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xC0FFEE, 8_000 * 5);
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(
             (500..=900).contains(&fpr.hashes.len()),
@@ -1156,14 +1157,8 @@ mod tests {
         let samples = synthetic_audio(0xBEEF, 8_000 * 3);
         let mut a = Panako::default();
         let mut b = Panako::default();
-        let fa = a
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
-        let fb = b
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let fa = a.extract(&samples, SampleRate::HZ_8000).unwrap();
+        let fb = b.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_eq!(fa.hashes, fb.hashes);
     }
 
@@ -1172,16 +1167,10 @@ mod tests {
         let samples = synthetic_audio(0xDEAD, 8_000 * 4);
 
         let mut fp1 = Panako::default();
-        let f1 = fp1
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let f1 = fp1.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut fp2 = Panako::default();
-        let f2 = fp2
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let f2 = fp2.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         assert_eq!(f1.hashes, f2.hashes);
     }
@@ -1192,14 +1181,8 @@ mod tests {
         let b = synthetic_audio(0x2222, 8_000 * 3);
 
         let mut fp = Panako::default();
-        let fa = fp
-            .extract(&a, SampleRate::HZ_8000,
-            )
-            .unwrap();
-        let fb = fp
-            .extract(&b, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let fa = fp.extract(&a, SampleRate::HZ_8000).unwrap();
+        let fb = fp.extract(&b, SampleRate::HZ_8000).unwrap();
         assert_ne!(fa.hashes, fb.hashes);
     }
 
@@ -1456,10 +1439,7 @@ mod tests {
         let samples = synthetic_audio(0xBEEF, 8_000 * 6);
 
         let mut offline = Panako::default();
-        let off = offline
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut streaming = StreamingPanako::default();
         let mut online: Vec<PanakoHash> = Vec::new();
@@ -1468,8 +1448,9 @@ mod tests {
             let end = cursor + n;
             online.extend(
                 streaming
-                    .push(&samples[cursor..end]).unwrap()
-                .into_iter()
+                    .push(&samples[cursor..end])
+                    .unwrap()
+                    .into_iter()
                     .map(|(_, h)| h),
             );
             cursor = end;
@@ -1702,7 +1683,7 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 3);
-        
+
         let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert!(!fpr.hashes.is_empty());
     }
@@ -1798,7 +1779,7 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = vec![0.0_f32; 2_000];
-        
+
         let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
@@ -1811,7 +1792,7 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = vec![0.0_f32; 16_000];
-        
+
         fp.extract(&samples, SampleRate::HZ_8000).unwrap();
     }
 
@@ -1823,7 +1804,7 @@ mod tests {
         };
         let mut fp = Panako::new(cfg);
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        
+
         let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
@@ -1862,7 +1843,7 @@ mod tests {
     fn extract_with_progress_is_called_and_monotonic() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        
+
         let mut values: Vec<f32> = Vec::new();
         let result = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert!(result.is_ok());
@@ -1891,18 +1872,11 @@ mod tests {
         let samples = synthetic_audio(0xDEAD, 8_000 * 4);
 
         let mut fp1 = Panako::default();
-        let result1 = fp1
-            .extract(&samples, SampleRate::HZ_8000,
-            )
-            .unwrap();
+        let result1 = fp1.extract(&samples, SampleRate::HZ_8000).unwrap();
 
         let mut fp2 = Panako::default();
         let result2 = fp2
-            .extract_with_progress(
-                &samples,
-                SampleRate::HZ_8000,
-                |_| {},
-            )
+            .extract_with_progress(&samples, SampleRate::HZ_8000, |_| {})
             .unwrap();
 
         assert_eq!(result1.hashes, result2.hashes);
@@ -1913,7 +1887,7 @@ mod tests {
     fn extract_with_progress_short_audio_still_reports_0_and_1() {
         let mut fp = Panako::default();
         let samples = synthetic_audio(0xFACE, 8_000 * 2);
-        
+
         let mut values: Vec<f32> = Vec::new();
         let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert_eq!(values[0], 0.0);

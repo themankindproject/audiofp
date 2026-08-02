@@ -1,11 +1,11 @@
 //! Generic ONNX log-mel embedder (offline / whole-buffer).
 
+use crate::SampleRate;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use std::path::Path;
-use crate::SampleRate;
 
 use tract_onnx::prelude::*;
 
@@ -633,8 +633,7 @@ impl Fingerprinter for NeuralEmbedder {
                 let mut batch_windows: Vec<&[f32]> = Vec::with_capacity(batch_size);
                 let mut batch_timestamps: Vec<TimestampMs> = Vec::with_capacity(batch_size);
                 let mut s = start;
-                while batch_windows.len() < batch_size && s + window_samples <= samples.len()
-                {
+                while batch_windows.len() < batch_size && s + window_samples <= samples.len() {
                     batch_windows.push(&samples[s..s + window_samples]);
                     batch_timestamps.push(TimestampMs((s as u64) * 1000 / sr));
                     s += hop_samples;

@@ -21,7 +21,6 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let samples = &input.samples[..min_len];
-    
 
     let mut fp = Haitsma::new(HaitsmaConfig::default());
     let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {
@@ -39,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
     // can be set; no bit is "reserved" in Haitsma). Verify that
     // extracting the same audio again produces identical output
     // (determinism).
-    
+
     let mut fp2 = Haitsma::new(HaitsmaConfig::default());
     let fpr2 = fp2.extract(&samples, SampleRate::HZ_8000).unwrap();
     assert_eq!(fpr.frames, fpr2.frames, "determinism violation");

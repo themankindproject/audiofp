@@ -336,9 +336,7 @@ mod real_audio_snapshots {
     fn wang_galway_flac_hash_count_stable() {
         let samples = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
         let mut w = Wang::default();
-        let fp = w
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
         // ~16s clip @ default config produces ~1500-2500 hashes
         assert_count_in_range("wang/galway.flac", fp.hashes.len(), 1000, 3000);
     }
@@ -347,9 +345,7 @@ mod real_audio_snapshots {
     fn wang_freak_flac_hash_count_stable() {
         let samples = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
         let mut w = Wang::default();
-        let fp = w
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_count_in_range("wang/freak.flac", fp.hashes.len(), 1000, 3000);
     }
 
@@ -357,9 +353,7 @@ mod real_audio_snapshots {
     fn wang_piano_ogg_hash_count_stable() {
         let samples = decode_to_mono_at(asset("piano.ogg"), 8_000).unwrap();
         let mut w = Wang::default();
-        let fp = w
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
         // Piano is sparser — fewer spectral peaks
         assert_count_in_range("wang/piano.ogg", fp.hashes.len(), 100, 2500);
     }
@@ -368,9 +362,7 @@ mod real_audio_snapshots {
     fn wang_speech_ogg_hash_count_stable() {
         let samples = decode_to_mono_at(asset("speech.ogg"), 8_000).unwrap();
         let mut w = Wang::default();
-        let fp = w
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
         // Speech has moderate spectral content
         assert_count_in_range("wang/speech.ogg", fp.hashes.len(), 200, 2500);
     }
@@ -381,9 +373,7 @@ mod real_audio_snapshots {
     fn panako_galway_flac_hash_count_stable() {
         let samples = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
         let mut p = Panako::default();
-        let fp = p
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = p.extract(&samples, SampleRate::HZ_8000).unwrap();
         // Panako with fan_out=5 produces fewer hashes than Wang
         assert_count_in_range("panako/galway.flac", fp.hashes.len(), 500, 2500);
     }
@@ -392,9 +382,7 @@ mod real_audio_snapshots {
     fn panako_freak_flac_hash_count_stable() {
         let samples = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
         let mut p = Panako::default();
-        let fp = p
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = p.extract(&samples, SampleRate::HZ_8000).unwrap();
         assert_count_in_range("panako/freak.flac", fp.hashes.len(), 500, 2500);
     }
 
@@ -404,9 +392,7 @@ mod real_audio_snapshots {
     fn haitsma_galway_flac_frame_count_stable() {
         let samples = decode_to_mono_at(asset("galway.flac"), 5_000).unwrap();
         let mut h = Haitsma::default();
-        let fp = h
-            .extract(&samples, SampleRate::HZ_5000)
-            .unwrap();
+        let fp = h.extract(&samples, SampleRate::HZ_5000).unwrap();
         // ~16s × 78.125 fps ≈ 1250 frames; allow ±20%
         assert_count_in_range("haitsma/galway.flac", fp.frames.len(), 1000, 1600);
     }
@@ -415,9 +401,7 @@ mod real_audio_snapshots {
     fn haitsma_freak_flac_frame_count_stable() {
         let samples = decode_to_mono_at(asset("freak.flac"), 5_000).unwrap();
         let mut h = Haitsma::default();
-        let fp = h
-            .extract(&samples, SampleRate::HZ_5000)
-            .unwrap();
+        let fp = h.extract(&samples, SampleRate::HZ_5000).unwrap();
         assert_count_in_range("haitsma/freak.flac", fp.frames.len(), 1000, 1600);
     }
 
@@ -429,12 +413,8 @@ mod real_audio_snapshots {
         let mp3 = decode_to_mono_at(asset("galway.mp3"), 8_000).unwrap();
 
         let mut w = Wang::default();
-        let fp_flac = w
-            .extract(&flac, SampleRate::HZ_8000)
-            .unwrap();
-        let fp_mp3 = w
-            .extract(&mp3, SampleRate::HZ_8000)
-            .unwrap();
+        let fp_flac = w.extract(&flac, SampleRate::HZ_8000).unwrap();
+        let fp_mp3 = w.extract(&mp3, SampleRate::HZ_8000).unwrap();
 
         // Compute hash overlap (Jaccard-style)
         use std::collections::HashSet;
@@ -457,12 +437,8 @@ mod real_audio_snapshots {
         let freak = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
 
         let mut w = Wang::default();
-        let fp_galway = w
-            .extract(&galway, SampleRate::HZ_8000)
-            .unwrap();
-        let fp_freak = w
-            .extract(&freak, SampleRate::HZ_8000)
-            .unwrap();
+        let fp_galway = w.extract(&galway, SampleRate::HZ_8000).unwrap();
+        let fp_freak = w.extract(&freak, SampleRate::HZ_8000).unwrap();
 
         use std::collections::HashSet;
         let set_a: HashSet<u32> = fp_galway.hashes.iter().map(|h| h.hash).collect();

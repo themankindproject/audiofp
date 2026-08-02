@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wang
     {
         let mut wang = Wang::default();
-        
+
         let t = Instant::now();
         let fp = wang.extract(&samples_8k, SampleRate::HZ_8000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Panako
     {
         let mut panako = Panako::default();
-        
+
         let t = Instant::now();
         let fp = panako.extract(&samples_8k, SampleRate::HZ_8000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Haitsma
     {
         let mut h = Haitsma::default();
-        
+
         let t = Instant::now();
         let fp = h.extract(&samples_5k, SampleRate::HZ_5000)?;
         let elapsed = t.elapsed().as_secs_f32() * 1000.0;

@@ -35,8 +35,10 @@ fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
 
 fn wang_fp(seed: u32, secs: usize) -> WangFingerprint {
     let samples = synth(seed, 8_000, secs);
-    
-    Wang::default().extract(&samples, SampleRate::HZ_8000).expect("wang extract")
+
+    Wang::default()
+        .extract(&samples, SampleRate::HZ_8000)
+        .expect("wang extract")
 }
 
 fn bench_wang_one(c: &mut Criterion) {
@@ -54,8 +56,10 @@ fn bench_wang_one(c: &mut Criterion) {
 
 fn bench_haitsma_one(c: &mut Criterion) {
     let samples = synth(2, 5_000, 5);
-    
-    let fp = Haitsma::default().extract(&samples, SampleRate::HZ_8000).expect("haitsma extract");
+
+    let fp = Haitsma::default()
+        .extract(&samples, SampleRate::HZ_8000)
+        .expect("haitsma extract");
     // Exact path: keep refs short enough that LUT is skipped, or force use_lut=false.
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig {
         use_lut: false,
@@ -73,8 +77,10 @@ fn bench_haitsma_one(c: &mut Criterion) {
 
 fn bench_panako_one(c: &mut Criterion) {
     let samples = synth(3, 8_000, 5);
-    
-    let fp = Panako::default().extract(&samples, SampleRate::HZ_8000).expect("panako extract");
+
+    let fp = Panako::default()
+        .extract(&samples, SampleRate::HZ_8000)
+        .expect("panako extract");
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
 
     let mut g = c.benchmark_group("matching/panako_1to1");

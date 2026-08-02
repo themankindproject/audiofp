@@ -115,16 +115,8 @@ impl Matcher for WangMatcher {
 
         // --- 2. Vote into dense offset histogram ---
         // δ = t_ref − t_query ∈ [−q_max, r_max]
-        let q_max = q_hashes
-            .iter()
-            .map(|&(_, t)| t as i64)
-            .max()
-            .unwrap_or(0);
-        let r_max = r_hashes
-            .iter()
-            .map(|&(_, t)| t as i64)
-            .max()
-            .unwrap_or(0);
+        let q_max = q_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
+        let r_max = r_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
 
         let dmin: i64 = -q_max;
         let dmax: i64 = r_max;

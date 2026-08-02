@@ -89,7 +89,9 @@ impl SampleRate {
 /// assert_eq!(t.0, 1_500);
 /// ```
 #[repr(transparent)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,
+)]
 pub struct TimestampMs(pub u64);
 
 #[cfg(test)]

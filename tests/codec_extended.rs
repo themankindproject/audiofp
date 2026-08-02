@@ -196,9 +196,7 @@ fn panako_sample_rate_ladder() {
     // Panako should also handle the sample-rate ladder
     let ref_samples = decode_to_mono_at("tests/assets/freak_44100hz.mp3", 8_000).unwrap();
     let mut panako = Panako::default();
-    let ref_fp = panako
-        .extract(&ref_samples, SampleRate::HZ_8000)
-        .unwrap();
+    let ref_fp = panako.extract(&ref_samples, SampleRate::HZ_8000).unwrap();
     let ref_set: HashSet<u32> = ref_fp.hashes.iter().map(|h| h.hash).collect();
 
     let variants = [
@@ -209,9 +207,7 @@ fn panako_sample_rate_ladder() {
 
     for path in variants {
         let samples = decode_to_mono_at(path, 8_000).unwrap();
-        let fp = panako
-            .extract(&samples, SampleRate::HZ_8000)
-            .unwrap();
+        let fp = panako.extract(&samples, SampleRate::HZ_8000).unwrap();
         let h: HashSet<u32> = fp.hashes.iter().map(|h| h.hash).collect();
         let j = jaccard(&ref_set, &h);
         eprintln!("Panako {path} vs 44.1kHz: Jaccard = {j:.3}");

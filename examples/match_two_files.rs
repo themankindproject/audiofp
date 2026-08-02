@@ -16,7 +16,7 @@ use audiofp::{Fingerprinter, SampleRate};
 
 fn fingerprint(wang: &mut Wang, path: &str) -> Result<WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
-    
+
     Ok(wang.extract(&samples, SampleRate::HZ_8000)?)
 }
 

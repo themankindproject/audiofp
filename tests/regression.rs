@@ -129,7 +129,7 @@ fn assert_bytes_equal(actual: &[u8], expected: &[u8], label: &str) {
 fn wang_v1_golden() {
     let samples = synth(0xCAFE, 8_000);
     let mut wang = Wang::default();
-    
+
     let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 
     let bytes = bytemuck::cast_slice::<WangHash, u8>(&fp.hashes);
@@ -146,7 +146,7 @@ fn wang_v1_golden() {
 fn panako_v2_golden() {
     let samples = synth(0xCAFE, 8_000);
     let mut panako = Panako::default();
-    
+
     let fp = panako.extract(&samples, SampleRate::HZ_8000).unwrap();
 
     let bytes = bytemuck::cast_slice::<PanakoHash, u8>(&fp.hashes);

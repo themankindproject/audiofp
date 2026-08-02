@@ -11,9 +11,7 @@ use audiofp::{Fingerprinter, SampleRate};
 fn assert_golden_wang(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut wang = Wang::default();
-    let fp = wang
-        .extract(&samples, SampleRate::HZ_8000)
-        .unwrap();
+    let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
     let actual: Vec<u8> = fp
         .hashes
         .iter()
@@ -33,9 +31,7 @@ fn assert_golden_wang(asset: &str, golden_path: &str) {
 fn assert_golden_panako(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
     let mut panako = Panako::default();
-    let fp = panako
-        .extract(&samples, SampleRate::HZ_8000)
-        .unwrap();
+    let fp = panako.extract(&samples, SampleRate::HZ_8000).unwrap();
     let actual: Vec<u8> = fp
         .hashes
         .iter()
@@ -49,9 +45,7 @@ fn assert_golden_panako(asset: &str, golden_path: &str) {
 fn assert_golden_haitsma(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 5_000).unwrap();
     let mut haitsma = Haitsma::default();
-    let fp = haitsma
-        .extract(&samples, SampleRate::HZ_5000)
-        .unwrap();
+    let fp = haitsma.extract(&samples, SampleRate::HZ_5000).unwrap();
     let actual: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}."));

@@ -9,8 +9,8 @@
 //! bundle them. Without a second path argument, runs on 1 s of silence
 //! at 16 kHz (useful as a smoke test that the model loads).
 
+use audiofp::SampleRate;
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-use audiofp::{SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
