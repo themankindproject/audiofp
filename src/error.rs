@@ -98,6 +98,11 @@ pub enum AfpError {
         index: usize,
     },
 
+    /// Deserialization of a fingerprint binary blob failed (magic mismatch,
+    /// unsupported version, truncated payload, wrong algorithm, …).
+    #[error("deserialize: {0}")]
+    Deserialize(String),
+
     /// A configuration value was rejected (out of range, mutually exclusive, …).
     #[error("invalid configuration: {0}")]
     Config(String),

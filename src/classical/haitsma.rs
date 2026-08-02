@@ -188,6 +188,113 @@ impl Haitsma {
     }
 }
 
+/// Progress callback reporting interval for Haitsma (78.125 fps):
+/// every 39 frames ≈ 500 ms of audio.
+const HAITSMA_PROGRESS_INTERVAL: usize = 39;
+
+impl Haitsma {
+    /// Extract fingerprint with a progress callback.
+    ///
+    /// `progress` is called periodically with a value in `[0.0, 1.0]`
+    /// representing the fraction of work completed. The final call is
+    /// always made with `1.0`. The callback is invoked at most once per
+    /// ~500 ms of audio to avoid overhead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fingerprinter::extract`].
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self,
+        audio: AudioBuffer<'_>,
+        mut progress: F,
+    ) -> Result<HaitsmaFingerprint> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
+        if audio.rate.hz() != HAITSMA_SR {
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        }
+        if audio.samples.len() < self.min_samples() {
+            return Err(AfpError::AudioTooShort {
+                needed: self.min_samples(),
+                got: audio.samples.len(),
+            });
+        }
+
+        progress(0.0);
+
+        // Pull power directly — band energy is `Σ |X|²`, so the previous
+        // path's `m * m` after a `sqrt(|X|²)` was redundant.
+        let (n_frames, n_bins) = self
+            .stft
+            .power_flat_into(audio.samples, &mut self.power_buf);
+        let power_flat = &self.power_buf;
+        if n_frames < 2 {
+            progress(1.0);
+            return Ok(HaitsmaFingerprint {
+                frames: Vec::new(),
+                frames_per_sec: HAITSMA_FRAMES_PER_SEC,
+            });
+        }
+
+        // Report STFT phase progress (~50% of total work for Haitsma).
+        let total_frames = n_frames;
+        let stft_weight = 0.50_f32;
+        let interval = HAITSMA_PROGRESS_INTERVAL;
+        {
+            let mut reported = 0usize;
+            while reported + interval < total_frames {
+                reported += interval;
+                progress(stft_weight * (reported as f32 / total_frames as f32));
+            }
+        }
+        progress(stft_weight);
+
+        // Compute per-frame band energies.
+        self.energies_buf.clear();
+        self.energies_buf.reserve(n_frames);
+        for f in 0..n_frames {
+            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
+            let mut e = [0.0_f32; HAITSMA_N_BANDS];
+            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
+                e[b] = row[start..end].iter().sum();
+            }
+            self.energies_buf.push(e);
+
+            // Report progress during band energy computation (~30% of work).
+            if (f + 1) % interval == 0 {
+                let band_progress = stft_weight + 0.30 * ((f + 1) as f32 / total_frames as f32);
+                progress(band_progress);
+            }
+        }
+        progress(0.80);
+
+        // For each frame n >= 1, compute the 32-bit hash.
+        self.frames_buf.clear();
+        self.frames_buf.reserve(self.energies_buf.len() - 1);
+        for n in 1..self.energies_buf.len() {
+            self.frames_buf.push(pack_frame_bits(
+                &self.energies_buf[n],
+                &self.energies_buf[n - 1],
+            ));
+        }
+
+        progress(1.0);
+
+        // Move ownership into the return value; the struct keeps capacity.
+        Ok(HaitsmaFingerprint {
+            frames: core::mem::take(&mut self.frames_buf),
+            frames_per_sec: HAITSMA_FRAMES_PER_SEC,
+        })
+    }
+}
+
 impl Fingerprinter for Haitsma {
     type Output = HaitsmaFingerprint;
     type Config = HaitsmaConfig;
@@ -209,65 +316,7 @@ impl Fingerprinter for Haitsma {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        crate::pcm::reject_non_finite(audio.samples)?;
-        if let Some(limit) = self.cfg.max_input_samples
-            && audio.samples.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: audio.samples.len(),
-            });
-        }
-        if audio.rate.hz() != HAITSMA_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
-        }
-        if audio.samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: audio.samples.len(),
-            });
-        }
-
-        // Pull power directly — band energy is `Σ |X|²`, so the previous
-        // path's `m * m` after a `sqrt(|X|²)` was redundant.
-        let (n_frames, n_bins) = self
-            .stft
-            .power_flat_into(audio.samples, &mut self.power_buf);
-        let power_flat = &self.power_buf;
-        if n_frames < 2 {
-            return Ok(HaitsmaFingerprint {
-                frames: Vec::new(),
-                frames_per_sec: HAITSMA_FRAMES_PER_SEC,
-            });
-        }
-
-        // Compute per-frame band energies.
-        self.energies_buf.clear();
-        self.energies_buf.reserve(n_frames);
-        for f in 0..n_frames {
-            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
-            let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
-                e[b] = row[start..end].iter().sum();
-            }
-            self.energies_buf.push(e);
-        }
-
-        // For each frame n >= 1, compute the 32-bit hash.
-        self.frames_buf.clear();
-        self.frames_buf.reserve(self.energies_buf.len() - 1);
-        for n in 1..self.energies_buf.len() {
-            self.frames_buf.push(pack_frame_bits(
-                &self.energies_buf[n],
-                &self.energies_buf[n - 1],
-            ));
-        }
-
-        // Move ownership into the return value; the struct keeps capacity.
-        Ok(HaitsmaFingerprint {
-            frames: core::mem::take(&mut self.frames_buf),
-            frames_per_sec: HAITSMA_FRAMES_PER_SEC,
-        })
+        self.extract_with_progress(audio, |_| {})
     }
 }
 
@@ -1059,5 +1108,79 @@ mod tests {
             rate: SampleRate::HZ_5000,
         };
         fp.extract(buf).unwrap();
+    }
+
+    // ── Progress callback tests ──
+
+    #[test]
+    fn extract_with_progress_is_called_and_monotonic() {
+        let mut fp = Haitsma::default();
+        let samples = synthetic_audio(0xCAFE, 5_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        assert!(result.is_ok());
+        // Must be called at least a few times.
+        assert!(
+            values.len() >= 3,
+            "expected at least 3 progress calls, got {}",
+            values.len()
+        );
+        // First value must be 0.0.
+        assert_eq!(values[0], 0.0);
+        // Last value must be 1.0.
+        assert_eq!(*values.last().unwrap(), 1.0);
+        // Must be monotonically non-decreasing.
+        for w in values.windows(2) {
+            assert!(w[1] >= w[0], "progress went backwards: {} → {}", w[0], w[1]);
+        }
+        // All values must be in [0, 1].
+        for &v in &values {
+            assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn extract_with_progress_matches_extract_output() {
+        let samples = synthetic_audio(0xDEAD, 5_000 * 4);
+
+        let mut fp1 = Haitsma::default();
+        let result1 = fp1
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_5000,
+            })
+            .unwrap();
+
+        let mut fp2 = Haitsma::default();
+        let result2 = fp2
+            .extract_with_progress(
+                AudioBuffer {
+                    samples: &samples,
+                    rate: SampleRate::HZ_5000,
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(result1.frames, result2.frames);
+        assert_eq!(result1.frames_per_sec, result2.frames_per_sec);
+    }
+
+    #[test]
+    fn extract_with_progress_short_audio_still_reports_0_and_1() {
+        let mut fp = Haitsma::default();
+        let samples = synthetic_audio(0xFACE, 5_000 * 2);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_5000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        assert_eq!(values[0], 0.0);
+        assert_eq!(*values.last().unwrap(), 1.0);
     }
 }

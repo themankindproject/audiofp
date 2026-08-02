@@ -78,6 +78,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`wide` 1.5 dependency** (no_std compatible, zero `unsafe`). Provides
   `f32x8` used across the DSP pipeline.
+- **Lightweight fingerprint serialization (`serial` module) (#117).**
+  `WangFingerprint::to_bytes()` / `from_bytes()`,
+  `PanakoFingerprint::to_bytes()` / `from_bytes()`,
+  `HaitsmaFingerprint::to_bytes()` / `from_bytes()` — compact binary
+  wire format with 8-byte magic, version byte, algorithm ID, and Pod
+  hash payload. `FingerprintEnvelope` struct for metadata inspection.
+  New `AfpError::Deserialize` variant for format errors.
+- **Extraction progress callback (#122).**
+  `Wang::extract_with_progress`, `Panako::extract_with_progress`,
+  `Haitsma::extract_with_progress` — callback receives monotonic
+  `f32` in `[0.0, 1.0]`. Called every ~500 ms of audio. Plain
+  `extract()` delegates with a no-op closure (no overhead).
+- **Decoder integrity mode (#76).**
+  `DecodeLimits::strict()` builder sets `integrity_mode: true` — any
+  per-packet decode error (corrupt frame, I/O glitch) becomes fatal
+  instead of being silently skipped. Default remains `false`
+  (backwards-compatible skip behavior).
+- **Fuzz harnesses for decoder wrappers (#84).**
+  `fuzz/fuzz_targets/decode_bytes.rs` (raw bytes → decode pipeline),
+  `fuzz/fuzz_targets/decode_resample.rs` (arbitrary bytes + target
+  sample rate → decode + resample). Both wired into CI fuzz smoke job
+  (now 9 targets total).
+- **macOS and Windows in CI test matrix (#29).**
+  `test` and `no-std-test` jobs now run on `ubuntu-latest`,
+  `macos-latest`, and `windows-latest` with `fail-fast: false`.
+- **Codec robustness documentation (#87).**
+  `ROBUSTNESS.md` documents the CC-BY corpus, overlap methodology,
+  published numbers, and local reproduction commands.
+  `scripts/codec_robustness.sh` helper to run and format results.
 - **SIMD `dot_sq_wide` for `MelFilterBank::log_mel` (#97).**
   Added `dot_sq_wide(a, b)` to `dsp/mod.rs` — computes `sum(a[i] *
   b[i]²)` via `f32x8` (square + fused multiply-add, 8 elements per

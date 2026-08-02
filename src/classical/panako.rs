@@ -219,6 +219,100 @@ impl Panako {
     }
 }
 
+/// Progress callback reporting interval for Panako (62.5 fps):
+/// every 32 frames ≈ 500 ms of audio.
+const PANAKO_PROGRESS_INTERVAL: usize = 32;
+
+impl Panako {
+    /// Extract fingerprint with a progress callback.
+    ///
+    /// `progress` is called periodically with a value in `[0.0, 1.0]`
+    /// representing the fraction of work completed. The final call is
+    /// always made with `1.0`. The callback is invoked at most once per
+    /// ~500 ms of audio to avoid overhead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fingerprinter::extract`].
+    pub fn extract_with_progress<F: FnMut(f32)>(
+        &mut self,
+        audio: AudioBuffer<'_>,
+        mut progress: F,
+    ) -> Result<PanakoFingerprint> {
+        crate::pcm::reject_non_finite(audio.samples)?;
+        if let Some(limit) = self.cfg.max_input_samples
+            && audio.samples.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: audio.samples.len(),
+            });
+        }
+        if audio.rate.hz() != PANAKO_SR {
+            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
+        }
+        if audio.samples.len() < self.min_samples() {
+            return Err(AfpError::AudioTooShort {
+                needed: self.min_samples(),
+                got: audio.samples.len(),
+            });
+        }
+
+        progress(0.0);
+
+        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
+        if n_frames == 0 {
+            progress(1.0);
+            return Ok(PanakoFingerprint {
+                hashes: Vec::new(),
+                frames_per_sec: PANAKO_FRAMES_PER_SEC,
+            });
+        }
+
+        // Report progress through the STFT phase (~70% of total work).
+        let total_frames = n_frames;
+        let stft_weight = 0.7_f32;
+        let interval = PANAKO_PROGRESS_INTERVAL;
+        {
+            let mut reported = 0usize;
+            while reported + interval < total_frames {
+                reported += interval;
+                progress(stft_weight * (reported as f32 / total_frames as f32));
+            }
+        }
+        progress(stft_weight);
+
+        // power → dB log-magnitude in-place (20·log10(sqrt(p)) ≡ 10·log10(p)).
+        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power). Vectorized via wide.
+        power_to_db_wide(&mut self.log_spec, PANAKO_LOG_FLOOR_POWER);
+        progress(0.80);
+
+        let peaks = self
+            .picker
+            .pick(&self.log_spec, n_frames, n_bins, PANAKO_FRAMES_PER_SEC);
+        progress(0.90);
+
+        let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
+        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+
+        if let Some(limit) = self.cfg.max_hashes
+            && hashes.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: hashes.len(),
+            });
+        }
+
+        progress(1.0);
+
+        Ok(PanakoFingerprint {
+            hashes,
+            frames_per_sec: PANAKO_FRAMES_PER_SEC,
+        })
+    }
+}
+
 impl Fingerprinter for Panako {
     type Output = PanakoFingerprint;
     type Config = PanakoConfig;
@@ -240,57 +334,7 @@ impl Fingerprinter for Panako {
     }
 
     fn extract(&mut self, audio: AudioBuffer<'_>) -> Result<Self::Output> {
-        crate::pcm::reject_non_finite(audio.samples)?;
-        if let Some(limit) = self.cfg.max_input_samples
-            && audio.samples.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: audio.samples.len(),
-            });
-        }
-        if audio.rate.hz() != PANAKO_SR {
-            return Err(AfpError::UnsupportedSampleRate(audio.rate.hz()));
-        }
-        if audio.samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: audio.samples.len(),
-            });
-        }
-
-        let (n_frames, n_bins) = self.stft.power_flat_into(audio.samples, &mut self.log_spec);
-        if n_frames == 0 {
-            return Ok(PanakoFingerprint {
-                hashes: Vec::new(),
-                frames_per_sec: PANAKO_FRAMES_PER_SEC,
-            });
-        }
-
-        // power → dB log-magnitude in-place (20·log10(sqrt(p)) ≡ 10·log10(p)).
-        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power). Vectorized via wide.
-        power_to_db_wide(&mut self.log_spec, PANAKO_LOG_FLOOR_POWER);
-
-        let peaks = self
-            .picker
-            .pick(&self.log_spec, n_frames, n_bins, PANAKO_FRAMES_PER_SEC);
-
-        let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
-        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
-
-        if let Some(limit) = self.cfg.max_hashes
-            && hashes.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: hashes.len(),
-            });
-        }
-
-        Ok(PanakoFingerprint {
-            hashes,
-            frames_per_sec: PANAKO_FRAMES_PER_SEC,
-        })
+        self.extract_with_progress(audio, |_| {})
     }
 }
 
@@ -1834,5 +1878,79 @@ mod tests {
         let _ = s.push(&samples);
         let _ = s.flush();
         assert_eq!(s.config().max_push_samples, Some(512));
+    }
+
+    // ── Progress callback tests ──
+
+    #[test]
+    fn extract_with_progress_is_called_and_monotonic() {
+        let mut fp = Panako::default();
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let result = fp.extract_with_progress(buf, |v| values.push(v));
+        assert!(result.is_ok());
+        // Must be called at least a few times.
+        assert!(
+            values.len() >= 3,
+            "expected at least 3 progress calls, got {}",
+            values.len()
+        );
+        // First value must be 0.0.
+        assert_eq!(values[0], 0.0);
+        // Last value must be 1.0.
+        assert_eq!(*values.last().unwrap(), 1.0);
+        // Must be monotonically non-decreasing.
+        for w in values.windows(2) {
+            assert!(w[1] >= w[0], "progress went backwards: {} → {}", w[0], w[1]);
+        }
+        // All values must be in [0, 1].
+        for &v in &values {
+            assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn extract_with_progress_matches_extract_output() {
+        let samples = synthetic_audio(0xDEAD, 8_000 * 4);
+
+        let mut fp1 = Panako::default();
+        let result1 = fp1
+            .extract(AudioBuffer {
+                samples: &samples,
+                rate: SampleRate::HZ_8000,
+            })
+            .unwrap();
+
+        let mut fp2 = Panako::default();
+        let result2 = fp2
+            .extract_with_progress(
+                AudioBuffer {
+                    samples: &samples,
+                    rate: SampleRate::HZ_8000,
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(result1.hashes, result2.hashes);
+        assert_eq!(result1.frames_per_sec, result2.frames_per_sec);
+    }
+
+    #[test]
+    fn extract_with_progress_short_audio_still_reports_0_and_1() {
+        let mut fp = Panako::default();
+        let samples = synthetic_audio(0xFACE, 8_000 * 2);
+        let buf = AudioBuffer {
+            samples: &samples,
+            rate: SampleRate::HZ_8000,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        let _ = fp.extract_with_progress(buf, |v| values.push(v));
+        assert_eq!(values[0], 0.0);
+        assert_eq!(*values.last().unwrap(), 1.0);
     }
 }

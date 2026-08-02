@@ -27,4 +27,5 @@ pub use crate::classical::{
 };
 pub use crate::error::{AfpError, Result};
 pub use crate::fp::{Fingerprinter, StreamingFingerprinter};
+pub use crate::serial::FingerprintEnvelope;
 pub use crate::types::{AudioBuffer, SampleRate, TimestampMs};

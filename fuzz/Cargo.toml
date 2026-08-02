@@ -61,3 +61,17 @@ path = "fuzz_targets/streaming_panako_equiv.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_bytes"
+path = "fuzz_targets/decode_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_resample"
+path = "fuzz_targets/decode_resample.rs"
+test = false
+doc = false
+bench = false
