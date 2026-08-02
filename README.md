@@ -157,15 +157,25 @@ Offline extract (`cargo bench --bench extract`, 30 s of synthetic audio):
 
 | Algorithm  | 30 s of audio | Realtime factor |
 | ---------- | ------------- | --------------- |
-| `Wang`     |  99 ms        | 303×            |
-| `Panako`   | 104 ms        | 288×            |
-| `Haitsma`  |  47 ms        | 638×            |
+| `Wang`     |  79 ms        | 380×            |
+| `Panako`   |  81 ms        | 370×            |
+| `Haitsma`  |  42 ms        | 714×            |
 
-| Streaming type      | `latency_ms()` | Notes                                                  |
-| ------------------- | -------------- | ------------------------------------------------------ |
-| `StreamingWang`     | 2 256 ms       | Includes 1 s for per-second adaptive peak thresholding |
-| `StreamingPanako`   | 2 784 ms       | Wider target zone (96 frames vs Wang's 63)             |
-| `StreamingHaitsma`  | 409 ms         | No peak picker → bounded by `n_fft / sr`               |
+Streaming push (`cargo bench --bench streaming`, 10 s of synthetic audio):
+
+| Streaming type      | Small chunks (256 samples) | Large chunks (1 s) | `latency_ms()` |
+| ------------------- | -------------------------: | ------------------:| --------------- |
+| `StreamingWang`     | 10.5 ms                    | 10.6 ms            | 2 256 ms        |
+| `StreamingPanako`   | 11.6 ms                    | 11.4 ms            | 2 784 ms        |
+| `StreamingHaitsma`  |  6.3 ms                    |  6.7 ms            | 409 ms          |
+
+Neural front-end (`cargo bench --features neural --bench neural_frontend`):
+
+| Path                          | Time       |
+|-------------------------------|:----------:|
+| `log_mel_pipeline_1s_window`  | 297 µs     |
+| `strided_tensor_write`        | 7.6 µs     |
+| `l2_normalize_1024d`          | 2.5 µs     |
 
 Run benchmarks for your own host:
 ```bash
