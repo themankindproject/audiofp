@@ -201,7 +201,7 @@ impl AfpError {
 ///
 /// Used by both the neural embedder and watermark detector when opening
 /// ONNX model files.
-#[cfg(feature = "std")]
+#[cfg(any(feature = "neural", feature = "watermark"))]
 pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
     use alloc::string::ToString;
     if e.kind() == std::io::ErrorKind::NotFound {
@@ -212,7 +212,7 @@ pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
 }
 
 /// Map any `Display`-able model-load error into [`AfpError::ModelLoad`].
-#[cfg(feature = "std")]
+#[cfg(any(feature = "neural", feature = "watermark"))]
 pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
     AfpError::ModelLoad(alloc::format!("load: {e}"))
 }

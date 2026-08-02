@@ -50,6 +50,9 @@ exclude      = [
     "USAGE.md",
     "ROBUSTNESS.md",
     "scripts/",
+
+    # Examples — available on GitHub; not needed for library usage.
+    "examples/",
 ]
 
 [features]
