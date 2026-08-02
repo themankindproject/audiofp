@@ -10,6 +10,11 @@
 //! ```bash
 //! cargo test --test stress --all-features
 //! ```
+//!
+//! The real-audio snapshot tests require the `std` feature (file decoding).
+//! The adversarial/stress tests work under `no_std + alloc`.
+
+#![cfg(feature = "std")]
 
 use audiofp::classical::{Haitsma, HaitsmaConfig, Panako, PanakoConfig, Wang, WangConfig};
 use audiofp::{AfpError, AudioBuffer, Fingerprinter, SampleRate};
@@ -38,7 +43,7 @@ fn square_wave(sr: u32, secs: f32, freq: f32) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let t = i as f32 / sr as f32;
-            if (t * freq * 2.0) as u32 % 2 == 0 {
+            if ((t * freq * 2.0) as u32).is_multiple_of(2) {
                 1.0
             } else {
                 -1.0
