@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **In-memory matching subsystem (`audiofp::matching`).**
+  `WangMatcher`, `HaitsmaMatcher`, `NeuralMatcher` (feature-gated),
+  plus `match_best` / `match_ranked` convenience functions and a
+  transient `WangIndex` for 1:N Wang queries. Purely in-memory — no
+  persistence, wire format, or DB adapters.
+- **`WangMatcher` / `HaitsmaMatcher` implement `Default`.**
+- **`benches/matching.rs`** — Criterion benchmarks for Wang/Haitsma 1:1
+  and small `WangIndex` (N=100) queries.
+
+### Changed
+
+- **Matching hot path uses `HashMap` under `std`** (default). Without
+  `std`, the same code paths fall back to `BTreeMap` via an internal
+  alias so `no_std + alloc` builds keep working.
+- **`PanakoMatcher` / `PanakoIndex` documented as stubs** — they always
+  return non-match / empty until tempo-invariant Hough lands.
+
+### Performance
+
+- **Pre-sized `HashMap` in `WangMatcher::match_one` and `WangIndex::build`**
+  — eliminates repeated rehashing during index construction.
+- **O(B²) → O(B log B) consolidation** in `WangIndex::query` via sorted
+  sliding window (10–100× faster for dense collision scenarios).
+- **`mem::take` instead of `hist.clone()`** when offset tolerance is 0.
+- **Sorted Vec + dedup** replaces `HashMap<u32, ()>` for contrib counting.
+
 ## [0.3.9] - 2026-08-02
 
 ### Changed
