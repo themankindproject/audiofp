@@ -116,7 +116,8 @@ impl WangIndex {
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        let mut map: HashMap<u32, Vec<(usize, u32)>> =
+            HashMap::with_capacity(refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2);
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -160,7 +161,8 @@ impl WangIndex {
 
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
-        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> = HashMap::new();
+        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
+            HashMap::with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
             if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
@@ -240,14 +242,15 @@ impl WangIndex {
                 continue;
             }
 
-            // Contrib count.
-            let mut contrib_bits: HashMap<u32, ()> = HashMap::new();
-            for &(d, qi) in votes {
-                if (d - peak_off).abs() <= tol {
-                    contrib_bits.insert(qi, ());
-                }
-            }
-            let score = clamp_score(contrib_bits.len() as f32 / q_len);
+            // Contrib count: distinct query-hash indices near peak.
+            let mut contrib_indices: Vec<u32> = votes
+                .iter()
+                .filter(|(d, _)| (*d - peak_off).abs() <= tol)
+                .map(|(_, qi)| *qi)
+                .collect();
+            contrib_indices.sort_unstable();
+            contrib_indices.dedup();
+            let score = clamp_score(contrib_indices.len() as f32 / q_len);
             if score < cfg.min_score {
                 continue;
             }
@@ -319,7 +322,8 @@ impl HaitsmaIndex {
         refs: &[crate::classical::HaitsmaFingerprint],
         max_postings_per_hash: u32,
     ) -> Self {
-        let mut lut: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        let mut lut: HashMap<u32, Vec<(usize, u32)>> =
+            HashMap::with_capacity(refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2);
         let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
