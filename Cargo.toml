@@ -45,6 +45,11 @@ exclude      = [
     # Personal scratch files.
     "prep.md",
     "dsp.md",
+
+    # Long-form docs — available on GitHub, not needed to compile.
+    "USAGE.md",
+    "ROBUSTNESS.md",
+    "scripts/",
 ]
 
 [features]
