@@ -19,7 +19,7 @@
 //!   `HZ_*` constants) and [`TimestampMs`] (ordered millisecond
 //!   timestamp). Extraction takes `&[f32]` samples plus a
 //!   [`SampleRate`] directly (the old `AudioBuffer` wrapper was removed
-//!   in 0.4.0; see `MIGRATING_0.4.md`).
+//!   in 0.4.0; see the migration guide in `CHANGELOG.md`).
 //! - **Traits** — [`Fingerprinter`] for whole-buffer extraction,
 //!   [`StreamingFingerprinter`] for incremental extraction. Every
 //!   algorithm in the crate implements both.

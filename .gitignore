@@ -17,7 +17,6 @@ cobertura.xml
 .env.local
 
 # Work docs (not for publishing)
-PROD_GRADE.md
 future.md
 audio.md
 context.md

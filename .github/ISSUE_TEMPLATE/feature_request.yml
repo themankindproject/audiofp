@@ -4,7 +4,7 @@ labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
-      value: Check [PROD_GRADE.md](https://github.com/themankindproject/audiofp/blob/main/PROD_GRADE.md) and open issues before filing duplicates.
+      value: Open issues before filing duplicates.
   - type: textarea
     id: problem
     attributes:
