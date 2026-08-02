@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 
 use crate::classical::HaitsmaFingerprint;
 use crate::matching::maps::HashMap;
-use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score};
+use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 // ---------------------------------------------------------------------------
 // Core BER computation
@@ -43,7 +43,7 @@ use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score};
 /// `delta = t_reference − t_query`, so `delta ≥ 0` means query
 /// starts after reference (query[0] ↔ ref[delta]).
 #[inline]
-fn hamming_at_offset(
+pub(crate) fn hamming_at_offset(
     query: &[u32],
     reference: &[u32],
     delta: i64,
@@ -73,7 +73,7 @@ fn hamming_at_offset(
 
 /// Overlap length (in frames) at a given `delta`.
 #[inline]
-fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
+pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
     if delta >= 0 {
         q_len.min(r_len.saturating_sub(delta as usize))
     } else {
@@ -189,6 +189,11 @@ impl Matcher for HaitsmaMatcher {
     }
 
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult {
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
+
         let q_frames = &query.frames;
         let r_frames = &reference.frames;
         let q_len = q_frames.len();

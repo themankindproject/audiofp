@@ -7,9 +7,10 @@
 //! — a stationary tone would repeat identical landmarks and blur the
 //! alignment peak.
 
-use audiofp::classical::{Haitsma, Wang};
+use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::matching::{
-    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, WangMatchConfig, WangMatcher,
+    HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig,
+    WangMatcher,
 };
 use audiofp::{AudioBuffer, Fingerprinter, SampleRate};
 
@@ -148,5 +149,49 @@ fn haitsma_self_match_end_to_end() {
         (res.score - 1.0).abs() < 1e-6,
         "self-match BER must be 0, score={}",
         res.score
+    );
+}
+
+#[test]
+fn panako_self_match_end_to_end() {
+    let mut p = Panako::default();
+    let sig = synth_chirp(6, 8_000);
+    let fp = p
+        .extract(AudioBuffer::new(&sig, SampleRate::HZ_8000))
+        .unwrap();
+    assert!(
+        !fp.hashes.is_empty(),
+        "Panako extraction must produce triplets"
+    );
+
+    let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
+    let res = matcher.match_one(&fp, &fp);
+    assert!(res.is_match, "Panako self-match must be positive: {res:?}");
+    assert_eq!(res.offset.frames, 0, "self-match offset must be zero");
+    assert!(
+        (res.time_scale - 1.0).abs() < 0.2,
+        "self-match scale should be ~1.0: {}",
+        res.time_scale
+    );
+    assert!(res.score > 0.3, "self-match score too low: {}", res.score);
+}
+
+#[test]
+fn panako_unrelated_no_match_end_to_end() {
+    let mut p = Panako::default();
+    let a = p
+        .extract(AudioBuffer::new(
+            &synth_chirp(7, 8_000),
+            SampleRate::HZ_8000,
+        ))
+        .unwrap();
+    let b = p
+        .extract(AudioBuffer::new(&synth_tones(8_000), SampleRate::HZ_8000))
+        .unwrap();
+    let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
+    let res = matcher.match_one(&a, &b);
+    assert!(
+        !res.is_match,
+        "spectrally disjoint Panako signals must not match: {res:?}"
     );
 }

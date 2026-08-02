@@ -469,7 +469,7 @@ impl Wang {
 | `WangMatcher` | `WangFingerprint` | Offset-histogram voter (Shazam-style) |
 | `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT) |
 | `NeuralMatcher` | `NeuralFingerprint` | Cosine similarity (`neural` feature) |
-| `PanakoMatcher` | `PanakoFingerprint` | **Stub** — always non-match until 2-D Hough lands |
+| `PanakoMatcher` | `PanakoFingerprint` | 2-D Hough + optional RANSAC (tempo-invariant) |
 
 ### 1:1 Wang match
 
@@ -499,11 +499,13 @@ Also see `cargo run --example match_two_files -- a.flac b.mp3`.
 
 ### 1:N helpers
 
-- `match_best(matcher, query, refs)` — single best `(index, MatchResult)`
+- `match_best(matcher, query, refs)` — single best `(index, MatchResult)` (sequential; early-exits on perfect score)
 - `match_ranked(matcher, query, refs)` — all refs sorted by score descending
-- `WangIndex::build(refs, max_postings_per_hash)` — inverted-index accelerator for Wang catalogs (still in-memory only)
+- `WangIndex::build(refs, max_postings_per_hash)` — inverted-index accelerator for Wang catalogs
+- `HaitsmaIndex::build(refs, max_postings_per_hash)` — sub-fingerprint LUT accelerator for Haitsma
+- `PanakoIndex::build(refs, max_postings_per_hash)` — 2-D Hough accelerator for Panako catalogs
 
-`PanakoIndex` exists for API symmetry but is a stub like `PanakoMatcher`.
+All indexes are in-memory only. Matching itself has no `rayon` path; use indexes for large 1:N catalogs. The `rayon` feature parallelises batch fingerprinting (`fingerprint_batch_parallel`), not matching.
 
 ### Benchmarks
 

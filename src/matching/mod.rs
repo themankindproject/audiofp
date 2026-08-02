@@ -11,7 +11,7 @@
 //! | Matcher | Fingerprint | Strategy |
 //! |---|---|---|
 //! | [`WangMatcher`] | [`WangFingerprint`](crate::classical::WangFingerprint) | Offset-histogram voter (Shazam-style) |
-//! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | **Stub** — always non-match until Phase 3 |
+//! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | 2-D Hough + optional RANSAC (tempo-invariant) |
 //! | [`HaitsmaMatcher`] | [`HaitsmaFingerprint`](crate::classical::HaitsmaFingerprint) | BER sliding + sub-fingerprint LUT |
 //! | [`NeuralMatcher`] | [`NeuralFingerprint`](crate::neural::NeuralFingerprint) | Cosine similarity (requires the `neural` feature) |
 //!
@@ -55,7 +55,7 @@ mod neural;
 pub use neural::{Aggregation, NeuralMatchConfig, NeuralMatcher};
 
 mod index;
-pub use index::{PanakoIndex, WangIndex, match_best, match_ranked};
+pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
 
 mod maps;
 
@@ -109,13 +109,29 @@ pub struct MatchResult {
     /// **High** (≫ 1) → sharp spike, a true alignment. **~1** → flat
     /// histogram, random collisions. This is the primary false-positive
     /// guard.
+    ///
+    /// # Semantics differ by matcher
+    ///
+    /// - **Wang / Panako**: `peak_consolidated / (mean_rest + 1)` on the
+    ///   offset or `(scale, offset)` histogram.
+    /// - **Haitsma** (matcher and index): `0.5 / ber` — a BER-derived
+    ///   proxy, **not** comparable to Wang/Panako prominence.
+    /// - **Neural**: relative cosine excess over other lag positions
+    ///   (SlidingMax) or `1.0` (Centroid / DTW).
+    ///
+    /// Do not threshold prominence with a single constant across matcher
+    /// types.
     pub prominence: f32,
     /// Estimated alignment of the query within the reference.
     pub offset: TimeOffset,
     /// Estimated time-scale: `query_duration / reference_duration`.
     ///
     /// 1.0 for algorithms with no tempo model (Wang, Haitsma, neural).
-    /// Panako fills this in from the Hough / RANSAC peak.
+    /// Panako reports the reciprocal of the internal Hough/RANSAC scale
+    /// `s = ref_span / query_span` (i.e. `1/s`), clamped to `[0.5, 2.0]`.
+    /// Note that [`PanakoMatchConfig::scale_min`] /
+    /// [`PanakoMatchConfig::scale_max`] bound the *internal* search grid
+    /// for `s`, not this public reciprocal.
     pub time_scale: f32,
 }
 
@@ -154,16 +170,33 @@ pub trait Matcher {
 
     /// Match a query against a **single** reference.
     ///
-    /// This is the core 1:1 operation. Both fingerprints must come from
-    /// the same fingerprinter (same `frames_per_sec`).
+    /// This is the core 1:1 operation. Both fingerprints **must** come from
+    /// the same fingerprinter configuration (same `frames_per_sec`).
     ///
-    /// # Panics
+    /// # Frame-rate mismatch
     ///
-    /// `debug_assert!`s that `query.frames_per_sec ==
-    /// reference.frames_per_sec`. In release mode the mismatch is
-    /// silently accepted (the reference rate is used for offset
-    /// conversion).
+    /// Both fingerprints **must** share the same `frames_per_sec`. A
+    /// mismatch returns [`MatchResult::NONE`] in all builds (debug and
+    /// release) rather than converting offsets with the wrong rate.
     fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint) -> MatchResult;
+}
+
+/// Relative tolerance for comparing fingerprint frame rates.
+const FPS_REL_EPS: f32 = 1e-3;
+
+/// Return `true` when two frame rates are compatible for matching.
+///
+/// Rates must be finite and positive, and agree within a relative
+/// tolerance (or both be near zero). Used by every matcher to soft-fail
+/// mismatched fingerprints in release builds (audit 67-5).
+#[inline]
+#[must_use]
+pub(crate) fn frames_per_sec_compatible(a: f32, b: f32) -> bool {
+    if !(a.is_finite() && b.is_finite()) || a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    let scale = a.abs().max(b.abs());
+    (a - b).abs() <= FPS_REL_EPS * scale
 }
 
 // ---------------------------------------------------------------------------
@@ -319,5 +352,19 @@ mod tests {
             ..MatchResult::NONE
         };
         assert_eq!(match_result_compare_desc(&a, &b), Ordering::Less); // a scored higher → Less in desc
+    }
+
+    #[test]
+    fn frames_per_sec_compatible_accepts_equal() {
+        assert!(frames_per_sec_compatible(62.5, 62.5));
+        assert!(frames_per_sec_compatible(78.125, 78.125));
+    }
+
+    #[test]
+    fn frames_per_sec_compatible_rejects_mismatch() {
+        assert!(!frames_per_sec_compatible(62.5, 31.25));
+        assert!(!frames_per_sec_compatible(62.5, f32::NAN));
+        assert!(!frames_per_sec_compatible(-1.0, 62.5));
+        assert!(!frames_per_sec_compatible(0.0, 62.5));
     }
 }
