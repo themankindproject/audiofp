@@ -95,3 +95,33 @@ pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
     }
     sum
 }
+
+/// SIMD-accelerated squared dot product: `sum(a[i] * b[i]²)` via `wide::f32x8`.
+///
+/// Processes 8 elements at a time: squares `b`, then fused multiply-adds
+/// with `a`. Used by the mel filterbank `log_mel` hot path to avoid a
+/// separate power-spectrum allocation when starting from magnitudes.
+#[inline]
+pub(crate) fn dot_sq_wide(a: &[f32], b: &[f32]) -> f32 {
+    use wide::f32x8;
+
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
+
+    let mut acc = f32x8::ZERO;
+    for i in 0..chunks {
+        let off = i * 8;
+        let va = f32x8::new(a[off..off + 8].try_into().unwrap());
+        let vb = f32x8::new(b[off..off + 8].try_into().unwrap());
+        let vb_sq = vb * vb;
+        acc = va.mul_add(vb_sq, acc);
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in tail_start..n {
+        sum += a[i] * (b[i] * b[i]);
+    }
+    sum
+}

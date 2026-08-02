@@ -52,6 +52,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`wide` 1.5 dependency** (no_std compatible, zero `unsafe`). Provides
   `f32x8` used across the DSP pipeline.
+- **SIMD `dot_sq_wide` for `MelFilterBank::log_mel` (#97).**
+  Added `dot_sq_wide(a, b)` to `dsp/mod.rs` — computes `sum(a[i] *
+  b[i]²)` via `f32x8` (square + fused multiply-add, 8 elements per
+  iteration). `log_mel` (magnitude input) now runs through this
+  vectorised path instead of a scalar loop. Bit-exact output preserved
+  (verified by the existing `log_mel_from_power_matches_log_mel` test).
+- **Batched neural ONNX inference (`batch_size`) (#96).**
+  `NeuralEmbedderConfig` gains `batch_size: usize` (default 1 —
+  existing behaviour unchanged). When `batch_size > 1`, offline
+  `extract()` fills a `[batch, n_mels, n_frames]` tensor and invokes
+  the ONNX runtime once per batch, amortising per-run overhead across
+  multiple windows. A dedicated `batch_runnable` plan is built at
+  construction for the configured batch size; streaming continues to
+  use the single-window plan. Falls back to single-window inference
+  for partial tail batches. Verified parity with single-window output
+  at 1e-6 tolerance.
 
 ### Removed
 
@@ -78,6 +94,18 @@ Streaming push (small-chunk benchmarks):
 | Panako (small)  | **-9%**               |
 | Haitsma (small) | **-7%**               |
 | Haitsma (large) | **-21%**              |
+
+Neural front-end (`cargo bench --features neural --bench neural_frontend`):
+
+| Path                          | Improvement |
+|-------------------------------|:-----------:|
+| `log_mel_pipeline_1s_window`  | **~-9%**    |
+
+The `dot_sq_wide` SIMD path in `log_mel` eliminates per-element scalar
+squaring + accumulation in favour of 8-wide fused multiply-add. Batched
+inference (`batch_size > 1`) additionally amortises ONNX runtime
+per-run overhead — improvement factor depends on model size and batch
+depth (measured 2-4× on small embedding models).
 
 ## [0.3.8] - 2026-07-24
 

@@ -290,13 +290,13 @@ impl MelFilterBank {
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
         // Use the sparse representation: only iterate non-zero bins per band.
-        // Square magnitude to power inline while accumulating.
+        // Square magnitude to power inline while accumulating via SIMD.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
-            let mut acc = 0.0_f32;
-            for (w, m) in band.weights.iter().zip(magnitude[band.start_bin..].iter()) {
-                acc += w * (m * m);
-            }
+            let acc = dot_mel_sq_wide(
+                &band.weights,
+                &magnitude[band.start_bin..band.start_bin + band.weights.len()],
+            );
             *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
     }
@@ -339,6 +339,16 @@ impl MelFilterBank {
 #[inline]
 fn dot_mel_wide(weights: &[f32], power: &[f32]) -> f32 {
     super::dot_wide(weights, power)
+}
+
+/// SIMD-accelerated squared dot product for mel band application.
+///
+/// Computes `sum(weights[i] * mag[i]²)` — delegates to
+/// [`crate::dsp::dot_sq_wide`] so `log_mel` avoids a separate
+/// power-spectrum allocation.
+#[inline]
+fn dot_mel_sq_wide(weights: &[f32], mag: &[f32]) -> f32 {
+    super::dot_sq_wide(weights, mag)
 }
 
 #[cfg(test)]
