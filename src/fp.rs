@@ -35,7 +35,7 @@ use crate::{Result, SampleRate, TimestampMs};
 ///
 ///     fn name(&self) -> &'static str { "energy-v0" }
 ///     fn config(&self) -> &Self::Config { &() }
-///     fn required_sample_rate(&self) -> u32 { 16_000 }
+///     fn required_sample_rate(&self) -> SampleRate { SampleRate::HZ_16000 }
 ///     fn min_samples(&self) -> usize { 16_000 }
 ///     fn extract(&mut self, samples: &[f32], _rate: SampleRate) -> Result<Self::Output> {
 ///         Ok(samples.iter().map(|s| s.abs()).sum())
@@ -69,9 +69,9 @@ pub trait Fingerprinter {
     /// Borrow the configuration this instance was built with.
     fn config(&self) -> &Self::Config;
 
-    /// Sample rate, in hertz, the fingerprinter expects its input at.
-    /// Resampling is the caller's responsibility.
-    fn required_sample_rate(&self) -> u32;
+    /// Sample rate the fingerprinter expects its input at. Resampling is
+    /// the caller's responsibility.
+    fn required_sample_rate(&self) -> SampleRate;
 
     /// Minimum buffer length, in samples, required to extract anything.
     /// Calls with shorter inputs return [`AfpError::AudioTooShort`].
@@ -223,7 +223,7 @@ pub trait StreamingFingerprinter {
 ///     type Config = ();
 ///     fn name(&self) -> &'static str { "sum" }
 ///     fn config(&self) -> &Self::Config { &() }
-///     fn required_sample_rate(&self) -> u32 { 8_000 }
+///     fn required_sample_rate(&self) -> SampleRate { SampleRate::HZ_8000 }
 ///     fn min_samples(&self) -> usize { 1 }
 ///     fn extract(&mut self, samples: &[f32], _rate: SampleRate) -> audiofp::Result<f32> {
 ///         Ok(samples.iter().sum())
@@ -374,8 +374,8 @@ mod tests {
             fn config(&self) -> &Self::Config {
                 &()
             }
-            fn required_sample_rate(&self) -> u32 {
-                8_000
+            fn required_sample_rate(&self) -> SampleRate {
+                SampleRate::HZ_8000
             }
             fn min_samples(&self) -> usize {
                 1

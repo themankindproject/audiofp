@@ -33,6 +33,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `audiofp::Panako`, `audiofp::Haitsma`, configs, fingerprints, and
   streaming variants are re-exported at the crate root (the
   `classical` module remains canonical).
+- **`std` feature split into per-codec sub-features** (#60) — the
+  monolithic `std` feature is replaced by `std-mp3`, `std-aac`,
+  `std-flac`, `std-ogg`, `std-wav`, `std-mp4`, plus extended `std-aiff` /
+  `std-mkv` / `std-adpcm` / `std-alac`, and the `all` feature restores
+  every codec at once. `default` is now `[]`, so the default build is
+  `no_std + alloc` with **no codecs**. `audiofp::io` is only available
+  with at least one `std-*` feature (or `all`); enabling bare `std`
+  without a codec is a `compile_error!` pointing at the feature list.
+  `neural`, `watermark`, `rayon`, and `mimalloc` are unaffected (they
+  imply `std` but not any codec).
+- **`Fingerprinter::required_sample_rate()` returns `SampleRate`** (#61) —
+  the offline trait now returns the `SampleRate` newtype
+  (`SampleRate::HZ_8000` for Wang/Panako, `SampleRate::HZ_5000` for
+  Haitsma) instead of a bare `u32`, so callers compare it directly
+  against an audio buffer's rate without an unwrap. `StreamingFingerprinter::required_sample_rate()`
+  still returns `u32` (streams feed raw `&[f32]` with no rate tag).
+- **`ShortTimeFFT::process_frame` / `process_frame_power` return
+  `Result`** (#8) — both methods now return `Result<(), AfpError>` and
+  reject mismatched `frame`/`out` lengths with `AfpError::Config`
+  instead of panicking via `assert_eq!`.
 
 ### Migration
 
@@ -49,12 +69,18 @@ Quick reference:
 | [#63] `push`/`flush` return `Result` | `s.push(&x)` → `Vec` | `s.push(&x)?` → `Result<Vec>` |
 | [#62] `min_magnitude` → `min_magnitude_db` | `min_magnitude: f32` | `min_magnitude_db: f32` + `min_magnitude_linear` |
 | [#64] Flat crate-root re-exports | `use audiofp::classical::Wang` | `use audiofp::Wang` (alias) |
+| [#60] Per-codec features | `features = ["std"]` | `features = ["std-wav"]` (pick your codecs) or `["all"]` |
+| [#61] `required_sample_rate` → `SampleRate` | `let sr = fp.required_sample_rate();` → `u32` | `let sr = fp.required_sample_rate();` → `SampleRate` |
+| [#8] `process_frame*` returns `Result` | `stft.process_frame_power(&f, &mut o);` | `stft.process_frame_power(&f, &mut o)?;` |
 
 [#62]: https://github.com/themankindproject/audiofp/issues/62
 [#63]: https://github.com/themankindproject/audiofp/issues/63
 [#64]: https://github.com/themankindproject/audiofp/issues/64
 [#65]: https://github.com/themankindproject/audiofp/issues/65
 [#66]: https://github.com/themankindproject/audiofp/issues/66
+[#60]: https://github.com/themankindproject/audiofp/issues/60
+[#61]: https://github.com/themankindproject/audiofp/issues/61
+[#8]: https://github.com/themankindproject/audiofp/issues/8
 
 #### 1. `AudioBuffer` removed — `extract` takes `&[f32]` + `SampleRate` (#65)
 
@@ -168,6 +194,66 @@ the 8-byte (Wang) / 16-byte (Panako) / 4-byte-per-frame (Haitsma) hash
 layouts are preserved. Persisted 0.3.x fingerprints and golden files
 remain valid — no re-extraction needed.
 
+#### 7. Per-codec features — `std` split into `std-*` (#60)
+
+The biggest *build-time* change. `audiofp = "0.3"` used to default to the
+full Symphonia decoder stack; now `default = []` and codecs are opt-in:
+
+```toml
+# 0.3.x — all 8 codecs, always
+audiofp = "0.3"
+
+# 0.4.0 — pick the codecs you decode
+audiofp = { version = "0.4", features = ["std-wav"] }
+audiofp = { version = "0.4", features = ["std-mp3", "std-flac", "std-ogg"] }
+
+# 0.4.0 — every codec, exactly like the old `std`
+audiofp = { version = "0.4", features = ["all"] }
+```
+
+- Each `std-*` feature pulls only its own Symphonia codec (plus `pcm` for
+  `std-wav`, `vorbis` for `std-ogg`); `all` pulls every codec at once.
+- `audiofp::io` exists only when at least one `std-*` feature (or `all`)
+  is on.
+- Bare `std` without a codec feature is a `compile_error!` with a helpful
+  message — you can't silently lose decoding.
+- `neural`, `watermark`, `rayon`, `mimalloc` imply `std` but **not** any
+  codec; they keep working unchanged.
+- Migration for 0.3.x users: replace `features = ["std"]` with
+  `features = ["all"]` for identical behavior, or `features = ["std-wav"]`
+  (or whichever codecs you need) to trim the build. No source-code
+  changes.
+
+#### 8. `required_sample_rate()` returns `SampleRate` (#61)
+
+```rust
+// 0.3.x — u32, callers unwrap
+let want = fp.required_sample_rate();
+if rate.hz() != want { /* … */ }
+
+// 0.4.0 — SampleRate, direct comparison
+let want = fp.required_sample_rate();
+if rate != want { /* … */ }
+```
+
+Mechanical for all four implementors (`Wang`, `Panako`, `Haitsma`,
+`NeuralEmbedder`); the streaming trait is unchanged (`u32`).
+
+#### 9. `process_frame` / `process_frame_power` return `Result` (#8)
+
+```rust
+// 0.3.x — panics on size mismatch
+stft.process_frame_power(&frame, &mut out);
+
+// 0.4.0 — returns Result<(), AfpError>
+stft.process_frame_power(&frame, &mut out)?;
+```
+
+Mismatched `frame.len() != n_fft` or `out.len() != n_bins` now returns
+`AfpError::Config` instead of panicking. All built-in streaming
+fingerprinters call these with exact-length buffers, so their public
+behaviour is unchanged.
+
 #### How to verify your migration
 
 ```bash
@@ -175,6 +261,7 @@ cargo test --all-features        # unit + integration + doctests
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo build --no-default-features
+cargo build --features std-wav   # codec picker works
 ```
 
 ### Added

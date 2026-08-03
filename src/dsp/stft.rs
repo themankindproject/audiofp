@@ -335,9 +335,10 @@ impl ShortTimeFFT {
     ///
     /// [`process_frame`]: ShortTimeFFT::process_frame
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `frame.len() != n_fft` or `out.len() != n_bins`.
+    /// Returns [`AfpError::Config`](crate::AfpError::Config) if
+    /// `frame.len() != n_fft` or `out.len() != n_bins`.
     ///
     /// # Example
     ///
@@ -347,12 +348,24 @@ impl ShortTimeFFT {
     /// let mut stft = ShortTimeFFT::new(StftConfig::new(256));
     /// let frame = vec![0.0_f32; 256];
     /// let mut out = vec![0.0_f32; 129]; // n_fft/2 + 1
-    /// stft.process_frame_power(&frame, &mut out);
+    /// stft.process_frame_power(&frame, &mut out).unwrap();
     /// assert!(out.iter().all(|&p| p == 0.0)); // silent input → zero power
     /// ```
-    pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) {
-        assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
-        assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
+    pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
+        if frame.len() != self.cfg.n_fft {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "frame length must equal n_fft: got {}, expected {}",
+                frame.len(),
+                self.cfg.n_fft
+            )));
+        }
+        if out.len() != self.n_bins() {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "out length must equal n_bins: got {}, expected {}",
+                out.len(),
+                self.n_bins()
+            )));
+        }
 
         apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
@@ -365,17 +378,32 @@ impl ShortTimeFFT {
             .expect("FFT process: input/output length mismatch");
 
         compute_power_wide(&self.scratch_out, out);
+
+        Ok(())
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
     /// magnitude spectrum into `out` (`n_bins` long).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `frame.len() != n_fft` or `out.len() != n_bins`.
-    pub fn process_frame(&mut self, frame: &[f32], out: &mut [f32]) {
-        assert_eq!(frame.len(), self.cfg.n_fft, "frame length must equal n_fft");
-        assert_eq!(out.len(), self.n_bins(), "out length must equal n_bins");
+    /// Returns [`AfpError::Config`](crate::AfpError::Config) if
+    /// `frame.len() != n_fft` or `out.len() != n_bins`.
+    pub fn process_frame(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
+        if frame.len() != self.cfg.n_fft {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "frame length must equal n_fft: got {}, expected {}",
+                frame.len(),
+                self.cfg.n_fft
+            )));
+        }
+        if out.len() != self.n_bins() {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "out length must equal n_bins: got {}, expected {}",
+                out.len(),
+                self.n_bins()
+            )));
+        }
 
         apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
@@ -390,6 +418,8 @@ impl ShortTimeFFT {
         for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
             *o = sqrtf(c.re * c.re + c.im * c.im);
         }
+
+        Ok(())
     }
 
     /// Fill `scratch_in` with `samples[start..start+n_fft] * window`,
@@ -524,6 +554,7 @@ fn reflect(i: isize, len: usize) -> usize {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use approx::assert_relative_eq;
     use core::f32::consts::PI;
 
@@ -655,7 +686,7 @@ mod tests {
             .collect();
 
         let mut frame_out = alloc::vec![0.0_f32; s.n_bins()];
-        s.process_frame(&samples, &mut frame_out);
+        s.process_frame(&samples, &mut frame_out).unwrap();
 
         let mut s2 = ShortTimeFFT::new(cfg);
         let buf_out = s2.magnitude(&samples);
@@ -664,6 +695,34 @@ mod tests {
         for (a, b) in frame_out.iter().zip(buf_out[0].iter()) {
             assert_relative_eq!(a, b, max_relative = 1e-5);
         }
+    }
+
+    #[test]
+    fn process_frame_rejects_wrong_frame_and_out_lengths() {
+        let mut s = ShortTimeFFT::new(StftConfig::new(256));
+        let frame = alloc::vec![0.0_f32; 256];
+        let mut out = alloc::vec![0.0_f32; s.n_bins()];
+
+        // Wrong frame length.
+        let err = s.process_frame(&frame[..128], &mut out).unwrap_err();
+        assert!(matches!(err, crate::AfpError::Config(_)));
+        assert!(err.to_string().contains("frame length"));
+
+        // Wrong out length.
+        let mut short_out = alloc::vec![0.0_f32; s.n_bins() - 1];
+        let err = s.process_frame(&frame, &mut short_out).unwrap_err();
+        assert!(matches!(err, crate::AfpError::Config(_)));
+        assert!(err.to_string().contains("out length"));
+
+        // Power variant behaves identically.
+        let err = s.process_frame_power(&frame[..128], &mut out).unwrap_err();
+        assert!(matches!(err, crate::AfpError::Config(_)));
+        let err = s.process_frame_power(&frame, &mut short_out).unwrap_err();
+        assert!(matches!(err, crate::AfpError::Config(_)));
+
+        // And the happy path still works after failed calls (no state corruption).
+        s.process_frame(&frame, &mut out).unwrap();
+        s.process_frame_power(&frame, &mut out).unwrap();
     }
 
     // -----------------------------------------------------------------

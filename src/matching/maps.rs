@@ -1,6 +1,6 @@
 //! Fast map aliases and sorted-posting helpers for matching hot paths.
 //!
-//! With the `std` feature (default), use [`std::collections::HashMap`] for
+//! With the `std` feature, use [`std::collections::HashMap`] for
 //! O(1) expected lookups. Without `std`, fall back to [`alloc::collections::BTreeMap`]
 //! so the matching module stays `no_std + alloc` capable.
 //!

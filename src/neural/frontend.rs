@@ -96,7 +96,9 @@ impl LogMelFrontend {
 
         for f in 0..self.n_frames {
             let frame = &window[f * self.hop..f * self.hop + self.n_fft];
-            self.stft.process_frame_power(frame, &mut self.power);
+            self.stft
+                .process_frame_power(frame, &mut self.power)
+                .expect("power scratch is sized n_bins and frames are exactly n_fft");
             self.mel
                 .log_mel_from_power(&self.power, &mut self.mel_per_frame);
             callback(f, &self.mel_per_frame);

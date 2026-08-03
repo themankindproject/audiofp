@@ -1,6 +1,6 @@
 //! End-to-end tests: segment matching, gain invariance, determinism,
 //! time-stretch robustness, and decoder edge cases.
-#![cfg(feature = "std")]
+#![cfg(feature = "std-ogg")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::dsp::resample::SincResampler;

@@ -7,7 +7,14 @@
 //! - MP3 sample-rate ladder (8kHz–44.1kHz → 8kHz fingerprint)
 //!
 //! Audio: Kevin MacLeod (incompetech.com), CC-BY 3.0. See CREDITS.md.
-#![cfg(feature = "std")]
+#![cfg(all(
+    feature = "std-mp3",
+    feature = "std-flac",
+    feature = "std-ogg",
+    feature = "std-wav",
+    feature = "std-mp4",
+    feature = "std-aiff"
+))]
 
 use std::collections::HashSet;
 

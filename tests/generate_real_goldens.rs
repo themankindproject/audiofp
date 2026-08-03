@@ -1,5 +1,5 @@
 // Run with: cargo test --test generate_real_goldens --all-features -- --ignored
-#![cfg(feature = "std")]
+#![cfg(feature = "std-ogg")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;

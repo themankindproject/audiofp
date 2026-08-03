@@ -305,8 +305,9 @@ impl Fingerprinter for Haitsma {
         &self.cfg
     }
 
-    fn required_sample_rate(&self) -> u32 {
-        HAITSMA_SR
+    fn required_sample_rate(&self) -> SampleRate {
+        // HAITSMA_SR is a compile-time constant; unwrap is trivially safe.
+        SampleRate::new(HAITSMA_SR).expect("HAITSMA_SR is non-zero")
     }
 
     fn min_samples(&self) -> usize {
@@ -533,10 +534,12 @@ impl StreamingHaitsma {
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= HAITSMA_N_FFT {
-            self.stft.process_frame_power(
-                &self.sample_carry[off..off + HAITSMA_N_FFT],
-                &mut self.frame_power,
-            );
+            self.stft
+                .process_frame_power(
+                    &self.sample_carry[off..off + HAITSMA_N_FFT],
+                    &mut self.frame_power,
+                )
+                .expect("frame_power is sized n_bins and frames are exactly n_fft");
             let mut e = [0.0_f32; HAITSMA_N_BANDS];
             for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
                 e[b] = self.frame_power[start..end].iter().sum();
@@ -929,7 +932,7 @@ mod tests {
     fn public_api_name_and_config_match_documented_values() {
         let fp = Haitsma::default();
         assert_eq!(fp.name(), "haitsma-v1");
-        assert_eq!(fp.required_sample_rate(), 5_000);
+        assert_eq!(fp.required_sample_rate(), SampleRate::HZ_5000);
         assert_eq!(fp.min_samples(), 10_000);
 
         let s = StreamingHaitsma::default();

@@ -328,8 +328,9 @@ impl Fingerprinter for Panako {
         &self.cfg
     }
 
-    fn required_sample_rate(&self) -> u32 {
-        PANAKO_SR
+    fn required_sample_rate(&self) -> SampleRate {
+        // PANAKO_SR is a compile-time constant; unwrap is trivially safe.
+        SampleRate::new(PANAKO_SR).expect("PANAKO_SR is non-zero")
     }
 
     fn min_samples(&self) -> usize {
@@ -907,10 +908,12 @@ impl StreamingPanako {
 
         let mut off = 0usize;
         while self.sample_carry.len() - off >= PANAKO_N_FFT {
-            self.stft.process_frame_power(
-                &self.sample_carry[off..off + PANAKO_N_FFT],
-                &mut self.frame_scratch,
-            );
+            self.stft
+                .process_frame_power(
+                    &self.sample_carry[off..off + PANAKO_N_FFT],
+                    &mut self.frame_scratch,
+                )
+                .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
             power_to_db_wide(&mut self.frame_scratch, PANAKO_LOG_FLOOR_POWER);
             self.append_frame_scratch_row();
 
@@ -1618,7 +1621,7 @@ mod tests {
     fn public_api_name_and_config_match_documented_values() {
         let fp = Panako::default();
         assert_eq!(fp.name(), "panako-v2");
-        assert_eq!(fp.required_sample_rate(), 8_000);
+        assert_eq!(fp.required_sample_rate(), SampleRate::HZ_8000);
         assert_eq!(fp.min_samples(), 16_000);
 
         let s = StreamingPanako::default();

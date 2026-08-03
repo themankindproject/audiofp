@@ -56,13 +56,42 @@ exclude      = [
 ]
 
 [features]
-default = ["std"]
+default = []
 
-# Pulls symphonia file decoding helpers (and, in a later phase, cpal mic
-# capture). Without it the crate is `no_std + alloc` in API shape for DSP
-# and classical fingerprinters, but the current FFT dependency chain keeps
-# the no_std path host-only today.
+# Symphonia-backed file decoding helpers (`audiofp::io`). `std` by itself
+# enables no codecs; pick the per-codec sub-features your application needs
+# (e.g. `features = ["std-wav"]` for WAV-only decoding). This keeps the
+# default build no_std + alloc and avoids paying the compile time for codecs
+# you never use. Without at least one codec feature, `audiofp::io` is not
+# available (see the `compile_error!` in `src/lib.rs`).
 std = ["dep:symphonia"]
+std-mp3 = ["std", "symphonia/mp3"]
+std-aac = ["std", "symphonia/aac"]
+std-flac = ["std", "symphonia/flac"]
+std-ogg = ["std", "symphonia/ogg", "symphonia/vorbis"]
+std-wav = ["std", "symphonia/wav", "symphonia/pcm"]
+std-mp4 = ["std", "symphonia/isomp4"]
+# Extra codecs beyond the common set — kept for compatibility with the
+# pre-0.4.0 monolithic `std` feature (AIFF, Matroska, ADPCM, ALAC).
+std-aiff = ["std", "symphonia/aiff"]
+std-mkv = ["std", "symphonia/mkv"]
+std-adpcm = ["std", "symphonia/adpcm"]
+std-alac = ["std", "symphonia/alac"]
+
+# Every format/codec feature in one flag — the equivalent of the
+# pre-0.4.0 monolithic `std` feature.
+all = [
+    "std-mp3",
+    "std-aac",
+    "std-flac",
+    "std-ogg",
+    "std-wav",
+    "std-mp4",
+    "std-aiff",
+    "std-mkv",
+    "std-adpcm",
+    "std-alac",
+]
 
 # ONNX-based neural fingerprinter. The user supplies an ONNX model whose
 # input is a `[1, n_mels, n_frames]` log-mel spectrogram and whose first
@@ -90,15 +119,15 @@ num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
 wide        = { version = "1.5.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive"] }
-symphonia   = { version = "0.6", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "pcm", "adpcm", "alac", "mkv", "aiff"], optional = true }
+symphonia   = { version = "0.6", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }
 
 [dev-dependencies]
 approx    = "0.5.1"
 hound     = "3.5.1"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-proptest  = { version = "1.5", default-features = false, features = ["std"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest  = { version = "1.11", default-features = false, features = ["std"] }
 
 [[bench]]
 name    = "extract"
@@ -122,20 +151,20 @@ name = "audiofp"
 path = "src/lib.rs"
 
 # Examples that use the symphonia-backed `audiofp::io` decoder require the
-# `std` feature. Cargo silently skips them when their required features
-# aren't enabled, so `cargo clippy --no-default-features --all-targets`
-# stays clean.
+# relevant per-codec `std-*` features. Cargo silently skips them when their
+# required features aren't enabled, so `cargo clippy --no-default-features
+# --all-targets` stays clean.
 [[example]]
 name = "enroll_file"
-required-features = ["std"]
+required-features = ["std-mp3", "std-flac", "std-ogg", "std-wav", "std-mp4"]
 
 [[example]]
 name = "match_two_files"
-required-features = ["std"]
+required-features = ["std-mp3", "std-flac", "std-ogg", "std-wav", "std-mp4"]
 
 [[example]]
 name = "compare_algorithms"
-required-features = ["std"]
+required-features = ["std-mp3", "std-flac", "std-ogg", "std-wav", "std-mp4"]
 
 [[example]]
 name = "stream_buffer"
@@ -149,7 +178,7 @@ required-features = ["neural"]
 
 [[example]]
 name = "watermark_detect"
-required-features = ["watermark"]
+required-features = ["watermark", "std-wav"]
 
 [profile.release]
 lto           = "fat"

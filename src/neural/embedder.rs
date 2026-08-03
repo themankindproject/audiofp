@@ -586,8 +586,10 @@ impl Fingerprinter for NeuralEmbedder {
         &self.core.cfg
     }
 
-    fn required_sample_rate(&self) -> u32 {
-        self.core.cfg.sample_rate
+    fn required_sample_rate(&self) -> SampleRate {
+        // The neural config already validates `sample_rate != 0` at
+        // construction, so the newtype conversion is infallible.
+        SampleRate::new(self.core.cfg.sample_rate).expect("neural sample_rate is non-zero")
     }
 
     fn min_samples(&self) -> usize {
@@ -826,7 +828,7 @@ mod tests {
         let cfg = NeuralEmbedderConfig::new("test-fixture");
         let fp = crate::neural::test_support::passthrough_embedder(cfg).unwrap();
         assert_eq!(fp.name(), "neural-onnx-v0");
-        assert_eq!(fp.required_sample_rate(), 16_000);
+        assert_eq!(fp.required_sample_rate(), crate::SampleRate::HZ_16000);
         // 1.0 s window at 16 kHz = 16 000 samples.
         assert_eq!(fp.min_samples(), 16_000);
     }

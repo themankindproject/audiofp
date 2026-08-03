@@ -50,22 +50,36 @@ Perfect for:
 
 ```toml
 [dependencies]
-audiofp = "0.3"
+# WAV + MP3 decoding for the quick-start below (pick the codecs you need):
+audiofp = { version = "0.4", features = ["std-wav", "std-mp3"] }
 ```
+
+The default build is `no_std + alloc` with **no codecs**. Decoding helpers
+(`audiofp::io`) are opt-in per codec: `std-wav`, `std-mp3`, `std-flac`,
+`std-ogg`, `std-aac`, `std-mp4`, plus `std-aiff` / `std-mkv` / `std-adpcm` /
+`std-alac` for the extended formats — or `all` for every codec at once
+(the pre-0.4.0 `std` behavior).
 
 ### Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | Yes | Enables `audiofp::io` (Symphonia file decoder) |
-| `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime |
-| `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model) |
-| `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` |
+| `std-wav` | No | WAV + raw PCM decoding via Symphonia (`audiofp::io`) |
+| `std-mp3` | No | MP3 decoding via Symphonia |
+| `std-flac` | No | FLAC decoding via Symphonia |
+| `std-ogg` | No | Ogg-Vorbis decoding via Symphonia |
+| `std-aac` | No | AAC decoding via Symphonia |
+| `std-mp4` | No | AAC-in-MP4 / ISO-BMFF decoding via Symphonia |
+| `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
+| `all` | No | Every codec at once — the pre-0.4.0 `std` behavior |
+| `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`) |
+| `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
+| `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |
 
 Minimal build (no_std + alloc, DSP and classical only):
 ```toml
 [dependencies]
-audiofp = { version = "0.3", default-features = false }
+audiofp = { version = "0.4", default-features = false }
 ```
 
 ## Quick Start
@@ -256,7 +270,7 @@ The `examples/` directory contains complete working programs that can be run wit
 ```bash
 cargo run --example dsp_starter
 cargo run --example neural_embed --features neural -- path/to/model.onnx
-cargo run --example watermark_detect --features watermark -- path/to/audioseal.onnx [audio.wav]
+cargo run --example watermark_detect --features watermark,std-wav -- path/to/audioseal.onnx [audio.wav]
 ```
 
 The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.

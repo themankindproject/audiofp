@@ -77,17 +77,61 @@
 //!
 //! # Cargo features
 //!
+//! The default build is `no_std + alloc` with **no codecs**. File decoding
+//! (`audiofp::io`) is opt-in per codec; each `std-*` feature pulls the
+//! matching [`symphonia`](https://docs.rs/symphonia) decoder:
+//!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |   ✅    | Pulls in [`symphonia`](https://docs.rs/symphonia) → [`io`].       |
-//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`]. |
-//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`](https://docs.rs/tract-onnx). |
-//! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator.      |
+//! | `std`        |         | Symphonia itself (no codecs; combine with a `std-*` feature).     |
+//! | `std-wav`    |         | WAV + raw PCM decoding → [`io`].                                  |
+//! | `std-mp3`    |         | MP3 decoding → [`io`].                                            |
+//! | `std-flac`   |         | FLAC decoding → [`io`].                                           |
+//! | `std-ogg`    |         | Ogg-Vorbis decoding → [`io`].                                     |
+//! | `std-aac`    |         | AAC decoding → [`io`].                                            |
+//! | `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF decoding → [`io`].                          |
+//! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`]. |
+//! | `all`        |         | Every format/codec above at once → [`io`] (the pre-0.4.0 `std`). |
+//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`] (implies `std`). |
+//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
+//! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator (implies `std`). |
 //!
 //! See [`USAGE.md`](https://github.com/themankindproject/audiofp/blob/main/USAGE.md)
 //! for the complete API guide.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
+
+// The `std` feature is a bare dependency on Symphonia; codec support is
+// opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, …) or the
+// `all` feature (every codec at once). Enable one of them to get
+// `audiofp::io`. Features that merely imply `std` (`neural`, `watermark`,
+// `rayon`, `mimalloc`) are unaffected.
+#[cfg(all(
+    feature = "std",
+    not(any(
+        feature = "std-mp3",
+        feature = "std-aac",
+        feature = "std-flac",
+        feature = "std-ogg",
+        feature = "std-wav",
+        feature = "std-mp4",
+        feature = "std-aiff",
+        feature = "std-mkv",
+        feature = "std-adpcm",
+        feature = "std-alac",
+        feature = "all",
+        feature = "neural",
+        feature = "watermark",
+        feature = "rayon",
+        feature = "mimalloc"
+    ))
+))]
+compile_error!(
+    "the `std` feature enables no codecs by itself; enable at least one \
+     per-codec feature (e.g. `std-wav`, `std-mp3`, `std-flac`, `std-ogg`, \
+     `std-aac`, `std-mp4`, or the extended `std-aiff` / `std-mkv` / \
+     `std-adpcm` / `std-alac`), or `all` for every codec, to use `audiofp::io`"
+);
 
 extern crate alloc;
 
@@ -97,7 +141,19 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod classical;
 pub mod dsp;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "std-mp3",
+    feature = "std-aac",
+    feature = "std-flac",
+    feature = "std-ogg",
+    feature = "std-wav",
+    feature = "std-mp4",
+    feature = "std-aiff",
+    feature = "std-mkv",
+    feature = "std-adpcm",
+    feature = "std-alac",
+    feature = "all"
+))]
 pub mod io;
 pub mod matching;
 #[cfg(feature = "neural")]

@@ -6,7 +6,13 @@
 //!
 //! Test audio: "Galway" by Kevin MacLeod (incompetech.com), CC-BY 3.0.
 //! 16 seconds, mono, 44100 Hz, 16-bit. See tests/assets/CREDITS.md.
-#![cfg(feature = "std")]
+#![cfg(all(
+    feature = "std-mp3",
+    feature = "std-flac",
+    feature = "std-ogg",
+    feature = "std-wav",
+    feature = "std-mp4"
+))]
 
 use std::collections::HashSet;
 

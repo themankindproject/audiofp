@@ -2,7 +2,7 @@
 //!
 //! If any of these fail after a code change, it means hash output has
 //! drifted — the algorithm version suffix must be bumped.
-#![cfg(feature = "std")]
+#![cfg(feature = "std-ogg")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;

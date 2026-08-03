@@ -38,7 +38,9 @@ Add the dependency:
 
 ```toml
 [dependencies]
-audiofp = "0.4"
+# The default build is no_std + alloc with no codecs. For file decoding
+# (audiofp::io), enable the codecs you need — see "Feature Flags" below.
+audiofp = { version = "0.4", features = ["std-mp3", "std-wav"] }
 ```
 
 ### Basic example: fingerprint silence (zero deps)
@@ -150,11 +152,15 @@ pub trait Fingerprinter {
 
     fn name(&self) -> &'static str;
     fn config(&self) -> &Self::Config;
-    fn required_sample_rate(&self) -> u32;
+    fn required_sample_rate(&self) -> SampleRate;
     fn min_samples(&self) -> usize;
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output>;
 }
 ```
+
+`required_sample_rate()` returns a [`SampleRate`] (e.g. `SampleRate::HZ_8000`
+for Wang/Panako, `SampleRate::HZ_5000` for Haitsma) — compare it against the
+audio's `SampleRate` directly, no manual unwrap needed.
 
 Stable algorithm IDs (`name()`):
 
@@ -187,7 +193,11 @@ pub trait StreamingFingerprinter {
 }
 ```
 
-`required_sample_rate()` returns the sample rate (Hz) the stream expects. Feed wrong-rate samples and you'll get garbage hashes silently — there's no runtime check on `push`, so callers should assert or resample upfront.
+`required_sample_rate()` returns the sample rate (Hz) the stream expects —
+note this streaming trait still returns a plain `u32`, unlike the offline
+[`Fingerprinter`] trait which returns a [`SampleRate`]. Feed wrong-rate
+samples and you'll get garbage hashes silently — there's no runtime check on
+`push`, so callers should assert or resample upfront.
 
 `push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
 
@@ -642,7 +652,7 @@ version, wrong algorithm ID, or truncated payload.
 
 ## Audio File Decoding
 
-Available with the default `std` feature, exposed as `audiofp::io`.
+Available with any `std-*` codec feature (e.g. `std-wav`), exposed as `audiofp::io`.
 
 ### `decode_to_mono`
 
@@ -756,7 +766,7 @@ Available with the `watermark` feature. Wraps `tract-onnx` to run an AudioSeal-c
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", features = ["watermark"] }
+audiofp = { version = "0.4", features = ["watermark"] }
 ```
 
 ### `WatermarkConfig`
@@ -863,7 +873,7 @@ use audiofp::watermark::WatermarkConfig;
 let cfg = WatermarkConfig::new("/models/audioseal_detector.onnx");
 ```
 
-Runnable starter: `cargo run --example watermark_detect --features watermark -- /path/to/model.onnx`.
+Runnable starter: `cargo run --example watermark_detect --features watermark,std-wav -- /path/to/model.onnx`.
 
 ---
 
@@ -873,7 +883,7 @@ Available with the `neural` feature (added in 0.3.0). Wraps `tract-onnx` to run 
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", features = ["neural"] }
+audiofp = { version = "0.4", features = ["neural"] }
 ```
 
 ### Model contract
@@ -1058,7 +1068,10 @@ let spec = stft.magnitude(&samples);   // Vec<Vec<f32>>: (n_frames, n_bins)
 println!("{} frames × {} bins", spec.len(), stft.n_bins());
 ```
 
-Streaming `process_frame` lets you feed exactly `n_fft` samples and get one spectrum without allocating per call.
+Streaming `process_frame` / `process_frame_power` let you feed exactly
+`n_fft` samples and get one spectrum without allocating per call. Both
+return `Result` and reject mismatched frame/out lengths with
+`AfpError::Config` instead of panicking.
 
 **0.2.0 fast-path methods:**
 
@@ -1080,7 +1093,7 @@ assert_eq!(pow.len(), mag.len());
 // Per-frame streaming variant of power_flat.
 let frame = vec![0.0_f32; 2048];
 let mut out = vec![0.0_f32; stft.n_bins()];
-stft.process_frame_power(&frame, &mut out);
+stft.process_frame_power(&frame, &mut out)?;
 ```
 
 The classical fingerprinters all use `power_flat` / `process_frame_power`
@@ -1099,7 +1112,7 @@ let (n_frames, n_bins) = stft.power_flat_into(&samples, &mut buf);
 
 // Streaming per-frame magnitude (with sqrt — use process_frame_power for power):
 let mut out = vec![0.0_f32; stft.n_bins()];
-stft.process_frame(&frame, &mut out);
+stft.process_frame(&frame, &mut out)?;
 ```
 
 ### `dsp::mel`
@@ -1301,7 +1314,7 @@ Neither `watermark` nor `neural` ships ONNX weights:
 | `neural` | Bring your own log-mel embedder ONNX that matches the Neural Embedder model contract above |
 
 ```bash
-cargo run --example watermark_detect --features watermark -- /path/to/audioseal.onnx
+cargo run --example watermark_detect --features watermark,std-wav -- /path/to/audioseal.onnx
 cargo run --example neural_embed --features neural -- /path/to/embedder.onnx
 ```
 
@@ -1428,10 +1441,10 @@ It's there as a baseline. Use `SincResampler` for anything user-facing — the a
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", features = ["mimalloc"] }
+audiofp = { version = "0.4", features = ["mimalloc"] }
 ```
 
-This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary or in `default = ["std", "mimalloc"]` if you're vendoring `audiofp`.
+This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary if you're vendoring `audiofp`.
 
 ### 6. Streaming hot path is allocation-free and truly incremental (0.2.0+)
 
@@ -1477,30 +1490,65 @@ per STFT frame per analysis window.
 
 ## Feature Flags
 
+> **0.4.0 change:** the monolithic `std` feature is split into per-codec
+> sub-features, and `default` is now `[]`. Pick the codecs you actually
+> decode:
+
 | Feature      | Default | Brings in                                                                       |
 | ------------ | :-----: | ------------------------------------------------------------------------------- |
-| `std`        |   ✅    | Symphonia file decoding helpers (`audiofp::io`)                                     |
-| `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark`                              |
-| `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model)  |
-| `mimalloc`   |         | Installs `mimalloc` as the process-wide `#[global_allocator]`                   |
+| `std`        |         | Symphonia itself (no codecs). Bare `std` without a codec feature is a compile error when you touch `audiofp::io`. |
+| `std-mp3`    |         | MP3 decoding (`symphonia/mp3`)                                                  |
+| `std-aac`    |         | AAC decoding (`symphonia/aac`)                                                  |
+| `std-flac`   |         | FLAC decoding (`symphonia/flac`)                                                |
+| `std-ogg`    |         | Ogg container + Vorbis (`symphonia/ogg`, `symphonia/vorbis`)                     |
+| `std-wav`    |         | WAV + raw PCM (`symphonia/wav`, `symphonia/pcm`)                                 |
+| `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF (`symphonia/isomp4`)                                       |
+| `std-aiff`   |         | AIFF (`symphonia/aiff`)                                                          |
+| `std-mkv`    |         | Matroska (`symphonia/mkv`)                                                       |
+| `std-adpcm`  |         | ADPCM (`symphonia/adpcm`)                                                        |
+| `std-alac`   |         | ALAC (`symphonia/alac`)                                                          |
+| `all`        |         | Every format/codec above at once — the pre-0.4.0 monolithic `std` behavior        |
+| `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark` (implies `std`)           |
+| `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model; implies `std`) |
+| `mimalloc`   |         | Installs `mimalloc` as the process-wide `#[global_allocator]` (implies `std`)    |
+
+### WAV-only decoding (typical case)
+
+```toml
+[dependencies]
+audiofp = { version = "0.4", features = ["std-wav"] }
+```
+
+### All formats at once (pre-0.4.0 behavior)
+
+```toml
+[dependencies]
+audiofp = { version = "0.4", features = ["all"] }
+```
+
+`all` enables every codec feature (`std-mp3`, `std-aac`, `std-flac`,
+`std-ogg`, `std-wav`, `std-mp4`, `std-aiff`, `std-mkv`, `std-adpcm`,
+`std-alac`) — the drop-in equivalent of the old monolithic `std`.
 
 ### Minimal build (no_std + alloc)
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", default-features = false }
+audiofp = { version = "0.4", default-features = false }
 ```
 
-This drops `symphonia` (so no `audiofp::io`), `tract-onnx` (so no `audiofp::watermark`), and `mimalloc`. The DSP primitives and classical fingerprinters all remain available.
+The default build now ships **no codecs at all** — `audiofp::io` is absent
+unless you opt into at least one `std-*` feature. DSP primitives and
+classical fingerprinters all remain available.
 
 ### Watermark detection only
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", default-features = false, features = ["watermark"] }
+audiofp = { version = "0.4", default-features = false, features = ["watermark"] }
 ```
 
-`watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without Symphonia.
+`watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without any file-decode codecs.
 
 ---
 
@@ -1510,7 +1558,7 @@ The DSP primitives and classical fingerprinters compile under `no_std + alloc`:
 
 ```toml
 [dependencies]
-audiofp = { version = "0.3.7", default-features = false }
+audiofp = { version = "0.4", default-features = false }
 ```
 
 In your crate root:
@@ -1531,7 +1579,7 @@ What works without `std` today:
 | --------------------- | ------------------------------------------------------- |
 | `audiofp::dsp::*`         | ✅ host-only no_std (rustfft transitive issue)          |
 | `audiofp::classical::*`   | ✅ same                                                 |
-| `audiofp::io`             | ❌ requires `std`                                        |
+| `audiofp::io`             | ❌ requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all` |
 | `audiofp::watermark`      | ❌ requires `std` + `watermark`                          |
 
 ---
@@ -1554,13 +1602,13 @@ Runnable starters under `examples/` (also listed in the README):
 
 | Example | Features | Command |
 | ------- | -------- | ------- |
-| `enroll_file` | `std` (default) | `cargo run --example enroll_file -- song.flac` |
-| `match_two_files` | `std` | `cargo run --example match_two_files -- a.flac b.mp3` |
-| `compare_algorithms` | `std` | `cargo run --example compare_algorithms -- song.flac` |
-| `stream_buffer` | default | `cargo run --example stream_buffer -- song.wav` |
+| `enroll_file` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example enroll_file --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
+| `match_two_files` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example match_two_files --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- a.flac b.mp3` |
+| `compare_algorithms` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example compare_algorithms --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
+| `stream_buffer` | none | `cargo run --example stream_buffer` |
 | `dsp_starter` | none | `cargo run --example dsp_starter` |
 | `neural_embed` | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
-| `watermark_detect` | `watermark` | `cargo run --example watermark_detect --features watermark -- model.onnx [audio.wav]` |
+| `watermark_detect` | `watermark`, `std-wav` | `cargo run --example watermark_detect --features watermark,std-wav -- model.onnx [audio.wav]` |
 
 ## Links
 

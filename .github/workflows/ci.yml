@@ -34,6 +34,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: clippy (per-codec features)
+        run: cargo clippy --all-targets --features std-wav,std-mp3,std-flac,std-ogg -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

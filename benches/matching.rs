@@ -4,7 +4,8 @@
 //! cargo bench --bench matching
 //! ```
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
@@ -58,7 +59,7 @@ fn bench_haitsma_one(c: &mut Criterion) {
     let samples = synth(2, 5_000, 5);
 
     let fp = Haitsma::default()
-        .extract(&samples, SampleRate::HZ_8000)
+        .extract(&samples, SampleRate::HZ_5000)
         .expect("haitsma extract");
     // Exact path: keep refs short enough that LUT is skipped, or force use_lut=false.
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig {

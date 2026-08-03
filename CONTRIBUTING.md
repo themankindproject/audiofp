@@ -42,7 +42,7 @@ audiofp/
     ├── fp.rs                # Fingerprinter, StreamingFingerprinter
     ├── dsp/                 # STFT, mel, peaks, resample, windows
     ├── classical/           # Wang, Panako, Haitsma + streaming
-    ├── io/        [std]     # symphonia decoder
+    ├── io/        [std-*]  # symphonia decoder (per-codec features)
     └── watermark/ [feat]    # AudioSeal ONNX wrapper
 ```
 

@@ -14,7 +14,7 @@
 //! The real-audio snapshot tests require the `std` feature (file decoding).
 //! The adversarial/stress tests work under `no_std + alloc`.
 
-#![cfg(feature = "std")]
+#![cfg(all(feature = "std-mp3", feature = "std-flac", feature = "std-ogg"))]
 
 use audiofp::classical::{Haitsma, HaitsmaConfig, Panako, PanakoConfig, Wang, WangConfig};
 use audiofp::{AfpError, Fingerprinter, SampleRate};

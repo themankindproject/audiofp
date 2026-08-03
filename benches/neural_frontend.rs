@@ -17,7 +17,8 @@
 
 #![cfg(feature = "neural")]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use audiofp::dsp::mel::{MelFilterBank, MelScale};
 use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
@@ -64,7 +65,7 @@ fn bench_log_mel_pipeline(c: &mut Criterion) {
         b.iter(|| {
             for f in 0..N_FRAMES {
                 let frame = &window[f * HOP..f * HOP + N_FFT];
-                stft.process_frame_power(frame, &mut power);
+                stft.process_frame_power(frame, &mut power).unwrap();
                 mel.log_mel_from_power(&power, &mut mel_row);
                 black_box(&mel_row);
             }

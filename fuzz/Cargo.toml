@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 arbitrary = { version = "1.3", features = ["derive"] }
 bytemuck = "1.25.0"
-audiofp = { path = "..", features = ["std"] }
+audiofp = { path = "..", features = ["all"] }
 
 [[bin]]
 name = "wang_hash_roundtrip"

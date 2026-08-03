@@ -2,7 +2,7 @@
 //!
 //! Real broadband music and speech are richer than synthetic two-tone signals
 //! and provide a more realistic test of spectral peak survival and bit similarity.
-#![cfg(feature = "std")]
+#![cfg(feature = "std-ogg")]
 
 use std::collections::HashSet;
 

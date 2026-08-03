@@ -1,7 +1,7 @@
 //! Detect an AudioSeal-compatible watermark with a BYO ONNX model.
 //!
 //! ```bash
-//! cargo run --example watermark_detect --features watermark -- path/to/model.onnx [audio.wav]
+//! cargo run --example watermark_detect --features watermark,std-wav -- path/to/model.onnx [audio.wav]
 //! ```
 //!
 //! Download / export detector weights from
