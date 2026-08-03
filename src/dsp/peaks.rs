@@ -123,6 +123,8 @@ impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
+        // A 1-D Lemire deque holds at most 2k+1 indices; size for the
+        // larger of the two axes.
         let dq_cap = 2 * cfg.neighborhood_t.max(cfg.neighborhood_f) + 2;
         Self {
             cfg,
@@ -191,6 +193,9 @@ impl PeakPicker {
         let min_mag_linear = self.cfg.min_magnitude_linear;
         let target_per_sec = self.cfg.target_per_sec;
 
+        // Upper bound on candidate peaks (fps × target/s), doubled as
+        // headroom, floored at 64 so the reserve is non-trivial even when
+        // the per-second cap is disabled.
         let upper = (frames_per_sec.ceil() as usize * target_per_sec)
             .max(1)
             .saturating_mul(2)
@@ -208,6 +213,8 @@ impl PeakPicker {
                 let idx = t * n_bins + f;
                 let v = spec[idx];
                 let above_floor = v > min_mag && min_mag_linear.map(|lin| v > lin).unwrap_or(true);
+                // >= (not >) so every cell of a flat plateau is emitted as
+                // a peak, matching streaming behavior.
                 if above_floor && v >= self.max_buf[idx] {
                     self.candidates.push(Peak {
                         t_frame: t as u32,

@@ -155,6 +155,8 @@ impl Matcher for PanakoMatcher {
         let scale_min = cfg.scale_min as f64;
         let scale_max = cfg.scale_max as f64;
         let scale_per_bin = (scale_max - scale_min) / cfg.scale_bins as f64;
+        // ±half-bin slack so a scale at the grid edge still votes into the
+        // boundary bin.
         let eps_scale = scale_per_bin * 0.5;
 
         // Accumulator: (scale_bin, offset_bin) → vote count
@@ -179,7 +181,6 @@ impl Matcher for PanakoMatcher {
 
                     let b = tr_a as f64 - s * q_ta as f64;
 
-                    // Compute bin indices
                     let s_bin = ((s - scale_min) / scale_per_bin)
                         .clamp(0.0, (cfg.scale_bins - 1) as f64)
                         as u32;
@@ -361,6 +362,8 @@ fn ransac_refine(
     // single-frame jitter still admits real inliers.
     let inlier_tol = (tol_frames.max(2)) as f64;
 
+    // Budget: at least 4 samples per pair, capped at 128 — more iterations
+    // cost time, fewer hurt the inlier estimate on noisy data.
     let n_iter = 128usize.min(pairs.len() * 4);
     // Deterministic seed derived from the data so repeated runs on the
     // same input produce identical results (no_std has no system RNG).
@@ -372,7 +375,6 @@ fn ransac_refine(
     let mut best_b = coarse_b;
 
     for _ in 0..n_iter {
-        // Pick two distinct random pairs.
         let i = (rng.next() % pairs.len() as u64) as usize;
         let j = (rng.next() % pairs.len() as u64) as usize;
         if i == j {
@@ -392,7 +394,6 @@ fn ransac_refine(
         }
         let b = tr1 - s as f64 * tq1;
 
-        // Count inliers.
         let mut inliers = 0u32;
         for &(tq, tr) in pairs {
             let predicted = s as f64 * tq + b;

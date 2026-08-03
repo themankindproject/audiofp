@@ -523,7 +523,6 @@ fn compute_power_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
             complex[off + 6].im,
             complex[off + 7].im,
         ]);
-        // re² + im² via fused multiply-add: re*re + im*im
         let power = re.mul_add(re, im * im);
         dst[off..off + 8].copy_from_slice(power.as_array());
     }

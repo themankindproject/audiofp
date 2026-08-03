@@ -196,7 +196,9 @@ impl MelFilterBank {
             let left = hz_points[k];
             let centre = hz_points[k + 1];
             let right = hz_points[k + 2];
-            // Slaney normalisation: unit area in linear frequency.
+            // Slaney normalisation: unit area in linear frequency. The
+            // 1e-10 floor guards against right == left collapsing under
+            // float rounding (adjacent mel points).
             let norm = 2.0 / (right - left).max(1e-10);
 
             // Analytical bin range where the triangle is non-zero:
@@ -218,6 +220,10 @@ impl MelFilterBank {
             };
 
             if first_bin <= last_bin && first_bin < n_bins {
+                // Build the band's weights directly in the final container
+                // (no intermediate full Vec + `to_vec` trim copy). Zeros
+                // from float edge cases are skipped by advancing
+                // `start_bin` past them.
                 let mut weights = Vec::with_capacity(last_bin - first_bin + 1);
                 for b in first_bin..=last_bin {
                     let f = b as f32 * bin_hz;
@@ -239,9 +245,13 @@ impl MelFilterBank {
                 let last_nz = weights.iter().rposition(|&w| w != 0.0);
                 match (first_nz, last_nz) {
                     (Some(f), Some(l)) => {
+                        // Move the kept slice to the front, then truncate —
+                        // a single memmove, no second allocation.
+                        weights.copy_within(f..=l, 0);
+                        weights.truncate(l - f + 1);
                         sparse.push(MelBand {
                             start_bin: first_bin + f,
-                            weights: weights[f..=l].to_vec(),
+                            weights,
                         });
                     }
                     _ => {

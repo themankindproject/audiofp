@@ -323,17 +323,18 @@ impl EmbedderCore {
             )));
         }
 
+        let mut scratch = Vec::with_capacity(embedding_dim);
         for (b, ts) in timestamps.iter().enumerate().take(batch) {
             let slice = &view.as_slice().unwrap()[b * embedding_dim..(b + 1) * embedding_dim];
-            let mut vector = Vec::with_capacity(embedding_dim);
-            vector.extend_from_slice(slice);
+            scratch.clear();
+            scratch.extend_from_slice(slice);
 
             if self.cfg.l2_normalize {
-                l2_normalize_inplace(&mut vector);
+                l2_normalize_inplace(&mut scratch);
             }
 
             out.push(NeuralEmbedding {
-                vector,
+                vector: scratch.clone(),
                 t_start: *ts,
             });
         }
@@ -631,7 +632,6 @@ impl Fingerprinter for NeuralEmbedder {
             // --- Batched inference path --------------------------------
             let mut start = 0usize;
             while start + window_samples <= samples.len() {
-                // Collect up to `batch_size` windows.
                 let mut batch_windows: Vec<&[f32]> = Vec::with_capacity(batch_size);
                 let mut batch_timestamps: Vec<TimestampMs> = Vec::with_capacity(batch_size);
                 let mut s = start;
@@ -664,13 +664,20 @@ impl Fingerprinter for NeuralEmbedder {
             }
         } else {
             // --- Single-window inference path (original behaviour) ------
+            // One reused scratch vector: `embed_window_into` writes into
+            // it, then we clone into the owned embedding. Avoids a fresh
+            // `Vec::with_capacity` per window (N windows → 1 alloc vs N).
+            let mut vector = Vec::with_capacity(embedding_dim);
             let mut start = 0usize;
             while start + window_samples <= samples.len() {
                 let window = &samples[start..start + window_samples];
-                let mut vector = Vec::with_capacity(embedding_dim);
+                vector.clear();
                 self.core.embed_window_into(window, &mut vector)?;
                 let t_start = TimestampMs((start as u64) * 1000 / sr);
-                embeddings.push(NeuralEmbedding { vector, t_start });
+                embeddings.push(NeuralEmbedding {
+                    vector: vector.clone(),
+                    t_start,
+                });
                 start += hop_samples;
             }
         }

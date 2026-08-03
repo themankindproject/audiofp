@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- **Comment cleanup across the crate** — removed redundant comments
+  that merely restated the code (band-energy loop, bin-index arithmetic,
+  SIMD power expression, LUT probing, stop-hash pruning, decoder
+  packet-skip branches, watermark runnable caching), merged a duplicated
+  `StreamingHaitsma` doc block, and added genuine comments where
+  non-obvious logic was unexplained (Wang's inclusive target-zone
+  emission bound, Panako's post-truncation `(t, f)` re-sort, Haitsma's
+  `< 2` frames threshold, polyphase kernel scaling and `wrapping_sub`
+  safety, histogram OOM cap / vote wrap, RANSAC iteration budget,
+  half-bin scale slack, BER-prominence sentinels, DTW tempo ratio, the
+  decoder's `ResetRequired` and track-id handling, peak-picker deque /
+  plateau `>=` semantics, serialisation trailing-bytes tolerance, mel
+  normalisation floor).
+- **Fixed misleading doc comments** — `decode_to_mono` had swapped
+  `# Example` / `# Security` sections; the neural module example claimed
+  16 kHz while passing `HZ_8000`; the `MatchResult::prominence` doc
+  misstated the Haitsma matcher's formula (it uses `median_BER / (BER +
+  ε)`, only the index path uses `0.5 / BER`).
+
 ## [0.4.0] - 2026-08-02
 
 ### Breaking

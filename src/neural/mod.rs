@@ -35,7 +35,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
-//! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
+//! let samples: Vec<f32> = vec![/* … 8 kHz mono PCM … */];
 
 //! let fp = emb.extract(&samples, SampleRate::HZ_8000)?;
 //! println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);

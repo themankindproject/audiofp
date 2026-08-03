@@ -285,8 +285,6 @@ impl Panako {
         }
         progress(stft_weight);
 
-        // power → dB log-magnitude in-place (20·log10(sqrt(p)) ≡ 10·log10(p)).
-        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power). Vectorized via wide.
         power_to_db_wide(&mut self.log_spec, PANAKO_LOG_FLOOR_POWER);
         progress(0.80);
 
@@ -395,6 +393,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
 
     let mut hashes = Vec::with_capacity(peaks.len() * fan_out);
 
+    // Capacity heuristics; both grow on demand.
     let mut targets: Vec<&Peak> = Vec::with_capacity(64);
     let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
         alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
@@ -408,7 +407,7 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         let zone_limit = anchor.t_frame.saturating_add(target_zone_t as u32 - 1);
         let zone_end = peaks[i + 1..].partition_point(|p| p.t_frame <= zone_limit);
 
-        // Collect peaks in the cone (within freq zone too).
+        // Collect peaks in the cone (time + freq zone, strict inequalities).
         targets.clear();
         for target in &peaks[i + 1..i + 1 + zone_end] {
             let dt = target.t_frame as i32 - anchor.t_frame as i32;
@@ -747,6 +746,8 @@ impl StreamingPanako {
                 .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
         });
         peaks.truncate(self.cfg.peaks_per_sec as usize);
+        // Re-sort by `(t, f)` so downstream iteration matches the offline
+        // hash builder's order.
         peaks.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
 
         let target_zone_t = self.cfg.target_zone_t as i32;

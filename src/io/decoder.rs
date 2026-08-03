@@ -105,8 +105,6 @@ impl DecodeLimits {
 ///   inside Symphonia are silently skipped so a single corrupt block
 ///   doesn't kill the whole-file decode.
 ///
-/// # Example
-///
 /// # Security
 ///
 /// This function applies **no resource limits**. A compressed
@@ -114,6 +112,8 @@ impl DecodeLimits {
 /// succeed and may OOM the process. For untrusted uploads use
 /// [`decode_to_mono_limited`] with [`DecodeLimits::both`] so both
 /// on-disk size and decoded PCM are bounded.
+///
+/// # Example
 ///
 /// ```no_run
 /// use audiofp::io::decode_to_mono;
@@ -277,6 +277,8 @@ fn decode_inner(
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
+            // ResetRequired means the reader re-synced (e.g. after a seek
+            // or a corrupt container header); retry the next packet.
             Err(SymphoniaError::ResetRequired) => continue,
             Err(e) => {
                 return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
@@ -284,13 +286,14 @@ fn decode_inner(
                 ))));
             }
         };
+        // Skip packets from tracks other than the selected default audio
+        // track (multi-track files).
         if packet.track_id != track_id {
             continue;
         }
 
         let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
-            // Recoverable per-packet failures: skip unless integrity mode is on.
             Err(SymphoniaError::IoError(e)) => {
                 if integrity_mode {
                     return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
@@ -429,9 +432,8 @@ mod tests {
         assert_eq!(sr, 8_000);
         assert_eq!(samples.len(), 8_000);
 
-        // Spot-check a sample mid-buffer.
-        let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 8_000.0) * 0.5;
         // 16-bit truncation introduces ~3e-5 error; allow a generous bound.
+        let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 8_000.0) * 0.5;
         assert!(
             (samples[100] - expected).abs() < 0.01,
             "sample[100] = {}, expected ≈ {expected}",
@@ -487,7 +489,6 @@ mod tests {
         let result = decode_to_mono(&renamed);
         std::fs::remove_file(&renamed).ok();
 
-        // Use of ? syntax via match: succeed or report.
         let (samples, sr) = match result {
             Ok(v) => v,
             Err(e) => panic!("decode without extension failed: {e}"),
@@ -663,7 +664,6 @@ mod tests {
         // chunk in the middle of the file.
         let file_len = std::fs::metadata(&path).unwrap().len() as usize;
         let mut bytes = std::fs::read(&path).unwrap();
-        // Overwrite bytes near the middle with invalid patterns.
         let mid = file_len / 2;
         for i in 0..core::cmp::min(64, file_len - mid) {
             bytes[mid + i] = 0xFF;

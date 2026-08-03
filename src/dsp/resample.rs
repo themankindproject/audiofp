@@ -180,7 +180,11 @@ impl SincResampler {
             let frac = s as f32 / steps as f32;
             let row = &mut kernel_table[s * taps..(s + 1) * taps];
             for (k, cell) in row.iter_mut().enumerate() {
+                // Sample position relative to kernel centre, shifted by the
+                // fractional phase `frac` for this polyphase step.
                 let x = (k as isize - half as isize) as f32 - frac;
+                // Scale by 2·fc: the ideal low-pass impulse response is
+                // 2·fc·sinc(2·fc·x).
                 *cell = sinc(x * two_cutoff)
                     * kaiser_window_input(x, half_f, quality.kaiser_beta, inv_i0_beta)
                     * two_cutoff;
@@ -288,6 +292,8 @@ impl SincResampler {
             let step = ((frac * steps as f32) as usize).min(steps - 1);
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
+            // Safe: in the middle region `n ≥ n_safe_start` guarantees
+            // `i_centre ≥ half`, so this cannot wrap.
             let base = i_centre.wrapping_sub(half);
             let acc = super::dot_wide(&input[base..base + taps], kernel);
             out.push(acc);

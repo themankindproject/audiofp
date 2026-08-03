@@ -234,6 +234,8 @@ impl Haitsma {
         let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.power_buf);
         let power_flat = &self.power_buf;
         if n_frames < 2 {
+            // Frame 0 has no hash, and every hash at frame n needs frame
+            // n−1's band energies — fewer than 2 frames yields zero hashes.
             progress(1.0);
             return Ok(HaitsmaFingerprint {
                 frames: Vec::new(),
@@ -254,7 +256,6 @@ impl Haitsma {
         }
         progress(stft_weight);
 
-        // Compute per-frame band energies.
         self.energies_buf.clear();
         self.energies_buf.reserve(n_frames);
         for f in 0..n_frames {
@@ -273,7 +274,6 @@ impl Haitsma {
         }
         progress(0.80);
 
-        // For each frame n >= 1, compute the 32-bit hash.
         self.frames_buf.clear();
         self.frames_buf.reserve(self.energies_buf.len() - 1);
         for n in 1..self.energies_buf.len() {
@@ -412,18 +412,13 @@ fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<u8> {
 
 /// Streaming Haitsma–Kalker fingerprinter.
 ///
-/// Each new frame's hash depends only on the current and previous
-/// frames' band energies, so latency is bounded by the STFT window
-/// length (`n_fft / sr ≈ 410 ms`) — much lower than the landmark
-/// extractors.
-///
-/// Streaming Haitsma–Kalker — fully incremental.
-///
 /// Trivially incremental: each output bit-frame depends only on the
 /// current and previous frames' band energies, so we just keep one
 /// previous-frame energy vector. No spectrogram window, no peak picker,
 /// no per-second adaptive threshold. Per-push CPU cost is proportional
-/// to the number of new samples, independent of total stream length.
+/// to the number of new samples, independent of total stream length,
+/// and latency is bounded by the STFT window length (`n_fft / sr ≈
+/// 410 ms`) — much lower than the landmark extractors.
 ///
 /// Output is bit-exactly equivalent to [`Haitsma::extract`].
 pub struct StreamingHaitsma {

@@ -114,8 +114,9 @@ pub struct MatchResult {
     ///
     /// - **Wang / Panako**: `peak_consolidated / (mean_rest + 1)` on the
     ///   offset or `(scale, offset)` histogram.
-    /// - **Haitsma** (matcher and index): `0.5 / ber` — a BER-derived
-    ///   proxy, **not** comparable to Wang/Panako prominence.
+    /// - **Haitsma**: BER-derived proxy, **not** comparable to Wang/Panako
+    ///   prominence. The matcher reports `median_BER / (BER + ε)`; the
+    ///   index path reports `0.5 / BER`.
     /// - **Neural**: relative cosine excess over other lag positions
     ///   (SlidingMax) or `1.0` (Centroid / DTW).
     ///

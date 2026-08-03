@@ -92,8 +92,8 @@ impl Matcher for NeuralMatcher {
             return MatchResult::NONE;
         }
 
-        // Both fingerprints must agree on embedding dimension, and every
-        // vector must actually have that length.
+        // Guard: embedding dims must agree and be consistent across all
+        // vectors (mismatch → NONE, not an error).
         let dim = query.embedding_dim;
         if dim == 0
             || reference.embedding_dim != dim
@@ -237,6 +237,8 @@ impl NeuralMatcher {
         };
         let equiv_cos = 1.0 - mean_dist;
 
+        // DTW is the one mode with a tempo model: report the
+        // query/reference window-count ratio.
         let time_scale = if n > 0 { m as f32 / n as f32 } else { 1.0 };
         let mut result = self.build(equiv_cos, 1.0, TimeOffset::ZERO, m.min(n) as u32);
         result.time_scale = time_scale;

@@ -62,7 +62,6 @@ pub(crate) fn hamming_at_offset(
 
     let mut hamming: u64 = 0;
     for (qa, ra) in q_slice.iter().zip(r_slice.iter()) {
-        // POPCNT on the XOR of two 32-bit sub-fingerprints
         hamming += (qa ^ ra).count_ones() as u64;
         if hamming > best_sofar {
             return u64::MAX;
@@ -213,7 +212,6 @@ impl Matcher for HaitsmaMatcher {
             let mut best_delta: i64 = 0;
             let mut best_overlap: usize = 0;
 
-            // Iterate over query frames, probe LUT for each
             for (q_pos, &q_frame) in q_frames.iter().enumerate() {
                 match self.cfg.probe_bit_flips {
                     0 => probe_exact(q_frame, &lut, &mut |positions| {
@@ -265,7 +263,6 @@ impl Matcher for HaitsmaMatcher {
                         }
                     }),
                 }
-                // If we already have a perfect match, stop probing
                 if best_hamming == 0 {
                     break;
                 }
@@ -347,12 +344,14 @@ fn build_result(
     let score = clamp_score(1.0 - ber);
     let is_match = ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
 
-    // Prominence: sample ~20 offsets across the range to estimate
-    // typical (median) BER, then compute median / best.
+    // Prominence: sample offsets across the range to estimate typical
+    // (median) BER, then compute median / best.
     let prominence = {
         let q_len = q_frames.len();
         let r_len = r_frames.len();
         let mut bers: Vec<f32> = Vec::new();
+        // Sample ~40 offsets across the range (40 balances estimate
+        // stability against per-offset BER cost).
         let step = ((q_len as i64 + r_len as i64) / 40).max(1);
         let dmin = -((q_len as i64).saturating_sub(1));
         let dmax = (r_len as i64).saturating_sub(1);
@@ -362,6 +361,8 @@ fn build_result(
                 continue;
             }
             let ov = overlap_at(q_len, r_len, d);
+            // Skip near-empty overlaps so the BER estimate is statistically
+            // meaningful (32 bits = one frame's worth).
             if ov < 32 {
                 continue;
             }

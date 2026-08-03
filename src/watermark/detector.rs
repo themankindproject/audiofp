@@ -214,9 +214,6 @@ impl WatermarkDetector {
         let input_tensor = Tensor::from_shape(&[1, 1, n], samples)
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
-        // Concretise input shape and prepare a runnable plan.
-        // Reuse the cached runnable when the input length matches;
-        // otherwise rebuild for the new length.
         let needs_rebuild = match &self.cached {
             Some((cached_n, _)) => *cached_n != n,
             None => true,

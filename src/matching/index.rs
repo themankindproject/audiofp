@@ -127,7 +127,6 @@ impl WangIndex {
             }
         }
 
-        // Remove stop-hashes (appear in too many references)
         map.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         Self { map, fps }
@@ -258,6 +257,8 @@ impl WangIndex {
                 continue;
             }
 
+            // fps is always populated by `build`; the 62.5 fallback is
+            // defensive only and masks nothing in practice.
             let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,
@@ -337,9 +338,8 @@ impl HaitsmaIndex {
             }
         }
 
-        // Stop-hash prune: drop sub-fingerprints whose posting list exceeds
-        // the cap. Without this, silence/DC frames produce enormous lists
-        // that blow up memory and query time.
+        // Silence/DC frames produce enormous posting lists; prune them so
+        // memory and query time stay bounded.
         lut.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         Self { lut, frames, fps }
@@ -431,6 +431,8 @@ impl HaitsmaIndex {
 
             // Prominence: approximate — compare the winning BER against
             // what you'd expect from random alignment (~0.5).
+            // ber ≈ 0 (perfect alignment) → sentinel 100.0; 1e-6 guards
+            // against division by zero.
             let prominence = if ber > 1e-6 { 0.5 / ber } else { 100.0 };
 
             let offset = crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id]);
@@ -533,6 +535,8 @@ impl PanakoIndex {
         let scale_min = cfg.scale_min as f64;
         let scale_max = cfg.scale_max as f64;
         let scale_per_bin = (scale_max - scale_min) / cfg.scale_bins as f64;
+        // ±half-bin slack so a scale at the grid edge still votes into the
+        // boundary bin.
         let eps_scale = scale_per_bin * 0.5;
         let tol = cfg.offset_tolerance_frames as i64;
         let q_len = query.hashes.len().max(1) as f32;
@@ -558,6 +562,8 @@ impl PanakoIndex {
                     let s_bin = ((s - scale_min) / scale_per_bin)
                         .clamp(0.0, (cfg.scale_bins - 1) as f64)
                         as u32;
+                    // Offset bin for the accumulator grid (±tol consolidation
+                    // happens around the peak, so use the raw rounded value).
                     let off_key = (b / (tol.max(1)) as f64).round() as i64;
 
                     *acc.entry(ref_id)
@@ -632,6 +638,8 @@ impl PanakoIndex {
                 1.0
             };
 
+            // fps is always populated by `build`; the 62.5 fallback is
+            // defensive only and masks nothing in practice.
             let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,

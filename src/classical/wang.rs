@@ -268,7 +268,6 @@ impl Wang {
         }
         progress(stft_weight);
 
-        // Convert power → dB log-magnitude in-place.
         // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
         power_to_db_wide(&mut self.log_spec, WANG_LOG_FLOOR_POWER);
         progress(0.80);
@@ -789,6 +788,10 @@ impl StreamingWang {
         // needs `&self` (for `build_hashes_for_anchor`) and `&mut emitted`.
         let mut emitted = core::mem::take(&mut self.emitted);
         while let Some(anchor) = self.pending_anchors.pop_front() {
+            // Wang's target zone is inclusive (`dt ≤ target_zone_t`, see
+            // `build_hashes`), so the last possible target frame is exactly
+            // `t + target_zone_t`; emission waits until that frame's bucket
+            // has been finalised.
             let last_target_frame = anchor.peak.t_frame + self.cfg.target_zone_t as u32;
             let last_target_bucket = (last_target_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
             if self.last_finalized_bucket < last_target_bucket {

@@ -44,7 +44,6 @@ const FORMAT_VERSION: u8 = 1;
 /// hash_count (4) + fps (4) = 18 bytes.
 const HEADER_SIZE: usize = 8 + 1 + 1 + 4 + 4;
 
-// Algorithm IDs.
 const ALG_WANG: u8 = 0;
 const ALG_PANAKO: u8 = 1;
 const ALG_HAITSMA: u8 = 2;
@@ -177,6 +176,8 @@ impl WangFingerprint {
         let (_alg, hash_count, fps) = read_header(bytes, ALG_WANG)?;
         let payload = &bytes[HEADER_SIZE..];
         let expected_len = (hash_count as usize) * core::mem::size_of::<WangHash>();
+        // Trailing bytes beyond the payload are intentionally ignored
+        // (forward compatibility for envelope extensions).
         if payload.len() < expected_len {
             return Err(AfpError::Deserialize(format!(
                 "payload too short: need {} bytes for {} hashes, got {}",
@@ -229,6 +230,8 @@ impl PanakoFingerprint {
         let (_alg, hash_count, fps) = read_header(bytes, ALG_PANAKO)?;
         let payload = &bytes[HEADER_SIZE..];
         let expected_len = (hash_count as usize) * core::mem::size_of::<PanakoHash>();
+        // Trailing bytes beyond the payload are intentionally ignored
+        // (forward compatibility for envelope extensions).
         if payload.len() < expected_len {
             return Err(AfpError::Deserialize(format!(
                 "payload too short: need {} bytes for {} hashes, got {}",
@@ -281,6 +284,8 @@ impl HaitsmaFingerprint {
         let (_alg, hash_count, fps) = read_header(bytes, ALG_HAITSMA)?;
         let payload = &bytes[HEADER_SIZE..];
         let expected_len = (hash_count as usize) * core::mem::size_of::<u32>();
+        // Trailing bytes beyond the payload are intentionally ignored
+        // (forward compatibility for envelope extensions).
         if payload.len() < expected_len {
             return Err(AfpError::Deserialize(format!(
                 "payload too short: need {} bytes for {} frames, got {}",

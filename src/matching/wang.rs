@@ -114,6 +114,8 @@ impl Matcher for WangMatcher {
         let dmax: i64 = r_max;
         let range = (dmax - dmin + 1) as usize;
 
+        // Cap the histogram so a pathological query/reference cannot OOM;
+        // votes beyond the cap are silently dropped.
         const MAX_HIST_BINS: usize = 10_000_000;
         let capped = range.min(MAX_HIST_BINS);
         let mut hist: Vec<u32> = vec![0u32; capped];
@@ -124,6 +126,8 @@ impl Matcher for WangMatcher {
                 let idx = (d - dmin) as usize;
                 if idx < capped {
                     let bucket = &mut hist[idx];
+                    // wrapping: votes are capped by MAX_HIST_BINS; overflow
+                    // only on pathological input and is harmless here.
                     *bucket = bucket.wrapping_add(1);
                 }
             }
