@@ -103,6 +103,23 @@ pub enum AfpError {
     #[error("deserialize: {0}")]
     Deserialize(String),
 
+    /// Decoding exceeded the configured wall-clock timeout.
+    ///
+    /// Raised in the decode loop when [`DecodeLimits::timeout`] is set and
+    /// elapsed time exceeds the limit. Use this to bound decode time for
+    /// untrusted uploads in multi-tenant / FFI environments where a hung
+    /// decode would block the calling thread indefinitely.
+    ///
+    /// [`DecodeLimits::timeout`]: crate::io::DecodeLimits::timeout
+    #[cfg(feature = "std")]
+    #[error("decode timeout: elapsed {elapsed_ms} ms exceeds limit of {limit_ms} ms")]
+    Timeout {
+        /// Milliseconds elapsed before the timeout fired.
+        elapsed_ms: u64,
+        /// Configured timeout limit in milliseconds.
+        limit_ms: u64,
+    },
+
     /// A configuration value was rejected (out of range, mutually exclusive, …).
     #[error("invalid configuration: {0}")]
     Config(String),

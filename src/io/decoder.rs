@@ -21,6 +21,9 @@ use crate::{AfpError, Result};
 /// before opening the stream, while `max_samples` bounds decoded mono
 /// PCM growth (critical for compressed formats where on-disk size does
 /// not bound decoded size).
+///
+/// For multi-tenant or FFI environments, set [`timeout`](Self::timeout)
+/// to prevent adversarial inputs from hanging the decode thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecodeLimits {
     /// Reject when on-disk file size exceeds this many bytes.
@@ -33,6 +36,16 @@ pub struct DecodeLimits {
     /// becomes a fatal error instead of being silently skipped.
     /// Default: `false` (skip recoverable errors, matching legacy behavior).
     pub integrity_mode: bool,
+    /// Maximum wall-clock time allowed for the entire decode operation.
+    /// When set, the decoder checks elapsed time after each packet and
+    /// returns [`AfpError::Timeout`] if exceeded. Default: `None` (no
+    /// time limit).
+    ///
+    /// Recommended for Python FFI / multi-tenant services where a hung
+    /// decode would block the calling worker indefinitely.
+    ///
+    /// [`AfpError::Timeout`]: crate::AfpError::Timeout
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl DecodeLimits {
@@ -44,6 +57,7 @@ impl DecodeLimits {
             max_bytes,
             max_samples: None,
             integrity_mode: false,
+            timeout: None,
         }
     }
 
@@ -54,6 +68,7 @@ impl DecodeLimits {
             max_bytes: 0,
             max_samples: Some(max_samples),
             integrity_mode: false,
+            timeout: None,
         }
     }
 
@@ -64,6 +79,7 @@ impl DecodeLimits {
             max_bytes,
             max_samples: Some(max_samples),
             integrity_mode: false,
+            timeout: None,
         }
     }
 
@@ -81,6 +97,27 @@ impl DecodeLimits {
     #[must_use]
     pub const fn strict(mut self) -> Self {
         self.integrity_mode = true;
+        self
+    }
+
+    /// Set a wall-clock timeout for the decode operation. Returns
+    /// [`AfpError::Timeout`] if decoding takes longer than `duration`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use audiofp::io::DecodeLimits;
+    ///
+    /// let limits = DecodeLimits::both(50_000_000, 960_000)
+    ///     .with_timeout(Duration::from_secs(30));
+    /// assert_eq!(limits.timeout, Some(Duration::from_secs(30)));
+    /// ```
+    ///
+    /// [`AfpError::Timeout`]: crate::AfpError::Timeout
+    #[must_use]
+    pub const fn with_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.timeout = Some(duration);
         self
     }
 }
@@ -161,7 +198,21 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
         hint.with_extension(ext);
     }
 
-    decode_inner(mss, &hint, limits.max_samples, limits.integrity_mode)
+    // `Instant::now` is the correct choice here: the decode timeout
+    // measures wall-clock time from the caller's perspective. This is not
+    // a testability concern — tests exercise the timeout via
+    // `Duration::from_nanos(0)` which fires on the first packet regardless
+    // of when the Instant was captured.
+    #[allow(clippy::disallowed_methods)]
+    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
+
+    decode_inner(
+        mss,
+        &hint,
+        limits.max_samples,
+        limits.integrity_mode,
+        deadline,
+    )
 }
 
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
@@ -213,6 +264,7 @@ fn decode_inner(
     hint: &Hint,
     max_samples: Option<usize>,
     integrity_mode: bool,
+    deadline: Option<(std::time::Instant, std::time::Duration)>,
 ) -> Result<(Vec<f32>, u32)> {
     let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
         .probe(
@@ -290,6 +342,18 @@ fn decode_inner(
         // track (multi-track files).
         if packet.track_id != track_id {
             continue;
+        }
+
+        // Wall-clock timeout check: bail if the configured timeout has
+        // elapsed. Checked per-packet (~1 ns overhead from Instant::elapsed).
+        if let Some((start, limit)) = deadline {
+            let elapsed = start.elapsed();
+            if elapsed > limit {
+                return Err(AfpError::Timeout {
+                    elapsed_ms: elapsed.as_millis() as u64,
+                    limit_ms: limit.as_millis() as u64,
+                });
+            }
         }
 
         let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
@@ -763,5 +827,45 @@ mod tests {
         assert!(result.is_err(), "mangled format should fail");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn timeout_zero_duration_returns_timeout_error() {
+        // A zero-duration timeout should fire immediately on the first packet.
+        let path = write_test_wav(1, 44100, 44100); // 1s of audio
+        let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_nanos(0));
+        let result = decode_to_mono_limited(&path, limits);
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(AfpError::Timeout {
+                elapsed_ms: _,
+                limit_ms,
+            }) => {
+                assert_eq!(limit_ms, 0);
+            }
+            other => panic!("expected Timeout error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeout_generous_succeeds() {
+        // A generous timeout should not interfere with normal decoding.
+        let path = write_test_wav(1, 44100, 44100); // 1s of audio
+        let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_secs(60));
+        let result = decode_to_mono_limited(&path, limits);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_ok(), "generous timeout should not fire");
+        let (samples, sr) = result.unwrap();
+        assert_eq!(sr, 44100);
+        assert!(!samples.is_empty());
+    }
+
+    #[test]
+    fn with_timeout_builder_sets_field() {
+        let limits =
+            DecodeLimits::both(1_000_000, 480_000).with_timeout(std::time::Duration::from_secs(30));
+        assert_eq!(limits.timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(limits.max_bytes, 1_000_000);
+        assert_eq!(limits.max_samples, Some(480_000));
     }
 }

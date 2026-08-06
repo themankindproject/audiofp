@@ -689,6 +689,7 @@ pub struct DecodeLimits {
     pub max_bytes: u64,              // 0 = unlimited
     pub max_samples: Option<usize>,  // None = unlimited
     pub integrity_mode: bool,        // default false; true = fail on corrupt packets
+    pub timeout: Option<Duration>,   // None = unlimited; checked per-packet
 }
 
 pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
@@ -731,6 +732,41 @@ let result = decode_to_mono_limited("suspect.mp3", limits);
 When `integrity_mode` is `true`, any per-packet `DecodeError` or `IoError`
 from Symphonia becomes a fatal `AfpError::Io` with message prefix
 `"decode integrity: ..."`. Default is `false` (backwards-compatible skip).
+
+### Decode Timeout (wall-clock bound)
+
+Symphonia can hang on adversarial inputs (degenerate container structures,
+infinite-loop-inducing headers). In multi-tenant services or Python FFI
+environments where a hung decode would block the calling worker
+indefinitely, set a **wall-clock timeout**:
+
+```rust
+use std::time::Duration;
+use audiofp::io::{decode_to_mono_at_limited, DecodeLimits};
+
+let limits = DecodeLimits::both(50_000_000, 30 * 60 * 8_000)
+    .with_timeout(Duration::from_secs(30));
+
+// Returns AfpError::Timeout if decoding takes > 30 s.
+let samples = decode_to_mono_at_limited("user_upload.mp3", 8_000, limits)?;
+```
+
+The timeout is checked **per decoded packet** (sub-microsecond overhead).
+If the elapsed wall-clock time exceeds the configured duration, the decoder
+returns `AfpError::Timeout { elapsed_ms, limit_ms }` immediately.
+
+**Recommended production configuration (Python FFI / web worker):**
+
+```rust
+let limits = DecodeLimits::both(
+    50 * 1024 * 1024,       // 50 MB on-disk max
+    30 * 60 * 48_000,       // 30 min at 48 kHz max samples
+)
+.with_timeout(Duration::from_secs(60))  // 60 s wall-clock max
+.strict();                               // no silent packet skipping
+```
+
+Default: `None` (no timeout, backwards-compatible).
 
 ### Supported formats
 

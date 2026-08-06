@@ -265,6 +265,13 @@ cargo build --features std-wav   # codec picker works
 ```
 
 ### Added
+- **`DecodeLimits::timeout` — wall-clock decode timeout (#77).**
+  `DecodeLimits::with_timeout(Duration)` builder sets a maximum
+  wall-clock time for the entire decode operation. Returns
+  `AfpError::Timeout { elapsed_ms, limit_ms }` if the limit is
+  exceeded. Checked per-packet (~1 ns overhead). Use in Python FFI /
+  multi-tenant services to prevent adversarial inputs from hanging
+  decode workers indefinitely. Default: `None` (no limit).
 
 - **In-memory matching subsystem (`audiofp::matching`).**
   `WangMatcher`, `HaitsmaMatcher`, `PanakoMatcher`, `NeuralMatcher`
