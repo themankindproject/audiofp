@@ -319,12 +319,15 @@ cargo build --features std-wav   # codec picker works
   linear.
 - **Pre-sized `HashMap` in `HaitsmaIndex::build_lut`** — eliminates
   ~10 re-hashes during LUT construction for typical reference lengths.
-- **`power_flat_into` eliminates redundant zero-fill** — uses `set_len`
-  after `reserve` since all elements are immediately written by
-  `compute_power_wide`. Saves a memset of ~3.8 MB per 30 s extraction.
-- **`pack_frame_bits` eliminates bounds-check panics** — slice-to-array
-  conversions use `unwrap_or_else(unreachable_unchecked)` for the 16
-  per-frame SIMD loads whose indices are statically within bounds.
+- **Early-abort on perfect score** in `WangIndex::query`,
+  `HaitsmaIndex::query`, and `PanakoIndex::query` — when a reference
+  scores `>= 1.0`, return immediately without evaluating remaining
+  candidates.
+- **`min_votes` pre-filter** in `WangIndex::query` — references whose
+  total raw vote count is below `cfg.min_votes` are skipped before the
+  expensive consolidation + prominence + score pipeline.
+- **`min_votes` pre-filter** in `PanakoIndex::query` — sum of all bin
+  votes for a reference is checked before consolidation.
 - **`mem::take` instead of `hist.clone()`** when offset tolerance is 0.
 - **Sorted Vec + dedup** replaces `HashMap<u32, ()>` for contrib counting.
 - **`SortedPostings`** — Wang 1:1 self-match on 5 s audio: ~107 µs
