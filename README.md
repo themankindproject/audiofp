@@ -211,6 +211,28 @@ Neural front-end (`cargo bench --features neural --bench neural_frontend`):
 | `strided_tensor_write`        | 7.6 µs     |
 | `l2_normalize_1024d`          | 2.5 µs     |
 
+Matching (`cargo bench --bench matching`, 5 s synthetic fingerprints):
+
+| Path                           | Time       | Notes                                      |
+|--------------------------------|:----------:|--------------------------------------------|
+| `WangMatcher` 1:1 self-match  | ~111 µs    | Offset-histogram voting + prominence       |
+| `HaitsmaMatcher` 1:1 exact    | ~96 µs     | Exhaustive BER at best alignment           |
+| `PanakoMatcher` 1:1           | ~315 µs    | 2-D Hough + RANSAC line-fitting            |
+| `WangIndex` N=100 query       | ~102 µs    | Inverted index + sliding-window peak       |
+
+Latency budget (per query, default configs, Intel i5-1135G7):
+
+| Catalog size | `WangIndex` query | Throughput  |
+|:------------:|:-----------------:|:-----------:|
+| 100 tracks   | ~102 µs           | ~9 800 q/s  |
+| 1 000 tracks | ~1 ms (est.)      | ~1 000 q/s  |
+| 10 000 tracks| ~10 ms (est.)     | ~100 q/s    |
+
+> Index query scales approximately linearly with catalog size (one
+> candidate-scoring pass per reference with hash hits). For catalogs
+> above ~10 000 tracks, use `min_votes` / `min_score` pre-filters or
+> shard the index.
+
 Run benchmarks for your own host:
 ```bash
 cargo bench --bench extract

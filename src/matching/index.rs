@@ -182,6 +182,15 @@ impl WangIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         for (&ref_id, votes) in &per_ref {
+            // Quick pre-filter: if the total raw vote count for this
+            // reference is below min_votes, the consolidated peak can
+            // never reach the threshold either (consolidation can only
+            // redistribute votes, not create them). Skip the expensive
+            // binning + consolidation entirely.
+            if (votes.len() as u32) < cfg.min_votes {
+                continue;
+            }
+
             // Raw per-offset bin counts (sparse), sorted by offset so
             // all downstream steps (peak search, prominence, plateau
             // selection) are independent of HashMap iteration order
@@ -301,6 +310,10 @@ impl WangIndex {
             };
             if better {
                 best = Some((ref_id, result));
+                // Early-abort: a perfect score cannot be beaten.
+                if result.score >= 1.0 {
+                    return best;
+                }
             }
         }
 
@@ -482,6 +495,10 @@ impl HaitsmaIndex {
             };
             if better {
                 best = Some((ref_id, result));
+                // Early-abort: a perfect score cannot be beaten.
+                if result.score >= 1.0 {
+                    return best;
+                }
             }
         }
 
@@ -603,6 +620,14 @@ impl PanakoIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         for (&ref_id, bins) in &acc {
+            // Quick pre-filter: sum of all bin votes for this reference.
+            // If total is below min_votes, the consolidated peak cannot
+            // reach the threshold — skip expensive consolidation.
+            let total_votes: u32 = bins.values().sum();
+            if total_votes < cfg.min_votes {
+                continue;
+            }
+
             let bin_vec: Vec<((u32, i64), u32)> = bins.iter().map(|(&k, &v)| (k, v)).collect();
 
             // Find peak bin via neighbourhood consolidation. Build a
@@ -682,6 +707,10 @@ impl PanakoIndex {
             };
             if better {
                 best = Some((ref_id, result));
+                // Early-abort: a perfect score cannot be beaten.
+                if result.score >= 1.0 {
+                    return best;
+                }
             }
         }
 
