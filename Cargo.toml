@@ -6,6 +6,8 @@ rust-version = "1.93.0"
 license      = "MIT"
 description  = "Pure-Rust audio fingerprinting and identification: Wang, Panako, Haitsma–Kalker, ONNX neural embedder, AudioSeal watermark, and streaming variants. no_std + alloc capable, bytemuck-friendly hash types."
 repository   = "https://github.com/themankindproject/audiofp"
+homepage     = "https://github.com/themankindproject/audiofp"
+documentation = "https://docs.rs/audiofp"
 authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
 keywords     = ["audio", "fingerprint", "no-std", "shazam", "acoustid"]
 categories   = ["multimedia::audio", "algorithms"]
@@ -123,6 +125,10 @@ ahash       = { version = "0.8.11", default-features = false, features = ["compi
 symphonia   = { version = "0.6", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 approx    = "0.5.1"

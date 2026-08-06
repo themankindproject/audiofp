@@ -100,6 +100,8 @@
 //! for the complete API guide.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
+#![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 // The `std` feature is a bare dependency on Symphonia; codec support is
 // opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, …) or the
@@ -201,3 +203,57 @@ pub use fp::fingerprint_batch_parallel;
 /// assert_eq!(audiofp::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ---------------------------------------------------------------------------
+// Compile-time assertions: all public types must be Send + Sync so they are
+// usable in async contexts and can be shared across threads.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod send_sync_assertions {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_types_are_send_sync() {
+        // Error type
+        assert_send_sync::<AfpError>();
+
+        // Value types
+        assert_send_sync::<SampleRate>();
+        assert_send_sync::<TimestampMs>();
+        assert_send_sync::<matching::TimeOffset>();
+        assert_send_sync::<matching::MatchResult>();
+
+        // Hash/fingerprint types
+        assert_send_sync::<classical::WangHash>();
+        assert_send_sync::<classical::WangFingerprint>();
+        assert_send_sync::<classical::PanakoHash>();
+        assert_send_sync::<classical::PanakoFingerprint>();
+        assert_send_sync::<classical::HaitsmaFingerprint>();
+
+        // Extractors
+        assert_send_sync::<classical::Wang>();
+        assert_send_sync::<classical::Panako>();
+        assert_send_sync::<classical::Haitsma>();
+
+        // Streaming extractors
+        assert_send_sync::<classical::StreamingWang>();
+        assert_send_sync::<classical::StreamingPanako>();
+        assert_send_sync::<classical::StreamingHaitsma>();
+
+        // Matchers
+        assert_send_sync::<matching::WangMatcher>();
+        assert_send_sync::<matching::HaitsmaMatcher>();
+        assert_send_sync::<matching::PanakoMatcher>();
+
+        // Configs
+        assert_send_sync::<classical::WangConfig>();
+        assert_send_sync::<classical::PanakoConfig>();
+        assert_send_sync::<classical::HaitsmaConfig>();
+        assert_send_sync::<matching::WangMatchConfig>();
+        assert_send_sync::<matching::HaitsmaMatchConfig>();
+        assert_send_sync::<matching::PanakoMatchConfig>();
+    }
+}

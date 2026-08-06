@@ -1,4 +1,8 @@
 //! Generic ONNX log-mel embedder (offline / whole-buffer).
+//!
+//! This module uses limited `unsafe` for zero-copy Tract tensor
+//! initialization — the only path in the crate that requires it.
+#![allow(unsafe_code)]
 
 use crate::SampleRate;
 use alloc::format;
