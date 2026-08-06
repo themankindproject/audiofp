@@ -1,7 +1,8 @@
 //! Fast map aliases and sorted-posting helpers for matching hot paths.
 //!
-//! With the `std` feature, use [`std::collections::HashMap`] for
-//! O(1) expected lookups. Without `std`, fall back to [`alloc::collections::BTreeMap`]
+//! With the `std` feature, use [`ahash::HashMap`] (AHash-backed) for
+//! O(1) expected lookups with ~2-5× faster hashing than SipHash on
+//! integer keys. Without `std`, fall back to [`alloc::collections::BTreeMap`]
 //! so the matching module stays `no_std + alloc` capable.
 //!
 //! [`SortedPostings`] provides an alternative to `HashMap<u32, Vec<u32>>`
@@ -12,7 +13,7 @@
 extern crate alloc;
 
 #[cfg(feature = "std")]
-pub(crate) use std::collections::HashMap;
+pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::collections::BTreeMap as HashMap;
@@ -21,12 +22,26 @@ pub(crate) use alloc::collections::BTreeMap as HashMap;
 #[cfg(feature = "std")]
 #[inline]
 pub(crate) fn hashmap_with_capacity<K: core::hash::Hash + Eq, V>(cap: usize) -> HashMap<K, V> {
-    HashMap::with_capacity(cap)
+    HashMap::with_capacity_and_hasher(cap, ahash::RandomState::default())
+}
+
+/// Create an empty map.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn hashmap_new<K: core::hash::Hash + Eq, V>() -> HashMap<K, V> {
+    HashMap::with_hasher(ahash::RandomState::default())
 }
 
 #[cfg(not(feature = "std"))]
 #[inline]
 pub(crate) fn hashmap_with_capacity<K: Ord, V>(_cap: usize) -> HashMap<K, V> {
+    HashMap::new()
+}
+
+/// Create an empty map (BTreeMap fallback).
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn hashmap_new<K: Ord, V>() -> HashMap<K, V> {
     HashMap::new()
 }
 

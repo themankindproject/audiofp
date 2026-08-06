@@ -20,7 +20,7 @@ use crate::matching::{MatchResult, Matcher};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::matching::maps::HashMap;
+use crate::matching::maps::{HashMap, hashmap_new};
 
 /// Soft cap on votes recorded per reference in [`WangIndex::query`].
 ///
@@ -195,7 +195,7 @@ impl WangIndex {
             // all downstream steps (peak search, prominence, plateau
             // selection) are independent of HashMap iteration order
             // (audit 67-1).
-            let mut bins: HashMap<i64, u32> = HashMap::new();
+            let mut bins: HashMap<i64, u32> = hashmap_new();
             for &(d, _) in votes {
                 *bins.entry(d).or_insert(0) += 1;
             }
@@ -413,7 +413,7 @@ impl HaitsmaIndex {
         // 1. Gather candidate (ref_id, delta) pairs from LUT probes.
         //    Track how many query frames hit each candidate so we can
         //    pick the best one (heuristic for the BER path).
-        let mut candidates: HashMap<(usize, i64), u32> = HashMap::new();
+        let mut candidates: HashMap<(usize, i64), u32> = hashmap_new();
 
         for (q_pos, &q_frame) in q_frames.iter().enumerate() {
             if let Some(list) = self.lut.get(&q_frame) {
@@ -438,7 +438,7 @@ impl HaitsmaIndex {
         // On tied hit counts, prefer the δ with the smallest absolute
         // value (closest to zero alignment) so the winner is independent
         // of HashMap iteration order (audit B8).
-        let mut per_ref: HashMap<usize, (i64, u32)> = HashMap::new();
+        let mut per_ref: HashMap<usize, (i64, u32)> = hashmap_new();
         for (&(ref_id, delta), &hits) in &candidates {
             let entry = per_ref.entry(ref_id).or_insert((delta, hits));
             let better = hits > entry.1 || (hits == entry.1 && delta.abs() < entry.0.abs());
@@ -537,7 +537,7 @@ pub struct PanakoIndex {
 impl PanakoIndex {
     /// Build from a slice of Panako fingerprints.
     pub fn build(refs: &[crate::classical::PanakoFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = HashMap::new();
+        let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = hashmap_new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -585,7 +585,7 @@ impl PanakoIndex {
         let q_len = query.hashes.len().max(1) as f32;
 
         // Build per-reference sparse accumulator across ALL query hashes.
-        let mut acc: HashMap<usize, HashMap<(u32, i64), u32>> = HashMap::new();
+        let mut acc: HashMap<usize, HashMap<(u32, i64), u32>> = hashmap_new();
 
         for h in &query.hashes {
             let hh = h.hash; // copy out of packed struct (unaligned refs are UB)

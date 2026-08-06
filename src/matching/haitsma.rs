@@ -60,12 +60,30 @@ pub(crate) fn hamming_at_offset(
     let q_slice = &query[q_start..q_start + overlap];
     let r_slice = &reference[r_start..r_start + overlap];
 
+    // Process in chunks of 64 frames without a per-element early-abort.
+    // This allows LLVM to auto-vectorize the XOR + POPCNT into SIMD
+    // instructions (on x86: vpxor + vpopcntd or scalar popcnt unrolled).
+    // The early-abort check every 64 frames retains the short-circuit
+    // benefit while amortizing the branch cost.
     let mut hamming: u64 = 0;
-    for (qa, ra) in q_slice.iter().zip(r_slice.iter()) {
-        hamming += (qa ^ ra).count_ones() as u64;
+    let mut q_iter = q_slice.chunks_exact(64);
+    let mut r_iter = r_slice.chunks_exact(64);
+    for (q_chunk, r_chunk) in q_iter.by_ref().zip(r_iter.by_ref()) {
+        let mut block_sum: u64 = 0;
+        for (qa, ra) in q_chunk.iter().zip(r_chunk.iter()) {
+            block_sum += (qa ^ ra).count_ones() as u64;
+        }
+        hamming += block_sum;
         if hamming > best_sofar {
             return u64::MAX;
         }
+    }
+    // Scalar tail (< 64 remaining frames).
+    for (qa, ra) in q_iter.remainder().iter().zip(r_iter.remainder().iter()) {
+        hamming += (qa ^ ra).count_ones() as u64;
+    }
+    if hamming > best_sofar {
+        return u64::MAX;
     }
     hamming
 }

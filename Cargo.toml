@@ -64,7 +64,7 @@ default = []
 # default build no_std + alloc and avoids paying the compile time for codecs
 # you never use. Without at least one codec feature, `audiofp::io` is not
 # available (see the `compile_error!` in `src/lib.rs`).
-std = ["dep:symphonia"]
+std = ["dep:symphonia", "dep:ahash"]
 std-mp3 = ["std", "symphonia/mp3"]
 std-aac = ["std", "symphonia/aac"]
 std-flac = ["std", "symphonia/flac"]
@@ -119,6 +119,7 @@ num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
 wide        = { version = "1.5.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive"] }
+ahash       = { version = "0.8.11", default-features = false, features = ["compile-time-rng"], optional = true }
 symphonia   = { version = "0.6", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }

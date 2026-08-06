@@ -1,0 +1,10 @@
+# Benchmark and release builds: instruct LLVM to use the host CPU's full
+# instruction set (AVX2, AVX-512, NEON, etc.). This unlocks hardware
+# popcount, FMA, and wider SIMD lanes for `wide::f32x8` and realfft.
+#
+# NOTE: Binaries produced with target-cpu=native are NOT portable.
+# Remove or override this file when cross-compiling or publishing to
+# crates.io. Published crate users get baseline (SSE2/NEON).
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
+rustflags = ["-C", "target-cpu=native"]

@@ -37,7 +37,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::classical::PanakoFingerprint;
-use crate::matching::maps::HashMap;
+use crate::matching::maps::{HashMap, hashmap_new};
 use crate::matching::{
     MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence, frames_per_sec_compatible,
 };
@@ -130,7 +130,7 @@ impl Matcher for PanakoMatcher {
 
         // --- 1. Index reference hashes ---
         // Keyed by hash; each posting stores the full triplet timestamps.
-        let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = HashMap::new();
+        let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = hashmap_new();
         for h in &reference.hashes {
             index
                 .entry(h.hash)
@@ -160,7 +160,7 @@ impl Matcher for PanakoMatcher {
         let eps_scale = scale_per_bin * 0.5;
 
         // Accumulator: (scale_bin, offset_bin) → vote count
-        let mut acc: HashMap<(u32, i64), u32> = HashMap::new();
+        let mut acc: HashMap<(u32, i64), u32> = hashmap_new();
         // Candidate anchor pairs for RANSAC: (t_query_anchor, t_ref_anchor).
         let mut pairs: Vec<(f64, f64)> = Vec::new();
         let tol = cfg.offset_tolerance_frames as i64;
