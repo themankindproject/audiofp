@@ -371,6 +371,20 @@ pub(crate) fn validate_config(cfg: &PanakoMatchConfig) {
 ///
 /// Returns `(scale, offset, inlier_count)`. When fewer than 2 pairs are
 /// available or no valid model is found, returns `(coarse_s, coarse_b, 0)`
+/// Count inliers for a candidate line `t_ref = s * t_query + b`.
+/// Written as a tight loop without per-element branching so LLVM can
+/// auto-vectorize the abs-diff + compare into SIMD instructions.
+#[inline]
+fn count_inliers_wide(pairs: &[(f64, f64)], s: f64, b: f64, tol: f64) -> u32 {
+    let mut count: u32 = 0;
+    for &(tq, tr) in pairs {
+        let predicted = s * tq + b;
+        // Branchless: cast bool to u32 — allows LLVM to vectorize.
+        count += ((tr - predicted).abs() <= tol) as u32;
+    }
+    count
+}
+
 /// so the caller can fall back to the Hough peak geometry without mixing
 /// the RANSAC score with the Hough vote count (audit B4).
 ///
@@ -423,13 +437,7 @@ fn ransac_refine(
         }
         let b = tr1 - s as f64 * tq1;
 
-        let mut inliers = 0u32;
-        for &(tq, tr) in pairs {
-            let predicted = s as f64 * tq + b;
-            if (tr - predicted).abs() <= inlier_tol {
-                inliers += 1;
-            }
-        }
+        let inliers = count_inliers_wide(pairs, s as f64, b, inlier_tol);
 
         if inliers > best_inliers {
             best_inliers = inliers;
