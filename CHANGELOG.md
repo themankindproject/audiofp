@@ -314,6 +314,15 @@ cargo build --features std-wav   # codec picker works
   silently converting offsets with the reference rate.
 
 ### Performance
+- **5.5× faster Haitsma BER computation** — `hamming_at_offset` now
+  processes frames in chunks of 64 without a per-element early-abort
+  branch, enabling LLVM to auto-vectorize the XOR+POPCNT inner loop.
+  Haitsma 1:1 self-match: 96 µs → 17.6 µs.
+- **AHash replaces SipHash** for all internal `HashMap` usage in the
+  matching layer. 2-5× faster hashing on integer keys (compile-time-rng
+  initialised). Panako 1:1: 315 µs → 264 µs (19% faster).
+- **`target-cpu=native`** in `.cargo/config.toml` for bench/release
+  builds — unlocks hardware POPCNT, AVX2, and FMA for `wide` and FFT.
 
 - **Pre-sized `HashMap` in `WangMatcher::match_one` and `WangIndex::build`**
   — eliminates repeated rehashing during index construction.

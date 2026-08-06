@@ -216,8 +216,8 @@ Matching (`cargo bench --bench matching`, 5 s synthetic fingerprints):
 | Path                           | Time       | Notes                                      |
 |--------------------------------|:----------:|--------------------------------------------|
 | `WangMatcher` 1:1 self-match  | ~111 µs    | Offset-histogram voting + prominence       |
-| `HaitsmaMatcher` 1:1 exact    | ~96 µs     | Exhaustive BER at best alignment           |
-| `PanakoMatcher` 1:1           | ~315 µs    | 2-D Hough + RANSAC line-fitting            |
+| `HaitsmaMatcher` 1:1 exact    | ~18 µs     | Exhaustive BER at best alignment           |
+| `PanakoMatcher` 1:1           | ~264 µs    | 2-D Hough + RANSAC line-fitting            |
 | `WangIndex` N=100 query       | ~102 µs    | Inverted index + sliding-window peak       |
 
 Latency budget (per query, default configs, Intel i5-1135G7):
