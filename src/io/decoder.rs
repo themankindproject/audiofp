@@ -330,7 +330,9 @@ fn decode_inner(
             let spec = decoded.spec().clone();
             convert_buf = Some(AudioBuffer::<f32>::new(spec, needed_cap));
         }
-        let buf = convert_buf.as_mut().unwrap();
+        let buf = convert_buf
+            .as_mut()
+            .expect("convert_buf initialized above when needs_buf is true");
 
         // In symphonia 0.6, copy_to requires the destination to have the
         // same frame count as the source. Set it before copying.
@@ -358,13 +360,17 @@ fn decode_inner(
         }
 
         if n_chans == 1 {
-            samples.extend_from_slice(&buf.plane(0).unwrap()[..n_frames]);
+            samples.extend_from_slice(
+                &buf.plane(0).expect("decoded buffer must have plane 0")[..n_frames],
+            );
         } else {
             samples.reserve(n_frames);
             for i in 0..n_frames {
                 let mut sum = 0.0_f32;
                 for c in 0..n_chans {
-                    sum += buf.plane(c).unwrap()[i];
+                    sum += buf
+                        .plane(c)
+                        .expect("decoded buffer must have plane for each channel")[i];
                 }
                 samples.push(sum / n_chans as f32);
             }

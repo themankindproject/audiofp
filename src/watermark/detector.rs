@@ -200,11 +200,10 @@ impl WatermarkDetector {
             return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
         let n = samples.len();
-        if self.cfg.max_input_samples.is_some_and(|limit| n > limit) {
-            return Err(AfpError::InputTooLarge {
-                limit: self.cfg.max_input_samples.unwrap(),
-                provided: n,
-            });
+        if let Some(limit) = self.cfg.max_input_samples
+            && n > limit
+        {
+            return Err(AfpError::InputTooLarge { limit, provided: n });
         }
         if n == 0 {
             return Err(AfpError::AudioTooShort { needed: 1, got: 0 });
@@ -236,7 +235,11 @@ impl WatermarkDetector {
             self.cached = Some((n, runnable));
         }
 
-        let runnable = &self.cached.as_ref().unwrap().1;
+        let runnable = &self
+            .cached
+            .as_ref()
+            .expect("cached runnable set in block above")
+            .1;
 
         let outputs = runnable
             .run(tvec!(input_tensor.into()))

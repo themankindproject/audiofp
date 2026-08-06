@@ -367,13 +367,10 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
                             && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
                 });
                 targets.insert(pos, *target);
-            } else if target.mag > targets.last().unwrap().mag
-                || (target.mag == targets.last().unwrap().mag
-                    && (target.t_frame, target.f_bin)
-                        < (
-                            targets.last().unwrap().t_frame,
-                            targets.last().unwrap().f_bin,
-                        ))
+            } else if let Some(last) = targets.last()
+                && (target.mag > last.mag
+                    || (target.mag == last.mag
+                        && (target.t_frame, target.f_bin) < (last.t_frame, last.f_bin)))
             {
                 let pos = targets.partition_point(|p| {
                     p.mag > target.mag

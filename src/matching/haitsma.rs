@@ -87,7 +87,7 @@ pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
 
 /// Build a LUT: `u32` sub-fingerprint → list of reference frame indices.
 fn build_lut(reference: &[u32]) -> HashMap<u32, Vec<usize>> {
-    let mut lut: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut lut: HashMap<u32, Vec<usize>> = super::maps::hashmap_with_capacity(reference.len() / 2);
     for (pos, &frame) in reference.iter().enumerate() {
         lut.entry(frame).or_default().push(pos);
     }

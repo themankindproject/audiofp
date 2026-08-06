@@ -211,7 +211,10 @@ impl Matcher for PanakoMatcher {
         // neighbourhood-aware peak selection and the Wang gold standard
         // (audit B5).
         let tol_i64 = tol;
-        let acc_vec: Vec<((u32, i64), u32)> = acc.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut acc_vec: Vec<((u32, i64), u32)> = acc.iter().map(|(&k, &v)| (k, v)).collect();
+        // Sort by (s_bin, off_key) so we can use a sliding window on
+        // the offset dimension within each scale-bin neighbourhood.
+        acc_vec.sort_unstable_by_key(|&((s, o), _)| (s, o));
 
         let mut consolidated: Vec<u32> = vec![0u32; acc_vec.len()];
         let mut peak_votes = 0u32;
@@ -219,10 +222,36 @@ impl Matcher for PanakoMatcher {
 
         for (i, &((s_bin, off_key), _)) in acc_vec.iter().enumerate() {
             let mut neigh_votes = 0u32;
-            for &((ns, no), v) in &acc_vec {
-                let ds = ns.abs_diff(s_bin);
-                let doff = (no - off_key).abs();
-                if ds <= 1 && doff <= tol_i64 {
+            // Since acc_vec is sorted by (s_bin, off_key), bins with
+            // ds <= 1 are clustered. Scan forward/backward from i to
+            // find neighbours within the scale ± 1 and offset ± tol
+            // window. This is O(W) per element where W is the
+            // neighbourhood size (typically small), giving O(B·W) total
+            // instead of O(B²).
+            //
+            // Scan backward from i.
+            let mut j = i;
+            loop {
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+                let ((ns, no), v) = acc_vec[j];
+                if s_bin.saturating_sub(ns) > 1 {
+                    break;
+                }
+                if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
+                    neigh_votes += v;
+                }
+            }
+            // Centre element.
+            neigh_votes += acc_vec[i].1;
+            // Scan forward from i.
+            for &((ns, no), v) in &acc_vec[(i + 1)..] {
+                if ns.saturating_sub(s_bin) > 1 {
+                    break;
+                }
+                if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
                     neigh_votes += v;
                 }
             }

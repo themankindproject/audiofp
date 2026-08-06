@@ -337,10 +337,26 @@ fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS])
 
     for chunk in 0..4 {
         let off = chunk * 8;
-        let curr_lo = f32x8::new(curr[off..off + 8].try_into().unwrap());
-        let curr_hi = f32x8::new(curr[off + 1..off + 9].try_into().unwrap());
-        let prev_lo = f32x8::new(prev[off..off + 8].try_into().unwrap());
-        let prev_hi = f32x8::new(prev[off + 1..off + 9].try_into().unwrap());
+        let curr_lo = f32x8::new(
+            curr[off..off + 8]
+                .try_into()
+                .expect("curr[off..off+8] is exactly 8 elements: 33-band array with chunk<4"),
+        );
+        let curr_hi = f32x8::new(
+            curr[off + 1..off + 9]
+                .try_into()
+                .expect("curr[off+1..off+9] is exactly 8 elements: 33-band array with chunk<4"),
+        );
+        let prev_lo = f32x8::new(
+            prev[off..off + 8]
+                .try_into()
+                .expect("prev[off..off+8] is exactly 8 elements: 33-band array with chunk<4"),
+        );
+        let prev_hi = f32x8::new(
+            prev[off + 1..off + 9]
+                .try_into()
+                .expect("prev[off+1..off+9] is exactly 8 elements: 33-band array with chunk<4"),
+        );
 
         // diff[i] = (curr[i] - curr[i+1]) - (prev[i] - prev[i+1])
         let diff = (curr_lo - curr_hi) - (prev_lo - prev_hi);

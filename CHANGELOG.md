@@ -7,29 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Documentation
-
-- **Comment cleanup across the crate** — removed redundant comments
-  that merely restated the code (band-energy loop, bin-index arithmetic,
-  SIMD power expression, LUT probing, stop-hash pruning, decoder
-  packet-skip branches, watermark runnable caching), merged a duplicated
-  `StreamingHaitsma` doc block, and added genuine comments where
-  non-obvious logic was unexplained (Wang's inclusive target-zone
-  emission bound, Panako's post-truncation `(t, f)` re-sort, Haitsma's
-  `< 2` frames threshold, polyphase kernel scaling and `wrapping_sub`
-  safety, histogram OOM cap / vote wrap, RANSAC iteration budget,
-  half-bin scale slack, BER-prominence sentinels, DTW tempo ratio, the
-  decoder's `ResetRequired` and track-id handling, peak-picker deque /
-  plateau `>=` semantics, serialisation trailing-bytes tolerance, mel
-  normalisation floor).
-- **Fixed misleading doc comments** — `decode_to_mono` had swapped
-  `# Example` / `# Security` sections; the neural module example claimed
-  16 kHz while passing `HZ_8000`; the `MatchResult::prominence` doc
-  misstated the Haitsma matcher's formula (it uses `median_BER / (BER +
-  ε)`, only the index path uses `0.5 / BER`).
-
-## [0.4.0] - 2026-08-02
-
 ### Breaking
 
 - **`AudioBuffer` removed** (#65) — `Fingerprinter::extract`,
@@ -333,12 +310,46 @@ cargo build --features std-wav   # codec picker works
 
 - **Pre-sized `HashMap` in `WangMatcher::match_one` and `WangIndex::build`**
   — eliminates repeated rehashing during index construction.
-- **O(B²) → O(B log B) consolidation** in `WangIndex::query` via sorted
-  sliding window (10–100× faster for dense collision scenarios).
+- **O(B²) → O(B) consolidation** in `WangIndex::query` via sorted
+  sliding window (previously quadratic in number of distinct offsets;
+  now linear regardless of hash-collision density).
+- **O(B²) → O(B·W) consolidation** in `PanakoMatcher::match_one` —
+  sorted accumulator with bounded-radius scan replaces full pairwise
+  comparison. Typical W is 5-15 for musical inputs, so effectively
+  linear.
+- **Pre-sized `HashMap` in `HaitsmaIndex::build_lut`** — eliminates
+  ~10 re-hashes during LUT construction for typical reference lengths.
+- **`power_flat_into` eliminates redundant zero-fill** — uses `set_len`
+  after `reserve` since all elements are immediately written by
+  `compute_power_wide`. Saves a memset of ~3.8 MB per 30 s extraction.
+- **`pack_frame_bits` eliminates bounds-check panics** — slice-to-array
+  conversions use `unwrap_or_else(unreachable_unchecked)` for the 16
+  per-frame SIMD loads whose indices are statically within bounds.
 - **`mem::take` instead of `hist.clone()`** when offset tolerance is 0.
 - **Sorted Vec + dedup** replaces `HashMap<u32, ()>` for contrib counting.
 - **`SortedPostings`** — Wang 1:1 self-match on 5 s audio: ~107 µs
   (single allocation vs N+1 per unique hash).
+
+### Documentation
+
+- **Comment cleanup across the crate** — removed redundant comments
+  that merely restated the code (band-energy loop, bin-index arithmetic,
+  SIMD power expression, LUT probing, stop-hash pruning, decoder
+  packet-skip branches, watermark runnable caching), merged a duplicated
+  `StreamingHaitsma` doc block, and added genuine comments where
+  non-obvious logic was unexplained (Wang's inclusive target-zone
+  emission bound, Panako's post-truncation `(t, f)` re-sort, Haitsma's
+  `< 2` frames threshold, polyphase kernel scaling and `wrapping_sub`
+  safety, histogram OOM cap / vote wrap, RANSAC iteration budget,
+  half-bin scale slack, BER-prominence sentinels, DTW tempo ratio, the
+  decoder's `ResetRequired` and track-id handling, peak-picker deque /
+  plateau `>=` semantics, serialisation trailing-bytes tolerance, mel
+  normalisation floor).
+- **Fixed misleading doc comments** — `decode_to_mono` had swapped
+  `# Example` / `# Security` sections; the neural module example claimed
+  16 kHz while passing `HZ_8000`; the `MatchResult::prominence` doc
+  misstated the Haitsma matcher's formula (it uses `median_BER / (BER +
+  ε)`, only the index path uses `0.5 / BER`).
 
 ## [0.3.9] - 2026-08-02
 
@@ -1708,7 +1719,7 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[0.4.0]: https://github.com/themankindproject/audiofp/compare/v0.3.9...v0.4.0
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.3.9...HEAD
 [0.3.9]: https://github.com/themankindproject/audiofp/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/themankindproject/audiofp/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/themankindproject/audiofp/compare/v0.3.6...v0.3.7

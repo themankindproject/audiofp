@@ -325,7 +325,10 @@ impl EmbedderCore {
 
         let mut scratch = Vec::with_capacity(embedding_dim);
         for (b, ts) in timestamps.iter().enumerate().take(batch) {
-            let slice = &view.as_slice().unwrap()[b * embedding_dim..(b + 1) * embedding_dim];
+            let slice = &view
+                .as_slice()
+                .expect("output tensor must be contiguous f32")
+                [b * embedding_dim..(b + 1) * embedding_dim];
             scratch.clear();
             scratch.extend_from_slice(slice);
 

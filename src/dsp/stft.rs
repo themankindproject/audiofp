@@ -476,8 +476,16 @@ fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
 
     for i in 0..chunks {
         let off = i * 8;
-        let s = f32x8::new(src[off..off + 8].try_into().unwrap());
-        let w = f32x8::new(win[off..off + 8].try_into().unwrap());
+        let s = f32x8::new(
+            src[off..off + 8]
+                .try_into()
+                .expect("src chunk is exactly 8 elements: loop iterates complete chunks of n/8"),
+        );
+        let w = f32x8::new(
+            win[off..off + 8]
+                .try_into()
+                .expect("win chunk is exactly 8 elements: loop iterates complete chunks of n/8"),
+        );
         let r = s * w;
         dst[off..off + 8].copy_from_slice(r.as_array());
     }

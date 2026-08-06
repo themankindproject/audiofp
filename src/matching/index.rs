@@ -194,25 +194,51 @@ impl WangIndex {
             bin_vec.sort_unstable_by_key(|&(d, _)| d);
 
             // Consolidated peak with a parallel consolidated-values
-            // vector (audit 67-2): peak selection sums ±tol neighbours,
-            // so prominence must be computed on the same consolidated
-            // values, not on raw bin counts. This matches WangMatcher's
-            // prefix-sum consolidation on the dense histogram.
+            // vector: peak selection sums ±tol neighbours, so prominence
+            // must be computed on the same consolidated values, not on raw
+            // bin counts. This matches WangMatcher's prefix-sum
+            // consolidation on the dense histogram.
+            //
+            // O(B) sliding-window approach: since bin_vec is sorted by
+            // offset, we maintain a window [lo, hi) where all offsets are
+            // within ±tol of the current centre. The running sum is updated
+            // incrementally as the centre advances.
             let mut consolidated: Vec<u32> = vec![0u32; bin_vec.len()];
             let mut peak_votes = 0u32;
             let mut peak_linear_idx = 0usize;
 
-            for (i, &(d0, _)) in bin_vec.iter().enumerate() {
-                let mut s = 0u32;
-                for &(d, c) in &bin_vec {
-                    if (d - d0).abs() <= tol {
-                        s += c;
+            if tol == 0 {
+                // Fast path: no neighbourhood, each bin stands alone.
+                for (i, &(_, c)) in bin_vec.iter().enumerate() {
+                    consolidated[i] = c;
+                    if c > peak_votes {
+                        peak_votes = c;
+                        peak_linear_idx = i;
                     }
                 }
-                consolidated[i] = s;
-                if s > peak_votes {
-                    peak_votes = s;
-                    peak_linear_idx = i;
+            } else {
+                // Sliding window: advance lo/hi pointers as centre moves.
+                let mut lo: usize = 0;
+                let mut hi: usize = 0;
+                let mut window_sum: u32 = 0;
+
+                for i in 0..bin_vec.len() {
+                    let d0 = bin_vec[i].0;
+                    // Expand hi to include all offsets ≤ d0 + tol.
+                    while hi < bin_vec.len() && bin_vec[hi].0 <= d0 + tol {
+                        window_sum += bin_vec[hi].1;
+                        hi += 1;
+                    }
+                    // Shrink lo to exclude offsets < d0 - tol.
+                    while lo < bin_vec.len() && bin_vec[lo].0 < d0 - tol {
+                        window_sum -= bin_vec[lo].1;
+                        lo += 1;
+                    }
+                    consolidated[i] = window_sum;
+                    if window_sum > peak_votes {
+                        peak_votes = window_sum;
+                        peak_linear_idx = i;
+                    }
                 }
             }
 

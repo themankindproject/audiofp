@@ -782,7 +782,7 @@ impl StreamingPanako {
                                 .then_with(|| (b.t_frame, b.f_bin).cmp(&(a.t_frame, a.f_bin)))
                         })
                         .map(|(i, _)| i)
-                        .unwrap();
+                        .expect("targets non-empty after cap check");
                     anchor.targets.swap_remove(min_idx);
                 }
             }

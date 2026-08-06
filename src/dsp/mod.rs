@@ -56,7 +56,11 @@ pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
 
     for i in 0..chunks {
         let off = i * 8;
-        let v = f32x8::new(buf[off..off + 8].try_into().unwrap());
+        let v = f32x8::new(
+            buf[off..off + 8]
+                .try_into()
+                .expect("buf chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
         let clamped = v.max(floor_v);
         let db = factor_v * clamped.log2();
         buf[off..off + 8].copy_from_slice(db.as_array());
@@ -84,8 +88,16 @@ pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = f32x8::ZERO;
     for i in 0..chunks {
         let off = i * 8;
-        let va = f32x8::new(a[off..off + 8].try_into().unwrap());
-        let vb = f32x8::new(b[off..off + 8].try_into().unwrap());
+        let va = f32x8::new(
+            a[off..off + 8]
+                .try_into()
+                .expect("a chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
+        let vb = f32x8::new(
+            b[off..off + 8]
+                .try_into()
+                .expect("b chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
         acc = va.mul_add(vb, acc);
     }
 
@@ -113,8 +125,16 @@ pub(crate) fn dot_sq_wide(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = f32x8::ZERO;
     for i in 0..chunks {
         let off = i * 8;
-        let va = f32x8::new(a[off..off + 8].try_into().unwrap());
-        let vb = f32x8::new(b[off..off + 8].try_into().unwrap());
+        let va = f32x8::new(
+            a[off..off + 8]
+                .try_into()
+                .expect("a chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
+        let vb = f32x8::new(
+            b[off..off + 8]
+                .try_into()
+                .expect("b chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
         let vb_sq = vb * vb;
         acc = va.mul_add(vb_sq, acc);
     }
