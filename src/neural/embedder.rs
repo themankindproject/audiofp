@@ -831,9 +831,7 @@ mod tests {
         assert_eq!(cfg.batch_size, 1);
     }
 
-    // -----------------------------------------------------------------
     // Public API contract pin.
-    // -----------------------------------------------------------------
 
     #[test]
     fn public_api_name_matches_documented_value() {
@@ -847,19 +845,10 @@ mod tests {
         assert_eq!(fp.min_samples(), 16_000);
     }
 
-    // -----------------------------------------------------------------
     // Happy-path coverage of the offline `extract` method.
-    //
-    // The existing in-module tests only hit error paths (no model,
-    // corrupt model, bad config). The streaming path is well-exercised
-    // by `src/neural/streaming.rs::tests`, but the offline `extract`
-    // end-to-end (front-end → strided tensor write → runnable →
-    // embedding collection → L2 normalisation) was not directly
-    // tested with a real (tract-built) runnable. This test uses the
-    // in-process passthrough fixture, which models a real
-    // input-pass-through model so the strided write + L2 path is
-    // actually exercised.
-    // -----------------------------------------------------------------
+    // Uses the in-process passthrough fixture to exercise the full pipeline
+    // (front-end → strided tensor write → runnable → L2 normalisation)
+    // without needing a real ONNX model file.
 
     #[test]
     fn offline_extract_produces_normalised_embeddings_of_expected_shape() {
@@ -897,9 +886,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Batched inference tests.
-    // -----------------------------------------------------------------
 
     #[test]
     fn zero_batch_size_is_rejected() {

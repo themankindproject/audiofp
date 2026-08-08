@@ -897,7 +897,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Direct unit tests for `IncrementalPeakDetector`.
     //
     // These pin the contract of the post-226e0f2 failable reads in
@@ -909,7 +908,6 @@ mod tests {
     // rolling max for every (kt, kf, n_bins) combination, and the
     // stream of ripe rows must be contiguous (kt, kt+1, …, n_pushed-1)
     // with no duplicates between `push_row` and `flush`.
-    // -----------------------------------------------------------------
 
     #[test]
     fn incremental_returns_none_until_window_fills_then_some() {

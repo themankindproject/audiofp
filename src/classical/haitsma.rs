@@ -935,9 +935,7 @@ mod tests {
         assert_eq!(s.pending.len(), 0, "pending after flush");
     }
 
-    // -----------------------------------------------------------------
     // Public API contract pins. See wang.rs for motivation.
-    // -----------------------------------------------------------------
 
     #[test]
     fn public_api_name_and_config_match_documented_values() {
@@ -969,14 +967,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Constructor panic coverage.
     //
     // `Haitsma::new` (used by the `Haitsma` extractor) validates
     // `fmin > 0`, `fmax > fmin`, and `fmax < Nyquist`. The latter two
     // are already covered by `invalid_band_range_returns_config_error`
     // and `fmax_above_nyquist_returns_config_error`. The fmin>0 case:
-    // -----------------------------------------------------------------
 
     #[test]
     fn haitsma_new_rejects_zero_fmin() {

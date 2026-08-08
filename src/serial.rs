@@ -30,10 +30,6 @@ use crate::classical::{
 };
 use crate::{AfpError, Result};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Magic header identifying an `audiofp` binary fingerprint blob.
 const MAGIC: [u8; 8] = *b"AUDIOFP\0";
 
@@ -47,10 +43,6 @@ const HEADER_SIZE: usize = 8 + 1 + 1 + 4 + 4;
 const ALG_WANG: u8 = 0;
 const ALG_PANAKO: u8 = 1;
 const ALG_HAITSMA: u8 = 2;
-
-// ---------------------------------------------------------------------------
-// FingerprintEnvelope
-// ---------------------------------------------------------------------------
 
 /// Metadata envelope for a serialized fingerprint.
 ///
@@ -83,10 +75,6 @@ pub struct FingerprintEnvelope {
     /// Number of hashes (or frames, for Haitsma) in the fingerprint.
     pub hash_count: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 /// Write the fixed header into a pre-allocated `Vec<u8>`.
 fn write_header(buf: &mut Vec<u8>, alg_id: u8, hash_count: u32, fps: f32) {
@@ -149,10 +137,6 @@ fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     vec
 }
 
-// ---------------------------------------------------------------------------
-// WangFingerprint serialization
-// ---------------------------------------------------------------------------
-
 impl WangFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     ///
@@ -205,10 +189,6 @@ impl WangFingerprint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PanakoFingerprint serialization
-// ---------------------------------------------------------------------------
-
 impl PanakoFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -259,10 +239,6 @@ impl PanakoFingerprint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HaitsmaFingerprint serialization
-// ---------------------------------------------------------------------------
-
 impl HaitsmaFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -312,10 +288,6 @@ impl HaitsmaFingerprint {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

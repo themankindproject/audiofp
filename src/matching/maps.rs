@@ -48,10 +48,6 @@ pub(crate) fn hashmap_new<K: Ord, V>() -> HashMap<K, V> {
 use alloc::vec;
 use alloc::vec::Vec;
 
-// ---------------------------------------------------------------------------
-// SortedPostings — flat sorted arrays + binary search
-// ---------------------------------------------------------------------------
-
 /// A sorted inverted index for `(hash, t_anchor)` pairs.
 ///
 /// Replaces `HashMap<hash, Vec<t_anchor>>` with a single sort + three
@@ -179,10 +175,6 @@ impl SortedPostings {
         self.hashes.len()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

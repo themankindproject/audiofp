@@ -25,7 +25,6 @@
 //!
 //! let samples: alloc::vec::Vec<f32> = alloc::vec![0.0_f32; 8_000 * 4];
 //! let mut wang = Wang::default();
-
 //! let q = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
 //! let r = q.clone();
 //!
@@ -58,10 +57,6 @@ mod index;
 pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
 
 mod maps;
-
-// ---------------------------------------------------------------------------
-// Common types
-// ---------------------------------------------------------------------------
 
 /// Signed time offset of the query relative to the reference.
 ///
@@ -148,10 +143,6 @@ impl MatchResult {
     };
 }
 
-// ---------------------------------------------------------------------------
-// The Matcher trait
-// ---------------------------------------------------------------------------
-
 /// One matcher per fingerprinting algorithm.
 ///
 /// Implementors are **infallible** — empty or degenerate fingerprints
@@ -199,10 +190,6 @@ pub(crate) fn frames_per_sec_compatible(a: f32, b: f32) -> bool {
     let scale = a.abs().max(b.abs());
     (a - b).abs() <= FPS_REL_EPS * scale
 }
-
-// ---------------------------------------------------------------------------
-// Score ordering helpers
-// ---------------------------------------------------------------------------
 
 /// Compare two `f32` scores safely (NaN-proof).
 ///
@@ -261,10 +248,6 @@ pub fn compute_prominence(values: &[u32], peak_idx: usize) -> f32 {
     };
     peak / (mean_rest + 1.0)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

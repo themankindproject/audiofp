@@ -252,7 +252,7 @@ mod tests {
     use crate::SampleRate;
     use crate::neural::test_support::{passthrough_streaming, small_cfg, synth_audio};
 
-    // ---------- Error path coverage (no model needed) ----------
+    // Error path coverage (no model needed).
 
     #[test]
     fn missing_model_propagates_through_streaming_constructor() {
@@ -274,7 +274,7 @@ mod tests {
         }
     }
 
-    // ---------- Behaviour tests via passthrough fixture ----------
+    // Behaviour tests via passthrough fixture.
 
     fn fixture() -> StreamingNeuralEmbedder {
         passthrough_streaming(small_cfg()).expect("fixture builds")
@@ -396,7 +396,7 @@ mod tests {
         }
     }
 
-    // ---------- Offline / streaming bit-exactness ----------
+    // Offline / streaming bit-exactness.
 
     #[test]
     fn streaming_matches_offline_on_full_buffer() {

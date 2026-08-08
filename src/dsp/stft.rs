@@ -732,7 +732,6 @@ mod tests {
         s.process_frame_power(&frame, &mut out).unwrap();
     }
 
-    // -----------------------------------------------------------------
     // `power_flat` / `power_flat_into` direct coverage.
     //
     // These two functions are the inputs to the Wang/Panako/Haitsma
@@ -741,7 +740,6 @@ mod tests {
     // identity `power = |magnitude|²` (modulo float-rounding), which
     // is the contract that lets the hash builders skip the redundant
     // `sqrt`.
-    // -----------------------------------------------------------------
 
     #[test]
     fn power_flat_matches_magnitude_squared() {

@@ -1505,14 +1505,12 @@ mod tests {
         assert_eq!(s.pending_anchors.len(), 0);
     }
 
-    // -----------------------------------------------------------------
     // Direct unit tests for `emit_finalized_anchors`.
     //
     // Same re-queue invariant as the wang.rs counterpart. See the
     // comment block there for motivation; this is the Panako
     // mirror. Panako's `last_target_frame = t + (target_zone_t - 1)`
     // (strict `dt < target_zone_t`).
-    // -----------------------------------------------------------------
 
     fn panako_anchor_with_target(
         t_frame: u32,
@@ -1614,9 +1612,7 @@ mod tests {
         assert!(s.pending_anchors.is_empty());
     }
 
-    // -----------------------------------------------------------------
     // Public API contract pins. See wang.rs for motivation.
-    // -----------------------------------------------------------------
 
     #[test]
     fn public_api_name_and_config_match_documented_values() {

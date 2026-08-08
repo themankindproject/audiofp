@@ -139,10 +139,6 @@ pub enum AfpError {
     Io(String),
 }
 
-// ---------------------------------------------------------------------------
-// IoError — structured I/O error (std only)
-// ---------------------------------------------------------------------------
-
 /// Structured I/O error with path and source.
 #[cfg(feature = "std")]
 #[derive(Debug)]
@@ -209,10 +205,6 @@ impl AfpError {
         AfpError::Io(IoError::new(path, source))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Model-loading helpers (shared by `neural` and `watermark` features)
-// ---------------------------------------------------------------------------
 
 /// Map a failed filesystem open into the appropriate [`AfpError`] variant.
 ///
@@ -310,13 +302,7 @@ mod tests {
         assert_eq!(f(21).unwrap(), 42);
     }
 
-    // -----------------------------------------------------------------
-    // Display formatting for variants that were previously untested.
-    //
-    // Each `assert_eq!` pins the exact `Display` text so a future
-    // `thiserror` annotation change is caught. The `to_string` of
-    // every public error variant is part of the contract.
-    // -----------------------------------------------------------------
+    // Pin the Display text so a future thiserror annotation change is caught.
 
     #[test]
     fn unsupported_channels_displays_the_count() {

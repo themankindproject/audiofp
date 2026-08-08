@@ -578,13 +578,11 @@ mod tests {
         assert_eq!(*r.quality(), q);
     }
 
-    // -----------------------------------------------------------------
     // Constructor panic coverage.
     //
     // `linear` and `SincResampler::with_quality` each have documented
     // panics on invalid input. Pin them with `should_panic` tests so
     // a refactor that loosens any assertion is caught.
-    // -----------------------------------------------------------------
 
     #[test]
     #[should_panic(expected = "sample rates must be non-zero")]

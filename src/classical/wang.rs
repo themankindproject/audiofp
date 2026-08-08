@@ -1437,7 +1437,6 @@ mod tests {
         assert_eq!(ta, 0);
     }
 
-    // -----------------------------------------------------------------
     // Direct unit tests for `emit_finalized_anchors`.
     //
     // These pin the re-queue invariant of the 226e0f2 refactor: when
@@ -1452,7 +1451,6 @@ mod tests {
     // We populate `pending_anchors` and `last_finalized_bucket`
     // directly (both are private; the test module sits inside the
     // same file with `use super::*`, so it has access).
-    // -----------------------------------------------------------------
 
     fn anchor_with_target(
         t_frame: u32,
@@ -1550,7 +1548,6 @@ mod tests {
         assert!(s.pending_anchors.is_empty());
     }
 
-    // -----------------------------------------------------------------
     // Public API contract pins.
     //
     // These pin the return values of the `Fingerprinter` and
@@ -1560,7 +1557,6 @@ mod tests {
     // downstream consumers that hardcode these values (e.g. the
     // `tests/goldens/*.bin` regression headers include the algorithm
     // name). The pins below catch the change at the unit-test level.
-    // -----------------------------------------------------------------
 
     #[test]
     fn public_api_name_and_config_match_documented_values() {

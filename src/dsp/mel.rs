@@ -481,14 +481,12 @@ mod tests {
         assert!(max > -9.0, "no band responded: max={max}");
     }
 
-    // -----------------------------------------------------------------
     // Constructor panic coverage.
     //
     // Pin the panic-asserts documented on `MelFilterBank::new`.
     // A refactor that loosens or removes any of these assertions would
     // silently change the filter bank's behaviour on bad input. Each
     // `should_panic` test below pins exactly one assertion.
-    // -----------------------------------------------------------------
 
     #[test]
     #[should_panic(expected = "n_mels must be > 0")]

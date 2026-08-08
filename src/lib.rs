@@ -204,11 +204,8 @@ pub use fp::fingerprint_batch_parallel;
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ---------------------------------------------------------------------------
 // Compile-time assertions: all public types must be Send + Sync so they are
 // usable in async contexts and can be shared across threads.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod send_sync_assertions {
     use super::*;

@@ -210,10 +210,6 @@ impl Matcher for WangMatcher {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 impl Default for WangMatcher {
     fn default() -> Self {
         Self::new(WangMatchConfig::default())

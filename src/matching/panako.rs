@@ -328,10 +328,6 @@ impl Matcher for PanakoMatcher {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Config validation
-// ---------------------------------------------------------------------------
-
 /// Validate a [`PanakoMatchConfig`] in debug builds.
 ///
 /// These invariants are required for correct behaviour:
@@ -360,10 +356,6 @@ pub(crate) fn validate_config(cfg: &PanakoMatchConfig) {
         "PanakoMatchConfig scale range must be finite"
     );
 }
-
-// ---------------------------------------------------------------------------
-// RANSAC line fitting
-// ---------------------------------------------------------------------------
 
 /// Iterative RANSAC over the `(t_query, t_ref)` anchor pairs collected
 /// during Hough voting. Samples 2 pairs, fits `t_ref = s·t_query + b`,
@@ -449,10 +441,6 @@ fn ransac_refine(
     (best_s, best_b, best_inliers)
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG for RANSAC (no_std compatible)
-// ---------------------------------------------------------------------------
-
 struct XorShift64(u64);
 
 impl XorShift64 {
@@ -463,10 +451,6 @@ impl XorShift64 {
         self.0
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

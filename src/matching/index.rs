@@ -93,10 +93,6 @@ pub fn match_ranked<M: Matcher>(
     results
 }
 
-// -----------------------------------------------------------------------
-// WangIndex — transient in-memory inverted index for 1:N Wang matching
-// -----------------------------------------------------------------------
-
 /// An in-memory inverted index over several Wang fingerprints.
 ///
 /// This is a matching **accelerator** — it combines many references into
@@ -333,10 +329,6 @@ impl WangIndex {
     }
 }
 
-// -----------------------------------------------------------------------
-// HaitsmaIndex — transient in-memory 1:N Haitsma matching accelerator
-// -----------------------------------------------------------------------
-
 /// An in-memory inverted index over several Haitsma fingerprints.
 ///
 /// Uses the same sub-fingerprint LUT strategy as
@@ -517,10 +509,6 @@ impl HaitsmaIndex {
         self.lut.is_empty()
     }
 }
-
-// -----------------------------------------------------------------------
-// PanakoIndex — transient in-memory 1:N Panako matching accelerator
-// -----------------------------------------------------------------------
 
 /// An in-memory inverted index over several Panako fingerprints.
 ///
@@ -729,10 +717,6 @@ impl PanakoIndex {
         self.map.is_empty()
     }
 }
-
-// -----------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

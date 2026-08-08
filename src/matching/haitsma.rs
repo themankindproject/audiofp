@@ -30,10 +30,6 @@ use crate::classical::HaitsmaFingerprint;
 use crate::matching::maps::HashMap;
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
-// ---------------------------------------------------------------------------
-// Core BER computation
-// ---------------------------------------------------------------------------
-
 /// Hamming distance over `overlap` frames at offset `delta`.
 ///
 /// Returns `u64::MAX` if the cumulative Hamming exceeds `best_sofar`
@@ -99,10 +95,6 @@ pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sub-fingerprint LUT
-// ---------------------------------------------------------------------------
-
 /// Build a LUT: `u32` sub-fingerprint → list of reference frame indices.
 fn build_lut(reference: &[u32]) -> HashMap<u32, Vec<usize>> {
     let mut lut: HashMap<u32, Vec<usize>> = super::maps::hashmap_with_capacity(reference.len() / 2);
@@ -145,10 +137,6 @@ fn probe_exact(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&V
         f(v);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 /// Configuration for [`HaitsmaMatcher`].
 #[derive(Clone, Debug)]
@@ -222,7 +210,7 @@ impl Matcher for HaitsmaMatcher {
 
         let min_overlap = self.cfg.min_overlap_frames as usize;
 
-        // ---------- LUT path ----------
+        // LUT path
         let use_lut = self.cfg.use_lut && r_len > 512;
         if use_lut {
             let lut = build_lut(r_frames);
@@ -301,7 +289,7 @@ impl Matcher for HaitsmaMatcher {
             );
         }
 
-        // ---------- Exact BER path (scan all offsets) ----------
+        // Exact BER path (scan all offsets)
         let dmin: i64 = -((q_len as i64).saturating_sub(1));
         let dmax: i64 = (r_len as i64).saturating_sub(1);
 
@@ -338,10 +326,6 @@ impl Matcher for HaitsmaMatcher {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// Result builder
-// ---------------------------------------------------------------------------
 
 fn build_result(
     best_hamming: u64,
@@ -407,10 +391,6 @@ fn build_result(
         time_scale: 1.0,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 impl Default for HaitsmaMatcher {
     fn default() -> Self {
