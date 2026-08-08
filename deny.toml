@@ -4,7 +4,12 @@ all-features = true
 [advisories]
 version = 2
 yanked  = "deny"
-ignore  = []
+ignore  = [
+    # wide 1.6.0 is yanked but 1.6.1 and 1.5.0 are broken with safe_arch
+    # 1.1.0 (missing AVX-512 intrinsics on CI runners). Pin the yanked
+    # 1.6.0 until upstream publishes a compatible release.
+    { crate = "wide@1.6.0", reason = "1.6.1 broken with safe_arch 1.1.0 (missing AVX-512 fns)" },
+]
 
 [licenses]
 version  = 2
