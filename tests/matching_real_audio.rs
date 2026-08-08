@@ -76,8 +76,8 @@ fn load_wang_catalog() -> Vec<(usize, WangFingerprint)> {
     CATALOG
         .iter()
         .map(|&(track, path)| {
-            let samples = decode_to_mono_at(path, 8_000)
-                .unwrap_or_else(|e| panic!("decode {path}: {e}"));
+            let samples =
+                decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("decode {path}: {e}"));
             let fp = wang
                 .extract(&samples, SampleRate::HZ_8000)
                 .unwrap_or_else(|e| panic!("extract {path}: {e}"));
@@ -91,8 +91,8 @@ fn load_haitsma_catalog() -> Vec<(usize, HaitsmaFingerprint)> {
     CATALOG
         .iter()
         .map(|&(track, path)| {
-            let samples = decode_to_mono_at(path, 5_000)
-                .unwrap_or_else(|e| panic!("decode {path}: {e}"));
+            let samples =
+                decode_to_mono_at(path, 5_000).unwrap_or_else(|e| panic!("decode {path}: {e}"));
             let fp = haitsma
                 .extract(&samples, SampleRate::HZ_5000)
                 .unwrap_or_else(|e| panic!("extract {path}: {e}"));
@@ -106,8 +106,8 @@ fn load_panako_catalog() -> Vec<(usize, PanakoFingerprint)> {
     CATALOG
         .iter()
         .map(|&(track, path)| {
-            let samples = decode_to_mono_at(path, 8_000)
-                .unwrap_or_else(|e| panic!("decode {path}: {e}"));
+            let samples =
+                decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("decode {path}: {e}"));
             let fp = panako
                 .extract(&samples, SampleRate::HZ_8000)
                 .unwrap_or_else(|e| panic!("extract {path}: {e}"));
