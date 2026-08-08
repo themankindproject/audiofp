@@ -67,6 +67,16 @@ jobs:
       - name: regression (bit-exact hash output)
         run: cargo test --test regression --all-features
 
+  matching-real-audio:
+    name: matching (real audio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cross-codec matching + index identification (Wang/Haitsma/Panako)
+        run: cargo test --test matching_real_audio --features std-wav,std-mp3,std-flac,std-ogg
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
