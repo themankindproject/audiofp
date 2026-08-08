@@ -5,6 +5,20 @@
 //! Conference on Music Information Retrieval (ISMIR), Paris, France,
 //! 2002. <https://www.ismir.net/resources/ismir-conferences/>
 //!
+//! # Patent status
+//!
+//! Philips filed related patents on multimedia fingerprinting
+//! (US20020178410A1, US20060075237A1, US20060041753A1 by Haitsma/Kalker).
+//! These are either expired, abandoned, or never granted as utility
+//! patents covering the specific band-energy sign-bit algorithm described
+//! in the ISMIR 2002 paper. The algorithm as published is in the public
+//! domain and free to use commercially worldwide.
+//!
+//! The closest granted patent (US7174293B2, "Audio identification system
+//! and method", Iceberg Industries) expired 2022-02-10 and was assigned
+//! to a different entity with different claims.
+//!
+//!
 //! Algorithm:
 //!
 //! 1. Resample the input to 5 kHz mono *(caller's responsibility)*.

@@ -5,6 +5,21 @@
 //! Information Retrieval (ISMIR), Baltimore, MD, USA, 2003.
 //! <https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf>
 //!
+//! # Patent status
+//!
+//! The original Shazam patent covering this algorithm (US6990453B2,
+//! "System and methods for recognizing sound and music signals in high
+//! noise and distortion", inventor Avery Li-Chun Wang, filed 2001-04-20,
+//! assigned to Apple Inc.) **expired on 2024-01-07** after its full
+//! adjusted term. All continuation patents in the family (US7346512,
+//! US7865368, US8190435, US8386258, US8700407, US9401154, US9899030,
+//! US10497378) are also expired or abandoned (fee-related expiration).
+//! The corresponding EP patent (EP1307833B1) expired 2021. This
+//! algorithm is free to use commercially worldwide without license.
+//!
+//! Source: <https://patents.google.com/patent/US6990453B2/en>
+//! (Legal status: "Expired - Lifetime, expires 2024-01-07")
+//!
 //! 1. Resample the input to 8 kHz mono *(caller's responsibility)*.
 //! 2. Take a Hann-windowed STFT with `n_fft = 1024`, `hop = 128` →
 //!    62.5 frames/s, 513 frequency bins.

@@ -52,6 +52,16 @@
 //! downstream alignment procedure. This crate only guarantees
 //! deterministic, codec-tolerant hashes; callers are responsible for
 //! the matching logic.
+//!
+//! # Patent status
+//!
+//! The Panako algorithm was published as academic research (ISMIR 2014,
+//! ISMIR 2021 late-breaking) by Joren Six at Ghent University. No
+//! utility patents were filed on the triplet-ratio fingerprinting
+//! method. The algorithm is free to use commercially worldwide.
+//! Note: Six's reference implementation is AGPL-licensed (software
+//! copyright), but this is an independent MIT-licensed reimplementation
+//! from the published paper — no AGPL code was used.
 
 use alloc::vec::Vec;
 
