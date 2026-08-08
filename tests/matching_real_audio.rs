@@ -8,10 +8,15 @@
 //!    different formats must match itself with high confidence.
 //! 2. **Cross-track rejection** — different songs must NOT match.
 //! 3. **Index identification** — the correct track is identified from a
-//!    small catalog using each algorithm's index type.
+//!    catalog using each algorithm's index type.
 //!
-//! Audio assets: "Galway" and "Furious Freak" by Kevin MacLeod (CC-BY 3.0),
-//! plus CC0 piano and speech clips. See tests/assets/CREDITS.md.
+//! Audio assets:
+//! - "Galway" and "Furious Freak" by Kevin MacLeod (CC-BY 3.0)
+//! - Piano and Speech clips (CC0, project-generated)
+//! - Classical recordings from Musopen (CC0/Public Domain):
+//!   Bach, Beethoven, Dvorak, Grieg
+//!
+//! See tests/assets/CREDITS.md.
 #![cfg(all(
     feature = "std-wav",
     feature = "std-mp3",
@@ -32,8 +37,7 @@ use audiofp::{Fingerprinter, SampleRate};
 // ─── Catalog of real audio files ─────────────────────────────────────
 
 /// Each entry: (logical track id, file path).
-/// Track 0 = Galway variants, Track 1 = Freak variants,
-/// Track 2 = Piano, Track 3 = Speech.
+/// Tracks 0-3: multi-codec originals. Tracks 4-10: Musopen classical (CC0).
 const CATALOG: &[(usize, &str)] = &[
     // Track 0: Galway in multiple codecs
     (0, "tests/assets/galway.wav"),
@@ -45,11 +49,27 @@ const CATALOG: &[(usize, &str)] = &[
     (1, "tests/assets/freak.mp3"),
     (1, "tests/assets/freak.flac"),
     (1, "tests/assets/freak.ogg"),
-    // Track 2: Piano
+    // Track 2: Piano (CC0)
     (2, "tests/assets/piano.ogg"),
-    // Track 3: Speech
+    // Track 3: Speech (CC0)
     (3, "tests/assets/speech.ogg"),
+    // Track 4: Bach - Goldberg Variations, Aria (CC0, Musopen)
+    (4, "tests/assets/catalog/bach_goldberg_aria.ogg"),
+    // Track 5: Bach - Goldberg Variations, Var 4 (CC0, Musopen)
+    (5, "tests/assets/catalog/bach_goldberg_var4.ogg"),
+    // Track 6: Beethoven - Coriolan Overture (CC0, Musopen)
+    (6, "tests/assets/catalog/beethoven_coriolan.ogg"),
+    // Track 7: Beethoven - Egmont Overture (CC0, Musopen)
+    (7, "tests/assets/catalog/beethoven_egmont.ogg"),
+    // Track 8: Beethoven - Symphony No.3 Eroica, Mvt 1 (CC0, Musopen)
+    (8, "tests/assets/catalog/beethoven_eroica_mvt1.ogg"),
+    // Track 9: Dvorak - String Quartet No.12 "American", Mvt 1 (CC0, Musopen)
+    (9, "tests/assets/catalog/dvorak_american_mvt1.ogg"),
+    // Track 10: Grieg - Peer Gynt, Morning (CC0, Musopen)
+    (10, "tests/assets/catalog/grieg_morning.ogg"),
 ];
+
+const NUM_TRACKS: usize = 11;
 
 fn load_wang_catalog() -> Vec<(usize, WangFingerprint)> {
     let mut wang = Wang::default();
@@ -136,9 +156,8 @@ fn wang_cross_track_rejection() {
     let matcher = WangMatcher::new(WangMatchConfig::default());
 
     // Pick one representative per track.
-    let representatives: Vec<_> = [0usize, 1, 2, 3]
-        .iter()
-        .map(|&t| catalog.iter().find(|(track, _)| *track == t).unwrap())
+    let representatives: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| catalog.iter().find(|(track, _)| *track == t).unwrap())
         .collect();
 
     for i in 0..representatives.len() {
@@ -157,21 +176,29 @@ fn wang_cross_track_rejection() {
 fn wang_index_identifies_correct_track() {
     let catalog = load_wang_catalog();
 
-    // Build index from all fingerprints.
-    let fps: Vec<_> = catalog.iter().map(|(_, fp)| fp.clone()).collect();
-    let index = WangIndex::build(&fps, 1000);
+    // Build index from one representative per track.
+    let refs: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| {
+            catalog
+                .iter()
+                .find(|(track, _)| *track == t)
+                .unwrap()
+                .1
+                .clone()
+        })
+        .collect();
+    let index = WangIndex::build(&refs, 1000);
 
-    // Query with each fingerprint — must identify its own track.
+    // Query with each entry — must identify its own track.
     for (idx, (track, fp)) in catalog.iter().enumerate() {
         let result = index.query(fp, &WangMatchConfig::default());
         if let Some((ref_id, res)) = result {
             assert_eq!(
-                catalog[ref_id].0, *track,
+                ref_id, *track,
                 "Wang index: query #{idx} ({}) identified as track {} (expected {}), score={:.3}",
-                CATALOG[idx].1, catalog[ref_id].0, track, res.score,
+                CATALOG[idx].1, ref_id, track, res.score,
             );
         } else {
-            // Self-match must always return something.
             panic!(
                 "Wang index: query #{idx} ({}) returned None",
                 CATALOG[idx].1,
@@ -217,9 +244,8 @@ fn haitsma_cross_track_rejection() {
     let catalog = load_haitsma_catalog();
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
 
-    let representatives: Vec<_> = [0usize, 1, 2, 3]
-        .iter()
-        .map(|&t| catalog.iter().find(|(track, _)| *track == t).unwrap())
+    let representatives: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| catalog.iter().find(|(track, _)| *track == t).unwrap())
         .collect();
 
     for i in 0..representatives.len() {
@@ -238,16 +264,25 @@ fn haitsma_cross_track_rejection() {
 fn haitsma_index_identifies_correct_track() {
     let catalog = load_haitsma_catalog();
 
-    let fps: Vec<_> = catalog.iter().map(|(_, fp)| fp.clone()).collect();
-    let index = HaitsmaIndex::build(&fps, 500);
+    let refs: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| {
+            catalog
+                .iter()
+                .find(|(track, _)| *track == t)
+                .unwrap()
+                .1
+                .clone()
+        })
+        .collect();
+    let index = HaitsmaIndex::build(&refs, 500);
 
     for (idx, (track, fp)) in catalog.iter().enumerate() {
         let result = index.query(fp, &HaitsmaMatchConfig::default());
         if let Some((ref_id, res)) = result {
             assert_eq!(
-                catalog[ref_id].0, *track,
+                ref_id, *track,
                 "Haitsma index: query #{idx} ({}) identified as track {} (expected {}), score={:.3}",
-                CATALOG[idx].1, catalog[ref_id].0, track, res.score,
+                CATALOG[idx].1, ref_id, track, res.score,
             );
         } else {
             panic!(
@@ -295,9 +330,8 @@ fn panako_cross_track_rejection() {
     let catalog = load_panako_catalog();
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
 
-    let representatives: Vec<_> = [0usize, 1, 2, 3]
-        .iter()
-        .map(|&t| catalog.iter().find(|(track, _)| *track == t).unwrap())
+    let representatives: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| catalog.iter().find(|(track, _)| *track == t).unwrap())
         .collect();
 
     for i in 0..representatives.len() {
@@ -316,16 +350,25 @@ fn panako_cross_track_rejection() {
 fn panako_index_identifies_correct_track() {
     let catalog = load_panako_catalog();
 
-    let fps: Vec<_> = catalog.iter().map(|(_, fp)| fp.clone()).collect();
-    let index = PanakoIndex::build(&fps, 1000);
+    let refs: Vec<_> = (0..NUM_TRACKS)
+        .map(|t| {
+            catalog
+                .iter()
+                .find(|(track, _)| *track == t)
+                .unwrap()
+                .1
+                .clone()
+        })
+        .collect();
+    let index = PanakoIndex::build(&refs, 1000);
 
     for (idx, (track, fp)) in catalog.iter().enumerate() {
         let result = index.query(fp, &PanakoMatchConfig::default());
         if let Some((ref_id, res)) = result {
             assert_eq!(
-                catalog[ref_id].0, *track,
+                ref_id, *track,
                 "Panako index: query #{idx} ({}) identified as track {} (expected {}), score={:.3}",
-                CATALOG[idx].1, catalog[ref_id].0, track, res.score,
+                CATALOG[idx].1, ref_id, track, res.score,
             );
         } else {
             panic!(
@@ -333,5 +376,44 @@ fn panako_index_identifies_correct_track() {
                 CATALOG[idx].1,
             );
         }
+    }
+}
+
+// ─── Hash count sanity (drift detection baseline) ────────────────────
+
+/// Verify all catalog tracks produce a reasonable number of hashes.
+/// This acts as a canary: if a future code change silently alters hash
+/// output, counts will shift and this test catches it.
+#[test]
+fn hash_counts_are_nonzero_and_reasonable() {
+    let wang_catalog = load_wang_catalog();
+    let haitsma_catalog = load_haitsma_catalog();
+    let panako_catalog = load_panako_catalog();
+
+    for (idx, (track, fp)) in wang_catalog.iter().enumerate() {
+        assert!(
+            fp.hashes.len() >= 10,
+            "Wang track {track} ({}) produced only {} hashes (expected ≥10)",
+            CATALOG[idx].1,
+            fp.hashes.len(),
+        );
+    }
+
+    for (idx, (track, fp)) in haitsma_catalog.iter().enumerate() {
+        assert!(
+            fp.frames.len() >= 50,
+            "Haitsma track {track} ({}) produced only {} frames (expected ≥50)",
+            CATALOG[idx].1,
+            fp.frames.len(),
+        );
+    }
+
+    for (idx, (track, fp)) in panako_catalog.iter().enumerate() {
+        assert!(
+            fp.hashes.len() >= 5,
+            "Panako track {track} ({}) produced only {} hashes (expected ≥5)",
+            CATALOG[idx].1,
+            fp.hashes.len(),
+        );
     }
 }
