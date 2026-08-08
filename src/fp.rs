@@ -158,8 +158,8 @@ pub trait StreamingFingerprinter {
     ///   drained returns an empty `Vec` (no error, no panic).
     /// - **Push after flush:** calling [`push`](Self::push) after `flush`
     ///   is valid and appends to the stream — the fingerprinter does not
-    ///   enter a "finished" state. Use [`reset`](Self::reset) to start a
-    ///   fresh stream.
+    ///   enter a "finished" state. Call `reset()` on the concrete type
+    ///   to start a fresh stream.
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Conservative upper bound on emission latency: from the time a
