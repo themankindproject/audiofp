@@ -21,6 +21,13 @@ use libm::{sinf, sqrtf};
 ///
 /// Pass-through when `from_sr == to_sr` (clones the input).
 ///
+/// Prefer [`SincResampler`] for production use — linear interpolation
+/// introduces aliasing artefacts above the Nyquist of the target rate.
+///
+/// # Panics
+///
+/// Panics if `from_sr == 0` or `to_sr == 0`.
+///
 /// # Example
 ///
 /// ```
@@ -225,6 +232,13 @@ impl SincResampler {
     ///
     /// Output length is `ceil(input.len() * to_sr / from_sr)`. Out-of-range
     /// neighbours are treated as zero (zero-pad boundary).
+    ///
+    /// # Performance
+    ///
+    /// Cost is `O(n_output × taps)` where `taps` = `quality * 2`
+    /// (default quality 64 → 128 multiply-adds per output sample).
+    /// For repeated calls, prefer [`process_into`](Self::process_into)
+    /// to reuse the output allocation.
     #[must_use]
     pub fn process(&self, input: &[f32]) -> Vec<f32> {
         let mut out = Vec::new();

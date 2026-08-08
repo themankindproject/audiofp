@@ -39,6 +39,11 @@ const MAX_VOTES_PER_REF: usize = 10_000_000;
 /// Stops early when a perfect score (`score >= 1.0`) is found. For the
 /// full ranking of every reference use [`match_ranked`]; for large
 /// catalogs prefer the index types.
+///
+/// # Performance
+///
+/// `O(N × match_one_cost)` sequential scan with early-exit on perfect
+/// score. Each reference is scored independently.
 #[must_use]
 pub fn match_best<M: Matcher>(
     matcher: &M,
@@ -99,6 +104,18 @@ pub fn match_ranked<M: Matcher>(
 /// one `hash → Vec<(ref_id, t_anchor)>` map so the per-query cost of
 /// 1:N lookups is paid once. It is dropped with its owning scope and is
 /// never serialised.
+///
+/// # Performance
+///
+/// - **Build cost:** `O(Σ hashes)` — one HashMap insertion per hash.
+/// - **Query cost:** `O(Q × avg_postings + C)` where `Q` = query hash
+///   count, `avg_postings` = mean posting list length, `C` = candidate
+///   references that received any vote (scored individually).
+/// - **Memory:** roughly `12 bytes × total_hashes` (after stop-hash
+///   removal) plus HashMap overhead.
+///
+/// For catalogs above ~10 000 tracks, raise `min_votes` / `min_score`
+/// pre-filters or shard the index.
 pub struct WangIndex {
     /// Inverted index: hash → list of (reference id, t_anchor).
     map: HashMap<u32, alloc::vec::Vec<(usize, u32)>>,
@@ -335,6 +352,23 @@ impl WangIndex {
 /// [`HaitsmaMatcher`](super::HaitsmaMatcher): build `u32 → Vec<(ref_id,
 /// frame_pos)>` per frame, probe each query frame to discover candidate
 /// alignments, then verify the best per-reference BER.
+///
+/// # Performance
+///
+/// - **Build:** `O(Σ frames)` — one LUT insertion per frame across all refs.
+/// - **Query:** `O(Q + C × overlap)` where `Q` = query frames probed,
+///   `C` = candidate refs with LUT hits, `overlap` = BER verification
+///   window.
+/// - **Memory:** `12 bytes × total_frames` (LUT) plus `4 bytes × total_frames`
+///   (per-ref frame clone for BER verification).
+///
+/// # Scoring note
+///
+/// Only **exact** sub-fingerprint matches are probed (no bit-flip
+/// neighbours). This is faster than the `probe_bit_flips` option on
+/// [`HaitsmaMatcher`](super::HaitsmaMatcher) but may miss weaker matches.
+/// Prominence uses `0.5 / BER` — not directly comparable to
+/// `HaitsmaMatcher`'s `median_BER / (BER + ε)` formula.
 pub struct HaitsmaIndex {
     /// Inverted index: 32-bit sub-fingerprint → list of (ref_id, frame_pos).
     lut: HashMap<u32, Vec<(usize, u32)>>,
@@ -515,6 +549,19 @@ impl HaitsmaIndex {
 /// Uses the same 2-D Hough accumulator strategy as
 /// [`PanakoMatcher`](super::PanakoMatcher) but across the combined
 /// reference set for efficient 1:N lookups.
+///
+/// # Performance
+///
+/// - **Build:** `O(Σ hashes)` — one map insertion per triplet hash.
+/// - **Query:** `O(Q × avg_postings + C)` where `C` = candidate refs
+///   that received votes, each scored via Hough peak extraction.
+/// - **Memory:** `20 bytes × total_hashes` (hash + 4 u32s per posting).
+///
+/// # Scoring note
+///
+/// RANSAC refinement is **not** applied (unlike `PanakoMatcher` with
+/// `ransac_refine: true`). The coarse Hough peak determines the final
+/// `time_scale` — less precise but much faster for large catalogs.
 pub struct PanakoIndex {
     /// Inverted index: hash → list of (ref_id, t_a, t_b, t_c).
     map: HashMap<u32, Vec<(usize, u32, u32, u32)>>,

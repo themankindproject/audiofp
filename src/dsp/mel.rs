@@ -309,6 +309,12 @@ impl MelFilterBank {
     /// squared to power before the matrix-vector product, and a small
     /// floor avoids `log10(0)`.
     ///
+    /// # Output range
+    ///
+    /// Values are in log₁₀ scale (not decibels). Silence floors at
+    /// `log10(1e-10) = −10.0`; typical music peaks around `−1` to `+2`.
+    /// The output is unbounded above in principle.
+    ///
     /// # Panics
     ///
     /// Panics if `magnitude.len() != n_bins()` or `out.len() != n_mels`.

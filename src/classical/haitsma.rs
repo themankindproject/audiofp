@@ -44,9 +44,26 @@ use crate::dsp::windows::WindowKind;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
+///
+/// Each `u32` in `frames` represents one STFT frame as 32 sign-difference
+/// bits: bit `k` (0 = LSB, 31 = MSB) is `1` when the energy in band `k`
+/// exceeds the energy in band `k+1` at that frame, relative to the
+/// previous frame. Two fingerprints are compared by computing the
+/// **Bit Error Rate** (Hamming distance / 32) at the best alignment.
+///
+/// # Ordering invariant
+///
+/// `frames` are in strict temporal order — `frames[i]` corresponds to
+/// STFT frame `i + 1` (frame 0 is consumed as the "previous" reference).
+///
+/// # Typical output size
+///
+/// At 78.125 fps the fingerprint produces **312 bytes per second**
+/// (`78.125 × 4 bytes`). A 30 s clip yields ~2 344 frames (~9 KB).
 #[derive(Clone, Debug)]
 pub struct HaitsmaFingerprint {
-    /// One `u32` per STFT frame from `n=1` onwards.
+    /// One `u32` per STFT frame from `n=1` onwards. Bit `k` encodes
+    /// the sign of `E[k](n) − E[k+1](n) − (E[k](n−1) − E[k+1](n−1))`.
     pub frames: Vec<u32>,
     /// Frame rate of the underlying STFT — always 78.125 for `haitsma-v1`
     /// (`5000 / 64`).

@@ -148,10 +148,15 @@ impl PeakPicker {
     /// `frames_per_sec` is used only for the per-second adaptive threshold.
     /// Output is sorted by `(t_frame, f_bin)`.
     ///
-    /// **Note (0.2.0):** this method now takes `&mut self` so it can re-use
-    /// scratch buffers across calls. If you previously held a `PeakPicker`
-    /// behind `&self`, store it as `Mutex<PeakPicker>` or use one picker
-    /// per producing thread.
+    /// # Panics
+    ///
+    /// Panics if `spec.len() != n_frames * n_bins`.
+    ///
+    /// # Note
+    ///
+    /// This method takes `&mut self` to re-use scratch buffers across calls.
+    /// If you previously held a `PeakPicker` behind `&self`, store it as
+    /// `Mutex<PeakPicker>` or use one picker per producing thread.
     pub fn pick(
         &mut self,
         spec: &[f32],
@@ -489,6 +494,14 @@ impl IncrementalPeakDetector {
     /// center row of the vertical window becomes ripe, writing its 2-D
     /// rolling-max into `out_max`. Returns `None` while filling the initial
     /// window.
+    ///
+    /// # Preconditions
+    ///
+    /// - `row.len()` must equal `n_bins` (the detector's configured width).
+    /// - `out_max.len()` must equal `n_bins`.
+    ///
+    /// Both are checked by `debug_assert` — violated in release builds,
+    /// this produces incorrect (but memory-safe) results.
     pub fn push_row(&mut self, row: &[f32], out_max: &mut [f32]) -> Option<u32> {
         debug_assert_eq!(row.len(), self.n_bins);
         debug_assert_eq!(out_max.len(), self.n_bins);

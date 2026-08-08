@@ -62,20 +62,44 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 
 /// One anchor-target-target triplet packed into a 32-bit hash plus the
 /// three STFT frame indices.
+///
+/// The type is `#[repr(C)]` and implements [`bytemuck::Pod`], enabling
+/// zero-copy persistence (mmap, flat files) and C FFI. Layout is four
+/// little-endian `u32` fields (16 bytes total, no padding).
+///
+/// # Frame index invariants
+///
+/// `t_anchor < t_b < t_c` — the anchor is always the earliest peak,
+/// `t_b` is the nearer target, and `t_c` is the farther one. The hash
+/// field encodes a tempo-invariant ratio `β = (t_c − t_b) / (t_c − t_a)`
+/// so matching survives ±5 % speed changes.
+///
+/// See the module-level doc for the full 32-bit hash layout.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PanakoHash {
-    /// 32-bit hash; see module docs for the layout.
+    /// 32-bit hash; see module docs for the bit layout.
     pub hash: u32,
-    /// STFT frame index of the anchor peak.
+    /// STFT frame index of the anchor peak (earliest of the three).
     pub t_anchor: u32,
-    /// STFT frame index of the first (closer) target.
+    /// STFT frame index of the nearer target (`t_anchor < t_b < t_c`).
     pub t_b: u32,
-    /// STFT frame index of the second (farther) target.
+    /// STFT frame index of the farther target (`t_b < t_c`).
     pub t_c: u32,
 }
 
 /// All triplet hashes produced by [`Panako`] over an audio buffer.
+///
+/// # Ordering invariant
+///
+/// `hashes` is sorted by `(t_anchor, t_b, t_c, hash)`. Consumers may
+/// rely on this for binary search or merge-join during matching.
+///
+/// # Typical output size
+///
+/// At default config (`fan_out = 5`, `peaks_per_sec = 30`), expect
+/// roughly **250 hashes per second** of rich audio, or ~4 KB/s
+/// (`250 × 16 bytes`). Silence produces zero hashes.
 #[derive(Clone, Debug)]
 pub struct PanakoFingerprint {
     /// Hashes sorted by `(t_anchor, t_b, t_c, hash)`.

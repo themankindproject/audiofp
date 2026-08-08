@@ -31,16 +31,43 @@ use crate::dsp::windows::WindowKind;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target landmark pair packed into a 32-bit hash.
+///
+/// The type is `#[repr(C)]` and implements [`bytemuck::Pod`], so it can be
+/// safely cast to/from `&[u8]` for zero-copy persistence (mmap, flat files)
+/// or transmitted across a C FFI boundary. Layout is two little-endian
+/// `u32` fields: `hash` followed by `t_anchor` (8 bytes total, no padding).
+///
+/// # Hash bit layout (MSB → LSB)
+///
+/// | Bits    | Field   | Meaning                                         |
+/// |---------|---------|--------------------------------------------------|
+/// | 31 – 23 | `f_a_q` | Anchor frequency (9 bits, 512-bucket quantised) |
+/// | 22 – 14 | `f_b_q` | Target frequency (same quantisation)            |
+/// | 13 –  0 | `Δt`    | Frame distance anchor→target (1 ..= 16 383)     |
+///
+/// Decode with shifts: `let f_a = hash >> 23; let f_b = (hash >> 14) & 0x1FF;`
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WangHash {
     /// 32-bit hash: `f_a_q (9) | f_b_q (9) | Δt (14)`, MSB first.
     pub hash: u32,
-    /// STFT frame index of the anchor peak.
+    /// STFT frame index of the anchor peak (0-based, monotonically
+    /// increasing within a fingerprint).
     pub t_anchor: u32,
 }
 
 /// All hashes produced by [`Wang`] over an audio buffer.
+///
+/// # Ordering invariant
+///
+/// `hashes` is sorted by `(t_anchor, hash)`. Consumers may rely on this
+/// for binary search or merge-join during matching.
+///
+/// # Typical output size
+///
+/// At default config (`fan_out = 10`, `peaks_per_sec = 30`), expect
+/// roughly **300 hashes per second** of rich audio (music), or
+/// ~2.4 KB/s (`300 × 8 bytes`). Silence produces zero hashes.
 #[derive(Clone, Debug)]
 pub struct WangFingerprint {
     /// Hashes sorted by `(t_anchor, hash)`.

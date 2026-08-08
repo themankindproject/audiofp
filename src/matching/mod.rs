@@ -227,6 +227,10 @@ pub fn clamp_score(s: f32) -> f32 {
 /// `values` is the raw histogram (or Hough accumulator) slice. `peak_idx`
 /// is the index of the peak bin. Returns `peak as f32 / mean(rest)` or a
 /// large sentinel when there is no background.
+///
+/// # Panics
+///
+/// Panics (index out of bounds) if `peak_idx >= values.len()`.
 #[inline]
 #[must_use]
 pub fn compute_prominence(values: &[u32], peak_idx: usize) -> f32 {

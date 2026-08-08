@@ -142,9 +142,24 @@ pub trait StreamingFingerprinter {
     /// Must not block and must not allocate beyond the per-instance
     /// budget set at construction. Returns `Err` if the stream cannot
     /// process the samples (e.g. neural inference failure).
+    ///
+    /// # Edge cases
+    ///
+    /// - **Empty slice** (`&[]`): returns `Ok(vec![])` immediately (no-op).
+    /// - **Partial frames**: internally buffered until enough samples
+    ///   accumulate for the next STFT frame.
     fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Drain any pending fingerprint material at end-of-stream.
+    ///
+    /// # Lifecycle
+    ///
+    /// - **Idempotent:** calling `flush` again after all material has been
+    ///   drained returns an empty `Vec` (no error, no panic).
+    /// - **Push after flush:** calling [`push`](Self::push) after `flush`
+    ///   is valid and appends to the stream — the fingerprinter does not
+    ///   enter a "finished" state. Use [`reset`](Self::reset) to start a
+    ///   fresh stream.
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Conservative upper bound on emission latency: from the time a
