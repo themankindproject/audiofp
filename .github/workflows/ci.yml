@@ -77,6 +77,25 @@ jobs:
       - name: cross-codec matching + index identification (Wang/Haitsma/Panako)
         run: cargo test --test matching_real_audio --features std-wav,std-mp3,std-flac,std-ogg
 
+  coverage:
+    name: code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: generate coverage (lcov)
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --skip golden
+      - name: upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

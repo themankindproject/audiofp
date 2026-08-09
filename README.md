@@ -4,6 +4,7 @@
 [![Documentation](https://docs.rs/audiofp/badge.svg)](https://docs.rs/audiofp)
 [![License](https://img.shields.io/crates/l/audiofp)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/audiofp/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/audiofp/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/themankindproject/audiofp/branch/main/graph/badge.svg)](https://codecov.io/gh/themankindproject/audiofp)
 ![Crates.io Downloads](https://img.shields.io/crates/d/audiofp)
 ![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 

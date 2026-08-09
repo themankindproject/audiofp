@@ -10,6 +10,7 @@ target/
 # Coverage / profiling
 *.profraw
 tarpaulin-report.html
+lcov.info
 cobertura.xml
 
 # Local env
