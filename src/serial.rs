@@ -137,155 +137,116 @@ fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     vec
 }
 
+/// Serialize a Pod hash slice with the standard header into a `Vec<u8>`.
+fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
+    let value_bytes: &[u8] = cast_slice(values);
+    let mut buf = Vec::with_capacity(HEADER_SIZE + value_bytes.len());
+    write_header(&mut buf, alg_id, values.len() as u32, fps);
+    buf.extend_from_slice(value_bytes);
+    buf
+}
+
+/// Parse and validate a fingerprint payload, returning `(values, fps)`.
+///
+/// Trailing bytes beyond the payload are intentionally ignored (forward
+/// compatibility for envelope extensions).
+fn read_payload<T: bytemuck::Pod>(bytes: &[u8], alg_id: u8, kind: &str) -> Result<(Vec<T>, f32)> {
+    let (_alg, hash_count, fps) = read_header(bytes, alg_id)?;
+    let payload = &bytes[HEADER_SIZE..];
+    let expected_len = (hash_count as usize) * core::mem::size_of::<T>();
+    if payload.len() < expected_len {
+        return Err(AfpError::Deserialize(format!(
+            "payload too short: need {} bytes for {} {kind}, got {}",
+            expected_len,
+            hash_count,
+            payload.len()
+        )));
+    }
+    let values = read_pod_vec::<T>(&payload[..expected_len]);
+    Ok((values, fps))
+}
+
+/// Build a metadata envelope from the per-algorithm constants.
+fn envelope(
+    algorithm: &'static str,
+    sample_rate: u32,
+    fps: f32,
+    hash_count: usize,
+) -> FingerprintEnvelope {
+    FingerprintEnvelope {
+        algorithm,
+        crate_version: crate::VERSION,
+        sample_rate,
+        frames_per_sec: fps,
+        hash_count,
+    }
+}
+
 impl WangFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     ///
     /// The format is documented in the [`serial`](crate::serial) module.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let hash_bytes: &[u8] = cast_slice(&self.hashes);
-        let mut buf = Vec::with_capacity(HEADER_SIZE + hash_bytes.len());
-        write_header(
-            &mut buf,
-            ALG_WANG,
-            self.hashes.len() as u32,
-            self.frames_per_sec,
-        );
-        buf.extend_from_slice(hash_bytes);
-        buf
+        pod_blob(&self.hashes, ALG_WANG, self.frames_per_sec)
     }
 
     /// Deserialize a Wang fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (_alg, hash_count, fps) = read_header(bytes, ALG_WANG)?;
-        let payload = &bytes[HEADER_SIZE..];
-        let expected_len = (hash_count as usize) * core::mem::size_of::<WangHash>();
-        // Trailing bytes beyond the payload are intentionally ignored
-        // (forward compatibility for envelope extensions).
-        if payload.len() < expected_len {
-            return Err(AfpError::Deserialize(format!(
-                "payload too short: need {} bytes for {} hashes, got {}",
-                expected_len,
-                hash_count,
-                payload.len()
-            )));
-        }
-        let hashes = read_pod_vec::<WangHash>(&payload[..expected_len]);
+        let (hashes, frames_per_sec) = read_payload::<WangHash>(bytes, ALG_WANG, "hashes")?;
         Ok(Self {
             hashes,
-            frames_per_sec: fps,
+            frames_per_sec,
         })
     }
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        FingerprintEnvelope {
-            algorithm: "wang-v1",
-            crate_version: crate::VERSION,
-            sample_rate: 8_000,
-            frames_per_sec: self.frames_per_sec,
-            hash_count: self.hashes.len(),
-        }
+        envelope("wang-v1", 8_000, self.frames_per_sec, self.hashes.len())
     }
 }
 
 impl PanakoFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let hash_bytes: &[u8] = cast_slice(&self.hashes);
-        let mut buf = Vec::with_capacity(HEADER_SIZE + hash_bytes.len());
-        write_header(
-            &mut buf,
-            ALG_PANAKO,
-            self.hashes.len() as u32,
-            self.frames_per_sec,
-        );
-        buf.extend_from_slice(hash_bytes);
-        buf
+        pod_blob(&self.hashes, ALG_PANAKO, self.frames_per_sec)
     }
 
     /// Deserialize a Panako fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (_alg, hash_count, fps) = read_header(bytes, ALG_PANAKO)?;
-        let payload = &bytes[HEADER_SIZE..];
-        let expected_len = (hash_count as usize) * core::mem::size_of::<PanakoHash>();
-        // Trailing bytes beyond the payload are intentionally ignored
-        // (forward compatibility for envelope extensions).
-        if payload.len() < expected_len {
-            return Err(AfpError::Deserialize(format!(
-                "payload too short: need {} bytes for {} hashes, got {}",
-                expected_len,
-                hash_count,
-                payload.len()
-            )));
-        }
-        let hashes = read_pod_vec::<PanakoHash>(&payload[..expected_len]);
+        let (hashes, frames_per_sec) = read_payload::<PanakoHash>(bytes, ALG_PANAKO, "hashes")?;
         Ok(Self {
             hashes,
-            frames_per_sec: fps,
+            frames_per_sec,
         })
     }
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        FingerprintEnvelope {
-            algorithm: "panako-v2",
-            crate_version: crate::VERSION,
-            sample_rate: 8_000,
-            frames_per_sec: self.frames_per_sec,
-            hash_count: self.hashes.len(),
-        }
+        envelope("panako-v2", 8_000, self.frames_per_sec, self.hashes.len())
     }
 }
 
 impl HaitsmaFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let frame_bytes: &[u8] = cast_slice(&self.frames);
-        let mut buf = Vec::with_capacity(HEADER_SIZE + frame_bytes.len());
-        write_header(
-            &mut buf,
-            ALG_HAITSMA,
-            self.frames.len() as u32,
-            self.frames_per_sec,
-        );
-        buf.extend_from_slice(frame_bytes);
-        buf
+        pod_blob(&self.frames, ALG_HAITSMA, self.frames_per_sec)
     }
 
     /// Deserialize a Haitsma fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (_alg, hash_count, fps) = read_header(bytes, ALG_HAITSMA)?;
-        let payload = &bytes[HEADER_SIZE..];
-        let expected_len = (hash_count as usize) * core::mem::size_of::<u32>();
-        // Trailing bytes beyond the payload are intentionally ignored
-        // (forward compatibility for envelope extensions).
-        if payload.len() < expected_len {
-            return Err(AfpError::Deserialize(format!(
-                "payload too short: need {} bytes for {} frames, got {}",
-                expected_len,
-                hash_count,
-                payload.len()
-            )));
-        }
-        let frames = read_pod_vec::<u32>(&payload[..expected_len]);
+        let (frames, frames_per_sec) = read_payload::<u32>(bytes, ALG_HAITSMA, "frames")?;
         Ok(Self {
             frames,
-            frames_per_sec: fps,
+            frames_per_sec,
         })
     }
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        FingerprintEnvelope {
-            algorithm: "haitsma-v1",
-            crate_version: crate::VERSION,
-            sample_rate: 5_000,
-            frames_per_sec: self.frames_per_sec,
-            hash_count: self.frames.len(),
-        }
+        envelope("haitsma-v1", 5_000, self.frames_per_sec, self.frames.len())
     }
 }
 
