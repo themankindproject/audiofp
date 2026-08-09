@@ -91,11 +91,12 @@ jobs:
       - name: generate coverage (lcov)
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --skip golden
       - name: upload to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
   audit:
