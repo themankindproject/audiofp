@@ -202,21 +202,7 @@ impl Wang {
     /// to prevent OOM from extreme values.
     #[must_use]
     pub fn new(mut cfg: WangConfig) -> Self {
-        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
-        cfg.fan_out = cfg.fan_out.clamp(1, 64);
-        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
-        // Reject zero-value limits (would reject all inputs/outputs).
-        if cfg.max_input_samples == Some(0) {
-            cfg.max_input_samples = Some(1);
-        }
-        if cfg.max_hashes == Some(0) {
-            cfg.max_hashes = Some(1);
-        }
-        if cfg.max_pending_anchors == Some(0) {
-            cfg.max_pending_anchors = Some(1);
-        }
-        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
-        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+        crate::classical::sanitize_cfg!(cfg);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -398,30 +384,7 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             if df.abs() > target_zone_f {
                 continue;
             }
-            // Linear-insert into sorted list: maintains top-K peaks by
-            // (mag desc, position asc). partition_point finds where
-            // this target belongs; insert shifts elements right.
-            // O(K) insert per target beats BinaryHeap for K ≤ 16.
-            if targets.len() < fan_out {
-                let pos = targets.partition_point(|p| {
-                    p.mag > target.mag
-                        || (p.mag == target.mag
-                            && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
-                });
-                targets.insert(pos, *target);
-            } else if let Some(last) = targets.last()
-                && (target.mag > last.mag
-                    || (target.mag == last.mag
-                        && (target.t_frame, target.f_bin) < (last.t_frame, last.f_bin)))
-            {
-                let pos = targets.partition_point(|p| {
-                    p.mag > target.mag
-                        || (p.mag == target.mag
-                            && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
-                });
-                targets.insert(pos, *target);
-                targets.pop();
-            }
+            insert_top_target(&mut targets, *target, fan_out);
         }
 
         // targets is already sorted by (mag desc, position asc) from the
@@ -445,42 +408,45 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
     hashes
 }
 
+/// Linear-insert `target` into a top-K list of peaks kept sorted by
+/// `(mag desc, position asc)`, capped at `fan_out` entries.
+///
+/// For `fan_out ≤ 16` the O(K) insert is faster than a `BinaryHeap`'s
+/// O(log K) because the constant factor of `partition_point` + memmove
+/// is lower in practice.
+#[inline]
+fn insert_top_target(targets: &mut Vec<Peak>, target: Peak, fan_out: usize) {
+    if targets.len() < fan_out {
+        let pos = targets.partition_point(|p| {
+            p.mag > target.mag
+                || (p.mag == target.mag && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
+        });
+        targets.insert(pos, target);
+    } else if let Some(last) = targets.last()
+        && (target.mag > last.mag
+            || (target.mag == last.mag
+                && (target.t_frame, target.f_bin) < (last.t_frame, last.f_bin)))
+    {
+        let pos = targets.partition_point(|p| {
+            p.mag > target.mag
+                || (p.mag == target.mag && (p.t_frame, p.f_bin) <= (target.t_frame, target.f_bin))
+        });
+        targets.insert(pos, target);
+        targets.pop();
+    }
+}
+
 /// FFT gives 513 bins; pack into 9 bits (512 buckets) per spec.
 #[inline]
 fn quantise_freq(bin: u16) -> u32 {
     (bin as u32 * WANG_FREQ_BUCKETS) / 513
 }
 
-/// Owned wrapper around `Peak` whose `Ord` reverses magnitude (and
-/// position tiebreak), so a `BinaryHeap<MinByMagOwned>` of size `K`
-/// behaves as a min-heap that retains the top-K largest peaks.
-#[derive(Copy, Clone)]
-struct MinByMagOwned(Peak);
-
-impl PartialEq for MinByMagOwned {
-    fn eq(&self, o: &Self) -> bool {
-        self.0.mag == o.0.mag && self.0.t_frame == o.0.t_frame && self.0.f_bin == o.0.f_bin
-    }
-}
-impl Eq for MinByMagOwned {}
-impl PartialOrd for MinByMagOwned {
-    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for MinByMagOwned {
-    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
-        o.0.mag
-            .partial_cmp(&self.0.mag)
-            .unwrap_or(core::cmp::Ordering::Equal)
-            .then_with(|| (o.0.t_frame, o.0.f_bin).cmp(&(self.0.t_frame, self.0.f_bin)))
-    }
-}
-
-/// Anchor pending finalisation, with its top-K target heap.
+/// Anchor pending finalisation, with its top-K target list.
 struct PendingAnchor {
     peak: Peak,
-    targets: alloc::collections::BinaryHeap<MinByMagOwned>,
+    /// Top-K targets by `(mag desc, position asc)`, capped at `fan_out`.
+    targets: Vec<Peak>,
 }
 
 /// Streaming Wang fingerprinter — fully incremental.
@@ -576,20 +542,7 @@ impl StreamingWang {
     /// to prevent OOM from extreme values.
     #[must_use]
     pub fn new(mut cfg: WangConfig) -> Self {
-        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
-        cfg.fan_out = cfg.fan_out.clamp(1, 64);
-        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
-        if cfg.max_input_samples == Some(0) {
-            cfg.max_input_samples = Some(1);
-        }
-        if cfg.max_hashes == Some(0) {
-            cfg.max_hashes = Some(1);
-        }
-        if cfg.max_pending_anchors == Some(0) {
-            cfg.max_pending_anchors = Some(1);
-        }
-        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
-        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+        crate::classical::sanitize_cfg!(cfg);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: WANG_N_FFT,
             hop: WANG_HOP,
@@ -761,10 +714,7 @@ impl StreamingWang {
                 if df.abs() > target_zone_f {
                     continue;
                 }
-                anchor.targets.push(MinByMagOwned(peak));
-                if anchor.targets.len() > fan_out {
-                    anchor.targets.pop();
-                }
+                insert_top_target(&mut anchor.targets, peak, fan_out);
             }
             // Register this peak as a new ANCHOR.
             // If a hard cap is configured, evict oldest anchors first
@@ -776,7 +726,7 @@ impl StreamingWang {
             }
             self.pending_anchors.push_back(PendingAnchor {
                 peak,
-                targets: alloc::collections::BinaryHeap::with_capacity(fan_out + 1),
+                targets: Vec::with_capacity(fan_out),
             });
         }
         self.last_finalized_bucket = bucket as i32;
@@ -842,22 +792,15 @@ impl StreamingWang {
         self.emitted = emitted;
     }
 
-    /// Drain an anchor's target heap, sort by `(mag desc, position asc)`
-    /// for deterministic emission, then emit the corresponding hashes.
+    /// Drain an anchor's target list (kept sorted by `(mag desc, position
+    /// asc)` by `insert_top_target`) and emit the corresponding hashes.
     fn build_hashes_for_anchor(
         &self,
         anchor: PendingAnchor,
         out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
     ) {
-        let mut targets: alloc::vec::Vec<Peak> = anchor.targets.into_iter().map(|w| w.0).collect();
-        targets.sort_unstable_by(|a, b| {
-            b.mag
-                .partial_cmp(&a.mag)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
-        });
         let f_a_q = quantise_freq(anchor.peak.f_bin);
-        for target in &targets {
+        for target in anchor.targets {
             let f_b_q = quantise_freq(target.f_bin);
             let dt = (target.t_frame - anchor.peak.t_frame).clamp(1, 0x3FFF);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
@@ -928,7 +871,7 @@ impl StreamingWang {
             .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
                 let row_idx = (ripe_abs - spec_first_frame) as usize;
                 let bucket = (ripe_abs as f32 / WANG_FRAMES_PER_SEC) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate().take(n_bins) {
+                for (bin, &row_max) in max_row.iter().enumerate() {
                     let idx = row_idx * n_bins + bin;
                     let v = spec[idx];
                     if v > min_mag && v >= row_max {
@@ -1501,14 +1444,14 @@ mod tests {
         target_f: u16,
         target_mag: f32,
     ) -> PendingAnchor {
-        let target = MinByMagOwned(Peak {
+        let target = Peak {
             t_frame: target_t,
             f_bin: target_f,
             _pad: 0,
             mag: target_mag,
-        });
-        let mut targets = alloc::collections::BinaryHeap::with_capacity(4);
-        targets.push(target);
+        };
+        let mut targets = Vec::with_capacity(4);
+        insert_top_target(&mut targets, target, 4);
         PendingAnchor {
             peak: Peak {
                 t_frame,

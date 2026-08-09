@@ -28,3 +28,27 @@ pub mod wang;
 pub use haitsma::{Haitsma, HaitsmaConfig, HaitsmaFingerprint, StreamingHaitsma};
 pub use panako::{Panako, PanakoConfig, PanakoFingerprint, PanakoHash, StreamingPanako};
 pub use wang::{StreamingWang, Wang, WangConfig, WangFingerprint, WangHash};
+
+/// Clamp the shared limit fields of [`WangConfig`] / [`PanakoConfig`] to
+/// safe bounds: min-1 floors prevent underflow/empty output, ceilings
+/// prevent OOM from extreme values, and zero-value limits are rejected
+/// (they would reject all inputs/outputs).
+macro_rules! sanitize_cfg {
+    ($cfg:expr) => {{
+        $cfg.target_zone_t = $cfg.target_zone_t.clamp(1, 512);
+        $cfg.fan_out = $cfg.fan_out.clamp(1, 64);
+        $cfg.peaks_per_sec = $cfg.peaks_per_sec.min(500);
+        if $cfg.max_input_samples == Some(0) {
+            $cfg.max_input_samples = Some(1);
+        }
+        if $cfg.max_hashes == Some(0) {
+            $cfg.max_hashes = Some(1);
+        }
+        if $cfg.max_pending_anchors == Some(0) {
+            $cfg.max_pending_anchors = Some(1);
+        }
+        $cfg.target_zone_f = $cfg.target_zone_f.clamp(1, 512);
+        $cfg.min_anchor_mag_db = $cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+    }};
+}
+pub(crate) use sanitize_cfg;

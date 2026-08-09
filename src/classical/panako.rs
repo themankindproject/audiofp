@@ -219,20 +219,7 @@ impl Panako {
     /// to prevent OOM from extreme values.
     #[must_use]
     pub fn new(mut cfg: PanakoConfig) -> Self {
-        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
-        cfg.fan_out = cfg.fan_out.clamp(1, 64);
-        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
-        if cfg.max_input_samples == Some(0) {
-            cfg.max_input_samples = Some(1);
-        }
-        if cfg.max_hashes == Some(0) {
-            cfg.max_hashes = Some(1);
-        }
-        if cfg.max_pending_anchors == Some(0) {
-            cfg.max_pending_anchors = Some(1);
-        }
-        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
-        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+        crate::classical::sanitize_cfg!(cfg);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -458,12 +445,8 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         // Heap-based top-K over (b, c) tuples, scored by `b.mag + c.mag`.
         // Suffix-max array enables early-exit without reordering targets.
         let targets_len = targets.len();
-        if suffix_max.len() < targets_len + 1 {
-            suffix_max.resize(targets_len + 1, 0.0_f32);
-        } else {
-            suffix_max.truncate(targets_len + 1);
-            suffix_max[targets_len] = 0.0_f32;
-        }
+        suffix_max.resize(targets_len + 1, 0.0_f32);
+        suffix_max[targets_len] = 0.0_f32;
         for j in (0..targets_len).rev() {
             let m = targets[j].mag;
             suffix_max[j] = if m > suffix_max[j + 1] {
@@ -635,20 +618,7 @@ impl StreamingPanako {
     /// to prevent OOM from extreme values.
     #[must_use]
     pub fn new(mut cfg: PanakoConfig) -> Self {
-        cfg.target_zone_t = cfg.target_zone_t.clamp(1, 512);
-        cfg.fan_out = cfg.fan_out.clamp(1, 64);
-        cfg.peaks_per_sec = cfg.peaks_per_sec.min(500);
-        if cfg.max_input_samples == Some(0) {
-            cfg.max_input_samples = Some(1);
-        }
-        if cfg.max_hashes == Some(0) {
-            cfg.max_hashes = Some(1);
-        }
-        if cfg.max_pending_anchors == Some(0) {
-            cfg.max_pending_anchors = Some(1);
-        }
-        cfg.target_zone_f = cfg.target_zone_f.clamp(1, 512);
-        cfg.min_anchor_mag_db = cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+        crate::classical::sanitize_cfg!(cfg);
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft: PANAKO_N_FFT,
             hop: PANAKO_HOP,
@@ -985,7 +955,7 @@ impl StreamingPanako {
             .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
                 let row_idx = (ripe_abs - spec_first_frame) as usize;
                 let bucket = (ripe_abs as f32 / PANAKO_FRAMES_PER_SEC) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate().take(n_bins) {
+                for (bin, &row_max) in max_row.iter().enumerate() {
                     let idx = row_idx * n_bins + bin;
                     let v = spec[idx];
                     if v > min_mag && v >= row_max {
