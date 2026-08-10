@@ -65,6 +65,7 @@
 
 use alloc::vec::Vec;
 
+use crate::classical::stream_core;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
@@ -544,63 +545,12 @@ fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
 /// Latency is higher than Wang because the triplet zone is wider
 /// (`target_zone_t = 96` vs Wang's 63).
 ///
-/// Anchor pending finalisation, with all observed targets in cone.
-struct PendingAnchorPanako {
-    peak: Peak,
-    targets: alloc::vec::Vec<Peak>,
-}
-
-/// Streaming Panako fingerprinter — fully incremental.
-///
-/// Same rolling-spectrogram + per-bucket-finalisation strategy as
-/// [`super::StreamingWang`]. Per-anchor state collects ALL targets in
-/// the cone (rather than top-K) because Panako's hash builder enumerates
-/// `(b, c)` pairs over them; the heap-based top-K is applied at the
-/// pair level when the anchor is finalised.
-///
-/// Output is bit-exactly equivalent to [`Panako::extract`].
+/// The pipeline is shared with [`StreamingWang`] via
+/// [`stream_core`](crate::classical::stream_core); this wrapper supplies
+/// only the Panako-specific triplet emission.
 pub struct StreamingPanako {
     cfg: PanakoConfig,
-
-    stft: ShortTimeFFT,
-    sample_carry: Vec<f32>,
-
-    spec: Vec<f32>,
-    spec_n_rows: usize,
-    spec_n_bins: usize,
-    spec_first_frame: u32,
-
-    n_frames_total: u32,
-    last_pd_frame: i32,
-
-    peak_det: crate::dsp::peaks::IncrementalPeakDetector,
-    peak_row_max: Vec<f32>,
-    frame_scratch: Vec<f32>,
-
-    // Sorted Vec replaces BTreeMap — bucket_pending is bounded (≤ 3
-    // entries in steady state), so linear/binary search is faster than
-    // tree traversal.
-    bucket_pending: Vec<(u32, Vec<Peak>)>,
-    last_finalized_bucket: i32,
-
-    pending_anchors: alloc::collections::VecDeque<PendingAnchorPanako>,
-
-    /// Pooled scratch for `finalize_buckets` / `flush`: the list of
-    /// bucket keys to finalise on this call. Previously a fresh
-    /// `Vec::collect()` on every `push`; pooled here and `clear()`ed
-    /// per call so the streaming hot path performs zero allocations
-    /// for bucket finalisation. Same pattern as `StreamingWang`.
-    to_finalize: Vec<u32>,
-
-    /// Pooled scratch for the sorted (b, c, score) triplet list.
-    /// Stores owned Peak copies to avoid lifetime issues on the struct.
-    triplet_scratch: Vec<(Peak, Peak, f32)>,
-
-    /// Pooled output buffer for `emit_finalized_anchors`. Cleared at
-    /// the start of each `push`/`flush`, populated by the emit logic,
-    /// and `take`n at the end to return. Avoids a fresh allocation per
-    /// call.
-    emitted: Vec<(TimestampMs, PanakoHash)>,
+    core: stream_core::StreamCore<PanakoHash>,
 }
 
 impl Default for StreamingPanako {
@@ -619,37 +569,16 @@ impl StreamingPanako {
     #[must_use]
     pub fn new(mut cfg: PanakoConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: PANAKO_N_FFT,
-            hop: PANAKO_HOP,
-            window: WindowKind::Hann,
-            center: false,
-        });
-        let n_bins = stft.n_bins();
-        let window_capacity = 2 * PANAKO_PEAK_NEIGHBOURHOOD + 1;
         Self {
             cfg,
-            stft,
-            sample_carry: Vec::new(),
-            spec: alloc::vec![0.0_f32; window_capacity * n_bins],
-            spec_n_rows: 0,
-            spec_n_bins: n_bins,
-            spec_first_frame: 0,
-            n_frames_total: 0,
-            last_pd_frame: -1,
-            peak_det: crate::dsp::peaks::IncrementalPeakDetector::new(
+            core: stream_core::StreamCore::new(
+                PANAKO_N_FFT,
+                PANAKO_HOP,
+                PANAKO_SR,
                 PANAKO_PEAK_NEIGHBOURHOOD,
-                PANAKO_PEAK_NEIGHBOURHOOD,
-                n_bins,
+                PANAKO_LOG_FLOOR_POWER,
+                stream_core::Zone::Strict,
             ),
-            peak_row_max: alloc::vec![0.0_f32; n_bins],
-            frame_scratch: alloc::vec![0.0_f32; n_bins],
-            bucket_pending: Vec::new(),
-            last_finalized_bucket: -1,
-            pending_anchors: alloc::collections::VecDeque::new(),
-            to_finalize: Vec::new(),
-            triplet_scratch: Vec::new(),
-            emitted: Vec::new(),
         }
     }
 
@@ -664,17 +593,7 @@ impl StreamingPanako {
     /// Call between independent streams sharing one instance so stale
     /// data from a previous stream doesn't bleed into new hashes.
     pub fn reset(&mut self) {
-        self.sample_carry.clear();
-        self.peak_det.reset();
-        self.spec_n_rows = 0;
-        self.spec_first_frame = 0;
-        self.n_frames_total = 0;
-        self.last_pd_frame = -1;
-        self.bucket_pending.clear();
-        self.last_finalized_bucket = -1;
-        self.pending_anchors.clear();
-        self.to_finalize.clear();
-        self.emitted.clear();
+        self.core.reset();
     }
 
     fn lookahead_frames(&self) -> u32 {
@@ -683,198 +602,60 @@ impl StreamingPanako {
             + PANAKO_FRAMES_PER_SEC.ceil() as u32
     }
 
-    /// Append the current contents of `self.frame_scratch` to the
-    /// rolling spec buffer, dropping the oldest row if at capacity.
-    /// Avoids the per-frame `Vec::clone` the borrow checker would
-    /// otherwise force on a `(&mut self, &[f32])` signature.
-    fn append_frame_scratch_row(&mut self) {
-        debug_assert_eq!(self.frame_scratch.len(), self.spec_n_bins);
-        let cap = 2 * PANAKO_PEAK_NEIGHBOURHOOD + 1;
-        if self.spec_n_rows == cap {
-            self.spec.copy_within(self.spec_n_bins.., 0);
-            self.spec_first_frame += 1;
-            self.spec_n_rows -= 1;
-        }
-        let dst_start = self.spec_n_rows * self.spec_n_bins;
-        let n_bins = self.spec_n_bins;
-        // Disjoint borrow of `self.spec` (mut) and `self.frame_scratch`
-        // (shared) — different fields of `self`, so this is sound.
-        self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
-        self.spec_n_rows += 1;
-    }
-
-    fn detect_rows(&mut self, from_row: usize, to_row: usize) {
-        if self.spec_n_rows == 0 || from_row > to_row {
-            return;
-        }
-        let n_bins = self.spec_n_bins;
-
-        for row in from_row..=to_row {
-            if row >= self.spec_n_rows {
-                break;
-            }
-            let abs_f = self.spec_first_frame + row as u32;
-            let bucket = (abs_f as f32 / PANAKO_FRAMES_PER_SEC) as u32;
-            for bin in 0..n_bins {
-                let idx = row * n_bins + bin;
-                let v = self.spec[idx];
-                if v > self.cfg.min_anchor_mag_db && v >= self.peak_row_max[bin] {
-                    let peak = Peak {
-                        t_frame: abs_f,
-                        f_bin: bin as u16,
-                        _pad: 0,
-                        mag: v,
-                    };
-                    match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                        Ok(idx) => self.bucket_pending[idx].1.push(peak),
-                        Err(idx) => self.bucket_pending.insert(idx, (bucket, alloc::vec![peak])),
-                    }
-                }
-            }
+    fn peak_cfg(&self) -> stream_core::PeakCfg {
+        stream_core::PeakCfg {
+            min_anchor_mag_db: self.cfg.min_anchor_mag_db,
+            target_zone_t: self.cfg.target_zone_t as i32,
+            target_zone_f: self.cfg.target_zone_f as i32,
+            fan_out: self.cfg.fan_out as usize,
+            peaks_per_sec: self.cfg.peaks_per_sec as usize,
+            max_pending_anchors: self.cfg.max_pending_anchors,
+            max_push_samples: self.cfg.max_push_samples,
         }
     }
 
-    fn finalize_bucket(&mut self, bucket: u32) {
-        let mut peaks = match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-            Ok(idx) => self.bucket_pending.remove(idx).1,
-            Err(_) => return,
-        };
-        // Sort by mag desc, then `(t, f)` ascending. The positional
-        // tiebreak is unique per peak, so equal-magnitude peaks at the
-        // truncation boundary resolve identically to the offline
-        // `adaptive_per_second`.
-        peaks.sort_unstable_by(|a, b| {
-            b.mag
-                .partial_cmp(&a.mag)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
-        });
-        peaks.truncate(self.cfg.peaks_per_sec as usize);
-        // Re-sort by `(t, f)` so downstream iteration matches the offline
-        // hash builder's order.
-        peaks.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-
-        let target_zone_t = self.cfg.target_zone_t as i32;
-        let target_zone_f = self.cfg.target_zone_f as i32;
-        let fan_out = self.cfg.fan_out as usize;
-        let target_cap = 2 * fan_out;
-
-        for peak in peaks {
-            // Add as TARGET to older anchors whose cone covers it
-            // (Panako uses STRICT inequalities `dt < target_zone_t`,
-            // `|df| < target_zone_f` — match `build_triplet_hashes`).
-            for anchor in self.pending_anchors.iter_mut() {
-                let dt = peak.t_frame as i32 - anchor.peak.t_frame as i32;
-                if dt < 1 || dt >= target_zone_t {
-                    continue;
-                }
-                let df = peak.f_bin as i32 - anchor.peak.f_bin as i32;
-                if df.abs() >= target_zone_f {
-                    continue;
-                }
-                anchor.targets.push(peak);
-                // M2: Cap targets at 2×fan_out — remove weakest (lowest mag).
-                if anchor.targets.len() > target_cap {
-                    let min_idx = anchor
-                        .targets
-                        .iter()
-                        .enumerate()
-                        .min_by(|(_, a), (_, b)| {
-                            a.mag
-                                .partial_cmp(&b.mag)
-                                .unwrap_or(core::cmp::Ordering::Equal)
-                                .then_with(|| (b.t_frame, b.f_bin).cmp(&(a.t_frame, a.f_bin)))
-                        })
-                        .map(|(i, _)| i)
-                        .expect("targets non-empty after cap check");
-                    anchor.targets.swap_remove(min_idx);
-                }
-            }
-            // Register this peak as a new ANCHOR.
-            // If a hard cap is configured, evict oldest anchors first
-            // so memory stays bounded under adversarial / dense input.
-            if let Some(limit) = self.cfg.max_pending_anchors {
-                while self.pending_anchors.len() >= limit {
-                    self.pending_anchors.pop_front();
-                }
-            }
-            self.pending_anchors.push_back(PendingAnchorPanako {
-                peak,
-                targets: Vec::new(),
-            });
+    /// Panako target maintenance: keep all in-cone targets, capped at
+    /// `2·fan_out` with weakest-magnitude eviction.
+    fn add_target(
+        targets: &mut Vec<Peak>,
+        target: Peak,
+        _dt: i32,
+        _df: i32,
+        cfg: stream_core::PeakCfg,
+    ) {
+        let target_cap = 2 * cfg.fan_out;
+        targets.push(target);
+        if targets.len() > target_cap {
+            let min_idx = targets
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.mag
+                        .partial_cmp(&b.mag)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                        .then_with(|| (b.t_frame, b.f_bin).cmp(&(a.t_frame, a.f_bin)))
+                })
+                .map(|(i, _)| i)
+                .expect("targets non-empty after cap check");
+            targets.swap_remove(min_idx);
         }
-        self.last_finalized_bucket = bucket as i32;
     }
 
-    fn finalize_buckets(&mut self) {
-        if self.last_pd_frame < 0 {
-            return;
-        }
-        let current_bucket = (self.last_pd_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32;
-        // Collect into the pooled buffer instead of allocating a fresh
-        // `Vec` on every `push`. `bucket_pending` is bounded (≤ 3 in
-        // steady state), so the buffer never grows after warmup.
-        //
-        // The index-based loop (rather than `drain(..)`) sidesteps the
-        // borrow conflict: `drain` would hold `&mut self.to_finalize`
-        // across the loop body where `self.finalize_bucket` needs
-        // `&mut self`. Indexing a `Copy` element produces a `u32` by
-        // value, so the immutable borrow of `to_finalize` ends before
-        // the mutable call begins.
-        self.to_finalize.clear();
-        self.to_finalize.extend(
-            self.bucket_pending.iter().map(|e| e.0).filter(|&b| {
-                (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket
-            }),
-        );
-        let n = self.to_finalize.len();
-        for i in 0..n {
-            let bucket = self.to_finalize[i];
-            self.finalize_bucket(bucket);
-        }
-        self.to_finalize.clear();
-    }
-
-    fn emit_finalized_anchors(&mut self) {
-        // Anchor's last possible target frame is `t + (target_zone_t - 1)`
-        // because Panako uses strict `dt < target_zone_t`.
-        let last_dt = self.cfg.target_zone_t as u32 - 1;
-        // Pop-and-push pattern: take the front anchor, decide whether its
-        // target zone is fully observed, and if not put it back. This avoids
-        // an `unwrap` after a separate `front()` peek and stays a clean
-        // `while let` over the pop result.
-        //
-        // Temporarily take `emitted` to split the borrow: the loop body
-        // needs `&mut self` (for `build_triplets_for_anchor`) and `&mut emitted`.
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            let last_target_frame = anchor.peak.t_frame + last_dt;
-            let last_target_bucket = (last_target_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32;
-            if self.last_finalized_bucket < last_target_bucket {
-                self.pending_anchors.push_front(anchor);
-                break;
-            }
-            self.build_triplets_for_anchor(anchor, &mut emitted);
-        }
-        self.emitted = emitted;
-    }
-
-    fn build_triplets_for_anchor(
-        &mut self,
-        mut anchor: PendingAnchorPanako,
+    /// Emit Panako triplet hashes for a finalised anchor: sort targets by
+    /// `(t_frame, f_bin)` and keep the top-K `(b, c)` pairs by
+    /// `b.mag + c.mag`.
+    fn emit_anchor(
+        anchor: &stream_core::PendingAnchor,
+        cfg: stream_core::PeakCfg,
         out: &mut Vec<(TimestampMs, PanakoHash)>,
     ) {
-        let fan_out = self.cfg.fan_out as usize;
-        // Sort targets by (t_frame, f_bin) to match the offline builder's
-        // iteration order — required for (b, c) pair enumeration to produce
-        // identical hashes (and avoid u32 underflow in pack_triplet).
-        anchor
-            .targets
-            .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+        let fan_out = cfg.fan_out;
+        let mut targets: Vec<Peak> = anchor.targets.clone();
+        targets.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
         let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
             alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
-        for (j, b) in anchor.targets.iter().enumerate() {
-            for c in &anchor.targets[j + 1..] {
+        for (j, b) in targets.iter().enumerate() {
+            for c in &targets[j + 1..] {
                 let score = b.mag + c.mag;
                 heap.push(MinByScoreOwned::new(b, c, score));
                 if heap.len() > fan_out {
@@ -882,16 +663,15 @@ impl StreamingPanako {
                 }
             }
         }
-        self.triplet_scratch.clear();
-        self.triplet_scratch
-            .extend(heap.drain().map(|w| (w.b, w.c, w.score)));
-        self.triplet_scratch.sort_unstable_by(|x, y| {
+        let mut scratch: Vec<(Peak, Peak, f32)> =
+            heap.drain().map(|w| (w.b, w.c, w.score)).collect();
+        scratch.sort_unstable_by(|x, y| {
             y.2.partial_cmp(&x.2)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then_with(|| (x.0.t_frame, x.0.f_bin).cmp(&(y.0.t_frame, y.0.f_bin)))
                 .then_with(|| (x.1.t_frame, x.1.f_bin).cmp(&(y.1.t_frame, y.1.f_bin)))
         });
-        for (b, c, _) in &self.triplet_scratch {
+        for (b, c, _) in &scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
             let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
             out.push((
@@ -905,91 +685,6 @@ impl StreamingPanako {
             ));
         }
     }
-    // ── Private helpers for the zero-alloc push_with / flush_with path ──
-
-    fn process_push_samples(&mut self, samples: &[f32]) {
-        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
-
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= PANAKO_N_FFT {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + PANAKO_N_FFT],
-                    &mut self.frame_scratch,
-                )
-                .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
-            power_to_db_wide(&mut self.frame_scratch, PANAKO_LOG_FLOOR_POWER);
-            self.append_frame_scratch_row();
-
-            self.n_frames_total += 1;
-            off += PANAKO_HOP;
-
-            if let Some(ripe_abs) = self
-                .peak_det
-                .push_row(&self.frame_scratch, &mut self.peak_row_max)
-            {
-                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
-                self.detect_rows(row_idx, row_idx);
-                self.last_pd_frame = ripe_abs as i32;
-            }
-        }
-
-        if off > 0 {
-            self.sample_carry.drain(0..off);
-        }
-
-        self.finalize_buckets();
-        self.emit_finalized_anchors();
-    }
-
-    fn process_flush(&mut self) {
-        let n_bins = self.spec_n_bins;
-        let min_mag = self.cfg.min_anchor_mag_db;
-        let spec = &self.spec;
-        let spec_first_frame = self.spec_first_frame;
-        let bucket_pending = &mut self.bucket_pending;
-        let last_pd = &mut self.last_pd_frame;
-
-        self.peak_det
-            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
-                let row_idx = (ripe_abs - spec_first_frame) as usize;
-                let bucket = (ripe_abs as f32 / PANAKO_FRAMES_PER_SEC) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate() {
-                    let idx = row_idx * n_bins + bin;
-                    let v = spec[idx];
-                    if v > min_mag && v >= row_max {
-                        let peak = Peak {
-                            t_frame: ripe_abs,
-                            f_bin: bin as u16,
-                            _pad: 0,
-                            mag: v,
-                        };
-                        match bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                            Ok(idx) => bucket_pending[idx].1.push(peak),
-                            Err(idx) => bucket_pending.insert(idx, (bucket, alloc::vec![peak])),
-                        }
-                    }
-                }
-                *last_pd = ripe_abs as i32;
-            });
-
-        self.to_finalize.clear();
-        self.to_finalize
-            .extend(self.bucket_pending.iter().map(|e| e.0));
-        let n = self.to_finalize.len();
-        for i in 0..n {
-            let bucket = self.to_finalize[i];
-            self.finalize_bucket(bucket);
-        }
-        self.to_finalize.clear();
-
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            self.build_triplets_for_anchor(anchor, &mut emitted);
-        }
-        self.emitted = emitted;
-    }
 }
 
 impl StreamingFingerprinter for StreamingPanako {
@@ -1000,19 +695,23 @@ impl StreamingFingerprinter for StreamingPanako {
     }
 
     fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        self.emitted.clear();
-        self.process_push_samples(samples);
-        Ok(core::mem::take(&mut self.emitted))
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
+        Ok(core::mem::take(&mut self.core.emitted))
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.emitted.clear();
-        self.process_push_samples(samples);
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
         let mut n = 0usize;
-        for (t, frame) in self.emitted.drain(..) {
+        for (t, frame) in self.core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -1020,19 +719,23 @@ impl StreamingFingerprinter for StreamingPanako {
     }
 
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        self.emitted.clear();
-        self.process_flush();
-        Ok(core::mem::take(&mut self.emitted))
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush(cfg, Self::add_target, Self::emit_anchor);
+        Ok(core::mem::take(&mut self.core.emitted))
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.emitted.clear();
-        self.process_flush();
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush(cfg, Self::add_target, Self::emit_anchor);
         let mut n = 0usize;
-        for (t, frame) in self.emitted.drain(..) {
+        for (t, frame) in self.core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -1481,13 +1184,13 @@ mod tests {
         while start < samples.len() {
             let end = (start + chunk).min(samples.len());
             let _ = s.push(&samples[start..end]).unwrap();
-            peak_carry = peak_carry.max(s.sample_carry.len());
-            peak_spec_rows = peak_spec_rows.max(s.spec_n_rows);
-            peak_bucket_pending = peak_bucket_pending.max(s.bucket_pending.len());
-            peak_anchors = peak_anchors.max(s.pending_anchors.len());
+            peak_carry = peak_carry.max(s.core.sample_carry.len());
+            peak_spec_rows = peak_spec_rows.max(s.core.spec_n_rows);
+            peak_bucket_pending = peak_bucket_pending.max(s.core.bucket_pending.len());
+            peak_anchors = peak_anchors.max(s.core.pending_anchors.len());
 
-            assert!(s.sample_carry.len() < PANAKO_N_FFT);
-            assert!(s.spec_n_rows <= max_spec_rows);
+            assert!(s.core.sample_carry.len() < PANAKO_N_FFT);
+            assert!(s.core.spec_n_rows <= max_spec_rows);
             start = end;
         }
 
@@ -1505,8 +1208,8 @@ mod tests {
         );
 
         let _ = s.flush().unwrap();
-        assert_eq!(s.bucket_pending.len(), 0);
-        assert_eq!(s.pending_anchors.len(), 0);
+        assert_eq!(s.core.bucket_pending.len(), 0);
+        assert_eq!(s.core.pending_anchors.len(), 0);
     }
 
     // Direct unit tests for `emit_finalized_anchors`.
@@ -1521,10 +1224,10 @@ mod tests {
         f_bin: u16,
         target_t: u32,
         target_f: u16,
-    ) -> PendingAnchorPanako {
-        // Two targets so that `build_triplets_for_anchor` (which
-        // iterates over `(b, c)` pairs) produces at least one hash.
-        PendingAnchorPanako {
+    ) -> stream_core::PendingAnchor {
+        // Two targets so that the triplet emission (which iterates over
+        // `(b, c)` pairs) produces at least one hash.
+        stream_core::PendingAnchor {
             peak: Peak {
                 t_frame,
                 f_bin,
@@ -1561,20 +1264,24 @@ mod tests {
         // = t_frame + 95.
         let mut s = StreamingPanako::default();
         // t=0 → last target frame 95 → bucket 1
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(0, 10, 10, 12));
         // t=5 → last target frame 100 → bucket 1
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(5, 20, 15, 22));
         // t=100 → last target frame 195 → bucket 3
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(100, 30, 110, 32));
-        s.last_finalized_bucket = panako_bucket_of(195);
+        s.core.last_finalized_bucket = panako_bucket_of(195);
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        assert_eq!(s.emitted.len(), 3);
-        assert!(s.pending_anchors.is_empty());
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        assert_eq!(s.core.emitted.len(), 3);
+        assert!(s.core.pending_anchors.is_empty());
     }
 
     #[test]
@@ -1582,18 +1289,21 @@ mod tests {
         // Two anchors; only the first is covered. The second must
         // remain in `pending_anchors` after the emit.
         let mut s = StreamingPanako::default();
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(0, 10, 10, 12));
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(100, 30, 110, 32));
         // Only cover bucket 1 (last target frame ≤ 95).
-        s.last_finalized_bucket = 1;
+        s.core.last_finalized_bucket = 1;
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        assert_eq!(s.emitted.len(), 1);
-        assert_eq!(s.pending_anchors.len(), 1);
-        assert_eq!(s.pending_anchors.front().unwrap().peak.t_frame, 100);
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        assert_eq!(s.core.emitted.len(), 1);
+        assert_eq!(s.core.pending_anchors.len(), 1);
+        assert_eq!(s.core.pending_anchors.front().unwrap().peak.t_frame, 100);
     }
 
     #[test]
@@ -1601,19 +1311,22 @@ mod tests {
         // With one anchor covered, two consecutive calls must emit
         // the same hashes (no double-emit, no lost anchor).
         let mut s = StreamingPanako::default();
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(panako_anchor_with_target(0, 10, 10, 12));
-        s.last_finalized_bucket = panako_bucket_of(95);
+        s.core.last_finalized_bucket = panako_bucket_of(95);
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        let first_len = s.emitted.len();
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        let second_len = s.emitted.len();
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        let first_len = s.core.emitted.len();
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        let second_len = s.core.emitted.len();
         assert_eq!(first_len, 1);
         assert_eq!(second_len, 0);
-        assert!(s.pending_anchors.is_empty());
+        assert!(s.core.pending_anchors.is_empty());
     }
 
     // Public API contract pins. See wang.rs for motivation.

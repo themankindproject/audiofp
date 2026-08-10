@@ -98,6 +98,24 @@ pub fn match_ranked<M: Matcher>(
     results
 }
 
+/// Track a candidate result into `best`, early-aborting when it hits a
+/// perfect score. Shared by all three index `query` paths.
+#[inline]
+fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: MatchResult) -> bool {
+    let better = match best {
+        None => true,
+        Some((_, b)) => {
+            crate::matching::match_result_compare_desc(&result, b) == core::cmp::Ordering::Less
+        }
+    };
+    if better {
+        *best = Some((ref_id, result));
+        // Early-abort: a perfect score cannot be beaten.
+        return result.score >= 1.0;
+    }
+    false
+}
+
 /// An in-memory inverted index over several Wang fingerprints.
 ///
 /// This is a matching **accelerator** — it combines many references into
@@ -164,9 +182,7 @@ impl WangIndex {
         query: &crate::classical::WangFingerprint,
         cfg: &crate::matching::WangMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use crate::matching::{
-            TimeOffset, clamp_score, compute_prominence, match_result_compare_desc,
-        };
+        use crate::matching::{TimeOffset, clamp_score, compute_prominence};
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
@@ -317,16 +333,8 @@ impl WangIndex {
                 time_scale: 1.0,
             };
 
-            let better = match &best {
-                None => true,
-                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
-            };
-            if better {
-                best = Some((ref_id, result));
-                // Early-abort: a perfect score cannot be beaten.
-                if result.score >= 1.0 {
-                    return best;
-                }
+            if track_best(&mut best, ref_id, result) {
+                return best;
             }
         }
 
@@ -426,7 +434,6 @@ impl HaitsmaIndex {
         cfg: &crate::matching::HaitsmaMatchConfig,
     ) -> Option<(usize, MatchResult)> {
         use super::haitsma::{hamming_at_offset, overlap_at};
-        use crate::matching::match_result_compare_desc;
 
         let q_frames = &query.frames;
         let q_len = q_frames.len();
@@ -515,16 +522,8 @@ impl HaitsmaIndex {
                 continue;
             }
 
-            let better = match &best {
-                None => true,
-                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
-            };
-            if better {
-                best = Some((ref_id, result));
-                // Early-abort: a perfect score cannot be beaten.
-                if result.score >= 1.0 {
-                    return best;
-                }
+            if track_best(&mut best, ref_id, result) {
+                return best;
             }
         }
 
@@ -600,9 +599,7 @@ impl PanakoIndex {
         cfg: &crate::matching::PanakoMatchConfig,
     ) -> Option<(usize, MatchResult)> {
         use super::panako::validate_config;
-        use crate::matching::{
-            TimeOffset, clamp_score, compute_prominence, match_result_compare_desc,
-        };
+        use crate::matching::{TimeOffset, clamp_score, compute_prominence};
 
         validate_config(cfg);
 
@@ -736,16 +733,8 @@ impl PanakoIndex {
                 time_scale,
             };
 
-            let better = match &best {
-                None => true,
-                Some((_, b)) => match_result_compare_desc(&result, b) == core::cmp::Ordering::Less,
-            };
-            if better {
-                best = Some((ref_id, result));
-                // Early-abort: a perfect score cannot be beaten.
-                if result.score >= 1.0 {
-                    return best;
-                }
+            if track_best(&mut best, ref_id, result) {
+                return best;
             }
         }
 

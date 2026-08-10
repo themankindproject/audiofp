@@ -38,8 +38,7 @@
 
 use alloc::vec::Vec;
 
-use bytemuck::Zeroable;
-
+use crate::classical::stream_core;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
@@ -442,13 +441,6 @@ fn quantise_freq(bin: u16) -> u32 {
     (bin as u32 * WANG_FREQ_BUCKETS) / 513
 }
 
-/// Anchor pending finalisation, with its top-K target list.
-struct PendingAnchor {
-    peak: Peak,
-    /// Top-K targets by `(mag desc, position asc)`, capped at `fan_out`.
-    targets: Vec<Peak>,
-}
-
 /// Streaming Wang fingerprinter — fully incremental.
 ///
 /// Maintains a rolling spectrogram window (`2·neighborhood_t + 1` rows),
@@ -461,6 +453,10 @@ struct PendingAnchor {
 /// The output hash multiset matches what [`Wang::extract`] would produce
 /// for the same total input — verified by the `streaming_offline_*`
 /// tests, including the 1-sample-per-push pathological case.
+///
+/// The pipeline itself is shared with [`StreamingPanako`] via
+/// [`stream_core`](crate::classical::stream_core); this wrapper supplies
+/// only the Wang-specific hash emission.
 ///
 /// # Example
 ///
@@ -477,54 +473,7 @@ struct PendingAnchor {
 /// ```
 pub struct StreamingWang {
     cfg: WangConfig,
-
-    // Front-end.
-    stft: ShortTimeFFT,
-    sample_carry: alloc::vec::Vec<f32>,
-
-    // Rolling log-power spectrogram window (contiguous, row-major).
-    // Capacity = `2*nbht + 1` rows.
-    spec: alloc::vec::Vec<f32>,
-    spec_n_rows: usize,
-    spec_n_bins: usize,
-    spec_first_frame: u32,
-
-    // Frame counter and detection cursor.
-    n_frames_total: u32,
-    last_pd_frame: i32,
-
-    // Incremental peak detection (replaces full-window rolling_max_2d).
-    peak_det: crate::dsp::peaks::IncrementalPeakDetector,
-    peak_row_max: alloc::vec::Vec<f32>,
-
-    // Reusable scratch row for STFT output.
-    frame_scratch: alloc::vec::Vec<f32>,
-
-    // Per-second adaptive thresholding.
-    // Sorted Vec replaces BTreeMap — bucket_pending is bounded (≤ 3
-    // entries in steady state), so linear search is faster than tree
-    // traversal.
-    bucket_pending: alloc::vec::Vec<(u32, alloc::vec::Vec<Peak>)>,
-    last_finalized_bucket: i32,
-
-    // Anchors awaiting finalisation, in t-order.
-    pending_anchors: alloc::collections::VecDeque<PendingAnchor>,
-
-    /// Pooled scratch for `finalize_buckets` / `flush`: the list of
-    /// bucket keys to finalise on this call. `bucket_pending` is
-    /// bounded by `≤ 3` entries in steady state (verified by
-    /// `streaming_state_stays_bounded_under_long_input`), so this Vec
-    /// is tiny — but it was previously a fresh `Vec::collect()` on
-    /// every `push`, i.e. one heap allocation per ~256 samples.
-    /// Pooled here and `clear()`ed per call so the streaming hot path
-    /// performs zero allocations for bucket finalisation.
-    to_finalize: alloc::vec::Vec<u32>,
-
-    /// Pooled output buffer for `emit_finalized_anchors`. Cleared at
-    /// the start of each `push`/`flush`, populated by the emit logic,
-    /// and `take`n at the end to return. Avoids a fresh allocation per
-    /// call.
-    emitted: alloc::vec::Vec<(TimestampMs, WangHash)>,
+    core: stream_core::StreamCore<WangHash>,
 }
 
 impl Default for StreamingWang {
@@ -543,36 +492,16 @@ impl StreamingWang {
     #[must_use]
     pub fn new(mut cfg: WangConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: WANG_N_FFT,
-            hop: WANG_HOP,
-            window: WindowKind::Hann,
-            center: false,
-        });
-        let n_bins = stft.n_bins();
-        let window_capacity = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
         Self {
             cfg,
-            stft,
-            sample_carry: alloc::vec::Vec::new(),
-            spec: alloc::vec![0.0_f32; window_capacity * n_bins],
-            spec_n_rows: 0,
-            spec_n_bins: n_bins,
-            spec_first_frame: 0,
-            n_frames_total: 0,
-            last_pd_frame: -1,
-            peak_det: crate::dsp::peaks::IncrementalPeakDetector::new(
+            core: stream_core::StreamCore::new(
+                WANG_N_FFT,
+                WANG_HOP,
+                WANG_SR,
                 WANG_PEAK_NEIGHBOURHOOD,
-                WANG_PEAK_NEIGHBOURHOOD,
-                n_bins,
+                WANG_LOG_FLOOR_POWER,
+                stream_core::Zone::Inclusive,
             ),
-            peak_row_max: alloc::vec![0.0_f32; n_bins],
-            frame_scratch: alloc::vec![0.0_f32; n_bins],
-            bucket_pending: alloc::vec::Vec::new(),
-            last_finalized_bucket: -1,
-            pending_anchors: alloc::collections::VecDeque::new(),
-            to_finalize: alloc::vec::Vec::new(),
-            emitted: alloc::vec::Vec::new(),
         }
     }
 
@@ -588,17 +517,7 @@ impl StreamingWang {
     /// data from a previous stream doesn't bleed into the first
     /// emitted hash.
     pub fn reset(&mut self) {
-        self.sample_carry.clear();
-        self.peak_det.reset();
-        self.spec_n_rows = 0;
-        self.spec_first_frame = 0;
-        self.n_frames_total = 0;
-        self.last_pd_frame = -1;
-        self.bucket_pending.clear();
-        self.last_finalized_bucket = -1;
-        self.pending_anchors.clear();
-        self.to_finalize.clear();
-        self.emitted.clear();
+        self.core.reset();
     }
 
     /// Frames an anchor must have *after* it before all of its targets
@@ -612,195 +531,39 @@ impl StreamingWang {
             + WANG_FRAMES_PER_SEC.ceil() as u32
     }
 
-    /// Append the current contents of `self.frame_scratch` to the
-    /// rolling spec buffer, dropping the oldest row if at capacity.
-    /// Avoids the per-frame `Vec::clone` the borrow checker would
-    /// otherwise force on a `(&mut self, &[f32])` signature.
-    fn append_frame_scratch_row(&mut self) {
-        debug_assert_eq!(self.frame_scratch.len(), self.spec_n_bins);
-        let cap = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
-        if self.spec_n_rows == cap {
-            self.spec.copy_within(self.spec_n_bins.., 0);
-            self.spec_first_frame += 1;
-            self.spec_n_rows -= 1;
-        }
-        let dst_start = self.spec_n_rows * self.spec_n_bins;
-        let n_bins = self.spec_n_bins;
-        // Disjoint borrow: `self.spec` (mut) and `self.frame_scratch`
-        // (shared) are different fields of `self`, so this is sound.
-        self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
-        self.spec_n_rows += 1;
-    }
-
-    /// Run rolling-max on the current spec buffer and extract peaks at
-    /// rows `[from_row_inclusive, to_row_inclusive]` (in spec-buffer-relative
-    /// indices). Push survivors into [`bucket_pending`].
-    fn detect_rows_range(&mut self, from_row: usize, to_row: usize) {
-        if self.spec_n_rows == 0 || from_row > to_row {
-            return;
-        }
-        let n_bins = self.spec_n_bins;
-        let min_mag = self.cfg.min_anchor_mag_db;
-
-        for row in from_row..=to_row {
-            if row >= self.spec_n_rows {
-                break;
-            }
-            let abs_f = self.spec_first_frame + row as u32;
-            let bucket = (abs_f as f32 / WANG_FRAMES_PER_SEC) as u32;
-            let row_start = row * n_bins;
-            let spec_row = &self.spec[row_start..row_start + n_bins];
-            let peak_max = &self.peak_row_max[..n_bins];
-            // Push peaks directly into bucket_pending — avoids a per-row
-            // Vec allocation (typically 1-3 peaks per row).  Matches
-            // Panako's `detect_rows` pattern.
-            for bin in 0..n_bins {
-                let v = spec_row[bin];
-                if v > min_mag && v >= peak_max[bin] {
-                    let peak = Peak {
-                        t_frame: abs_f,
-                        f_bin: bin as u16,
-                        mag: v,
-                        ..Peak::zeroed()
-                    };
-                    // Linear search in the sorted Vec; insert sorted if
-                    // not found. bucket_pending is bounded (≤ 3 entries).
-                    match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                        Ok(idx) => self.bucket_pending[idx].1.push(peak),
-                        Err(idx) => self.bucket_pending.insert(idx, (bucket, alloc::vec![peak])),
-                    }
-                }
-            }
+    fn peak_cfg(&self) -> stream_core::PeakCfg {
+        stream_core::PeakCfg {
+            min_anchor_mag_db: self.cfg.min_anchor_mag_db,
+            target_zone_t: self.cfg.target_zone_t as i32,
+            target_zone_f: self.cfg.target_zone_f as i32,
+            fan_out: self.cfg.fan_out as usize,
+            peaks_per_sec: self.cfg.peaks_per_sec as usize,
+            max_pending_anchors: self.cfg.max_pending_anchors,
+            max_push_samples: self.cfg.max_push_samples,
         }
     }
 
-    /// Finalise one bucket: apply per-second adaptive threshold (top
-    /// `peaks_per_sec` by magnitude), then for each surviving peak in
-    /// `(t, f)` order, grow target heaps of older anchors and register
-    /// the peak as a new anchor.
-    fn finalize_bucket(&mut self, bucket: u32) {
-        let mut peaks = match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-            Ok(idx) => self.bucket_pending.remove(idx).1,
-            Err(_) => return,
-        };
-        // Match the offline picker's `adaptive_per_second`: sort by mag
-        // desc, then `(t, f)` ascending. The positional tiebreak is unique
-        // per peak, so equal-magnitude peaks at the truncation boundary
-        // resolve identically to the offline path.
-        peaks.sort_unstable_by(|a, b| {
-            b.mag
-                .partial_cmp(&a.mag)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
-        });
-        peaks.truncate(self.cfg.peaks_per_sec as usize);
-        // Re-sort by `(t, f)` so downstream iteration matches the offline
-        // hash builder's order.
-        peaks.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-
-        let target_zone_t = self.cfg.target_zone_t as i32;
-        let target_zone_f = self.cfg.target_zone_f as i32;
-        let fan_out = self.cfg.fan_out as usize;
-
-        for peak in peaks {
-            // Add this peak as a TARGET to every still-pending anchor whose
-            // zone covers it.
-            for anchor in self.pending_anchors.iter_mut() {
-                let dt = peak.t_frame as i32 - anchor.peak.t_frame as i32;
-                if dt < 1 || dt > target_zone_t {
-                    continue;
-                }
-                let df = peak.f_bin as i32 - anchor.peak.f_bin as i32;
-                if df.abs() > target_zone_f {
-                    continue;
-                }
-                insert_top_target(&mut anchor.targets, peak, fan_out);
-            }
-            // Register this peak as a new ANCHOR.
-            // If a hard cap is configured, evict oldest anchors first
-            // so memory stays bounded under adversarial / dense input.
-            if let Some(limit) = self.cfg.max_pending_anchors {
-                while self.pending_anchors.len() >= limit {
-                    self.pending_anchors.pop_front();
-                }
-            }
-            self.pending_anchors.push_back(PendingAnchor {
-                peak,
-                targets: Vec::with_capacity(fan_out),
-            });
-        }
-        self.last_finalized_bucket = bucket as i32;
+    /// Wang target maintenance: keep the top-K targets by
+    /// `(mag desc, position asc)`.
+    fn add_target(
+        targets: &mut Vec<Peak>,
+        target: Peak,
+        _dt: i32,
+        _df: i32,
+        cfg: stream_core::PeakCfg,
+    ) {
+        crate::classical::wang::insert_top_target(targets, target, cfg.fan_out);
     }
 
-    /// Finalise every bucket whose ALL frames have been peak-detected.
-    /// Conservative: bucket B is finalisable iff `bucket(last_pd_frame) > B`.
-    fn finalize_buckets(&mut self) {
-        if self.last_pd_frame < 0 {
-            return;
-        }
-        let current_bucket = (self.last_pd_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
-        // Collect into the pooled buffer instead of allocating a fresh
-        // `Vec` on every `push`. `bucket_pending` is bounded (≤ 3 in
-        // steady state), so the buffer never grows after warmup.
-        //
-        // The index-based loop (rather than `drain(..)`) sidesteps the
-        // borrow conflict: `drain` would hold `&mut self.to_finalize`
-        // across the loop body where `self.finalize_bucket` needs
-        // `&mut self`. Indexing a `Copy` element produces a `u32` by
-        // value, so the immutable borrow of `to_finalize` ends before
-        // the mutable call begins.
-        self.to_finalize.clear();
-        self.to_finalize.extend(
-            self.bucket_pending.iter().map(|e| e.0).filter(|&b| {
-                (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket
-            }),
-        );
-        let n = self.to_finalize.len();
-        for i in 0..n {
-            let bucket = self.to_finalize[i];
-            self.finalize_bucket(bucket);
-        }
-        self.to_finalize.clear();
-    }
-
-    /// Pop anchors whose target zone is fully observed (i.e. the bucket
-    /// containing the last possible target frame has been finalised),
-    /// build hashes from their accumulated target heap, and push into
-    /// `self.emitted`.
-    fn emit_finalized_anchors(&mut self) {
-        // Pop-and-push pattern: take the front anchor, decide whether its
-        // target zone is fully observed, and if not put it back. This avoids
-        // an `unwrap` after a separate `front()` peek and stays a clean
-        // `while let` over the pop result.
-        //
-        // Temporarily take `emitted` to split the borrow: the loop body
-        // needs `&self` (for `build_hashes_for_anchor`) and `&mut emitted`.
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            // Wang's target zone is inclusive (`dt ≤ target_zone_t`, see
-            // `build_hashes`), so the last possible target frame is exactly
-            // `t + target_zone_t`; emission waits until that frame's bucket
-            // has been finalised.
-            let last_target_frame = anchor.peak.t_frame + self.cfg.target_zone_t as u32;
-            let last_target_bucket = (last_target_frame as f32 / WANG_FRAMES_PER_SEC) as i32;
-            if self.last_finalized_bucket < last_target_bucket {
-                self.pending_anchors.push_front(anchor);
-                break;
-            }
-            self.build_hashes_for_anchor(anchor, &mut emitted);
-        }
-        self.emitted = emitted;
-    }
-
-    /// Drain an anchor's target list (kept sorted by `(mag desc, position
-    /// asc)` by `insert_top_target`) and emit the corresponding hashes.
-    fn build_hashes_for_anchor(
-        &self,
-        anchor: PendingAnchor,
+    /// Emit Wang hashes for a finalised anchor: linear walk over its
+    /// top-K target list.
+    fn emit_anchor(
+        anchor: &stream_core::PendingAnchor,
+        _cfg: stream_core::PeakCfg,
         out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
     ) {
         let f_a_q = quantise_freq(anchor.peak.f_bin);
-        for target in anchor.targets {
+        for target in &anchor.targets {
             let f_b_q = quantise_freq(target.f_bin);
             let dt = (target.t_frame - anchor.peak.t_frame).clamp(1, 0x3FFF);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
@@ -814,98 +577,6 @@ impl StreamingWang {
             ));
         }
     }
-
-    // ── Private helpers for the zero-alloc push_with / flush_with path ──
-
-    /// Common processing for `push` and `push_with`: advance the STFT,
-    /// detect peaks, finalise buckets, emit ready anchors into
-    /// `self.emitted`.
-    fn process_push_samples(&mut self, samples: &[f32]) {
-        let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
-
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= WANG_N_FFT {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + WANG_N_FFT],
-                    &mut self.frame_scratch,
-                )
-                .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
-            power_to_db_wide(&mut self.frame_scratch, WANG_LOG_FLOOR_POWER);
-            self.append_frame_scratch_row();
-
-            self.n_frames_total += 1;
-            off += WANG_HOP;
-
-            if let Some(ripe_abs) = self
-                .peak_det
-                .push_row(&self.frame_scratch, &mut self.peak_row_max)
-            {
-                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
-                self.detect_rows_range(row_idx, row_idx);
-                self.last_pd_frame = ripe_abs as i32;
-            }
-        }
-
-        if off > 0 {
-            self.sample_carry.drain(0..off);
-        }
-
-        self.finalize_buckets();
-        self.emit_finalized_anchors();
-    }
-
-    /// Common processing for `flush` and `flush_with`: drain remaining
-    /// peaks from the incremental detector, finalise all buckets, emit
-    /// all anchors into `self.emitted`.
-    fn process_flush(&mut self) {
-        let n_bins = self.spec_n_bins;
-        let min_mag = self.cfg.min_anchor_mag_db;
-        let spec = &self.spec;
-        let spec_first_frame = self.spec_first_frame;
-        let bucket_pending = &mut self.bucket_pending;
-        let last_pd = &mut self.last_pd_frame;
-
-        self.peak_det
-            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
-                let row_idx = (ripe_abs - spec_first_frame) as usize;
-                let bucket = (ripe_abs as f32 / WANG_FRAMES_PER_SEC) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate() {
-                    let idx = row_idx * n_bins + bin;
-                    let v = spec[idx];
-                    if v > min_mag && v >= row_max {
-                        let peak = Peak {
-                            t_frame: ripe_abs,
-                            f_bin: bin as u16,
-                            _pad: 0,
-                            mag: v,
-                        };
-                        match bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                            Ok(idx) => bucket_pending[idx].1.push(peak),
-                            Err(idx) => bucket_pending.insert(idx, (bucket, alloc::vec![peak])),
-                        }
-                    }
-                }
-                *last_pd = ripe_abs as i32;
-            });
-
-        self.to_finalize.clear();
-        self.to_finalize
-            .extend(self.bucket_pending.iter().map(|e| e.0));
-        let n = self.to_finalize.len();
-        for i in 0..n {
-            let bucket = self.to_finalize[i];
-            self.finalize_bucket(bucket);
-        }
-        self.to_finalize.clear();
-
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            self.build_hashes_for_anchor(anchor, &mut emitted);
-        }
-        self.emitted = emitted;
-    }
 }
 
 impl StreamingFingerprinter for StreamingWang {
@@ -916,19 +587,23 @@ impl StreamingFingerprinter for StreamingWang {
     }
 
     fn push(&mut self, samples: &[f32]) -> Result<alloc::vec::Vec<(TimestampMs, Self::Frame)>> {
-        self.emitted.clear();
-        self.process_push_samples(samples);
-        Ok(core::mem::take(&mut self.emitted))
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
+        Ok(core::mem::take(&mut self.core.emitted))
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.emitted.clear();
-        self.process_push_samples(samples);
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
         let mut n = 0usize;
-        for (t, frame) in self.emitted.drain(..) {
+        for (t, frame) in self.core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -936,19 +611,23 @@ impl StreamingFingerprinter for StreamingWang {
     }
 
     fn flush(&mut self) -> Result<alloc::vec::Vec<(TimestampMs, Self::Frame)>> {
-        self.emitted.clear();
-        self.process_flush();
-        Ok(core::mem::take(&mut self.emitted))
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush(cfg, Self::add_target, Self::emit_anchor);
+        Ok(core::mem::take(&mut self.core.emitted))
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.emitted.clear();
-        self.process_flush();
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush(cfg, Self::add_target, Self::emit_anchor);
         let mut n = 0usize;
-        for (t, frame) in self.emitted.drain(..) {
+        for (t, frame) in self.core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -1332,14 +1011,14 @@ mod tests {
         while start < samples.len() {
             let end = (start + chunk).min(samples.len());
             let _ = s.push(&samples[start..end]).unwrap();
-            peak_carry = peak_carry.max(s.sample_carry.len());
-            peak_spec_rows = peak_spec_rows.max(s.spec_n_rows);
-            peak_bucket_pending = peak_bucket_pending.max(s.bucket_pending.len());
-            peak_anchors = peak_anchors.max(s.pending_anchors.len());
+            peak_carry = peak_carry.max(s.core.sample_carry.len());
+            peak_spec_rows = peak_spec_rows.max(s.core.spec_n_rows);
+            peak_bucket_pending = peak_bucket_pending.max(s.core.bucket_pending.len());
+            peak_anchors = peak_anchors.max(s.core.pending_anchors.len());
 
             // Hard structural invariants — must hold every push.
-            assert!(s.sample_carry.len() < WANG_N_FFT);
-            assert!(s.spec_n_rows <= max_spec_rows);
+            assert!(s.core.sample_carry.len() < WANG_N_FFT);
+            assert!(s.core.spec_n_rows <= max_spec_rows);
             start = end;
         }
 
@@ -1364,8 +1043,8 @@ mod tests {
 
         // Flush drains everything.
         let _ = s.flush().unwrap();
-        assert_eq!(s.bucket_pending.len(), 0);
-        assert_eq!(s.pending_anchors.len(), 0);
+        assert_eq!(s.core.bucket_pending.len(), 0);
+        assert_eq!(s.core.pending_anchors.len(), 0);
     }
 
     #[test]
@@ -1443,7 +1122,7 @@ mod tests {
         target_t: u32,
         target_f: u16,
         target_mag: f32,
-    ) -> PendingAnchor {
+    ) -> stream_core::PendingAnchor {
         let target = Peak {
             t_frame: target_t,
             f_bin: target_f,
@@ -1452,7 +1131,7 @@ mod tests {
         };
         let mut targets = Vec::with_capacity(4);
         insert_top_target(&mut targets, target, 4);
-        PendingAnchor {
+        stream_core::PendingAnchor {
             peak: Peak {
                 t_frame,
                 f_bin,
@@ -1476,20 +1155,24 @@ mod tests {
         let mut s = StreamingWang::default();
         // Anchor at frame 0: zone covers frames [1, 63], last target frame = 63
         // → bucket 1.
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
         // Anchor at frame 5: zone covers [6, 68], bucket 1.
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(5, 20, 15, 22, 0.8));
         // Anchor at frame 100: zone covers [101, 163], bucket 2.
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(100, 30, 110, 32, 0.7));
-        s.last_finalized_bucket = wang_bucket_of(163);
+        s.core.last_finalized_bucket = wang_bucket_of(163);
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        assert_eq!(s.emitted.len(), 3);
-        assert!(s.pending_anchors.is_empty());
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingWang::emit_anchor);
+        assert_eq!(s.core.emitted.len(), 3);
+        assert!(s.core.pending_anchors.is_empty());
     }
 
     #[test]
@@ -1497,20 +1180,23 @@ mod tests {
         // Two anchors; only the first is covered. The second must
         // remain in `pending_anchors` after the emit.
         let mut s = StreamingWang::default();
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
         // Zone covers [1, 63], bucket 1.
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(100, 30, 110, 32, 0.7));
         // Only cover bucket 1, not bucket 2.
-        s.last_finalized_bucket = 1;
+        s.core.last_finalized_bucket = 1;
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        assert_eq!(s.emitted.len(), 1);
-        assert_eq!(s.pending_anchors.len(), 1);
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingWang::emit_anchor);
+        assert_eq!(s.core.emitted.len(), 1);
+        assert_eq!(s.core.pending_anchors.len(), 1);
         // The re-queued anchor must be the unfinalised one (frame 100).
-        assert_eq!(s.pending_anchors.front().unwrap().peak.t_frame, 100);
+        assert_eq!(s.core.pending_anchors.front().unwrap().peak.t_frame, 100);
     }
 
     #[test]
@@ -1518,19 +1204,22 @@ mod tests {
         // With one anchor covered, two consecutive calls must emit
         // the same hashes (no double-emit, no lost anchor).
         let mut s = StreamingWang::default();
-        s.pending_anchors
+        s.core
+            .pending_anchors
             .push_back(anchor_with_target(0, 10, 10, 12, 0.9));
-        s.last_finalized_bucket = wang_bucket_of(63);
+        s.core.last_finalized_bucket = wang_bucket_of(63);
 
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        let first_len = s.emitted.len();
-        s.emitted.clear();
-        s.emit_finalized_anchors();
-        let second_len = s.emitted.len();
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingWang::emit_anchor);
+        let first_len = s.core.emitted.len();
+        s.core.emitted.clear();
+        s.core
+            .emit_finalized_anchors(s.peak_cfg(), StreamingWang::emit_anchor);
+        let second_len = s.core.emitted.len();
         assert_eq!(first_len, 1);
         assert_eq!(second_len, 0);
-        assert!(s.pending_anchors.is_empty());
+        assert!(s.core.pending_anchors.is_empty());
     }
 
     // Public API contract pins.

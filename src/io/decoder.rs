@@ -448,7 +448,6 @@ fn decode_inner(
 mod tests {
     use super::*;
     use core::f32::consts::PI;
-    use std::io::Write;
 
     fn write_test_wav(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
         // Counter ensures each test gets a unique path so parallel runs
@@ -577,11 +576,6 @@ mod tests {
         // Should not error out.
         std::fs::remove_file(&path).unwrap();
     }
-
-    /// Dummy `Write` ensures the unused-import pruner doesn't strip
-    /// `std::io::Write` if a future test needs in-memory writers.
-    #[allow(dead_code)]
-    fn _writer_witness<W: Write>(_w: W) {}
 
     fn write_test_wav_float(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

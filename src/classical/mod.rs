@@ -23,6 +23,7 @@
 
 pub mod haitsma;
 pub mod panako;
+pub(crate) mod stream_core;
 pub mod wang;
 
 pub use haitsma::{Haitsma, HaitsmaConfig, HaitsmaFingerprint, StreamingHaitsma};
