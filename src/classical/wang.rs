@@ -38,7 +38,7 @@
 
 use alloc::vec::Vec;
 
-use crate::classical::stream_core;
+use crate::classical::stream;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
@@ -454,8 +454,9 @@ fn quantise_freq(bin: u16) -> u32 {
 /// for the same total input — verified by the `streaming_offline_*`
 /// tests, including the 1-sample-per-push pathological case.
 ///
-/// The pipeline itself is shared with [`StreamingPanako`] via
-/// [`stream_core`](crate::classical::stream_core); this wrapper supplies
+/// The pipeline itself is shared with
+/// [`StreamingPanako`](crate::classical::StreamingPanako) via the
+/// crate-internal streaming core; this wrapper supplies
 /// only the Wang-specific hash emission.
 ///
 /// # Example
@@ -473,7 +474,7 @@ fn quantise_freq(bin: u16) -> u32 {
 /// ```
 pub struct StreamingWang {
     cfg: WangConfig,
-    core: stream_core::StreamCore<WangHash>,
+    core: stream::StreamCore<WangHash>,
 }
 
 impl Default for StreamingWang {
@@ -494,13 +495,13 @@ impl StreamingWang {
         crate::classical::sanitize_cfg!(cfg);
         Self {
             cfg,
-            core: stream_core::StreamCore::new(
+            core: stream::StreamCore::new(
                 WANG_N_FFT,
                 WANG_HOP,
                 WANG_SR,
                 WANG_PEAK_NEIGHBOURHOOD,
                 WANG_LOG_FLOOR_POWER,
-                stream_core::Zone::Inclusive,
+                stream::Zone::Inclusive,
             ),
         }
     }
@@ -531,8 +532,8 @@ impl StreamingWang {
             + WANG_FRAMES_PER_SEC.ceil() as u32
     }
 
-    fn peak_cfg(&self) -> stream_core::PeakCfg {
-        stream_core::PeakCfg {
+    fn peak_cfg(&self) -> stream::PeakCfg {
+        stream::PeakCfg {
             min_anchor_mag_db: self.cfg.min_anchor_mag_db,
             target_zone_t: self.cfg.target_zone_t as i32,
             target_zone_f: self.cfg.target_zone_f as i32,
@@ -550,7 +551,7 @@ impl StreamingWang {
         target: Peak,
         _dt: i32,
         _df: i32,
-        cfg: stream_core::PeakCfg,
+        cfg: stream::PeakCfg,
     ) {
         crate::classical::wang::insert_top_target(targets, target, cfg.fan_out);
     }
@@ -558,8 +559,8 @@ impl StreamingWang {
     /// Emit Wang hashes for a finalised anchor: linear walk over its
     /// top-K target list.
     fn emit_anchor(
-        anchor: &stream_core::PendingAnchor,
-        _cfg: stream_core::PeakCfg,
+        anchor: &stream::PendingAnchor,
+        _cfg: stream::PeakCfg,
         out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
     ) {
         let f_a_q = quantise_freq(anchor.peak.f_bin);
@@ -1122,7 +1123,7 @@ mod tests {
         target_t: u32,
         target_f: u16,
         target_mag: f32,
-    ) -> stream_core::PendingAnchor {
+    ) -> stream::PendingAnchor {
         let target = Peak {
             t_frame: target_t,
             f_bin: target_f,
@@ -1131,7 +1132,7 @@ mod tests {
         };
         let mut targets = Vec::with_capacity(4);
         insert_top_target(&mut targets, target, 4);
-        stream_core::PendingAnchor {
+        stream::PendingAnchor {
             peak: Peak {
                 t_frame,
                 f_bin,

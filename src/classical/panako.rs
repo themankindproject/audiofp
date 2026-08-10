@@ -65,7 +65,7 @@
 
 use alloc::vec::Vec;
 
-use crate::classical::stream_core;
+use crate::classical::stream;
 use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
@@ -545,12 +545,12 @@ fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
 /// Latency is higher than Wang because the triplet zone is wider
 /// (`target_zone_t = 96` vs Wang's 63).
 ///
-/// The pipeline is shared with [`StreamingWang`] via
-/// [`stream_core`](crate::classical::stream_core); this wrapper supplies
+/// The pipeline is shared with [`StreamingWang`](crate::classical::StreamingWang)
+/// via the crate-internal streaming core; this wrapper supplies
 /// only the Panako-specific triplet emission.
 pub struct StreamingPanako {
     cfg: PanakoConfig,
-    core: stream_core::StreamCore<PanakoHash>,
+    core: stream::StreamCore<PanakoHash>,
 }
 
 impl Default for StreamingPanako {
@@ -571,13 +571,13 @@ impl StreamingPanako {
         crate::classical::sanitize_cfg!(cfg);
         Self {
             cfg,
-            core: stream_core::StreamCore::new(
+            core: stream::StreamCore::new(
                 PANAKO_N_FFT,
                 PANAKO_HOP,
                 PANAKO_SR,
                 PANAKO_PEAK_NEIGHBOURHOOD,
                 PANAKO_LOG_FLOOR_POWER,
-                stream_core::Zone::Strict,
+                stream::Zone::Strict,
             ),
         }
     }
@@ -602,8 +602,8 @@ impl StreamingPanako {
             + PANAKO_FRAMES_PER_SEC.ceil() as u32
     }
 
-    fn peak_cfg(&self) -> stream_core::PeakCfg {
-        stream_core::PeakCfg {
+    fn peak_cfg(&self) -> stream::PeakCfg {
+        stream::PeakCfg {
             min_anchor_mag_db: self.cfg.min_anchor_mag_db,
             target_zone_t: self.cfg.target_zone_t as i32,
             target_zone_f: self.cfg.target_zone_f as i32,
@@ -621,7 +621,7 @@ impl StreamingPanako {
         target: Peak,
         _dt: i32,
         _df: i32,
-        cfg: stream_core::PeakCfg,
+        cfg: stream::PeakCfg,
     ) {
         let target_cap = 2 * cfg.fan_out;
         targets.push(target);
@@ -645,8 +645,8 @@ impl StreamingPanako {
     /// `(t_frame, f_bin)` and keep the top-K `(b, c)` pairs by
     /// `b.mag + c.mag`.
     fn emit_anchor(
-        anchor: &stream_core::PendingAnchor,
-        cfg: stream_core::PeakCfg,
+        anchor: &stream::PendingAnchor,
+        cfg: stream::PeakCfg,
         out: &mut Vec<(TimestampMs, PanakoHash)>,
     ) {
         let fan_out = cfg.fan_out;
@@ -1224,10 +1224,10 @@ mod tests {
         f_bin: u16,
         target_t: u32,
         target_f: u16,
-    ) -> stream_core::PendingAnchor {
+    ) -> stream::PendingAnchor {
         // Two targets so that the triplet emission (which iterates over
         // `(b, c)` pairs) produces at least one hash.
-        stream_core::PendingAnchor {
+        stream::PendingAnchor {
             peak: Peak {
                 t_frame,
                 f_bin,
