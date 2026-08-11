@@ -616,13 +616,7 @@ impl StreamingPanako {
 
     /// Panako target maintenance: keep all in-cone targets, capped at
     /// `2·fan_out` with weakest-magnitude eviction.
-    fn add_target(
-        targets: &mut Vec<Peak>,
-        target: Peak,
-        _dt: i32,
-        _df: i32,
-        cfg: stream::PeakCfg,
-    ) {
+    fn add_target(targets: &mut Vec<Peak>, target: Peak, _dt: i32, _df: i32, cfg: stream::PeakCfg) {
         let target_cap = 2 * cfg.fan_out;
         targets.push(target);
         if targets.len() > target_cap {

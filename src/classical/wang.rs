@@ -546,13 +546,7 @@ impl StreamingWang {
 
     /// Wang target maintenance: keep the top-K targets by
     /// `(mag desc, position asc)`.
-    fn add_target(
-        targets: &mut Vec<Peak>,
-        target: Peak,
-        _dt: i32,
-        _df: i32,
-        cfg: stream::PeakCfg,
-    ) {
+    fn add_target(targets: &mut Vec<Peak>, target: Peak, _dt: i32, _df: i32, cfg: stream::PeakCfg) {
         crate::classical::wang::insert_top_target(targets, target, cfg.fan_out);
     }
 
