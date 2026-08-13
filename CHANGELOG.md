@@ -380,6 +380,17 @@ cargo build --features std-wav   # codec picker works
 - **SIMD neural-matcher dot product** — `NeuralMatcher`'s cosine
   kernel (the `Nq·Nr` inner loop of SlidingMax and DTW) is vectorised
   8-wide (~8× faster at 256 dims: 510 → 62 ns).
+- **`u32` reference ids in inverted-index posting lists (#125)** —
+  `WangIndex` / `HaitsmaIndex` / `PanakoIndex` store `(u32, u32)` /
+  `(u32, u32, u32, u32)` postings instead of `usize`-wide ids: 33 %
+  smaller posting memory on 64-bit, better cache density. Build panics
+  if the reference count exceeds `u32::MAX`; public `query` signatures
+  are unchanged.
+- **Threshold calibration suite (#104)** — new
+  `tests/threshold_calibration.rs` measures same-track cross-codec vs
+  cross-track score/prominence distributions over the real CC0 catalog
+  and pins that the shipped defaults separate every pair. The measured
+  margins are documented in `ROBUSTNESS.md`.
 
 ### Documentation
 
