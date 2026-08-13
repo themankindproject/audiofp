@@ -129,14 +129,18 @@ fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: Ma
 /// - **Query cost:** `O(Q × avg_postings + C)` where `Q` = query hash
 ///   count, `avg_postings` = mean posting list length, `C` = candidate
 ///   references that received any vote (scored individually).
-/// - **Memory:** roughly `12 bytes × total_hashes` (after stop-hash
+/// - **Memory:** roughly `8 bytes × total_hashes` (after stop-hash
 ///   removal) plus HashMap overhead.
 ///
 /// For catalogs above ~10 000 tracks, raise `min_votes` / `min_score`
 /// pre-filters or shard the index.
 pub struct WangIndex {
     /// Inverted index: hash → list of (reference id, t_anchor).
-    map: HashMap<u32, alloc::vec::Vec<(usize, u32)>>,
+    ///
+    /// `ref_id` is stored as `u32` (8 bytes per posting instead of 16 for
+    /// `(usize, u32)` on 64-bit). Reference counts above `u32::MAX` are
+    /// rejected at build time.
+    map: HashMap<u32, alloc::vec::Vec<(u32, u32)>>,
     /// Frame rates are stored per-reference for offset conversion.
     fps: alloc::vec::Vec<f32>,
 }
@@ -146,15 +150,26 @@ impl WangIndex {
     ///
     /// Only hashes appearing in ≤ `max_postings_per_hash` references are
     /// kept (TF-IDF-style stop-hash removal applied globally).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
+    /// as `u32`).
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32)>> = super::maps::hashmap_with_capacity(
+        assert!(
+            refs.len() <= u32::MAX as usize,
+            "reference count exceeds u32::MAX"
+        );
+        let mut map: HashMap<u32, Vec<(u32, u32)>> = super::maps::hashmap_with_capacity(
             refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
         );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for h in &fp.hashes {
-                map.entry(h.hash).or_default().push((ref_id, h.t_anchor));
+                map.entry(h.hash)
+                    .or_default()
+                    .push((ref_id as u32, h.t_anchor));
             }
         }
 
@@ -190,7 +205,7 @@ impl WangIndex {
 
         // Per-reference votes: ref_id → list of (offset δ, query-hash index).
         // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
-        let mut per_ref: HashMap<usize, Vec<(i64, u32)>> =
+        let mut per_ref: HashMap<u32, Vec<(i64, u32)>> =
             super::maps::hashmap_with_capacity(self.fps.len().min(256));
         for (qi, h) in query.hashes.iter().enumerate() {
             let q_t = h.t_anchor as i64;
@@ -323,7 +338,7 @@ impl WangIndex {
 
             // fps is always populated by `build`; the 62.5 fallback is
             // defensive only and masks nothing in practice.
-            let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
+            let fps = self.fps.get(ref_id as usize).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,
                 score,
@@ -333,7 +348,7 @@ impl WangIndex {
                 time_scale: 1.0,
             };
 
-            if track_best(&mut best, ref_id, result) {
+            if track_best(&mut best, ref_id as usize, result) {
                 return best;
             }
         }
@@ -367,7 +382,7 @@ impl WangIndex {
 /// - **Query:** `O(Q + C × overlap)` where `Q` = query frames probed,
 ///   `C` = candidate refs with LUT hits, `overlap` = BER verification
 ///   window.
-/// - **Memory:** `12 bytes × total_frames` (LUT) plus `4 bytes × total_frames`
+/// - **Memory:** `8 bytes × total_frames` (LUT) plus `4 bytes × total_frames`
 ///   (per-ref frame clone for BER verification).
 ///
 /// # Scoring note
@@ -379,7 +394,10 @@ impl WangIndex {
 /// `HaitsmaMatcher`'s `median_BER / (BER + ε)` formula.
 pub struct HaitsmaIndex {
     /// Inverted index: 32-bit sub-fingerprint → list of (ref_id, frame_pos).
-    lut: HashMap<u32, Vec<(usize, u32)>>,
+    ///
+    /// `ref_id` is stored as `u32` (8 bytes per posting instead of 16 for
+    /// `(usize, u32)` on 64-bit).
+    lut: HashMap<u32, Vec<(u32, u32)>>,
     /// Per-reference frame slices for BER verification.
     frames: Vec<Vec<u32>>,
     /// Per-reference frame rates for offset conversion.
@@ -395,11 +413,20 @@ impl HaitsmaIndex {
     /// the same TF-IDF-style stop-hash pruning used by [`WangIndex`] and
     /// [`PanakoIndex`]. This keeps query-time memory and work bounded on
     /// pathological catalogs (audit B7 / A1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
+    /// as `u32`).
     pub fn build(
         refs: &[crate::classical::HaitsmaFingerprint],
         max_postings_per_hash: u32,
     ) -> Self {
-        let mut lut: HashMap<u32, Vec<(usize, u32)>> = super::maps::hashmap_with_capacity(
+        assert!(
+            refs.len() <= u32::MAX as usize,
+            "reference count exceeds u32::MAX"
+        );
+        let mut lut: HashMap<u32, Vec<(u32, u32)>> = super::maps::hashmap_with_capacity(
             refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2,
         );
         let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
@@ -407,7 +434,9 @@ impl HaitsmaIndex {
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for (pos, &frame) in fp.frames.iter().enumerate() {
-                lut.entry(frame).or_default().push((ref_id, pos as u32));
+                lut.entry(frame)
+                    .or_default()
+                    .push((ref_id as u32, pos as u32));
             }
         }
 
@@ -446,13 +475,13 @@ impl HaitsmaIndex {
         // 1. Gather candidate (ref_id, delta) pairs from LUT probes.
         //    Track how many query frames hit each candidate so we can
         //    pick the best one (heuristic for the BER path).
-        let mut candidates: HashMap<(usize, i64), u32> = hashmap_new();
+        let mut candidates: HashMap<(u32, i64), u32> = hashmap_new();
 
         for (q_pos, &q_frame) in q_frames.iter().enumerate() {
             if let Some(list) = self.lut.get(&q_frame) {
                 for &(ref_id, r_pos) in list {
                     let delta = r_pos as i64 - q_pos as i64;
-                    let overlap = overlap_at(q_len, self.frames[ref_id].len(), delta);
+                    let overlap = overlap_at(q_len, self.frames[ref_id as usize].len(), delta);
                     if overlap >= min_overlap {
                         *candidates.entry((ref_id, delta)).or_insert(0) += 1;
                     }
@@ -471,7 +500,7 @@ impl HaitsmaIndex {
         // On tied hit counts, prefer the δ with the smallest absolute
         // value (closest to zero alignment) so the winner is independent
         // of HashMap iteration order (audit B8).
-        let mut per_ref: HashMap<usize, (i64, u32)> = hashmap_new();
+        let mut per_ref: HashMap<u32, (i64, u32)> = hashmap_new();
         for (&(ref_id, delta), &hits) in &candidates {
             let entry = per_ref.entry(ref_id).or_insert((delta, hits));
             let better = hits > entry.1 || (hits == entry.1 && delta.abs() < entry.0.abs());
@@ -482,7 +511,7 @@ impl HaitsmaIndex {
         }
 
         for (ref_id, (delta, _hits)) in per_ref {
-            let r_frames = &self.frames[ref_id];
+            let r_frames = &self.frames[ref_id as usize];
             let overlap = overlap_at(q_len, r_frames.len(), delta);
 
             if overlap < min_overlap {
@@ -507,7 +536,7 @@ impl HaitsmaIndex {
             // against division by zero.
             let prominence = if ber > 1e-6 { 0.5 / ber } else { 100.0 };
 
-            let offset = crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id]);
+            let offset = crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id as usize]);
 
             let result = MatchResult {
                 is_match,
@@ -522,7 +551,7 @@ impl HaitsmaIndex {
                 continue;
             }
 
-            if track_best(&mut best, ref_id, result) {
+            if track_best(&mut best, ref_id as usize, result) {
                 return best;
             }
         }
@@ -554,7 +583,7 @@ impl HaitsmaIndex {
 /// - **Build:** `O(Σ hashes)` — one map insertion per triplet hash.
 /// - **Query:** `O(Q × avg_postings + C)` where `C` = candidate refs
 ///   that received votes, each scored via Hough peak extraction.
-/// - **Memory:** `20 bytes × total_hashes` (hash + 4 u32s per posting).
+/// - **Memory:** `16 bytes × total_hashes` (4 u32s per posting).
 ///
 /// # Scoring note
 ///
@@ -563,15 +592,27 @@ impl HaitsmaIndex {
 /// `time_scale` — less precise but much faster for large catalogs.
 pub struct PanakoIndex {
     /// Inverted index: hash → list of (ref_id, t_a, t_b, t_c).
-    map: HashMap<u32, Vec<(usize, u32, u32, u32)>>,
+    ///
+    /// `ref_id` is stored as `u32` (16 bytes per posting instead of 24
+    /// for `(usize, u32, u32, u32)` on 64-bit).
+    map: HashMap<u32, Vec<(u32, u32, u32, u32)>>,
     /// Per-reference frame rates for offset conversion.
     fps: Vec<f32>,
 }
 
 impl PanakoIndex {
     /// Build from a slice of Panako fingerprints.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
+    /// as `u32`).
     pub fn build(refs: &[crate::classical::PanakoFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = super::maps::hashmap_with_capacity(
+        assert!(
+            refs.len() <= u32::MAX as usize,
+            "reference count exceeds u32::MAX"
+        );
+        let mut map: HashMap<u32, Vec<(u32, u32, u32, u32)>> = super::maps::hashmap_with_capacity(
             refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
         );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
@@ -580,7 +621,7 @@ impl PanakoIndex {
             for h in &fp.hashes {
                 map.entry(h.hash)
                     .or_default()
-                    .push((ref_id, h.t_anchor, h.t_b, h.t_c));
+                    .push((ref_id as u32, h.t_anchor, h.t_b, h.t_c));
             }
         }
 
@@ -619,7 +660,7 @@ impl PanakoIndex {
         let q_len = query.hashes.len().max(1) as f32;
 
         // Build per-reference sparse accumulator across ALL query hashes.
-        let mut acc: HashMap<usize, HashMap<(u32, i64), u32>> = hashmap_new();
+        let mut acc: HashMap<u32, HashMap<(u32, i64), u32>> = hashmap_new();
 
         for h in &query.hashes {
             let hh = h.hash; // copy out of packed struct (unaligned refs are UB)
@@ -750,7 +791,7 @@ impl PanakoIndex {
 
             // fps is always populated by `build`; the 62.5 fallback is
             // defensive only and masks nothing in practice.
-            let fps = self.fps.get(ref_id).copied().unwrap_or(62.5);
+            let fps = self.fps.get(ref_id as usize).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,
                 score,
@@ -760,7 +801,7 @@ impl PanakoIndex {
                 time_scale,
             };
 
-            if track_best(&mut best, ref_id, result) {
+            if track_best(&mut best, ref_id as usize, result) {
                 return best;
             }
         }
