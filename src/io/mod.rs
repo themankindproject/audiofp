@@ -2,10 +2,10 @@
 //!
 //! Available only when at least one per-codec feature is enabled
 //! (`std-wav`, `std-mp3`, `std-flac`, `std-ogg`, `std-aac`, `std-mp4`,
-//! `std-aiff`, `std-mkv`, `std-adpcm`, `std-alac`), or `all` for every
-//! codec at once. Each sub-feature pulls the matching Symphonia decoder;
-//! the bare `std` feature alone enables no codecs and produces a compile
-//! error if you try to use this module. Wraps Symphonia's probe →
+//! `std-aiff`, `std-mkv`, `std-adpcm`, `std-alac`), or `all-codecs` for
+//! every codec at once. Each sub-feature pulls the matching Symphonia
+//! decoder; the bare `std` feature alone enables no codecs and produces a
+//! compile error if you try to use this module. Wraps Symphonia's probe →
 //! format-reader → decoder pipeline behind simple,
 //! allocation-conservative helpers:
 //!

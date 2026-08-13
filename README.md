@@ -58,8 +58,8 @@ audiofp = { version = "0.4", features = ["std-wav", "std-mp3"] }
 The default build is `no_std + alloc` with **no codecs**. Decoding helpers
 (`audiofp::io`) are opt-in per codec: `std-wav`, `std-mp3`, `std-flac`,
 `std-ogg`, `std-aac`, `std-mp4`, plus `std-aiff` / `std-mkv` / `std-adpcm` /
-`std-alac` for the extended formats — or `all` for every codec at once
-(the pre-0.4.0 `std` behavior).
+`std-alac` for the extended formats — or `all-codecs` for every codec at
+once (the pre-0.4.0 `std` behavior).
 
 ### Feature Flags
 
@@ -72,7 +72,7 @@ The default build is `no_std + alloc` with **no codecs**. Decoding helpers
 | `std-aac` | No | AAC decoding via Symphonia |
 | `std-mp4` | No | AAC-in-MP4 / ISO-BMFF decoding via Symphonia |
 | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
-| `all` | No | Every codec at once — the pre-0.4.0 `std` behavior |
+| `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
 | `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`) |
 | `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
 | `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |

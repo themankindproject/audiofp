@@ -1543,7 +1543,7 @@ per STFT frame per analysis window.
 | `std-mkv`    |         | Matroska (`symphonia/mkv`)                                                       |
 | `std-adpcm`  |         | ADPCM (`symphonia/adpcm`)                                                        |
 | `std-alac`   |         | ALAC (`symphonia/alac`)                                                          |
-| `all`        |         | Every format/codec above at once — the pre-0.4.0 monolithic `std` behavior        |
+| `all-codecs` |         | Every format/codec above at once — the pre-0.4.0 monolithic `std` behavior        |
 | `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark` (implies `std`)           |
 | `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model; implies `std`) |
 | `mimalloc`   |         | Installs `mimalloc` as the process-wide `#[global_allocator]` (implies `std`)    |
@@ -1559,12 +1559,15 @@ audiofp = { version = "0.4", features = ["std-wav"] }
 
 ```toml
 [dependencies]
-audiofp = { version = "0.4", features = ["all"] }
+audiofp = { version = "0.4", features = ["all-codecs"] }
 ```
 
-`all` enables every codec feature (`std-mp3`, `std-aac`, `std-flac`,
-`std-ogg`, `std-wav`, `std-mp4`, `std-aiff`, `std-mkv`, `std-adpcm`,
-`std-alac`) — the drop-in equivalent of the old monolithic `std`.
+`all-codecs` enables every codec feature (`std-mp3`, `std-aac`,
+`std-flac`, `std-ogg`, `std-wav`, `std-mp4`, `std-aiff`, `std-mkv`,
+`std-adpcm`, `std-alac`) — the drop-in equivalent of the old monolithic
+`std`. It deliberately does **not** pull in the heavyweight optional
+subsystems (`neural`, `watermark`, `rayon`, `mimalloc`); enable those
+explicitly if you need them.
 
 ### Minimal build (no_std + alloc)
 
@@ -1615,7 +1618,7 @@ What works without `std` today:
 | --------------------- | ------------------------------------------------------- |
 | `audiofp::dsp::*`         | ✅ host-only no_std (rustfft transitive issue)          |
 | `audiofp::classical::*`   | ✅ same                                                 |
-| `audiofp::io`             | ❌ requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all` |
+| `audiofp::io`             | ❌ requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all-codecs` |
 | `audiofp::watermark`      | ❌ requires `std` + `watermark`                          |
 
 ---

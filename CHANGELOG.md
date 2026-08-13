@@ -36,13 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`std` feature split into per-codec sub-features** (#60) — the
   monolithic `std` feature is replaced by `std-mp3`, `std-aac`,
   `std-flac`, `std-ogg`, `std-wav`, `std-mp4`, plus extended `std-aiff` /
-  `std-mkv` / `std-adpcm` / `std-alac`, and the `all` feature restores
-  every codec at once. `default` is now `[]`, so the default build is
-  `no_std + alloc` with **no codecs**. `audiofp::io` is only available
-  with at least one `std-*` feature (or `all`); enabling bare `std`
-  without a codec is a `compile_error!` pointing at the feature list.
-  `neural`, `watermark`, `rayon`, and `mimalloc` are unaffected (they
-  imply `std` but not any codec).
+  `std-mkv` / `std-adpcm` / `std-alac`, and the `all-codecs` feature
+  restores every codec at once. `default` is now `[]`, so the default
+  build is `no_std + alloc` with **no codecs**. `audiofp::io` is only
+  available with at least one `std-*` feature (or `all-codecs`);
+  enabling bare `std` without a codec is a `compile_error!` pointing at
+  the feature list. `neural`, `watermark`, `rayon`, and `mimalloc` are
+  unaffected (they imply `std` but not any codec).
+- **`all` feature renamed to `all-codecs`** — the old `all` name didn't
+  convey that the feature covers only the *codec* features and not the
+  heavyweight optional subsystems (`neural`, `watermark`, `rayon`,
+  `mimalloc`). The rename ships in the same unreleased 0.4.0 cycle that
+  introduced the feature, so there is no back-compat alias: update
+  `features = ["all"]` to `features = ["all-codecs"]`.
 - **`Fingerprinter::required_sample_rate()` returns `SampleRate`** (#61) —
   the offline trait now returns the `SampleRate` newtype
   (`SampleRate::HZ_8000` for Wang/Panako, `SampleRate::HZ_5000` for
@@ -69,7 +75,7 @@ Quick reference:
 | [#63] `push`/`flush` return `Result` | `s.push(&x)` → `Vec` | `s.push(&x)?` → `Result<Vec>` |
 | [#62] `min_magnitude` → `min_magnitude_db` | `min_magnitude: f32` | `min_magnitude_db: f32` + `min_magnitude_linear` |
 | [#64] Flat crate-root re-exports | `use audiofp::classical::Wang` | `use audiofp::Wang` (alias) |
-| [#60] Per-codec features | `features = ["std"]` | `features = ["std-wav"]` (pick your codecs) or `["all"]` |
+| [#60] Per-codec features | `features = ["std"]` | `features = ["std-wav"]` (pick your codecs) or `["all-codecs"]` |
 | [#61] `required_sample_rate` → `SampleRate` | `let sr = fp.required_sample_rate();` → `u32` | `let sr = fp.required_sample_rate();` → `SampleRate` |
 | [#8] `process_frame*` returns `Result` | `stft.process_frame_power(&f, &mut o);` | `stft.process_frame_power(&f, &mut o)?;` |
 
@@ -208,19 +214,20 @@ audiofp = { version = "0.4", features = ["std-wav"] }
 audiofp = { version = "0.4", features = ["std-mp3", "std-flac", "std-ogg"] }
 
 # 0.4.0 — every codec, exactly like the old `std`
-audiofp = { version = "0.4", features = ["all"] }
+audiofp = { version = "0.4", features = ["all-codecs"] }
 ```
 
 - Each `std-*` feature pulls only its own Symphonia codec (plus `pcm` for
-  `std-wav`, `vorbis` for `std-ogg`); `all` pulls every codec at once.
-- `audiofp::io` exists only when at least one `std-*` feature (or `all`)
-  is on.
+  `std-wav`, `vorbis` for `std-ogg`); `all-codecs` pulls every codec at
+  once.
+- `audiofp::io` exists only when at least one `std-*` feature (or
+  `all-codecs`) is on.
 - Bare `std` without a codec feature is a `compile_error!` with a helpful
   message — you can't silently lose decoding.
 - `neural`, `watermark`, `rayon`, `mimalloc` imply `std` but **not** any
   codec; they keep working unchanged.
 - Migration for 0.3.x users: replace `features = ["std"]` with
-  `features = ["all"]` for identical behavior, or `features = ["std-wav"]`
+  `features = ["all-codecs"]` for identical behavior, or `features = ["std-wav"]`
   (or whichever codecs you need) to trim the build. No source-code
   changes.
 

@@ -82,7 +82,12 @@ std-alac = ["std", "symphonia/alac"]
 
 # Every format/codec feature in one flag — the equivalent of the
 # pre-0.4.0 monolithic `std` feature.
-all = [
+#
+# `all-codecs` deliberately covers ONLY the codec features. The optional
+# heavyweight subsystems (`neural`, `watermark`, `rayon`, `mimalloc`)
+# are NOT included: they add large compile times or process-wide side
+# effects that most consumers don't want. Enable them explicitly.
+all-codecs = [
     "std-mp3",
     "std-aac",
     "std-flac",
