@@ -351,6 +351,28 @@ cargo build --features std-wav   # codec picker works
 - **Sorted Vec + dedup** replaces `HashMap<u32, ()>` for contrib counting.
 - **`SortedPostings`** — Wang 1:1 self-match on 5 s audio: ~107 µs
   (single allocation vs N+1 per unique hash).
+- **O(B²) → O(B·W) consolidation in `PanakoIndex::query`** — sorted
+  `(scale_bin, offset_bin)` accumulator with bounded-radius scans
+  replaces the full pairwise comparison, matching `PanakoMatcher`.
+  Also makes peak selection deterministic (sorted order instead of
+  `HashMap` iteration order).
+- **Pre-sized `HashMap` in `PanakoIndex::build`** — matches
+  `WangIndex`; eliminates repeated rehashing during index construction.
+- **Streaming Panako emit no longer clones per anchor** — the emit
+  closure now consumes the finalized `PendingAnchor` by value and sorts
+  its targets in place, restoring the zero-copy emit path from the
+  streaming-core extraction.
+- **SIMD magnitude spectra** — `ShortTimeFFT::magnitude_flat` and
+  `process_frame` now compute `sqrt(re² + im²)` 8-lane via
+  `wide::f32x8::sqrt` instead of scalar `libm::sqrtf`. ~4× faster
+  (513 bins: 2056 → 486 ns); bit-identical on default builds (hardware
+  IEEE sqrt vs libm's musl-derived software sqrt).
+- **SIMD L2 normalisation** — the neural embedder's embedding
+  normalisation accumulates sum-of-squares via `wide::f32x8` (~5.4×
+  faster at 1024 dims: 2453 → 457 ns).
+- **SIMD neural-matcher dot product** — `NeuralMatcher`'s cosine
+  kernel (the `Nq·Nr` inner loop of SlidingMax and DTW) is vectorised
+  8-wide (~8× faster at 256 dims: 510 → 62 ns).
 
 ### Documentation
 

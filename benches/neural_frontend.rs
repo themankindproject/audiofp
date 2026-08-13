@@ -94,9 +94,38 @@ fn bench_strided_tensor_write(c: &mut Criterion) {
 fn bench_l2_normalize(c: &mut Criterion) {
     let mut v = synth(3, EMBEDDING_DIM);
 
-    c.bench_function("neural_frontend/l2_normalize_1024d", |b| {
+    // Scalar reference (the pre-SIMD implementation).
+    c.bench_function("neural_frontend/l2_normalize_scalar_1024d", |b| {
         b.iter(|| {
             let sumsq: f32 = v.iter().map(|x| x * x).sum();
+            let norm = sumsq.sqrt();
+            if norm > 1e-12 {
+                let inv = 1.0 / norm;
+                for x in v.iter_mut() {
+                    *x *= inv;
+                }
+            }
+            black_box(&v);
+        });
+    });
+
+    // SIMD implementation — mirrors `EmbedderCore`'s `sumsq_wide`.
+    c.bench_function("neural_frontend/l2_normalize_simd_1024d", |b| {
+        b.iter(|| {
+            use wide::f32x8;
+            let n = v.len();
+            let chunks = n / 8;
+            let tail = chunks * 8;
+            let mut acc = f32x8::ZERO;
+            for i in 0..chunks {
+                let off = i * 8;
+                let x = f32x8::new(v[off..off + 8].try_into().unwrap());
+                acc = x.mul_add(x, acc);
+            }
+            let mut sumsq = acc.reduce_add();
+            for &x in &v[tail..] {
+                sumsq += x * x;
+            }
             let norm = sumsq.sqrt();
             if norm > 1e-12 {
                 let inv = 1.0 / norm;

@@ -317,9 +317,7 @@ impl ShortTimeFFT {
                 .expect("FFT process: input/output length mismatch");
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            for (o, c) in row.iter_mut().zip(self.scratch_out.iter()) {
-                *o = sqrtf(c.re * c.re + c.im * c.im);
-            }
+            compute_magnitude_wide(&self.scratch_out, row);
         }
 
         (out, n_frames, n_bins)
@@ -415,9 +413,7 @@ impl ShortTimeFFT {
             )
             .expect("FFT process: input/output length mismatch");
 
-        for (c, o) in self.scratch_out.iter().zip(out.iter_mut()) {
-            *o = sqrtf(c.re * c.re + c.im * c.im);
-        }
+        compute_magnitude_wide(&self.scratch_out, out);
 
         Ok(())
     }
@@ -492,6 +488,57 @@ fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
 
     for i in tail_start..n {
         dst[i] = src[i] * win[i];
+    }
+}
+
+/// SIMD-accelerated magnitude computation: `dst[i] = sqrt(re² + im²)` using
+/// `wide`.
+///
+/// Vectorises the sqrt that the scalar path must take through `libm::sqrtf`,
+/// which cannot be auto-vectorised. `f32x8::sqrt` is the hardware IEEE sqrt
+/// (or the same musl-derived software sqrt in `wide`'s no-SIMD fallback), so
+/// on default builds results are bit-identical to the scalar loop. On FMA
+/// builds the `mul_add` fuses one rounding, matching the existing
+/// `compute_power_wide` behaviour.
+fn compute_magnitude_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
+    use wide::f32x8;
+
+    debug_assert_eq!(complex.len(), dst.len());
+
+    let n = complex.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let re = f32x8::new([
+            complex[off].re,
+            complex[off + 1].re,
+            complex[off + 2].re,
+            complex[off + 3].re,
+            complex[off + 4].re,
+            complex[off + 5].re,
+            complex[off + 6].re,
+            complex[off + 7].re,
+        ]);
+        let im = f32x8::new([
+            complex[off].im,
+            complex[off + 1].im,
+            complex[off + 2].im,
+            complex[off + 3].im,
+            complex[off + 4].im,
+            complex[off + 5].im,
+            complex[off + 6].im,
+            complex[off + 7].im,
+        ]);
+        let power = re.mul_add(re, im * im);
+        dst[off..off + 8].copy_from_slice(power.sqrt().as_array());
+    }
+
+    // Scalar tail.
+    for i in tail_start..n {
+        let c = &complex[i];
+        dst[i] = sqrtf(c.re * c.re + c.im * c.im);
     }
 }
 

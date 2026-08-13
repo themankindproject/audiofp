@@ -269,10 +269,41 @@ impl NeuralMatcher {
     }
 }
 
-/// Dot product of two equal-length vectors.
+/// Dot product of two equal-length vectors, vectorised 8-wide.
+///
+/// The hot inner loop of every aggregation mode (SlidingMax runs it
+/// `Nq·Nr` times, DTW `Nq·Nr` times), so this is the single most
+/// valuable SIMD site in the neural matcher.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    use wide::f32x8;
+
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 8;
+    let tail_start = chunks * 8;
+
+    let mut acc = f32x8::ZERO;
+    for i in 0..chunks {
+        let off = i * 8;
+        let va = f32x8::new(
+            a[off..off + 8]
+                .try_into()
+                .expect("a chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
+        let vb = f32x8::new(
+            b[off..off + 8]
+                .try_into()
+                .expect("b chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
+        );
+        acc = va.mul_add(vb, acc);
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in tail_start..n {
+        sum += a[i] * b[i];
+    }
+    sum
 }
 
 /// Cosine similarity. When `assume_norm` is `true` the inputs are taken
@@ -283,8 +314,8 @@ fn cosine(a: &[f32], b: &[f32], assume_norm: bool) -> f32 {
     if assume_norm {
         return d;
     }
-    let na = dot(a, a).sqrt();
-    let nb = dot(b, b).sqrt();
+    let na = crate::neural::embedder::sumsq_wide(a).sqrt();
+    let nb = crate::neural::embedder::sumsq_wide(b).sqrt();
     if na < 1e-12 || nb < 1e-12 {
         0.0
     } else {
