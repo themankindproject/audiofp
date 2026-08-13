@@ -553,7 +553,7 @@ impl StreamingWang {
     /// Emit Wang hashes for a finalised anchor: linear walk over its
     /// top-K target list.
     fn emit_anchor(
-        anchor: &stream::PendingAnchor,
+        anchor: stream::PendingAnchor,
         _cfg: stream::PeakCfg,
         out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
     ) {

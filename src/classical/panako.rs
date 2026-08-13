@@ -639,17 +639,18 @@ impl StreamingPanako {
     /// `(t_frame, f_bin)` and keep the top-K `(b, c)` pairs by
     /// `b.mag + c.mag`.
     fn emit_anchor(
-        anchor: &stream::PendingAnchor,
+        mut anchor: stream::PendingAnchor,
         cfg: stream::PeakCfg,
         out: &mut Vec<(TimestampMs, PanakoHash)>,
     ) {
         let fan_out = cfg.fan_out;
-        let mut targets: Vec<Peak> = anchor.targets.clone();
-        targets.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+        anchor
+            .targets
+            .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
         let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
             alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
-        for (j, b) in targets.iter().enumerate() {
-            for c in &targets[j + 1..] {
+        for (j, b) in anchor.targets.iter().enumerate() {
+            for c in &anchor.targets[j + 1..] {
                 let score = b.mag + c.mag;
                 heap.push(MinByScoreOwned::new(b, c, score));
                 if heap.len() > fan_out {

@@ -316,7 +316,7 @@ impl<F> StreamCore<F> {
     pub(crate) fn emit_finalized_anchors(
         &mut self,
         cfg: PeakCfg,
-        emit_anchor: impl FnMut(&PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
     ) {
         // Pop-and-push pattern: take the front anchor, decide whether its
         // target zone is fully observed, and if not put it back. This avoids
@@ -341,7 +341,7 @@ impl<F> StreamCore<F> {
                 self.pending_anchors.push_front(anchor);
                 break;
             }
-            emit_anchor(&anchor, cfg, &mut emitted);
+            emit_anchor(anchor, cfg, &mut emitted);
         }
         self.emitted = emitted;
     }
@@ -354,7 +354,7 @@ impl<F> StreamCore<F> {
         samples: &[f32],
         cfg: PeakCfg,
         mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        emit_anchor: impl FnMut(&PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
         pcm::extend_sanitized(&mut self.sample_carry, samples);
@@ -400,7 +400,7 @@ impl<F> StreamCore<F> {
         &mut self,
         cfg: PeakCfg,
         mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        emit_anchor: impl FnMut(&PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
     ) {
         let n_bins = self.spec_n_bins;
         let spec = &self.spec;
@@ -450,7 +450,7 @@ impl<F> StreamCore<F> {
         let mut emitted = core::mem::take(&mut self.emitted);
         let mut emit_anchor = emit_anchor;
         while let Some(anchor) = self.pending_anchors.pop_front() {
-            emit_anchor(&anchor, cfg, &mut emitted);
+            emit_anchor(anchor, cfg, &mut emitted);
         }
         self.emitted = emitted;
     }
