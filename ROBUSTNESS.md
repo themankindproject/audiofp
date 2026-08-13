@@ -118,6 +118,31 @@ cargo test --test codec_extended --all-features -- --nocapture
 cargo test --all-features -- --nocapture 2>&1 | grep -E "(Jaccard|bit-sim|overlap)"
 ```
 
+### Threshold Calibration
+
+Issue #104 — matcher threshold defaults are calibrated against the full
+real-audio catalog (11 tracks, 17 files, same-track cross-codec pairs vs
+cross-track pairs). The sweep lives in
+[`tests/threshold_calibration.rs`](tests/threshold_calibration.rs):
+
+```bash
+# Print the score/prominence distribution table
+cargo test --test threshold_calibration --features all-codecs -- --ignored --nocapture
+```
+
+Measured on the catalog (`audiofp` v0.4.0):
+
+| Matcher | Positives (n=12) score | Positives prom | Negatives (n=55) score | Negatives prom |
+|---------|------------------------|----------------|------------------------|----------------|
+| Wang | 0.405 – 1.00 | ≥ 380.9 | 0.000 – 0.001 | ≤ 2.9 |
+| Haitsma | 0.888 – 1.00 | ≥ 4.5 | 0.000 – 0.531 | ≤ 1.1 |
+| Panako | 0.480 – 1.00 | ≥ 6.9 | 0.000 – 0.003 | ≤ 1.0 |
+
+Every positive pair clears the shipped defaults and every negative pair
+fails them (pinned by `*_defaults_separate_all_pairs` in the same file).
+Score margins are ≥ 0.35 in all three matchers, so the defaults are not
+tuned to the corpus edge — they sit a wide margin from the first FP/FN.
+
 ### Helper Script
 
 A convenience script is provided at [`scripts/codec_robustness.sh`](scripts/codec_robustness.sh):
