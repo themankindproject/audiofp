@@ -110,6 +110,12 @@ rayon = ["std", "dep:rayon"]
 # Install mimalloc as the process-wide #[global_allocator]. Requires std.
 # Off by default because libraries should not pick the allocator on behalf of
 # downstream binaries; flip this into `default` if you want it always-on.
+#
+# Most useful for FFI/CDYLIB consumers: a C host embedding audiofp cannot set
+# Rust's #[global_allocator], so this feature is the only way to get mimalloc
+# for the Rust side of the process. Pure-Rust binaries can (and should) set
+# their own allocator instead — enabling this in a binary that already defines
+# one is a link-time conflict.
 mimalloc = ["std", "dep:mimalloc"]
 
 [dependencies]
