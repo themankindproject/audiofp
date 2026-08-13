@@ -87,12 +87,12 @@ These are tracked as non-breaking issues; this document will be updated as they 
 
 | Topic | Issue |
 | --- | --- |
-| NaN/Inf PCM policy at extract/push | [#75](https://github.com/themankindproject/audiofp/issues/75) ✅ |
+| NaN/Inf PCM policy at extract/push | [#75](https://github.com/themankindproject/audiofp/issues/75) — done |
 | Decoder integrity (fail on corrupt packets) | [#76](https://github.com/themankindproject/audiofp/issues/76) |
 | Decode wall-clock timeout | [#77](https://github.com/themankindproject/audiofp/issues/77) |
 | ONNX max size / content-hash pin | [#78](https://github.com/themankindproject/audiofp/issues/78) |
-| Model path load-error mapping | [#79](https://github.com/themankindproject/audiofp/issues/79) ✅ |
-| Finish `max_push_samples` on all streamers | [#80](https://github.com/themankindproject/audiofp/issues/80) ✅ |
+| Model path load-error mapping | [#79](https://github.com/themankindproject/audiofp/issues/79) — done |
+| Finish `max_push_samples` on all streamers | [#80](https://github.com/themankindproject/audiofp/issues/80) — done |
 
 ---
 

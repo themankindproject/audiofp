@@ -641,9 +641,9 @@ pub struct FingerprintEnvelope {
 
 | Type | `to_bytes()` | `from_bytes(&[u8])` | `envelope()` |
 |------|:------------:|:-------------------:|:------------:|
-| `WangFingerprint` | ✓ | ✓ | ✓ |
-| `PanakoFingerprint` | ✓ | ✓ | ✓ |
-| `HaitsmaFingerprint` | ✓ | ✓ | ✓ |
+| `WangFingerprint` | Yes | Yes | Yes |
+| `PanakoFingerprint` | Yes | Yes | Yes |
+| `HaitsmaFingerprint` | Yes | Yes | Yes |
 
 `from_bytes` returns `AfpError::Deserialize` on magic mismatch, unsupported
 version, wrong algorithm ID, or truncated payload.
@@ -1610,16 +1610,16 @@ use audiofp::{Fingerprinter, SampleRate, classical::Wang};
 // ... use audiofp APIs as usual.
 ```
 
-> ⚠️ **Bare-metal note.** `rustfft` (used by the STFT primitive) transitively pulls `num-traits` with the `std` feature, so the no_std build currently only runs on hosted targets where `std` is reachable for *dependencies* (even if your own crate is `no_std`). True Cortex-M support will require a `microfft`-backed swap — on the roadmap.
+> **Note — bare-metal.** `rustfft` (used by the STFT primitive) transitively pulls `num-traits` with the `std` feature, so the no_std build currently only runs on hosted targets where `std` is reachable for *dependencies* (even if your own crate is `no_std`). True Cortex-M support will require a `microfft`-backed swap — on the roadmap.
 
 What works without `std` today:
 
 | Module                | Status                                                  |
 | --------------------- | ------------------------------------------------------- |
-| `audiofp::dsp::*`         | ✅ host-only no_std (rustfft transitive issue)          |
-| `audiofp::classical::*`   | ✅ same                                                 |
-| `audiofp::io`             | ❌ requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all-codecs` |
-| `audiofp::watermark`      | ❌ requires `std` + `watermark`                          |
+| `audiofp::dsp::*`         | host-only no_std (rustfft transitive issue)          |
+| `audiofp::classical::*`   | same                                                 |
+| `audiofp::io`             | requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all-codecs` |
+| `audiofp::watermark`      | requires `std` + `watermark`                          |
 
 ---
 
