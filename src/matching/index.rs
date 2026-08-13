@@ -571,7 +571,9 @@ pub struct PanakoIndex {
 impl PanakoIndex {
     /// Build from a slice of Panako fingerprints.
     pub fn build(refs: &[crate::classical::PanakoFingerprint], max_postings_per_hash: u32) -> Self {
-        let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = hashmap_new();
+        let mut map: HashMap<u32, Vec<(usize, u32, u32, u32)>> = super::maps::hashmap_with_capacity(
+            refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
+        );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -660,7 +662,11 @@ impl PanakoIndex {
                 continue;
             }
 
-            let bin_vec: Vec<((u32, i64), u32)> = bins.iter().map(|(&k, &v)| (k, v)).collect();
+            let mut bin_vec: Vec<((u32, i64), u32)> = bins.iter().map(|(&k, &v)| (k, v)).collect();
+            // Sort by (s_bin, off_key) so the neighbourhood consolidation
+            // below can early-break instead of rescanning every bin
+            // (O(B·W) instead of O(B²), same as PanakoMatcher).
+            bin_vec.sort_unstable_by_key(|&((s, o), _)| (s, o));
 
             // Find peak bin via neighbourhood consolidation. Build a
             // consolidated-values vector aligned with `bin_vec` so
@@ -672,11 +678,32 @@ impl PanakoIndex {
             let mut peak_s_bin: u32 = 0;
             let mut peak_off_key: i64 = 0;
 
+            let tol_i64 = tol;
             for (i, &((s_bin, off_key), _)) in bin_vec.iter().enumerate() {
                 let mut neigh = 0u32;
-                for &((ns, no), v) in &bin_vec {
-                    let ds = ns.abs_diff(s_bin);
-                    if ds <= 1 && (no - off_key).abs() <= tol {
+                // Scan backward from i.
+                let mut j = i;
+                loop {
+                    if j == 0 {
+                        break;
+                    }
+                    j -= 1;
+                    let ((ns, no), v) = bin_vec[j];
+                    if s_bin.saturating_sub(ns) > 1 {
+                        break;
+                    }
+                    if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
+                        neigh += v;
+                    }
+                }
+                // Centre element.
+                neigh += bin_vec[i].1;
+                // Scan forward from i.
+                for &((ns, no), v) in &bin_vec[(i + 1)..] {
+                    if ns.saturating_sub(s_bin) > 1 {
+                        break;
+                    }
+                    if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
                         neigh += v;
                     }
                 }
