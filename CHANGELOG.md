@@ -435,7 +435,66 @@ cargo build --features std-wav   # codec picker works
 
 ### Fixed
 
-- **CRITICAL: streaming `flush` is now idempotent and `push` after
+- **Haitsma BER selection is rate-normalized across offsets.** Both the
+  exact-BER path and the LUT verification path compared candidates by
+  **absolute** Hamming totals (and passed that total as the
+  early-abort bound). Candidates at different offsets have different
+  overlap lengths, so a short overlap with a small raw total but a
+  *worse* bit-error rate could suppress a longer, strictly better-rate
+  alignment — yielding wrong offsets, inflated scores, or dropped true
+  matches on noisy audio. Selection and pruning now operate on BER
+  (`hamming ÷ overlap·32`); clean bit-exact matches are unaffected.
+- **Panako Hough offsets are 1-frame precise.** Offset votes were binned
+  at `offset_tolerance_frames`-frame granularity and then consolidated
+  over ±tol *bins* — an effective ±tol²-frame window that quantized
+  the reported offset to multiples of `tol` whenever
+  `offset_tolerance_frames > 1`. Binning is now 1-frame with a ±tol-bin
+  (= ±tol-frame) consolidation window, matching `WangMatcher`'s
+  semantics. Default `tol = 1` behaviour is unchanged.
+- **`PanakoMatchConfig` degenerate scale grids are normalized at
+  construction.** `scale_bins = 0` / inverted / non-finite scale bounds
+  were only caught by a `debug_assert`; release builds silently divided
+  by a 0/∞/NaN bin width and collapsed every Hough vote into saturated
+  bins. `PanakoMatcher::new` and `PanakoIndex::query` now substitute
+  the default scale grid (0.80–1.25, 24 bins) for the degenerate
+  fields, identically in every build.
+- **1:N index queries are deterministic under `std`.** `WangIndex`,
+  `HaitsmaIndex`, and `PanakoIndex` iterated candidate references in
+  `ahash` HashMap order, so exact (score, prominence) ties — and which
+  perfect-scoring reference wins the early-exit — varied per process
+  run. Candidates are now visited in ascending reference id.
+- **`WangIndex` prominence matches `WangMatcher`'s dense-range
+  semantics.** The index divided the background by *occupied* offset
+  bins while the 1:1 matcher's dense histogram dilutes it with the
+  empty bins in between — systematically understating index prominence
+  and rejecting matches the matcher accepts on wide, sparse vote
+  spreads. The denominator is now the vote-offset span width.
+- **`HaitsmaIndex` verifies up to 8 candidate offsets per reference**
+  (most-hit first, BER-normalized bounds) instead of only the single
+  most-hit delta. A repeated motif concentrating exact LUT hits at a
+  wrong offset no longer masks the true, low-BER alignment.
+- **`WangMatcher` histogram hardening.** The offset-range computation
+  now stays in `u64` until after the cap (a >4-Gi-bin span used to
+  truncate through `as usize` on 32-bit targets and fold distant
+  offsets together), and the ±tolerance consolidation uses an O(1)
+  sliding window instead of a transient `u64` prefix array that
+  tripled peak memory on adversarial inputs.
+- **Decoder: mid-stream `ResetRequired` is recovered.** A codec
+  parameter change (AAC config update, track switch) mid-file used to
+  fail the whole decode; the decoder is now reset and the packet
+  retried once before giving up. The f32 conversion buffer is also
+  reallocated when the stream's audio spec (rate/channel layout)
+  changes mid-file instead of reusing a stale layout.
+- **`decode_to_mono_at_limited` enforces `max_samples` on the returned
+  buffer.** The limit bounded native-rate decoding, so an upsample
+  could legally return up to `target_sr/native_sr`× the cap; the
+  output is now re-checked after resampling.
+- **`max_push_samples: Some(0)` is bumped to `Some(1)`** by the
+  classical config sanitizer, matching the other zero-value limits —
+  `Some(0)` silently truncated every streaming push to empty. The
+  `max_pending_anchors` docs now state explicitly that evicted anchors
+  and their hashes are **lost**, not deferred.
+- **CRITICAL: streaming `flush` is now idempotent and `push` after `push` after
   `flush` no longer duplicates hashes.**
   `IncrementalPeakDetector::flush` kept no record of rows it had
   already drained, so a second `flush()` (or a `push()` after a

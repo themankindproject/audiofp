@@ -120,6 +120,10 @@ pub struct WangConfig {
     /// Maximum number of pending anchors in the streaming pipeline.
     /// `None` disables (default, unbounded). When set, anchors exceeding
     /// this cap are dropped oldest-first so memory stays bounded.
+    /// **Dropped anchors and their accumulated target hashes are lost,
+    /// not deferred** — under sustained pressure with a small cap the
+    /// streaming output can shrink well below what offline extraction
+    /// would produce, with no error signal.
     /// Recommended: `Some(10_000)` for untrusted input.
     /// Relevant only for [`StreamingWang`].
     pub max_pending_anchors: Option<usize>,
@@ -1594,5 +1598,17 @@ mod tests {
         let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert_eq!(values[0], 0.0);
         assert_eq!(*values.last().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn max_push_samples_zero_is_bumped_to_one() {
+        // `Some(0)` would silently truncate every push to empty — the
+        // same degenerate-limit treatment the other limits get.
+        let cfg = WangConfig {
+            max_push_samples: Some(0),
+            ..WangConfig::default()
+        };
+        let s = StreamingWang::new(cfg);
+        assert_eq!(s.config().max_push_samples, Some(1));
     }
 }

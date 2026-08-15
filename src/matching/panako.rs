@@ -107,8 +107,9 @@ impl Matcher for PanakoMatcher {
     type Config = PanakoMatchConfig;
 
     fn new(cfg: Self::Config) -> Self {
-        validate_config(&cfg);
-        Self { cfg }
+        Self {
+            cfg: normalize_config(cfg),
+        }
     }
 
     fn config(&self) -> &Self::Config {
@@ -184,9 +185,13 @@ impl Matcher for PanakoMatcher {
                     let s_bin = ((s - scale_min) / scale_per_bin)
                         .clamp(0.0, (cfg.scale_bins - 1) as f64)
                         as u32;
-                    // Offset bin for the accumulator grid (±tol consolidation
-                    // happens around the peak, so use the raw rounded value).
-                    let off_key = (b / (tol.max(1)) as f64).round() as i64;
+                    // Offset bin at 1-frame granularity. Binning at
+                    // `tol`-frame granularity would combine the ±tol-bin
+                    // consolidation into an effective ±tol²-frame window
+                    // (and quantize the reported offset to `tol` frames);
+                    // keeping 1-frame keys makes consolidation ±tol frames
+                    // exactly, matching `WangMatcher`'s semantics.
+                    let off_key = b.round() as i64;
 
                     *acc.entry((s_bin, off_key)).or_insert(0) += 1;
                     pairs.push((q_ta as f64, tr_a as f64));
@@ -277,9 +282,10 @@ impl Matcher for PanakoMatcher {
             return MatchResult::NONE;
         }
 
-        // Coarse scale / offset from the peak bin centre.
+        // Coarse scale from the peak bin centre; offset straight from
+        // the 1-frame-granularity peak key.
         let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
-        let coarse_b = peak_off_key as f64 * (tol.max(1)) as f64;
+        let coarse_b = peak_off_key as f64;
 
         // --- 5. RANSAC refinement ---
         // Reuses the (t_q, t_r) pairs gathered during voting — no second
@@ -328,33 +334,29 @@ impl Matcher for PanakoMatcher {
     }
 }
 
-/// Validate a [`PanakoMatchConfig`] in debug builds.
+/// Normalize a [`PanakoMatchConfig`] so the Hough grid is always
+/// well-formed.
 ///
-/// These invariants are required for correct behaviour:
-/// - `scale_min < scale_max` and `scale_bins > 0` (else `scale_per_bin` is
-///   zero / negative and binning divides by zero or goes backwards).
-/// - Thresholds that the matcher compares with `>=` / `<` should not be
-///   negative in production; we allow them only for testing (relaxed
-///   configs that accept every candidate).
-///
-/// In release builds this is a no-op (UB if violated); in debug it panics
-/// so misconfiguration is caught early in tests and CI.
-pub(crate) fn validate_config(cfg: &PanakoMatchConfig) {
-    debug_assert!(
-        cfg.scale_bins > 0,
-        "PanakoMatchConfig.scale_bins must be > 0, got {}",
-        cfg.scale_bins
-    );
-    debug_assert!(
-        cfg.scale_max > cfg.scale_min,
-        "PanakoMatchConfig.scale_max ({}) must exceed scale_min ({})",
-        cfg.scale_max,
-        cfg.scale_min
-    );
-    debug_assert!(
-        cfg.scale_min.is_finite() && cfg.scale_max.is_finite(),
-        "PanakoMatchConfig scale range must be finite"
-    );
+/// A degenerate scale grid (`scale_bins == 0`, non-finite bounds, or
+/// `scale_max ≤ scale_min`) used to be caught only by a `debug_assert`
+/// — in release builds it silently produced `scale_per_bin` = 0 / ∞ /
+/// NaN, collapsing every vote into saturated bins and yielding garbage
+/// results. Normalization replaces those fields with the defaults so
+/// every build behaves identically; well-formed configs pass through
+/// untouched.
+pub(crate) fn normalize_config(mut cfg: PanakoMatchConfig) -> PanakoMatchConfig {
+    const DEFAULT_SCALE_MIN: f32 = 0.80;
+    const DEFAULT_SCALE_MAX: f32 = 1.25;
+    const DEFAULT_SCALE_BINS: u32 = 24;
+
+    if cfg.scale_bins == 0 {
+        cfg.scale_bins = DEFAULT_SCALE_BINS;
+    }
+    if !(cfg.scale_min.is_finite() && cfg.scale_max.is_finite() && cfg.scale_max > cfg.scale_min) {
+        cfg.scale_min = DEFAULT_SCALE_MIN;
+        cfg.scale_max = DEFAULT_SCALE_MAX;
+    }
+    cfg
 }
 
 /// Iterative RANSAC over the `(t_query, t_ref)` anchor pairs collected
@@ -850,5 +852,144 @@ mod tests {
         let res = m.match_one(&fp, &fp);
         assert!(res.is_match, "RANSAC self-match must be positive: {res:?}");
         assert_eq!(res.offset.frames, 0);
+    }
+
+    // ── 1-frame offset-bin granularity (±tol consolidation window) ──
+    //
+    // Pre-fix, offsets were binned at `tol`-frame granularity and the
+    // ±tol-bin consolidation window spanned ±tol² frames, quantizing
+    // the reported offset to multiples of `tol`. With RANSAC disabled,
+    // a query shifted by exactly 7 frames (plus distant decoys outside
+    // the window) must report offset 7, not a quantized 8 (or 0).
+
+    #[test]
+    fn hough_offset_is_frame_precise_with_tolerance_4() {
+        use crate::classical::PanakoHash;
+
+        // Reference triplets: spans of exactly 10 frames, distinct hashes.
+        let mut hashes = alloc::vec::Vec::new();
+        for i in 0..10_u32 {
+            hashes.push(PanakoHash {
+                hash: 1_000 + i,
+                t_anchor: 100 + i * 10,
+                t_b: 105 + i * 10,
+                t_c: 110 + i * 10,
+            });
+        }
+        // Two decoy triplets far outside the ±4 window of the peak.
+        hashes.push(PanakoHash {
+            hash: 2_000,
+            t_anchor: 500,
+            t_b: 505,
+            t_c: 510,
+        });
+        hashes.push(PanakoHash {
+            hash: 2_001,
+            t_anchor: 510,
+            t_b: 515,
+            t_c: 520,
+        });
+        let reference = PanakoFingerprint {
+            hashes,
+            frames_per_sec: 62.5,
+        };
+
+        // Query: the same ten triplets shifted by exactly 7 frames
+        // (spans preserved → s = 1.0), plus the two decoys at δ=0.
+        let mut q_hashes = alloc::vec::Vec::new();
+        for i in 0..10_u32 {
+            let t = 100 + i * 10 - 7;
+            q_hashes.push(PanakoHash {
+                hash: 1_000 + i,
+                t_anchor: t,
+                t_b: t + 5,
+                t_c: t + 10,
+            });
+        }
+        q_hashes.push(PanakoHash {
+            hash: 2_000,
+            t_anchor: 500,
+            t_b: 505,
+            t_c: 510,
+        });
+        q_hashes.push(PanakoHash {
+            hash: 2_001,
+            t_anchor: 510,
+            t_b: 515,
+            t_c: 520,
+        });
+        let query = PanakoFingerprint {
+            hashes: q_hashes,
+            frames_per_sec: 62.5,
+        };
+
+        // min_prominence 2: the sparse accumulator (peak bin + one
+        // decoy bin) caps prominence at ~3, below the default 5 — the
+        // assertion under test is the offset, not the threshold.
+        let m = crate::matching::PanakoMatcher::new(crate::matching::PanakoMatchConfig {
+            ransac_refine: false,
+            offset_tolerance_frames: 4,
+            min_votes: 5,
+            min_prominence: 2.0,
+            ..Default::default()
+        });
+        let res = m.match_one(&query, &reference);
+        assert!(res.is_match, "query must match: {res:?}");
+        assert_eq!(
+            res.offset.frames, 7,
+            "coarse Hough offset must be frame-precise, not quantized to tol"
+        );
+    }
+
+    // ── Config normalization: degenerate scale grids are repaired at
+    //    construction instead of silently corrupting Hough binning. ──
+
+    #[test]
+    fn degenerate_scale_config_is_normalized_at_construction() {
+        use crate::matching::{PanakoMatchConfig, PanakoMatcher};
+
+        let m = PanakoMatcher::new(PanakoMatchConfig {
+            scale_bins: 0,
+            ..Default::default()
+        });
+        assert_eq!(m.config().scale_bins, 24);
+
+        let m = PanakoMatcher::new(PanakoMatchConfig {
+            scale_min: 2.0,
+            scale_max: 1.0, // inverted range
+            ..Default::default()
+        });
+        assert_eq!(m.config().scale_min, 0.80);
+        assert_eq!(m.config().scale_max, 1.25);
+
+        let m = PanakoMatcher::new(PanakoMatchConfig {
+            scale_min: f32::NAN,
+            ..Default::default()
+        });
+        assert!(m.config().scale_min.is_finite());
+        assert!(m.config().scale_max > m.config().scale_min);
+
+        // And a normalized degenerate config still matches correctly.
+        let fp = PanakoFingerprint {
+            hashes: (0..6_u32)
+                .map(|i| crate::classical::PanakoHash {
+                    hash: 100 + i,
+                    t_anchor: 10 + i * 10,
+                    t_b: 15 + i * 10,
+                    t_c: 20 + i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let m = PanakoMatcher::new(PanakoMatchConfig {
+            scale_bins: 0,
+            min_votes: 3,
+            ..Default::default()
+        });
+        let res = m.match_one(&fp, &fp);
+        assert!(
+            res.is_match,
+            "self-match must survive normalization: {res:?}"
+        );
     }
 }

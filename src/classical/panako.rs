@@ -146,6 +146,10 @@ pub struct PanakoConfig {
     /// Maximum number of pending anchors in the streaming pipeline.
     /// `None` disables (default, unbounded). When set, anchors exceeding
     /// this cap are dropped oldest-first so memory stays bounded.
+    /// **Dropped anchors and their accumulated target hashes are lost,
+    /// not deferred** — under sustained pressure with a small cap the
+    /// streaming output can shrink well below what offline extraction
+    /// would produce, with no error signal.
     /// Recommended: `Some(10_000)` for untrusted input.
     /// Relevant only for [`StreamingPanako`].
     pub max_pending_anchors: Option<usize>,

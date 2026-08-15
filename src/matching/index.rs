@@ -197,7 +197,7 @@ impl WangIndex {
         query: &crate::classical::WangFingerprint,
         cfg: &crate::matching::WangMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use crate::matching::{TimeOffset, clamp_score, compute_prominence};
+        use crate::matching::{TimeOffset, clamp_score};
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
@@ -225,7 +225,14 @@ impl WangIndex {
         let q_len = query.hashes.len().max(1) as f32;
         let mut best: Option<(usize, MatchResult)> = None;
 
-        for (&ref_id, votes) in &per_ref {
+        // Deterministic candidate order: iterate references by ascending
+        // id, not in HashMap order, so exact (score, prominence) ties and
+        // the perfect-score early-exit always resolve to the lowest
+        // reference id regardless of hasher state (audit 67-1 follow-up).
+        let mut per_ref_list: Vec<(&u32, &Vec<(i64, u32)>)> = per_ref.iter().collect();
+        per_ref_list.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+        for (&ref_id, votes) in per_ref_list {
             // Quick pre-filter: if the total raw vote count for this
             // reference is below min_votes, the consolidated peak can
             // never reach the threshold either (consolidation can only
@@ -316,9 +323,27 @@ impl WangIndex {
                 continue;
             }
 
-            // Prominence on the consolidated histogram (parity with
-            // WangMatcher — audit 67-2).
-            let prominence = compute_prominence(&consolidated, peak_linear_idx);
+            // Prominence with dense-range parity with `WangMatcher`.
+            //
+            // The matcher computes prominence over its dense histogram
+            // (zeros included) — mean background is diluted by the empty
+            // bins. This sparse path only materialises occupied bins, so
+            // dividing by (occupied − 1) would systematically *understate*
+            // prominence versus the 1:1 matcher at the same
+            // `min_prominence`. Normalise by the vote-offset span width
+            // instead: same mean-of-rest semantics over the same window
+            // the dense histogram would cover.
+            let d_min = votes.iter().map(|&(d, _)| d).min().unwrap_or(0);
+            let d_max = votes.iter().map(|&(d, _)| d).max().unwrap_or(0);
+            let dense_bins = (d_max - d_min + 1).max(1) as f32;
+            let sum_rest: u64 = consolidated
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != peak_linear_idx)
+                .map(|(_, &v)| v as u64)
+                .sum();
+            let mean_rest = sum_rest as f32 / (dense_bins - 1.0).max(1.0);
+            let prominence = peak_votes as f32 / (mean_rest + 1.0);
             if prominence < cfg.min_prominence {
                 continue;
             }
@@ -450,8 +475,10 @@ impl HaitsmaIndex {
     /// Query the index, returning the best-matching `(ref_id, result)`.
     ///
     /// For each query frame, probes the LUT to gather candidate
-    /// `(ref_id, delta)` pairs. Each candidate reference is then
-    /// verified with the exact-BER path at the best candidate offset.
+    /// `(ref_id, delta)` pairs. Each candidate reference is then verified
+    /// with the exact-BER path at up to the 8 most-hit candidate offsets
+    /// (a repeated motif can concentrate hits at a wrong offset while the
+    /// true alignment has the better BER).
     ///
     /// Only exact sub-fingerprint matches are probed (no bit-flips in
     /// the index path — use [`match_ranked`] with explicit
@@ -493,39 +520,81 @@ impl HaitsmaIndex {
             return None;
         }
 
-        // 2. For each candidate reference, take the best δ and run exact BER.
-        let mut best: Option<(usize, MatchResult)> = None;
+        // 2. For each candidate reference, verify up to
+        //    `MAX_DELTAS_PER_REF` best-hit alignments with exact BER and
+        //    keep the best rate.
+        //
+        //    Verifying only the single most-hit delta biased the score:
+        //    a repeated motif can concentrate LUT hits at a wrong offset
+        //    while the true alignment (fewer bit-exact frames under
+        //    codec noise) has a far better BER. Verification order is
+        //    (hits desc, |δ| asc, δ asc) so it is independent of HashMap
+        //    iteration order, and references are visited in ascending
+        //    id order for the same reason.
+        const MAX_DELTAS_PER_REF: usize = 8;
 
-        // Group candidates by ref_id and pick the top δ per reference.
-        // On tied hit counts, prefer the δ with the smallest absolute
-        // value (closest to zero alignment) so the winner is independent
-        // of HashMap iteration order (audit B8).
-        let mut per_ref: HashMap<u32, (i64, u32)> = hashmap_new();
+        let mut per_ref: HashMap<u32, Vec<(i64, u32)>> = hashmap_new();
         for (&(ref_id, delta), &hits) in &candidates {
-            let entry = per_ref.entry(ref_id).or_insert((delta, hits));
-            let better = hits > entry.1 || (hits == entry.1 && delta.abs() < entry.0.abs());
-            if better {
-                entry.0 = delta;
-                entry.1 = hits;
-            }
+            per_ref.entry(ref_id).or_default().push((delta, hits));
+        }
+        for deltas in per_ref.values_mut() {
+            deltas.sort_unstable_by(|&(d1, h1), &(d2, h2)| {
+                h2.cmp(&h1)
+                    .then_with(|| d1.abs().cmp(&d2.abs()))
+                    .then_with(|| d1.cmp(&d2))
+            });
+            deltas.truncate(MAX_DELTAS_PER_REF);
         }
 
-        for (ref_id, (delta, _hits)) in per_ref {
-            let r_frames = &self.frames[ref_id as usize];
-            let overlap = overlap_at(q_len, r_frames.len(), delta);
+        let mut cand_refs: Vec<(&u32, &Vec<(i64, u32)>)> = per_ref.iter().collect();
+        cand_refs.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
-            if overlap < min_overlap {
+        let mut best: Option<(usize, MatchResult)> = None;
+
+        for (ref_id, deltas) in cand_refs {
+            let r_len = self.frames[*ref_id as usize].len();
+            // Best-BER tracking with a rate-normalized early-abort bound
+            // (same rationale as `HaitsmaMatcher`): a short-overlap
+            // candidate must not suppress a longer better-rate one.
+            let mut best_ber = f64::INFINITY;
+            let mut best_hamming = u64::MAX;
+            let mut best_delta: i64 = 0;
+            let mut best_overlap: usize = 0;
+
+            for &(delta, _hits) in deltas {
+                let overlap = overlap_at(q_len, r_len, delta);
+                if overlap < min_overlap {
+                    continue;
+                }
+                let bound = (best_ber * overlap as f64 * 32.0) as u64;
+                let h = hamming_at_offset(
+                    q_frames,
+                    &self.frames[*ref_id as usize],
+                    delta,
+                    overlap,
+                    bound,
+                );
+                if h == u64::MAX {
+                    continue;
+                }
+                let ber = h as f64 / (overlap as f64 * 32.0);
+                if ber < best_ber {
+                    best_ber = ber;
+                    best_hamming = h;
+                    best_delta = delta;
+                    best_overlap = overlap;
+                }
+            }
+
+            if best_hamming == u64::MAX {
                 continue;
             }
 
-            let exact_hamming = hamming_at_offset(q_frames, r_frames, delta, overlap, u64::MAX);
+            let delta = best_delta;
+            let overlap = best_overlap;
 
             let total_bits = (overlap * 32) as u64;
-            let ber = if total_bits > 0 {
-                exact_hamming as f32 / total_bits as f32
-            } else {
-                1.0
-            };
+            let ber = best_hamming as f32 / total_bits as f32;
 
             let score = crate::matching::clamp_score(1.0 - ber);
             let is_match = ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
@@ -536,7 +605,8 @@ impl HaitsmaIndex {
             // against division by zero.
             let prominence = if ber > 1e-6 { 0.5 / ber } else { 100.0 };
 
-            let offset = crate::matching::TimeOffset::from_frames(delta, self.fps[ref_id as usize]);
+            let offset =
+                crate::matching::TimeOffset::from_frames(delta, self.fps[*ref_id as usize]);
 
             let result = MatchResult {
                 is_match,
@@ -551,7 +621,7 @@ impl HaitsmaIndex {
                 continue;
             }
 
-            if track_best(&mut best, ref_id as usize, result) {
+            if track_best(&mut best, *ref_id as usize, result) {
                 return best;
             }
         }
@@ -641,10 +711,13 @@ impl PanakoIndex {
         query: &crate::classical::PanakoFingerprint,
         cfg: &crate::matching::PanakoMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use super::panako::validate_config;
+        use super::panako::normalize_config;
         use crate::matching::{TimeOffset, clamp_score, compute_prominence};
 
-        validate_config(cfg);
+        // Normalize (clone) so a degenerate scale grid can't poison the
+        // Hough accumulator with 0/∞/NaN bin widths — same treatment as
+        // `PanakoMatcher::new`.
+        let cfg = normalize_config(cfg.clone());
 
         if query.hashes.is_empty() || self.map.is_empty() {
             return None;
@@ -680,9 +753,10 @@ impl PanakoIndex {
                     let s_bin = ((s - scale_min) / scale_per_bin)
                         .clamp(0.0, (cfg.scale_bins - 1) as f64)
                         as u32;
-                    // Offset bin for the accumulator grid (±tol consolidation
-                    // happens around the peak, so use the raw rounded value).
-                    let off_key = (b / (tol.max(1)) as f64).round() as i64;
+                    // 1-frame offset granularity (see PanakoMatcher for
+                    // why not `tol`-sized bins): the ±tol-bin
+                    // consolidation window must mean ±tol frames.
+                    let off_key = b.round() as i64;
 
                     *acc.entry(ref_id)
                         .or_default()
@@ -694,7 +768,13 @@ impl PanakoIndex {
 
         let mut best: Option<(usize, MatchResult)> = None;
 
-        for (&ref_id, bins) in &acc {
+        // Deterministic candidate order: ascending reference id, not
+        // HashMap order (same rationale as WangIndex::query).
+        type BinMap = HashMap<(u32, i64), u32>;
+        let mut cand_refs: Vec<(&u32, &BinMap)> = acc.iter().collect();
+        cand_refs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+        for (&ref_id, bins) in cand_refs {
             // Quick pre-filter: sum of all bin votes for this reference.
             // If total is below min_votes, the consolidated peak cannot
             // reach the threshold — skip expensive consolidation.
@@ -778,7 +858,7 @@ impl PanakoIndex {
             }
 
             let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
-            let coarse_b = peak_off_key as f64 * (tol.max(1)) as f64;
+            let coarse_b = peak_off_key as f64;
 
             // Public contract: `time_scale = query_duration /
             // reference_duration` = `1 / s` where `s = ref_span /
@@ -1277,5 +1357,193 @@ mod tests {
         let cfg = PanakoMatchConfig::default();
         let q = mk_panako_fp(&[(10, 20, 30), (50, 60, 70)], 9_000);
         assert!(index.query(&q, &cfg).is_none());
+    }
+
+    // ── Deterministic candidate ordering (ascending ref id) ──
+    //
+    // Two identical references both score perfectly; the query must
+    // always return ref 0, not whichever reference the hasher's
+    // iteration order happens to visit first.
+
+    #[test]
+    fn wang_index_tie_resolves_to_lowest_ref_id() {
+        let fp = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        let refs = alloc::vec![fp.clone(), fp.clone()];
+        let index = WangIndex::build(&refs, 100);
+        for _ in 0..8 {
+            let (id, res) = index.query(&fp, &WangMatchConfig::default()).unwrap();
+            assert_eq!(id, 0);
+            assert!(res.is_match);
+            assert!((res.score - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn haitsma_index_tie_resolves_to_lowest_ref_id() {
+        let frames: alloc::vec::Vec<u32> = (0..600)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761))
+            .collect();
+        let fp = mk_haitsma_fp(&frames, 78.125);
+        let refs = alloc::vec![fp.clone(), fp.clone()];
+        let index = HaitsmaIndex::build(&refs, 1_000);
+        for _ in 0..8 {
+            let (id, res) = index.query(&fp, &HaitsmaMatchConfig::default()).unwrap();
+            assert_eq!(id, 0);
+            assert!(res.is_match);
+        }
+    }
+
+    #[test]
+    fn panako_index_tie_resolves_to_lowest_ref_id() {
+        let fp = mk_panako_fp(
+            &[
+                (10, 15, 20),
+                (30, 35, 40),
+                (50, 55, 60),
+                (70, 75, 80),
+                (90, 95, 100),
+                (110, 115, 120),
+            ],
+            0,
+        );
+        let refs = alloc::vec![fp.clone(), fp.clone()];
+        let index = PanakoIndex::build(&refs, 100);
+        for _ in 0..8 {
+            let (id, res) = index.query(&fp, &PanakoMatchConfig::default()).unwrap();
+            assert_eq!(id, 0);
+            assert!(res.is_match);
+        }
+    }
+
+    // ── WangIndex prominence parity with the dense matcher ──
+    //
+    // A peak with a wide, sparse background must score the same
+    // *acceptance* in the index as in `WangMatcher`. Pre-fix, the index
+    // divided the background by occupied bins only, understating
+    // prominence and rejecting matches the 1:1 matcher accepts.
+
+    #[test]
+    fn wang_index_prominence_parity_with_matcher_on_sparse_background() {
+        use crate::classical::WangHash;
+
+        // Reference: 8 aligned anchors at t≈1000, two decoys at t=2500
+        // and t=600.
+        let mut ref_hashes = alloc::vec![
+            WangHash {
+                hash: 200,
+                t_anchor: 2_500,
+            },
+            WangHash {
+                hash: 201,
+                t_anchor: 600,
+            },
+        ];
+        for i in 0..8_u32 {
+            ref_hashes.push(WangHash {
+                hash: 100 + i,
+                t_anchor: 1_000 + i * 10,
+            });
+        }
+        let reference = WangFingerprint {
+            hashes: ref_hashes,
+            frames_per_sec: 62.5,
+        };
+
+        // Query: the same 8 anchors at δ=+100, plus the two decoy
+        // matches at δ=+2_500 and δ=−1_800 — a deliberately wide,
+        // sparse offset spread.
+        let mut q_hashes = alloc::vec![
+            WangHash {
+                hash: 200,
+                t_anchor: 0,
+            },
+            WangHash {
+                hash: 201,
+                t_anchor: 2_400,
+            },
+        ];
+        for i in 0..8_u32 {
+            q_hashes.push(WangHash {
+                hash: 100 + i,
+                t_anchor: 900 + i * 10,
+            });
+        }
+        let query = WangFingerprint {
+            hashes: q_hashes,
+            frames_per_sec: 62.5,
+        };
+
+        let matcher = WangMatcher::new(WangMatchConfig::default());
+        let m = matcher.match_one(&query, &reference);
+        assert!(m.is_match, "dense matcher accepts the wide-sparse case");
+
+        let index = WangIndex::build(&[reference], 100);
+        let (id, r) = index
+            .query(&query, &WangMatchConfig::default())
+            .expect("index must accept what the dense matcher accepts");
+        assert_eq!(id, 0);
+        assert!(r.is_match);
+        // Both paths report the same winning offset.
+        assert_eq!(r.offset.frames, m.offset.frames);
+    }
+
+    // ── HaitsmaIndex top-k delta verification ──
+    //
+    // A repeated motif concentrates exact LUT hits at a WRONG offset;
+    // the true alignment has fewer exact frames but far better BER.
+    // Pre-fix, only the most-hit delta was verified → no match.
+
+    #[test]
+    fn haitsma_index_verifies_beyond_the_most_hit_delta() {
+        struct XorShift(u32);
+        impl XorShift {
+            fn next(&mut self) -> u32 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 17;
+                self.0 ^= self.0 << 5;
+                self.0
+            }
+        }
+
+        let mut rng = XorShift(0x1D3A_5EED);
+        let r: alloc::vec::Vec<u32> = (0..900).map(|_| rng.next() | 1).collect();
+
+        // Query: 50-frame exact motif at δ=+100 (high LUT hits, BER≈0.44
+        // over the 450-frame overlap → rejected), plus a 400-frame
+        // window at δ=+400 lightly flipped (few exact frames, low BER
+        // → the true match: Q[50+j] = flip(R[450+j]) ⇒ δ = 400).
+        let mut q: alloc::vec::Vec<u32> = r[100..150].to_vec();
+        for (j, &src) in r[450..850].iter().enumerate() {
+            // Keep exactly three bit-exact frames so the LUT discovers
+            // δ=+400; flip a handful of bits everywhere else.
+            let exact = j == 0 || j == 100 || j == 200;
+            let mut v = src;
+            if !exact {
+                // One flipped bit per frame: ~3% BER in the window, so
+                // the total over the 450-frame overlap is ≈ (50·0.5 +
+                // 400·0.03)/450 ≈ 0.08 — well under the decoy's ≈0.44.
+                v ^= 1 << (rng.next() % 32);
+            }
+            q.push(v);
+        }
+        assert_eq!(q.len(), 450);
+
+        let query = mk_haitsma_fp(&q, 78.125);
+        let reference = mk_haitsma_fp(&r, 78.125);
+        let index = HaitsmaIndex::build(&[reference], 1_000);
+
+        let (id, res) = index
+            .query(&query, &HaitsmaMatchConfig::default())
+            .expect("true alignment (δ=400, low BER) must be found beyond the top-hit δ=100");
+        assert_eq!(id, 0);
+        assert!(res.is_match);
+        assert_eq!(res.offset.frames, 400);
+        // Score reflects the lightly-flipped window (BER ≈ 0.08),
+        // not the ≈0.44-BER decoy overlap (which would score ≈ 0.56).
+        assert!(
+            res.score > 0.85,
+            "score {} should reflect the low-BER alignment",
+            res.score
+        );
     }
 }

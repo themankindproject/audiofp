@@ -254,8 +254,21 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     if sr == target_sr {
         Ok(samples)
     } else {
-        let r = SincResampler::new(sr, target_sr);
-        Ok(r.process(&samples))
+        let out = SincResampler::new(sr, target_sr).process(&samples);
+        // `DecodeLimits::max_samples` is documented to bound the
+        // *returned* buffer. It is enforced at the native rate during
+        // decode, so an upsample can legally grow the output by the
+        // resample ratio (≤ ~6× for 8k→48k) — re-check here and fail
+        // rather than silently returning more than the caller allowed.
+        if let Some(limit) = limits.max_samples
+            && out.len() > limit
+        {
+            return Err(AfpError::InputTooLarge {
+                limit,
+                provided: out.len(),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -358,6 +371,22 @@ fn decode_inner(
 
         let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
+            // Mid-stream codec-parameter change (e.g. an AAC config
+            // update or a track switch inside the container): the decoder
+            // must be re-initialised before it can decode further
+            // packets. Reset and retry the same packet once; a second
+            // failure is fatal.
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                match decoder.decode(&packet) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+                            format!("decode after reset: {e}"),
+                        ))));
+                    }
+                }
+            }
             Err(SymphoniaError::IoError(e)) => {
                 if integrity_mode {
                     return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
@@ -384,11 +413,13 @@ fn decode_inner(
         // Lazily allocate the f32 conversion buffer once the first packet
         // tells us the channel layout / capacity. Reallocate if a later
         // packet decodes to more frames than the current buffer can hold
-        // (the first packet's capacity is not guaranteed to bound the rest).
+        // (the first packet's capacity is not guaranteed to bound the rest)
+        // or if the stream's audio spec changes mid-file (channel-layout
+        // switch) — a stale spec would misinterpret the planes below.
         let needed_cap = decoded.frames().max(decoded.capacity());
         let needs_buf = match &convert_buf {
             None => true,
-            Some(buf) => needed_cap > buf.capacity(),
+            Some(buf) => needed_cap > buf.capacity() || buf.spec() != decoded.spec(),
         };
         if needs_buf {
             let spec = decoded.spec().clone();

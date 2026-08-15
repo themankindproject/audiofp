@@ -95,6 +95,74 @@ pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
     }
 }
 
+/// Running best alignment across candidate offsets, compared by **BER**
+/// (hamming ÷ overlap-bits) — not by raw hamming.
+///
+/// The BER basis matters for the early-abort bound: candidates at
+/// different deltas have different overlap lengths, so an absolute
+/// "best hamming so far" lets a short-overlap candidate with a small
+/// raw total suppress a longer candidate with a strictly better rate
+/// (e.g. 256 frames @ 30 % BER = 2 458 bits beating 768 frames @
+/// 5 % BER on totals while losing on rate). Passing
+/// `best_ber × overlap × 32` as the abort bound keeps the prune
+/// rate-normalized: a candidate is only aborted when its *rate* can no
+/// longer beat the incumbent.
+struct BestAlignment {
+    ber: f64,
+    hamming: u64,
+    delta: i64,
+    overlap: usize,
+}
+
+impl BestAlignment {
+    fn new() -> Self {
+        Self {
+            ber: f64::INFINITY,
+            hamming: u64::MAX,
+            delta: 0,
+            overlap: 0,
+        }
+    }
+
+    fn found(&self) -> bool {
+        self.ber < f64::INFINITY
+    }
+
+    /// Verify `delta` and update the incumbent if its BER is strictly
+    /// better. Ties keep the first-found candidate (the exact path
+    /// scans deltas in ascending order; the LUT path probes query
+    /// frames in order), so selection is deterministic.
+    #[inline]
+    fn consider(
+        &mut self,
+        query: &[u32],
+        reference: &[u32],
+        q_len: usize,
+        r_len: usize,
+        delta: i64,
+        min_overlap: usize,
+    ) {
+        let overlap = overlap_at(q_len, r_len, delta);
+        if overlap < min_overlap {
+            return;
+        }
+        // Saturating cast: `INFINITY as u64` → `u64::MAX` (never aborts);
+        // finite bounds are far below u64::MAX for any real overlap.
+        let bound = (self.ber * overlap as f64 * 32.0) as u64;
+        let h = hamming_at_offset(query, reference, delta, overlap, bound);
+        if h == u64::MAX {
+            return; // aborted: rate cannot beat the incumbent
+        }
+        let ber = h as f64 / (overlap as f64 * 32.0);
+        if ber < self.ber {
+            self.ber = ber;
+            self.hamming = h;
+            self.delta = delta;
+            self.overlap = overlap;
+        }
+    }
+}
+
 /// Build a LUT: `u32` sub-fingerprint → list of reference frame indices.
 fn build_lut(reference: &[u32]) -> HashMap<u32, Vec<usize>> {
     let mut lut: HashMap<u32, Vec<usize>> = super::maps::hashmap_with_capacity(reference.len() / 2);
@@ -214,74 +282,43 @@ impl Matcher for HaitsmaMatcher {
         let use_lut = self.cfg.use_lut && r_len > 512;
         if use_lut {
             let lut = build_lut(r_frames);
-            let mut best_hamming = u64::MAX;
-            let mut best_delta: i64 = 0;
-            let mut best_overlap: usize = 0;
+            let mut best = BestAlignment::new();
+
+            // Deduplicated body across the three probe modes: verify
+            // each candidate offset by BER with a rate-normalized
+            // early-abort bound.
+            let consider = |q_pos: usize, positions: &Vec<usize>, best: &mut BestAlignment| {
+                for &r_pos in positions {
+                    let delta = r_pos as i64 - q_pos as i64;
+                    best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
+                }
+            };
 
             for (q_pos, &q_frame) in q_frames.iter().enumerate() {
                 match self.cfg.probe_bit_flips {
                     0 => probe_exact(q_frame, &lut, &mut |positions| {
-                        for &r_pos in positions {
-                            let delta = r_pos as i64 - q_pos as i64;
-                            let overlap = overlap_at(q_len, r_len, delta);
-                            if overlap < min_overlap {
-                                continue;
-                            }
-                            let h =
-                                hamming_at_offset(q_frames, r_frames, delta, overlap, best_hamming);
-                            if h < best_hamming {
-                                best_hamming = h;
-                                best_delta = delta;
-                                best_overlap = overlap;
-                            }
-                        }
+                        consider(q_pos, positions, &mut best)
                     }),
                     1 => probe_1flip(q_frame, &lut, &mut |positions| {
-                        for &r_pos in positions {
-                            let delta = r_pos as i64 - q_pos as i64;
-                            let overlap = overlap_at(q_len, r_len, delta);
-                            if overlap < min_overlap {
-                                continue;
-                            }
-                            let h =
-                                hamming_at_offset(q_frames, r_frames, delta, overlap, best_hamming);
-                            if h < best_hamming {
-                                best_hamming = h;
-                                best_delta = delta;
-                                best_overlap = overlap;
-                            }
-                        }
+                        consider(q_pos, positions, &mut best)
                     }),
                     _ => probe_2flip(q_frame, &lut, &mut |positions| {
-                        for &r_pos in positions {
-                            let delta = r_pos as i64 - q_pos as i64;
-                            let overlap = overlap_at(q_len, r_len, delta);
-                            if overlap < min_overlap {
-                                continue;
-                            }
-                            let h =
-                                hamming_at_offset(q_frames, r_frames, delta, overlap, best_hamming);
-                            if h < best_hamming {
-                                best_hamming = h;
-                                best_delta = delta;
-                                best_overlap = overlap;
-                            }
-                        }
+                        consider(q_pos, positions, &mut best)
                     }),
                 }
-                if best_hamming == 0 {
+                if best.ber == 0.0 {
                     break;
                 }
             }
 
-            if best_hamming == u64::MAX {
+            if !best.found() {
                 return MatchResult::NONE;
             }
 
             return build_result(
-                best_hamming,
-                best_delta,
-                best_overlap,
+                best.hamming,
+                best.delta,
+                best.overlap,
                 q_frames,
                 r_frames,
                 query.frames_per_sec,
@@ -289,36 +326,25 @@ impl Matcher for HaitsmaMatcher {
             );
         }
 
-        // Exact BER path (scan all offsets)
+        // Exact BER path (scan all offsets, ascending delta so
+        // BER ties resolve to the smallest offset deterministically).
         let dmin: i64 = -((q_len as i64).saturating_sub(1));
         let dmax: i64 = (r_len as i64).saturating_sub(1);
 
-        let mut best_hamming = u64::MAX;
-        let mut best_delta: i64 = 0;
-        let mut best_overlap: usize = 0;
+        let mut best = BestAlignment::new();
 
         for delta in dmin..=dmax {
-            let overlap = overlap_at(q_len, r_len, delta);
-            if overlap < min_overlap {
-                continue;
-            }
-
-            let h = hamming_at_offset(q_frames, r_frames, delta, overlap, best_hamming);
-            if h < best_hamming {
-                best_hamming = h;
-                best_delta = delta;
-                best_overlap = overlap;
-            }
+            best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
         }
 
-        if best_hamming == u64::MAX {
+        if !best.found() {
             return MatchResult::NONE;
         }
 
         build_result(
-            best_hamming,
-            best_delta,
-            best_overlap,
+            best.hamming,
+            best.delta,
+            best.overlap,
             q_frames,
             r_frames,
             query.frames_per_sec,
@@ -408,6 +434,90 @@ mod tests {
             frames: frames.to_vec(),
             frames_per_sec: 78.125,
         }
+    }
+
+    // ── BER-normalized early-abort regression ──
+    //
+    // A short-overlap candidate with a small *absolute* hamming total
+    // but a *worse* bit-error rate must not suppress a longer,
+    // better-rate alignment via the early-abort bound. Pre-fix, the
+    // bound was the raw incumbent total: 256 frames @ 30 % BER
+    // (2 458 bits) evaluated first would abort 300 frames @ 28 % BER
+    // (2 688 bits) mid-scan and win with the wrong offset.
+
+    /// Deterministic xorshift32.
+    struct XorShift(u32);
+    impl XorShift {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// Copy `src`, flipping each bit independently with probability
+    /// `pct`% (deterministic given the seed).
+    fn flip_bits(src: &[u32], pct: u32, rng: &mut XorShift) -> Vec<u32> {
+        src.iter()
+            .map(|&f| {
+                let mut v = f;
+                for b in 0..32 {
+                    if rng.next() % 100 < pct {
+                        v ^= 1 << b;
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn short_overlap_worse_ber_does_not_beat_longer_better_ber() {
+        // Reference: 900 random frames.
+        let mut rng = XorShift(0xBEEF_5EED);
+        let r: Vec<u32> = (0..900).map(|_| rng.next() | 1).collect();
+
+        // Query, 800 frames, two crafted alignments on disjoint windows:
+        // - TRUE, delta = +600: Q[0..299]  = R[600..899] @ 28% flips
+        //   → overlap 300, BER ≈ 0.28 (total ≈ 2 688 bits).
+        // - SPURIOUS, delta = -544 (evaluated FIRST in the ascending
+        //   exact-path scan): Q[544..799] = R[0..255] @ 30% flips
+        //   → overlap 256, BER ≈ 0.30 (total ≈ 2 458 bits).
+        // The middle stretch Q[300..543] is fresh random noise.
+        let true_win = flip_bits(&r[600..900], 28, &mut rng);
+        let spur_win = flip_bits(&r[0..256], 30, &mut rng);
+        let mid: Vec<u32> = (0..244).map(|_| rng.next() | 1).collect();
+
+        let mut q: Vec<u32> = Vec::with_capacity(800);
+        q.extend_from_slice(&true_win); // 300
+        q.extend_from_slice(&mid); // 244
+        q.extend_from_slice(&spur_win); // 256 → 800 total
+        assert_eq!(q.len(), 800);
+
+        let query = make_fp(&q);
+        let reference = make_fp(&r);
+
+        // Exact path (LUT would find no bit-exact frames under 28/30%
+        // flips and is covered by its own tests).
+        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
+            use_lut: false,
+            ..Default::default()
+        });
+        let res = m.match_one(&query, &reference);
+        assert!(res.is_match, "true alignment (BER≈0.28) must match");
+        assert_eq!(
+            res.offset.frames, 600,
+            "must pick the longer better-rate alignment (delta 600), not the \
+             short worse-rate one (delta -544); ber-based selection broken?",
+        );
+
+        // And the winner's score reflects the ≈0.28 BER, not ≈0.30.
+        assert!(
+            res.score > 0.70 && res.score < 0.73,
+            "score {} should reflect BER ≈ 0.28",
+            res.score
+        );
     }
 
     #[test]

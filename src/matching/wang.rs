@@ -112,20 +112,24 @@ impl Matcher for WangMatcher {
 
         let dmin: i64 = -q_max;
         let dmax: i64 = r_max;
-        let range = (dmax - dmin + 1) as usize;
+        // Range arithmetic in u64: on 32-bit targets a span beyond
+        // 4 Gi bins used to truncate through `as usize` and silently
+        // fold distant offsets onto the same bins.
+        let range_u64 = (dmax - dmin + 1) as u64;
 
         // Cap the histogram so a pathological query/reference cannot OOM;
         // votes beyond the cap are silently dropped.
-        const MAX_HIST_BINS: usize = 10_000_000;
-        let capped = range.min(MAX_HIST_BINS);
+        const MAX_HIST_BINS: u64 = 10_000_000;
+        let capped_u64 = range_u64.min(MAX_HIST_BINS);
+        let capped = capped_u64 as usize;
         let mut hist: Vec<u32> = vec![0u32; capped];
 
         for &(q_hash, q_t) in &q_hashes {
             for &tr in index.get(q_hash) {
                 let d = tr as i64 - q_t as i64;
-                let idx = (d - dmin) as usize;
-                if idx < capped {
-                    let bucket = &mut hist[idx];
+                let idx = (d - dmin) as u64;
+                if idx < capped_u64 {
+                    let bucket = &mut hist[idx as usize];
                     // wrapping: votes are capped by MAX_HIST_BINS; overflow
                     // only on pathological input and is harmless here.
                     *bucket = bucket.wrapping_add(1);
@@ -133,19 +137,30 @@ impl Matcher for WangMatcher {
             }
         }
 
-        // --- 3. Consolidate ±tolerance via prefix-sum box filter ---
+        // --- 3. Consolidate ±tolerance with a sliding window ---
+        // Equivalent to a ±tol box filter, but O(1) per bin with no
+        // transient O(range)-byte u64 prefix array (the previous
+        // prefix-sum approach peaked at ~3× the histogram's memory).
         let tol = cfg.offset_tolerance_frames as usize;
         let consolidated: Vec<u32> = if tol > 0 {
-            // Build prefix sums for O(1) range queries
-            let mut prefix: Vec<u64> = vec![0u64; capped + 1];
-            for i in 0..capped {
-                prefix[i + 1] = prefix[i] + hist[i] as u64;
-            }
             let mut out = vec![0u32; capped];
-            for (i, item) in out.iter_mut().enumerate() {
-                let left = i.saturating_sub(tol);
-                let right = (i + tol + 1).min(capped);
-                *item = (prefix[right] - prefix[left]) as u32;
+            let mut window: u64 = 0;
+            // Window for bin 0: hist[0 ..= min(tol, capped-1)].
+            let init_hi = tol.min(capped - 1);
+            for &v in &hist[..=init_hi] {
+                window += v as u64;
+            }
+            out[0] = window as u32;
+            for i in 1..capped {
+                let enter = i + tol;
+                if enter < capped {
+                    window += hist[enter] as u64;
+                }
+                // The bin leaving the window on the left.
+                if i > tol {
+                    window -= hist[i - tol - 1] as u64;
+                }
+                out[i] = window as u32;
             }
             out
         } else {

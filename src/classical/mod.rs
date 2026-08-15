@@ -48,6 +48,9 @@ macro_rules! sanitize_cfg {
         if $cfg.max_pending_anchors == Some(0) {
             $cfg.max_pending_anchors = Some(1);
         }
+        if $cfg.max_push_samples == Some(0) {
+            $cfg.max_push_samples = Some(1);
+        }
         $cfg.target_zone_f = $cfg.target_zone_f.clamp(1, 512);
         $cfg.min_anchor_mag_db = $cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
     }};
