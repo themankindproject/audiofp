@@ -456,6 +456,11 @@ pub struct IncrementalPeakDetector {
     abs_pushed: u32,
     // Number of rows pushed so far (saturates at u32::MAX in practice).
     n_pushed: u32,
+    // Absolute index of the last row whose 2-D max was emitted, via
+    // either `push_row` or `flush`. Rows at or below it are never
+    // re-emitted — this is what makes `flush` idempotent and
+    // `push`-after-`flush` duplicate-free. -1 = nothing emitted yet.
+    last_emitted: i64,
     // Per-column vertical Lemire deques: (abs_row_index, value).
     vert_deques: Vec<VecDeque<(u32, f32)>>,
     // Scratch for horizontal rolling-max.
@@ -484,6 +489,7 @@ impl IncrementalPeakDetector {
             ring_write: 0,
             abs_pushed: 0,
             n_pushed: 0,
+            last_emitted: -1,
             vert_deques,
             horiz_scratch: alloc::vec![0.0_f32; n_bins],
             dq: VecDeque::with_capacity(2 * kf + 2),
@@ -534,12 +540,20 @@ impl IncrementalPeakDetector {
             dq.push_back((abs, val));
         }
 
-        // 3. Check if a ripe row exists (need at least kt+1 rows pushed).
+        // 3. Check if a ripe row exists (need at least kt+1 rows pushed)
+        //    and hasn't already been emitted by a prior `flush`.
         if abs < self.kt as u32 {
             return None;
         }
 
         let ripe_abs = abs - self.kt as u32;
+        if ripe_abs as i64 <= self.last_emitted {
+            // This row's 2-D max was already emitted by an earlier
+            // `flush` (the flush drain covers rows that `push_row` would
+            // otherwise ripen later). Skip it — re-emitting would
+            // duplicate peaks downstream.
+            return None;
+        }
         // The vertical window for the ripe row: [ripe_abs - kt, ripe_abs + kt]
         // = [abs - 2*kt, abs]. Expire entries before that.
         let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
@@ -558,12 +572,17 @@ impl IncrementalPeakDetector {
             }
         }
 
+        self.last_emitted = ripe_abs as i64;
         Some(ripe_abs)
     }
 
     /// Flush remaining rows that haven't become ripe during normal push.
     /// These are the tail rows whose forward context extends past end-of-stream.
     /// Calls `emit_fn(abs_frame, max_slice)` for each.
+    ///
+    /// Idempotent: rows already emitted (by earlier `push_row` calls or a
+    /// prior `flush`) are never emitted again. A second `flush` with no
+    /// intervening `push_row` calls emits nothing.
     pub fn flush(&mut self, out_max: &mut [f32], mut emit_fn: impl FnMut(u32, &[f32])) {
         if self.n_pushed == 0 {
             return;
@@ -572,9 +591,19 @@ impl IncrementalPeakDetector {
         // (if n_pushed > kt). The remaining un-emitted frames are
         // [last_ripe + 1, n_pushed - 1], i.e. the last `min(kt, n_pushed-1)` frames.
         // But if n_pushed <= kt, then NO frames were emitted by push at all,
-        // so we need to emit all of [0, n_pushed-1].
-        let first_flush = self.n_pushed.saturating_sub(self.kt as u32);
+        // so we need to emit all of [0, n_pushed-1]. Rows at or below
+        // `last_emitted` were already drained by a prior flush and are
+        // skipped (idempotency / push-after-flush correctness).
+        let first_flush = self
+            .n_pushed
+            .saturating_sub(self.kt as u32)
+            .max((self.last_emitted + 1).max(0) as u32);
         let last_flush = self.n_pushed - 1;
+
+        // After this drain every row [0, n_pushed-1] has been emitted
+        // (earlier rows via push_row, the tail via flush), so advance the
+        // cursor unconditionally — even when the range below is empty.
+        self.last_emitted = self.n_pushed as i64 - 1;
 
         // For flush frames, we can't push new rows — the deques already
         // contain all the data. The vertical window shrinks on the right.
@@ -613,6 +642,7 @@ impl IncrementalPeakDetector {
         self.ring_write = 0;
         self.abs_pushed = 0;
         self.n_pushed = 0;
+        self.last_emitted = -1;
         for dq in &mut self.vert_deques {
             dq.clear();
         }
@@ -991,5 +1021,97 @@ mod tests {
             let ref_row = &reference[r * n_cols..(r + 1) * n_cols];
             assert_eq!(row_max.as_slice(), ref_row, "row {r} mismatch");
         }
+    }
+
+    // ── Idempotency / push-after-flush contract ──
+    //
+    // `flush` must be idempotent and `push_row` after a `flush` must
+    // not re-emit rows the flush already drained (the
+    // `StreamingFingerprinter::flush` lifecycle contract in `fp.rs`).
+    // These tests pin the `last_emitted` cursor: without it, a second
+    // flush re-detects the tail rows and a push after flush re-ripens
+    // them, duplicating every downstream peak/hash.
+
+    #[test]
+    fn flush_is_idempotent() {
+        let kt = 2;
+        let mut det = IncrementalPeakDetector::new(kt, 1, 4);
+        let mut out = vec![0.0_f32; 4];
+        let row = vec![1.0_f32; 4];
+        for _ in 0..6 {
+            let _ = det.push_row(&row, &mut out);
+        }
+        let mut first: Vec<u32> = Vec::new();
+        det.flush(&mut out, |abs, _| first.push(abs));
+        assert!(!first.is_empty());
+        let mut second: Vec<u32> = Vec::new();
+        det.flush(&mut out, |abs, _| second.push(abs));
+        assert!(
+            second.is_empty(),
+            "second flush re-emitted rows {second:?} (first flush emitted {first:?})"
+        );
+    }
+
+    #[test]
+    fn push_after_flush_never_reemits_rows() {
+        let kt = 3;
+        let n_first = 5usize;
+        let n_more = kt + 2;
+        let mut det = IncrementalPeakDetector::new(kt, 1, 2);
+        let mut out = vec![0.0_f32; 2];
+        let row = vec![1.0_f32, 2.0];
+        let mut emitted: Vec<u32> = Vec::new();
+
+        for _ in 0..n_first {
+            if let Some(r) = det.push_row(&row, &mut out) {
+                emitted.push(r);
+            }
+        }
+        det.flush(&mut out, |abs, _| emitted.push(abs));
+
+        // Continue the same stream after the flush.
+        for _ in 0..n_more {
+            if let Some(r) = det.push_row(&row, &mut out) {
+                emitted.push(r);
+            }
+        }
+        det.flush(&mut out, |abs, _| emitted.push(abs));
+
+        let total = n_first + n_more;
+        let mut sorted = emitted.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            emitted.len(),
+            "rows emitted more than once: {emitted:?}"
+        );
+        let want: Vec<u32> = (0..total as u32).collect();
+        assert_eq!(sorted, want, "full session must cover rows 0..{total} once");
+    }
+
+    #[test]
+    fn reset_clears_emission_cursor() {
+        let kt = 2;
+        let mut det = IncrementalPeakDetector::new(kt, 1, 3);
+        let mut out = vec![0.0_f32; 3];
+        let row = vec![1.0_f32; 3];
+        for _ in 0..5 {
+            let _ = det.push_row(&row, &mut out);
+        }
+        let mut n = 0;
+        det.flush(&mut out, |_, _| n += 1);
+        assert!(n > 0);
+
+        // After reset the same session must emit again (fresh stream).
+        det.reset();
+        let mut re_emitted = 0usize;
+        for _ in 0..5 {
+            if det.push_row(&row, &mut out).is_some() {
+                re_emitted += 1;
+            }
+        }
+        det.flush(&mut out, |_, _| re_emitted += 1);
+        assert_eq!(re_emitted, 5, "reset must restart the emission cursor");
     }
 }

@@ -966,6 +966,25 @@ mod tests {
     }
 
     #[test]
+    fn streaming_flush_is_idempotent() {
+        // `StreamingFingerprinter::flush` lifecycle contract: a second
+        // flush after the stream is drained returns nothing. Pins the
+        // `IncrementalPeakDetector` emitted-row cursor at the Panako
+        // public API (shared StreamCore with Wang).
+        let mut s = StreamingPanako::default();
+        let samples = synthetic_audio(0x2D2D, 8_000 * 3);
+        let _ = s.push(&samples).unwrap();
+        let first = s.flush().unwrap();
+        let second = s.flush().unwrap();
+        assert!(
+            second.is_empty(),
+            "second flush returned {} frames after {} in the first",
+            second.len(),
+            first.len(),
+        );
+    }
+
+    #[test]
     fn mag_order_picks_largest_of_three() {
         // mag_order = 1 (b largest)
         let a = Peak {

@@ -839,6 +839,52 @@ mod tests {
         assert!(s.flush().unwrap().is_empty());
     }
 
+    // ── flush lifecycle contract (fp.rs): idempotent flush, valid
+    //    push-after-flush without duplicate hashes ──
+
+    #[test]
+    fn streaming_flush_is_idempotent() {
+        let mut s = StreamingWang::default();
+        let samples = synthetic_audio(0x1D1D, 8_000 * 3);
+        let _ = s.push(&samples).unwrap();
+        let first = s.flush().unwrap();
+        let second = s.flush().unwrap();
+        assert!(
+            second.is_empty(),
+            "second flush returned {} frames after {} in the first",
+            second.len(),
+            first.len(),
+        );
+    }
+
+    #[test]
+    fn streaming_push_after_flush_does_not_reemit_old_rows() {
+        // Push A, flush, then continue the stream with B. Every hash
+        // emitted after the flush must be anchored at/after B's first
+        // frame — re-emitted A rows (the pre-`last_emitted` bug) would
+        // anchor strictly before it. B's first frame index is the frame
+        // count A produced (frames are non-centered, so that frame's
+        // window overlaps A's tail — but its index is ≥ every A frame).
+        let a = synthetic_audio(0x0AF1, 8_000 * 3);
+        let b = synthetic_audio(0x0AF2, 8_000 * 2);
+        let mut s = StreamingWang::default();
+        let _ = s.push(&a).unwrap();
+        let _ = s.flush().unwrap();
+
+        let mut after: Vec<(TimestampMs, WangHash)> = s.push(&b).unwrap();
+        after.extend(s.flush().unwrap());
+        assert!(!after.is_empty(), "continuation should emit hashes");
+        let first_new_frame = 1 + (a.len().saturating_sub(WANG_N_FFT)) / WANG_HOP;
+        for (t, h) in &after {
+            assert!(
+                h.t_anchor as usize >= first_new_frame,
+                "hash anchored in pre-flush audio re-emitted: anchor frame {} (first new frame {first_new_frame}), t={} ms",
+                h.t_anchor,
+                t.0,
+            );
+        }
+    }
+
     #[test]
     fn streaming_silence_emits_nothing() {
         let mut s = StreamingWang::default();

@@ -435,6 +435,23 @@ cargo build --features std-wav   # codec picker works
 
 ### Fixed
 
+- **CRITICAL: streaming `flush` is now idempotent and `push` after
+  `flush` no longer duplicates hashes.**
+  `IncrementalPeakDetector::flush` kept no record of rows it had
+  already drained, so a second `flush()` (or a `push()` after a
+  mid-stream `flush()`, both legal per the
+  `StreamingFingerprinter::flush` lifecycle contract) re-emitted the
+  last `neighborhood_t` spectrogram rows, re-created their buckets,
+  and re-emitted their hashes — silently inflating vote counts and
+  corrupting downstream matching for any consumer with retry logic or
+  a push-flush-push cycle. The detector now tracks a `last_emitted`
+  row cursor: `push_row` never re-ripens rows a flush already drained,
+  and a second `flush` emits nothing. `StreamingWang` and
+  `StreamingPanako` inherit the fix through the shared stream core;
+  `StreamingHaitsma` and the neural streamer were already idempotent.
+  Pinned by new detector-level (idempotency, no-re-emission,
+  reset-restarts-cursor) and stream-level (double-flush, no
+  pre-flush anchors after continuation) tests.
 - **Codec features pull their companion decoders (#0.4.0 audit).**
   `std-mp4` enabled only the isomp4 *demuxer*, so real M4A files parsed
   but failed to decode — it now also enables `symphonia/aac`. Likewise
