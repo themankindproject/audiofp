@@ -1538,11 +1538,11 @@ per STFT frame per analysis window.
 | `std-flac`   |         | FLAC decoding (`symphonia/flac`)                                                |
 | `std-ogg`    |         | Ogg container + Vorbis (`symphonia/ogg`, `symphonia/vorbis`)                     |
 | `std-wav`    |         | WAV + raw PCM (`symphonia/wav`, `symphonia/pcm`)                                 |
-| `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF (`symphonia/isomp4`)                                       |
-| `std-aiff`   |         | AIFF (`symphonia/aiff`)                                                          |
+| `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF (`symphonia/isomp4`, `symphonia/aac`)                      |
+| `std-aiff`   |         | AIFF + PCM payloads (`symphonia/aiff`, `symphonia/pcm`)                          |
 | `std-mkv`    |         | Matroska (`symphonia/mkv`)                                                       |
 | `std-adpcm`  |         | ADPCM (`symphonia/adpcm`)                                                        |
-| `std-alac`   |         | ALAC (`symphonia/alac`)                                                          |
+| `std-alac`   |         | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                           |
 | `all-codecs` |         | Every format/codec above at once — the pre-0.4.0 monolithic `std` behavior        |
 | `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark` (implies `std`)           |
 | `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model; implies `std`) |

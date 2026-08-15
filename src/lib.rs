@@ -37,17 +37,20 @@
 //!
 //! # Panics in streaming APIs
 //!
-//! All `StreamingFingerprinter::push` implementations are infallible
-//! **except** [`neural::StreamingNeuralEmbedder::push`], which panics
-//! if the underlying ONNX model reports an inference error. The
-//! non-panicking counterpart [`neural::StreamingNeuralEmbedder::try_push`]
-//! returns `Result` for any code that needs to surface those failures
-//! (audio callbacks, `tokio::spawn` workers, etc.). Classical
-//! streaming fingerprinters (Wang / Panako / Haitsma) never panic on
-//! valid input.
+//! All `StreamingFingerprinter::push` / `flush` implementations are
+//! fallible and return `Result` — including
+//! [`neural::StreamingNeuralEmbedder::push`], which propagates ONNX
+//! inference errors instead of panicking (use
+//! [`neural::StreamingNeuralEmbedder::try_push`] / `try_push_with`
+//! for the callback-style equivalents). Classical streaming
+//! fingerprinters (Wang / Panako / Haitsma) never error on valid
+//! input. Constructors named `new` (e.g. [`ShortTimeFFT::new`]) panic
+//! on invalid configs; each has a `try_new` counterpart returning
+//! `Result`.
 //!
 //! [`neural::StreamingNeuralEmbedder::push`]: crate::neural::StreamingNeuralEmbedder::push
 //! [`neural::StreamingNeuralEmbedder::try_push`]: crate::neural::StreamingNeuralEmbedder::try_push
+//! [`ShortTimeFFT::new`]: crate::dsp::stft::ShortTimeFFT::new
 //!
 //! # Example
 //!
@@ -92,9 +95,12 @@
 //! | `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF decoding → [`io`].                          |
 //! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`]. |
 //! | `all-codecs` |         | Every format/codec above at once → [`io`] (the pre-0.4.0 `std`). |
+//! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] (implies `std`). |
 //! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`] (implies `std`). |
 //! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator (implies `std`). |
+//!
+//! [`fingerprint_batch_parallel`]: crate::fingerprint_batch_parallel
 //!
 //! See [`USAGE.md`](https://github.com/themankindproject/audiofp/blob/main/USAGE.md)
 //! for the complete API guide.

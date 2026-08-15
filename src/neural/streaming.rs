@@ -45,6 +45,14 @@ pub struct StreamingNeuralEmbedder {
     /// Ring buffer of unconsumed input samples. Bounded by
     /// `window_samples - 1 + max push size`.
     sample_carry: Vec<f32>,
+    /// Read cursor into `sample_carry`: index of the first sample not yet
+    /// consumed by an emitted window. Compacted back to `0` with a single
+    /// `copy_within` at the end of every [`try_push_with`] call, so one
+    /// large push costs `O(N)` total instead of `O(N²/hop)` of
+    /// front-drain memmoves.
+    ///
+    /// [`try_push_with`]: StreamingNeuralEmbedder::try_push_with
+    carry_read: usize,
     /// Total samples consumed (i.e. drained from `sample_carry`) since
     /// construction. Drives output timestamps so they match the offline
     /// embedder.
@@ -71,6 +79,7 @@ impl StreamingNeuralEmbedder {
         Ok(Self {
             core: inner.core,
             sample_carry: Vec::new(),
+            carry_read: 0,
             samples_consumed: 0,
             embedding_scratch: Vec::with_capacity(embedding_dim),
         })
@@ -117,9 +126,11 @@ impl StreamingNeuralEmbedder {
     /// buffer and is overwritten on the next emit — copy out before
     /// the next iteration if you need to keep it.
     ///
-    /// Performs **zero allocations per call**: the embedding scratch is
-    /// allocated once at construction (with capacity = `embedding_dim`)
-    /// and reused across every emit in every push.
+    /// Performs **zero allocations per embedding**: the embedding scratch
+    /// is allocated once at construction (with capacity =
+    /// `embedding_dim`) and reused across every emit in every push. The
+    /// sample carry grows only when a push larger than one analysis
+    /// window arrives (amortised growth, `O(1)` per sample).
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -142,28 +153,48 @@ impl StreamingNeuralEmbedder {
         let sr = self.core.cfg.sample_rate as u64;
         let mut emitted = 0usize;
 
-        while self.sample_carry.len() >= window_samples {
+        while self.sample_carry.len() - self.carry_read >= window_samples {
             // Disjoint borrow: `sample_carry` (immutable), `core` (mutable),
             // and `embedding_scratch` (mutable) are different fields of
             // `self`, so this is sound under Rust 2024's borrow rules.
-            {
-                let window = &self.sample_carry[..window_samples];
+            let embed_result = {
+                let window = &self.sample_carry[self.carry_read..self.carry_read + window_samples];
                 self.core
-                    .embed_window_into(window, &mut self.embedding_scratch)?;
+                    .embed_window_into(window, &mut self.embedding_scratch)
+            };
+            if let Err(e) = embed_result {
+                // Preserve the "committed samples are drained" contract:
+                // compact past everything the successful iterations took.
+                self.compact_carry();
+                return Err(e);
             }
             let t_start = TimestampMs(self.samples_consumed * 1000 / sr);
             callback(t_start, &self.embedding_scratch);
             emitted += 1;
 
-            // Drop the hop_samples we've now committed to; the remainder
-            // becomes the prefix of the next window. This keeps the
-            // carry strictly bounded — never larger than
-            // `window_samples + max_push - hop_samples`.
-            self.sample_carry.drain(..hop_samples);
+            // Advance the cursor past the hop we've now committed to; the
+            // remainder becomes the prefix of the next window. The carry
+            // stays strictly bounded — never larger than
+            // `window_samples + max_push - hop_samples` after compaction.
+            self.carry_read += hop_samples;
             self.samples_consumed += hop_samples as u64;
         }
 
+        self.compact_carry();
+
         Ok(emitted)
+    }
+
+    /// Move the unconsumed tail of `sample_carry` to the front and reset
+    /// the read cursor — one `memmove` of the surviving samples instead
+    /// of one front-drain per emitted window.
+    fn compact_carry(&mut self) {
+        if self.carry_read > 0 {
+            let keep = self.sample_carry.len() - self.carry_read;
+            self.sample_carry.copy_within(self.carry_read.., 0);
+            self.sample_carry.truncate(keep);
+            self.carry_read = 0;
+        }
     }
 
     /// Discard any unconsumed samples without emitting embeddings.
@@ -173,6 +204,7 @@ impl StreamingNeuralEmbedder {
     /// samples from the previous one don't bleed into the first window.
     pub fn reset(&mut self) {
         self.sample_carry.clear();
+        self.carry_read = 0;
         self.samples_consumed = 0;
     }
 
@@ -205,6 +237,7 @@ impl StreamingNeuralEmbedder {
         Self {
             core,
             sample_carry: Vec::new(),
+            carry_read: 0,
             samples_consumed: 0,
             embedding_scratch: Vec::with_capacity(embedding_dim),
         }

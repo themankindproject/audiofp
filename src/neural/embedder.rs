@@ -417,6 +417,13 @@ impl NeuralEmbedder {
                 cfg.n_fft,
             )));
         }
+        if cfg.n_fft > 1 << 20 {
+            return Err(AfpError::Config(format!(
+                "n_fft {} exceeds the maximum of {} (front-end scratch would be unbounded)",
+                cfg.n_fft,
+                1 << 20,
+            )));
+        }
         if cfg.hop == 0 || cfg.hop > cfg.n_fft {
             return Err(AfpError::Config(format!(
                 "hop must satisfy 0 < hop <= n_fft (hop={}, n_fft={})",
@@ -425,6 +432,12 @@ impl NeuralEmbedder {
         }
         if cfg.n_mels == 0 {
             return Err(AfpError::Config("n_mels must be > 0".to_string()));
+        }
+        if cfg.n_mels > 8_192 {
+            return Err(AfpError::Config(format!(
+                "n_mels {} exceeds the maximum of 8192",
+                cfg.n_mels,
+            )));
         }
         let nyquist = cfg.sample_rate as f32 / 2.0;
         if !(cfg.fmin >= 0.0 && cfg.fmax > cfg.fmin && cfg.fmax <= nyquist) {
@@ -436,6 +449,12 @@ impl NeuralEmbedder {
         if !(cfg.window_secs > 0.0 && cfg.window_secs.is_finite()) {
             return Err(AfpError::Config(format!(
                 "window_secs must be a positive finite number (got {})",
+                cfg.window_secs,
+            )));
+        }
+        if cfg.window_secs > 3_600.0 {
+            return Err(AfpError::Config(format!(
+                "window_secs {} exceeds the maximum of 3600 (one hour per window)",
                 cfg.window_secs,
             )));
         }
@@ -474,6 +493,22 @@ impl NeuralEmbedder {
             )));
         }
         let n_frames = (window_samples - cfg.n_fft) / cfg.hop + 1;
+        // Front-end ceiling: the per-window log-mel frame (and the probe
+        // tensor below) is `n_mels × n_frames` f32 cells. Cap it so an
+        // extreme-but-finite config fails with `Config` instead of an
+        // OOM abort deep inside `vec![0.0; …]`.
+        const MAX_FRONTEND_CELLS: usize = 1 << 28; // 268M f32 = 1 GiB
+        let frontend_cells = cfg
+            .n_mels
+            .checked_mul(n_frames)
+            .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
+        if frontend_cells.is_none() {
+            return Err(AfpError::Config(format!(
+                "front-end spectrogram too large: {} mels × {} frames exceeds {} cells; \
+                 reduce window_secs, n_mels, or raise hop",
+                cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
+            )));
+        }
 
         // --- Model loading -------------------------------------------
         if cfg.model_path.is_empty() {
@@ -490,9 +525,9 @@ impl NeuralEmbedder {
             .map_err(map_model_load_err)?;
 
         // Concretise input shape, type, optimise, and build the runnable
-        // plan — once. This is the work the watermark detector
-        // (incorrectly) does per call; doing it once is the single
-        // largest perf win available here.
+        // plan — once, up front. (The watermark detector instead rebuilds
+        // its typed plan only when the input length changes; doing this
+        // once at construction remains the cheaper contract here.)
         let runnable: Runnable = model
             .with_input_fact(
                 0,
@@ -632,7 +667,9 @@ impl Fingerprinter for NeuralEmbedder {
     }
 
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
-        crate::pcm::reject_non_finite(samples)?;
+        if rate.hz() != self.core.cfg.sample_rate {
+            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
+        }
         if let Some(limit) = self.core.cfg.max_input_samples
             && samples.len() > limit
         {
@@ -641,9 +678,7 @@ impl Fingerprinter for NeuralEmbedder {
                 provided: samples.len(),
             });
         }
-        if rate.hz() != self.core.cfg.sample_rate {
-            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
-        }
+        crate::pcm::reject_non_finite(samples)?;
         if samples.len() < self.core.window_samples {
             return Err(AfpError::AudioTooShort {
                 needed: self.core.window_samples,
@@ -683,12 +718,15 @@ impl Fingerprinter for NeuralEmbedder {
                         &batch_timestamps,
                     )?;
                 } else {
-                    // Partial final batch — fall back to single-window inference.
+                    // Partial final batch — fall back to single-window
+                    // inference, reusing one scratch vector across the
+                    // leftovers (mirrors the single-window path below).
+                    let mut vector = Vec::with_capacity(embedding_dim);
                     for (window, ts) in batch_windows.iter().zip(batch_timestamps.iter()) {
-                        let mut vector = Vec::with_capacity(embedding_dim);
+                        vector.clear();
                         self.core.embed_window_into(window, &mut vector)?;
                         embeddings.push(NeuralEmbedding {
-                            vector,
+                            vector: vector.clone(),
                             t_start: *ts,
                         });
                     }
@@ -699,8 +737,10 @@ impl Fingerprinter for NeuralEmbedder {
         } else {
             // --- Single-window inference path (original behaviour) ------
             // One reused scratch vector: `embed_window_into` writes into
-            // it, then we clone into the owned embedding. Avoids a fresh
-            // `Vec::with_capacity` per window (N windows → 1 alloc vs N).
+            // it, then we clone into the owned embedding. The clone is
+            // unavoidable (each embedding is owned by the output), but
+            // the capacity bookkeeping is shared: 1 scratch + 1 clone
+            // per window instead of a fresh `Vec::with_capacity` each.
             let mut vector = Vec::with_capacity(embedding_dim);
             let mut start = 0usize;
             while start + window_samples <= samples.len() {
@@ -1013,5 +1053,49 @@ mod tests {
             .extract(&samples, SampleRate::new(cfg.sample_rate).unwrap())
             .expect("extract");
         assert_eq!(out.embeddings.len(), 2);
+    }
+
+    // ── Config upper-bound guards: extreme-but-finite values must fail
+    //    with `AfpError::Config` instead of an OOM abort downstream. ──
+
+    use crate::neural::test_support::small_cfg;
+
+    #[test]
+    fn absurd_window_secs_is_rejected_as_config() {
+        let mut cfg = small_cfg();
+        cfg.window_secs = 1.0e30;
+        match NeuralEmbedder::new(cfg) {
+            Err(AfpError::Config(msg)) => {
+                assert!(msg.contains("3600"), "unexpected message: {msg}");
+            }
+            Err(e) => panic!("expected Config, got {e:?}"),
+            Ok(_) => panic!("expected Config error for window_secs=1e30, got Ok"),
+        }
+    }
+
+    #[test]
+    fn absurd_n_mels_is_rejected_as_config() {
+        let mut cfg = small_cfg();
+        cfg.n_mels = 1_000_000;
+        match NeuralEmbedder::new(cfg) {
+            Err(AfpError::Config(msg)) => {
+                assert!(msg.contains("n_mels"), "unexpected message: {msg}");
+            }
+            Err(e) => panic!("expected Config, got {e:?}"),
+            Ok(_) => panic!("expected Config error for n_mels=1e6, got Ok"),
+        }
+    }
+
+    #[test]
+    fn absurd_n_fft_is_rejected_as_config() {
+        let mut cfg = small_cfg();
+        cfg.n_fft = 1 << 24; // power of two, but over the cap
+        match NeuralEmbedder::new(cfg) {
+            Err(AfpError::Config(msg)) => {
+                assert!(msg.contains("n_fft"), "unexpected message: {msg}");
+            }
+            Err(e) => panic!("expected Config, got {e:?}"),
+            Ok(_) => panic!("expected Config error for n_fft=1<<24, got Ok"),
+        }
     }
 }

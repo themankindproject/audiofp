@@ -2,7 +2,9 @@
 //!
 //! Each fingerprint can be round-tripped through a compact binary format
 //! via [`to_bytes`] / [`from_bytes`], and metadata about a fingerprint
-//! (without parsing the hash payload) is available through [`envelope`].
+//! blob is available without parsing the hash payload through
+//! [`FingerprintEnvelope::peek`] (raw bytes) or [`envelope`] (on a
+//! parsed fingerprint).
 //!
 //! # Wire format (v1)
 //!
@@ -18,6 +20,7 @@
 //! [`to_bytes`]: crate::classical::WangFingerprint::to_bytes
 //! [`from_bytes`]: crate::classical::WangFingerprint::from_bytes
 //! [`envelope`]: crate::classical::WangFingerprint::envelope
+//! [`peek`]: FingerprintEnvelope::peek
 
 use alloc::format;
 use alloc::string::ToString;
@@ -66,7 +69,11 @@ const ALG_HAITSMA: u8 = 2;
 pub struct FingerprintEnvelope {
     /// Algorithm name string (e.g. `"wang-v1"`, `"panako-v2"`, `"haitsma-v1"`).
     pub algorithm: &'static str,
-    /// Crate version that produced the fingerprint.
+    /// Version of the **reading** crate. The v1 wire format does not
+    /// persist the producer's version, so after a
+    /// [`from_bytes`](crate::classical::WangFingerprint::from_bytes)
+    /// round-trip this reports the current crate, not necessarily the
+    /// crate that wrote the blob.
     pub crate_version: &'static str,
     /// Sample rate the algorithm expects (Hz).
     pub sample_rate: u32,
@@ -74,6 +81,50 @@ pub struct FingerprintEnvelope {
     pub frames_per_sec: f32,
     /// Number of hashes (or frames, for Haitsma) in the fingerprint.
     pub hash_count: usize,
+}
+
+impl FingerprintEnvelope {
+    /// Read a blob's metadata without deserializing the hash payload.
+    ///
+    /// Parses and validates only the fixed 18-byte header — the payload
+    /// can be arbitrarily large and is never touched. Useful for
+    /// triaging mixed-format blobs before committing to a full decode.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Deserialize`] on short buffers, bad magic,
+    /// unsupported format version, an unknown algorithm id, or a
+    /// non-finite / non-positive frame rate.
+    pub fn peek(bytes: &[u8]) -> Result<Self> {
+        const fn alg_name(alg_id: u8) -> Option<&'static str> {
+            match alg_id {
+                ALG_WANG => Some("wang-v1"),
+                ALG_PANAKO => Some("panako-v2"),
+                ALG_HAITSMA => Some("haitsma-v1"),
+                _ => None,
+            }
+        }
+        const fn alg_sample_rate(alg_id: u8) -> u32 {
+            match alg_id {
+                ALG_PANAKO => 8_000,
+                ALG_HAITSMA => 5_000,
+                _ => 8_000,
+            }
+        }
+
+        // No expected-algorithm check: peek validates the id against the
+        // known-algorithm table itself so foreign ids get a precise error.
+        let (alg_id, hash_count, fps) = read_header(bytes, None)?;
+        let algorithm = alg_name(alg_id)
+            .ok_or_else(|| AfpError::Deserialize(format!("unknown algorithm id: {alg_id}")))?;
+        Ok(FingerprintEnvelope {
+            algorithm,
+            crate_version: crate::VERSION,
+            sample_rate: alg_sample_rate(alg_id),
+            frames_per_sec: fps,
+            hash_count: hash_count as usize,
+        })
+    }
 }
 
 /// Write the fixed header into a pre-allocated `Vec<u8>`.
@@ -86,7 +137,13 @@ fn write_header(buf: &mut Vec<u8>, alg_id: u8, hash_count: u32, fps: f32) {
 }
 
 /// Parse and validate the fixed header, returning `(algorithm_id, hash_count, fps)`.
-fn read_header(bytes: &[u8], expected_alg: u8) -> Result<(u8, u32, f32)> {
+///
+/// With `expected_alg = None` the algorithm id is accepted as-is (used
+/// by [`FingerprintEnvelope::peek`], which validates the id against the
+/// known-algorithm table itself).
+///
+/// [`FingerprintEnvelope::peek`]: FingerprintEnvelope::peek
+fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)> {
     if bytes.len() < HEADER_SIZE {
         return Err(AfpError::Deserialize(format!(
             "buffer too short: {} bytes, need at least {}",
@@ -106,9 +163,11 @@ fn read_header(bytes: &[u8], expected_alg: u8) -> Result<(u8, u32, f32)> {
         )));
     }
     let alg_id = bytes[9];
-    if alg_id != expected_alg {
+    if let Some(expected) = expected_alg
+        && alg_id != expected
+    {
         return Err(AfpError::Deserialize(format!(
-            "algorithm mismatch: blob has id {alg_id}, expected {expected_alg}"
+            "algorithm mismatch: blob has id {alg_id}, expected {expected}"
         )));
     }
     let hash_count = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
@@ -118,30 +177,30 @@ fn read_header(bytes: &[u8], expected_alg: u8) -> Result<(u8, u32, f32)> {
 
 /// Read a byte slice into a `Vec<T>` where `T: Pod`.
 ///
-/// This handles potentially-unaligned input by allocating a fresh `Vec<T>`
-/// (which is always properly aligned) and copying the raw bytes into it.
-/// `src` must be an exact multiple of `size_of::<T>()`.
+/// This handles potentially-unaligned input by allocating a properly
+/// aligned `Vec<T>` and copying the raw bytes into it exactly once (no
+/// intermediate zero-fill). `src` must be an exact multiple of
+/// `size_of::<T>()`.
 fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     let elem_size = core::mem::size_of::<T>();
-    let count = if elem_size == 0 {
-        0
-    } else {
-        src.len() / elem_size
-    };
-    // Allocate a zeroed vec (Pod guarantees all-zeros is valid).
-    let mut vec: Vec<T> = alloc::vec![T::zeroed(); count];
-    if count > 0 {
-        let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut vec);
-        dst.copy_from_slice(src);
+    if elem_size == 0 || src.is_empty() {
+        return Vec::new();
     }
-    vec
+    debug_assert_eq!(src.len() % elem_size, 0);
+    bytemuck::allocation::pod_collect_to_vec(src)
 }
 
 /// Serialize a Pod hash slice with the standard header into a `Vec<u8>`.
 fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
     let value_bytes: &[u8] = cast_slice(values);
+    debug_assert!(values.len() <= u32::MAX as usize);
     let mut buf = Vec::with_capacity(HEADER_SIZE + value_bytes.len());
-    write_header(&mut buf, alg_id, values.len() as u32, fps);
+    write_header(
+        &mut buf,
+        alg_id,
+        values.len().min(u32::MAX as usize) as u32,
+        fps,
+    );
     buf.extend_from_slice(value_bytes);
     buf
 }
@@ -151,17 +210,23 @@ fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
 /// Trailing bytes beyond the payload are intentionally ignored (forward
 /// compatibility for envelope extensions).
 fn read_payload<T: bytemuck::Pod>(bytes: &[u8], alg_id: u8, kind: &str) -> Result<(Vec<T>, f32)> {
-    let (_alg, hash_count, fps) = read_header(bytes, alg_id)?;
-    let payload = &bytes[HEADER_SIZE..];
-    let expected_len = (hash_count as usize) * core::mem::size_of::<T>();
-    if payload.len() < expected_len {
+    let (_alg, hash_count, fps) = read_header(bytes, Some(alg_id))?;
+    if !fps.is_finite() || fps <= 0.0 {
         return Err(AfpError::Deserialize(format!(
-            "payload too short: need {} bytes for {} {kind}, got {}",
-            expected_len,
+            "invalid frame rate in header: {fps} (must be finite and > 0)"
+        )));
+    }
+    let payload = &bytes[HEADER_SIZE..];
+    let expected_len = (hash_count as usize).checked_mul(core::mem::size_of::<T>());
+    let expected_len = expected_len.filter(|&len| payload.len() >= len);
+    let Some(expected_len) = expected_len else {
+        return Err(AfpError::Deserialize(format!(
+            "payload too short or hash count overflows: need {} bytes for {} {kind}, got {}",
+            (hash_count as usize).saturating_mul(core::mem::size_of::<T>()),
             hash_count,
             payload.len()
         )));
-    }
+    };
     let values = read_pod_vec::<T>(&payload[..expected_len]);
     Ok((values, fps))
 }
@@ -450,5 +515,71 @@ mod tests {
         bytes.extend_from_slice(&[0xDE, 0xAD]); // extra junk
         let fp2 = WangFingerprint::from_bytes(&bytes).unwrap();
         assert_eq!(fp.hashes, fp2.hashes);
+    }
+
+    #[test]
+    fn peek_reads_header_without_payload() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0xAB,
+                t_anchor: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let bytes = fp.to_bytes();
+        let env = FingerprintEnvelope::peek(&bytes).unwrap();
+        assert_eq!(env.algorithm, "wang-v1");
+        assert_eq!(env.sample_rate, 8_000);
+        assert_eq!(env.frames_per_sec, 62.5);
+        assert_eq!(env.hash_count, 1);
+        // peek must work on a header-only prefix: the payload is never
+        // touched, so a truncated-tail blob still yields metadata.
+        let mut header_only = bytes[..HEADER_SIZE].to_vec();
+        header_only.truncate(HEADER_SIZE);
+        let env2 = FingerprintEnvelope::peek(&header_only).unwrap();
+        assert_eq!(env2.hash_count, 1);
+    }
+
+    #[test]
+    fn peek_rejects_unknown_algorithm_id() {
+        let fp = PanakoFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        };
+        let mut bytes = fp.to_bytes();
+        bytes[9] = 0x7F; // unknown algorithm id
+        let err = FingerprintEnvelope::peek(&bytes).unwrap_err();
+        assert!(err.to_string().contains("unknown algorithm id"));
+    }
+
+    #[test]
+    fn peek_rejects_bad_header_like_from_bytes() {
+        let mut bytes = WangFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        }
+        .to_bytes();
+        bytes[0] = b'X';
+        assert!(FingerprintEnvelope::peek(&bytes).is_err());
+        assert!(FingerprintEnvelope::peek(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_non_finite_or_non_positive_fps() {
+        for bad_fps in [0.0_f32, -62.5, f32::NAN, f32::INFINITY] {
+            let fp = WangFingerprint {
+                hashes: vec![],
+                frames_per_sec: 62.5,
+            };
+            let mut bytes = fp.to_bytes();
+            // fps is the last 4 header bytes (LE).
+            let fps_bytes = bad_fps.to_le_bytes();
+            bytes[HEADER_SIZE - 4..HEADER_SIZE].copy_from_slice(&fps_bytes);
+            let err = WangFingerprint::from_bytes(&bytes).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid frame rate"),
+                "fps={bad_fps}: {err}"
+            );
+        }
     }
 }

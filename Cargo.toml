@@ -72,13 +72,17 @@ std-aac = ["std", "symphonia/aac"]
 std-flac = ["std", "symphonia/flac"]
 std-ogg = ["std", "symphonia/ogg", "symphonia/vorbis"]
 std-wav = ["std", "symphonia/wav", "symphonia/pcm"]
-std-mp4 = ["std", "symphonia/isomp4"]
+# MP4/M4A is a container: the isomp4 demuxer alone can't decode the
+# AAC frames inside it, so pull the AAC codec too.
+std-mp4 = ["std", "symphonia/isomp4", "symphonia/aac"]
 # Extra codecs beyond the common set — kept for compatibility with the
 # pre-0.4.0 monolithic `std` feature (AIFF, Matroska, ADPCM, ALAC).
-std-aiff = ["std", "symphonia/aiff"]
+# AIFF payloads are PCM (the `aiff` feature only enables the RIFF/AIFF
+# demuxer); ALAC in practice arrives inside MP4/M4A.
+std-aiff = ["std", "symphonia/aiff", "symphonia/pcm"]
 std-mkv = ["std", "symphonia/mkv"]
 std-adpcm = ["std", "symphonia/adpcm"]
-std-alac = ["std", "symphonia/alac"]
+std-alac = ["std", "symphonia/alac", "symphonia/isomp4"]
 
 # Every format/codec feature in one flag — the equivalent of the
 # pre-0.4.0 monolithic `std` feature.
@@ -131,7 +135,7 @@ num-traits  = { version = "0.2.19", default-features = false }
 num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
 wide        = { version = "1.6.0", default-features = false }
-bytemuck    = { version = "1.25.0", features = ["derive"] }
+bytemuck    = { version = "1.25.0", features = ["derive", "extern_crate_alloc"] }
 ahash       = { version = "0.8.11", default-features = false, features = ["compile-time-rng"], optional = true }
 symphonia   = { version = "0.6", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }

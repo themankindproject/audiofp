@@ -195,7 +195,6 @@ impl WatermarkDetector {
     ///   typing, building the runnable plan, running inference, or extracting
     ///   the output tensors. The variant payload identifies which step.
     pub fn detect(&mut self, samples: &[f32], rate: SampleRate) -> Result<WatermarkResult> {
-        crate::pcm::reject_non_finite(samples)?;
         if rate.hz() != self.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(rate.hz()));
         }
@@ -208,6 +207,7 @@ impl WatermarkDetector {
         if n == 0 {
             return Err(AfpError::AudioTooShort { needed: 1, got: 0 });
         }
+        crate::pcm::reject_non_finite(samples)?;
 
         // Build [1, 1, T] f32 input tensor without going through ndarray.
         let input_tensor = Tensor::from_shape(&[1, 1, n], samples)
@@ -230,6 +230,8 @@ impl WatermarkDetector {
                 .into_typed()
                 .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
             let runnable = typed
+                .into_optimized()
+                .map_err(|e| AfpError::Inference(format!("optimize: {e}")))?
                 .into_runnable()
                 .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
             self.cached = Some((n, runnable));

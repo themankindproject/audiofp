@@ -272,6 +272,10 @@ cargo build --features std-wav   # codec picker works
 ```
 
 ### Added
+- **`FingerprintEnvelope::peek`** — reads a blob's metadata (algorithm,
+  sample rate, frame rate, hash count) from the fixed 18-byte header
+  without touching the hash payload, for triaging mixed-format blobs
+  before a full decode.
 - **`DecodeLimits::timeout` — wall-clock decode timeout (#77).**
   `DecodeLimits::with_timeout(Duration)` builder sets a maximum
   wall-clock time for the entire decode operation. Returns
@@ -391,6 +395,16 @@ cargo build --features std-wav   # codec picker works
   cross-track score/prominence distributions over the real CC0 catalog
   and pins that the shipped defaults separate every pair. The measured
   margins are documented in `ROBUSTNESS.md`.
+- **O(N²) → O(N) `StreamingNeuralEmbedder` push** — see Fixed: the
+  per-window front drain is replaced by a read cursor with one
+  compaction per call.
+- **Watermark inference on an optimised graph** — see Fixed:
+  `into_optimized()` added to the cached per-length plan.
+- **Deserialisation no longer double-writes the payload** —
+  `from_bytes` zero-filled the destination `Vec` and immediately
+  overwrote it with `copy_from_slice`; it now builds the `Vec<T>` with
+  a single copy via `bytemuck::pod_collect_to_vec` (bytemuck's
+  `extern_crate_alloc` feature).
 
 ### Documentation
 
@@ -412,6 +426,47 @@ cargo build --features std-wav   # codec picker works
   16 kHz while passing `HZ_8000`; the `MatchResult::prominence` doc
   misstated the Haitsma matcher's formula (it uses `median_BER / (BER +
   ε)`, only the index path uses `0.5 / BER`).
+- **Stale crate-doc sections refreshed** — the crate-root "Panics in
+  streaming APIs" section still described the pre-#63 world where
+  `StreamingNeuralEmbedder::push` panicked on inference errors; the
+  `fp` module doc referenced modules that never existed
+  (`fp_classical::Wang`, `neural::ResonaFp`); the feature table omitted
+  `rayon`; the neural/watermark doc TOML snippets said `version = "0.3"`.
+
+### Fixed
+
+- **Codec features pull their companion decoders (#0.4.0 audit).**
+  `std-mp4` enabled only the isomp4 *demuxer*, so real M4A files parsed
+  but failed to decode — it now also enables `symphonia/aac`. Likewise
+  `std-aiff` gains `symphonia/pcm` (AIFF payloads are PCM) and
+  `std-alac` gains `symphonia/isomp4` (ALAC ships inside MP4/M4A).
+- **`WatermarkDetector` runs an optimised tract plan** — the cached
+  per-length plan skipped `into_optimized()` (the neural embedder never
+  did), leaving watermark inference on unoptimised graphs. Same outputs,
+  markedly faster repeated-`detect` inference.
+- **`StreamingNeuralEmbedder` large-push cost is linear, not quadratic**
+  — the per-window front `drain(..hop)` memmoved the entire remaining
+  carry on every emitted embedding (an hours-long single push
+  approached hundreds of GB of memmove). A read cursor now advances per
+  window and compacts once per `push` call. Output is bit-identical
+  (pinned by the chunk-size-invariance and offline-equivalence tests).
+- **`from_bytes` rejects corrupt frame rates** — a malicious/corrupt
+  blob could inject NaN / negative / zero `frames_per_sec`, which then
+  propagated silently into downstream offset math. The header frame
+  rate must now be finite and positive.
+- **`from_bytes` payload sizing is overflow-safe on 32-bit** —
+  `hash_count * size_of::<T>()` is now a checked multiply, so a
+  truncated blob can no longer wrap the expected length and pass
+  validation.
+- **`NeuralEmbedderConfig` upper bounds** — extreme-but-finite
+  `window_secs` / `n_mels` / `n_fft` values (e.g. `window_secs = 1e30`)
+  previously passed validation and aborted on the OOM/overflow of the
+  front-end allocation; they now fail fast with `AfpError::Config`
+  (`window_secs ≤ 3600`, `n_mels ≤ 8192`, `n_fft ≤ 2²⁰`, and
+  `n_mels × n_frames ≤ 2²⁸` cells).
+- **Cheap checks before the O(n) finiteness scan** — the neural
+  embedder and watermark detector now reject wrong-rate / oversized
+  input before scanning every sample for NaN.
 
 ## [0.3.9] - 2026-08-02
 

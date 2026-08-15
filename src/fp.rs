@@ -8,8 +8,10 @@
 //!   fingerprints whenever the algorithm has enough material. Suited to
 //!   live capture.
 //!
-//! Concrete implementations live in feature-gated modules
-//! (`fp_classical::Wang`, `neural::ResonaFp`, …).
+//! Concrete implementations live in the algorithm modules
+//! ([`classical::Wang`](crate::classical::Wang), [`classical::Panako`](crate::classical::Panako),
+//! [`classical::Haitsma`](crate::classical::Haitsma), and — behind the
+//! `neural` feature — [`neural::NeuralEmbedder`](crate::neural::NeuralEmbedder)).
 
 use alloc::vec::Vec;
 
