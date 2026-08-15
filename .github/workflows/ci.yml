@@ -52,12 +52,23 @@ jobs:
         run: cargo test --all-features -- --skip golden
       - name: doc tests
         run: cargo test --doc --all-features
-      - name: USAGE.md snippet check
-        run: python3 scripts/check_usage_snippets.py
       - name: doc build
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # USAGE.md snippet validity is OS-independent; run the checker once on
+  # Linux rather than on the 3-OS matrix (Windows runners don't expose
+  # a reliable `python3`).
+  usage-snippets:
+    name: USAGE.md snippet check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: compile + run rust snippets
+        run: python3 scripts/check_usage_snippets.py
 
   golden:
     name: golden hash drift
