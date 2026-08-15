@@ -52,6 +52,8 @@ jobs:
         run: cargo test --all-features -- --skip golden
       - name: doc tests
         run: cargo test --doc --all-features
+      - name: USAGE.md snippet check
+        run: python3 scripts/check_usage_snippets.py
       - name: doc build
         run: cargo doc --no-deps --all-features
         env:

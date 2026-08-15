@@ -1,6 +1,12 @@
 # audiofp Usage Guide
 
-> Complete API reference and examples for `audiofp`, the Rust audio fingerprinting SDK.
+> Complete reference for `audiofp` 0.4.0 — the pure-Rust audio fingerprinting SDK.
+>
+> This guide documents every public API and every algorithm at full
+> implement-it-by-hand depth: exact constants, bit layouts, formulas, ordering
+> rules, and failure modes. Every runnable snippet in this guide is compiled as
+> part of the crate's CI (they live as a compile-checked fixture), so nothing
+> here rots silently.
 
 ---
 
@@ -12,11 +18,18 @@
   - [Fingerprinter trait](#fingerprinter-trait)
   - [StreamingFingerprinter trait](#streamingfingerprinter-trait)
   - [Shared value types](#shared-value-types)
-- [Classical Fingerprinters](#classical-fingerprinters)
+- [Algorithm Reference](#algorithm-reference)
+  - [Shared front-end](#shared-front-end)
   - [Wang (landmark pairs)](#wang-landmark-pairs)
   - [Panako (triplet hashes)](#panako-triplet-hashes)
   - [Haitsma–Kalker (band-power sign bits)](#haitsmakalker-band-power-sign-bits)
 - [Matching / Identification](#matching--identification)
+  - [MatchResult semantics](#matchresult-semantics)
+  - [WangMatcher](#wangmatcher)
+  - [HaitsmaMatcher](#haitsmamatcher)
+  - [PanakoMatcher](#panakomatcher)
+  - [NeuralMatcher](#neuralmatcher)
+  - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Fingerprint Serialization](#fingerprint-serialization)
 - [Audio File Decoding](#audio-file-decoding)
@@ -28,38 +41,38 @@
 - [Performance Tips](#performance-tips)
 - [Feature Flags](#feature-flags)
 - [no_std / Embedded](#no_std--embedded)
+- [Determinism Guarantees](#determinism-guarantees)
 - [Examples](#examples)
 
 ---
 
 ## Quick Start
 
-Add the dependency:
+Add the dependency. The default build is `no_std + alloc` with **no codecs**;
+for file decoding (`audiofp::io`) enable the codecs you need — see
+[Feature Flags](#feature-flags):
 
 ```toml
 [dependencies]
-# The default build is no_std + alloc with no codecs. For file decoding
-# (audiofp::io), enable the codecs you need — see "Feature Flags" below.
 audiofp = { version = "0.4", features = ["std-mp3", "std-wav"] }
 ```
 
-### Basic example: fingerprint silence (zero deps)
+### Example 1 — fingerprint raw PCM (no codec features needed)
 
 ```rust
 use audiofp::classical::Wang;
 use audiofp::{Fingerprinter, SampleRate};
 
 fn main() {
-    let samples = vec![0.0_f32; 8_000 * 3]; // 3 s @ 8 kHz
+    let samples = vec![0.0_f32; 8_000 * 3]; // 3 s of silence @ 8 kHz
     let mut wang = Wang::default();
-    let fp = wang
-        .extract(&samples, SampleRate::HZ_8000)
-        .unwrap();
-    println!("{} hashes", fp.hashes.len()); // silence → usually 0
+    let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
+    println!("{} hashes", fp.hashes.len()); // silence → 0
+    assert_eq!(fp.frames_per_sec, 62.5);
 }
 ```
 
-### Basic example: fingerprint an MP3 with Wang
+### Example 2 — fingerprint an MP3 and print the first hashes
 
 ```rust
 use audiofp::classical::Wang;
@@ -67,43 +80,73 @@ use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Decode to mono f32 at the rate Wang requires.
+    // Decode any enabled format to mono f32 at Wang's required 8 kHz.
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
     let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 
-    println!("{} hashes, {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
+    println!("{} hashes at {:.1} frames/s", fp.hashes.len(), fp.frames_per_sec);
     for h in fp.hashes.iter().take(5) {
-        println!("  t_anchor={.0} hash={:08x}", h.t_anchor.0, h.hash);
+        // t_anchor is the anchor's STFT frame index (a plain u32).
+        println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
     }
     Ok(())
 }
 ```
 
-### Detect duplicate songs across re-encodings
+### Example 3 — identify a clip against a catalog
 
 ```rust
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 use audiofp::{Fingerprinter, SampleRate};
-use std::collections::HashSet;
 
-fn fingerprint(path: &str) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
+fn fingerprint(
+    path: &str,
+    wang: &mut Wang,
+) -> Result<audiofp::classical::WangFingerprint, Box<dyn std::error::Error>> {
     let samples = decode_to_mono_at(path, 8_000)?;
-    let mut wang = Wang::default();
-    Ok(wang.extract(&samples, SampleRate::HZ_8000)?.hashes.into_iter().map(|h| h.hash).collect())
+    Ok(wang.extract(&samples, SampleRate::HZ_8000)?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let original = fingerprint("song.flac")?;
-    let mp3 = fingerprint("song_128kbps.mp3")?;
-    let overlap = original.intersection(&mp3).count();
-    let pct = 100.0 * overlap as f64 / original.len().max(mp3.len()) as f64;
-    println!("{overlap} hashes shared ({pct:.1} %)");
+    let mut wang = Wang::default();
+    let query = fingerprint("clip.wav", &mut wang)?;
+    let refs = vec![
+        fingerprint("catalog_a.flac", &mut wang)?,
+        fingerprint("catalog_b.flac", &mut wang)?,
+    ];
+
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let m = matcher.match_one(&query, &refs[0]);
+    if m.is_match {
+        // Positive offset ⇒ the query starts later in the reference.
+        println!("match: score={:.3} votes={} offset={} ms",
+                 m.score, m.votes, m.offset.ms);
+    }
     Ok(())
 }
 ```
+
+### Example 4 — the prelude (fewer imports)
+
+```rust
+use audiofp::prelude::*; // Wang, configs, hash types, both traits, error types
+
+fn main() {
+    let samples = vec![0.0_f32; 16_000];
+    let mut wang = Wang::default();
+    let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
+    let _ = fp.hashes.len();
+}
+```
+
+The prelude carries the classical fingerprinters (offline + streaming), their
+config/hash types, `AfpError`/`Result`, `SampleRate`/`TimestampMs`,
+`FingerprintEnvelope`, and both traits. Feature-gated modules (`io`, `neural`,
+`watermark`) are **not** in the prelude — import those from their own modules.
 
 ---
 
@@ -111,31 +154,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### What is an audio fingerprint?
 
-A **perceptual hash** of an audio recording — small enough to store and search at scale, yet stable across re-encoding, modest noise, and (for some algorithms) tempo or pitch changes. Two recordings of the same song will share many hashes; two unrelated recordings won't.
+A **perceptual hash** of an audio recording — small enough to store and search
+at scale, yet stable across re-encoding, modest noise, and (for Panako) small
+tempo changes. Two recordings of the same song share many hashes; two
+unrelated recordings do not.
 
-`audiofp` ships three classical fingerprinters, each making different tradeoffs:
+`audiofp` ships three classical fingerprinters, one neural embedder, and one
+watermark detector:
 
-| Algorithm  | Output          | Sample rate | Frame rate  | Storage / sec       | When to use                          |
-| ---------- | --------------- | ----------- | ----------- | ------------------- | ------------------------------------ |
-| `Wang`     | Landmark pairs  | 8 kHz       | 62.5 fps    | ~2.4 KB (fan-out 10)| Music ID; "Shazam-style" matching    |
-| `Panako`   | Triplet hashes  | 8 kHz       | 62.5 fps    | ~2.0 KB (fan-out 5) | Tempo-robust music ID (±5 % stretch) |
-| `Haitsma`  | 32-bit/frame    | 5 kHz       | 78.125 fps  | 312 B               | Compact dense IDs; fastest extraction|
+| Algorithm  | Output          | Rate  | Frame rate | Storage / s        | When to use                            |
+| ---------- | --------------- | ----- | ---------- | ------------------ | -------------------------------------- |
+| `Wang`     | Landmark pairs  | 8 kHz | 62.5 fps   | ~2.4 KB (fan-out 10) | Music ID; "Shazam-style" matching    |
+| `Panako`   | Triplet hashes  | 8 kHz | 62.5 fps   | ~2.0 KB (fan-out 5)  | Tempo-robust music ID (±5 % stretch) |
+| `Haitsma`  | 32 bits / frame | 5 kHz | 78.125 fps | 312 B               | Compact dense IDs; lowest latency    |
+| `NeuralEmbedder` | f32 vector / window | model-defined | 1/`hop_secs` | `4·dim` B / window | Semantic / cover detection (BYO ONNX model) |
+| `WatermarkDetector` | message + confidence | 16 kHz | — | — | AudioSeal-style watermark detection (BYO model) |
 
-All three:
-- accept mono `f32` PCM in `[-1.0, 1.0]`
-- **require** their native sample rate (resample first if your source differs — see [Audio File Decoding](#audio-file-decoding))
-- need at least **2 seconds** of audio
-- produce hash structs that are `bytemuck::Pod` — castable directly to bytes for storage / IPC
+All three classical fingerprinters:
+
+- accept mono `f32` PCM, nominally in `[-1.0, 1.0]` (values outside are
+  fingerprinted as-is; only NaN/Inf are rejected — see
+  [Error Handling](#error-handling))
+- **require** their native sample rate (wrong rate → `UnsupportedSampleRate`
+  from `extract`; resample first — see
+  [Audio File Decoding](#audio-file-decoding))
+- need at least **2 seconds** of audio (`min_samples()`)
+- produce hash structs that are `#[repr(C)]` + `bytemuck::Pod` — castable
+  directly to/from bytes for storage, `mmap`, or IPC
 
 ### Matching vs persistence
 
-**In-memory matching is in scope** — see [Matching / Identification](#matching--identification). Use `WangMatcher` (or `HaitsmaMatcher`) instead of naive hash-set overlap.
+**In-memory matching is in scope** — see
+[Matching / Identification](#matching--identification). Use the matchers or
+the 1:N indexes instead of naive hash-set overlap.
 
-**Persistence is still out of scope.** There is no on-disk index, wire format, or database adapter. A typical production pipeline is:
+**Persistence is out of scope** beyond a simple self-describing binary blob
+([Fingerprint Serialization](#fingerprint-serialization)). There is no
+on-disk index, RPC wire format, or database adapter. A typical production
+pipeline is:
 
-1. `audiofp` → fingerprints per song
+1. `audiofp` → fingerprints per track (enrolment)
 2. Your store (RocksDB, SQLite, object store, …) → durable catalog
-3. Load candidates into memory → `WangMatcher` / `WangIndex` / `match_ranked`
+3. Load references into memory → `WangIndex` / `match_ranked` / your own
+   inverted index over the raw Pod hashes
+
+### The one-minute mental model
+
+For Wang/Panako/Haitsma alike, extraction is a fixed pipeline:
+
+```text
+PCM f32 @ native rate
+   │  Hann-windowed STFT (real FFT, pre-planned, non-centred framing)
+   ▼
+power spectrogram  (|X|² per bin — the sqrt is skipped algebraically)
+   │  10·log10(max(p, floor)) — dB with a floor
+   ▼
+[ Wang / Panako ]  2-D peak picking → per-second top-K → pairing/triplets → hashes
+[ Haitsma ]        33 log-spaced band energies → sign of band-delta change → 32 bits/frame
+```
+
+Matching then looks for **agreement**: Wang votes on a constant time offset,
+Panako votes on a (time-scale, offset) line, Haitsma minimises a bit error
+rate over sliding alignments. Every matcher outputs the same
+[`MatchResult`](#matchresult-semantics) shape.
 
 ---
 
@@ -143,9 +224,12 @@ All three:
 
 ### `Fingerprinter` trait
 
-Offline (whole-buffer) extraction. Implementors are stateful only insofar as they may reuse scratch buffers — `extract(a)` does not depend on any previous call.
+Offline (whole-buffer) extraction. Implementors are stateful only insofar as
+they reuse scratch buffers — `extract(a)` never depends on a previous call.
 
-```rust
+```rust,ignore
+// Reference definition (see src/fp.rs). Shown for orientation; use the
+// real trait via `use audiofp::Fingerprinter;`.
 pub trait Fingerprinter {
     type Output;
     type Config: Clone + Send + Sync;
@@ -158,25 +242,45 @@ pub trait Fingerprinter {
 }
 ```
 
-`required_sample_rate()` returns a [`SampleRate`] (e.g. `SampleRate::HZ_8000`
-for Wang/Panako, `SampleRate::HZ_5000` for Haitsma) — compare it against the
-audio's `SampleRate` directly, no manual unwrap needed.
+`required_sample_rate()` returns a `SampleRate` — compare it directly against
+your audio's rate:
 
-Stable algorithm IDs (`name()`):
+```rust
+use audiofp::classical::{Haitsma, Panako, Wang};
+use audiofp::Fingerprinter;
 
-| Type      | `name()`     |
-| --------- | ------------ |
-| `Wang`    | `"wang-v1"`  |
-| `Panako`  | `"panako-v2"`|
+fn main() {
+    assert_eq!(Wang::default().required_sample_rate().hz(), 8_000);
+    assert_eq!(Panako::default().required_sample_rate().hz(), 8_000);
+    assert_eq!(Haitsma::default().required_sample_rate().hz(), 5_000);
+
+    // Minimum audio length (2 s at each algorithm's native rate):
+    assert_eq!(Wang::default().min_samples(), 16_000);
+    assert_eq!(Haitsma::default().min_samples(), 10_000);
+}
+```
+
+Stable algorithm IDs (`name()`) — persist these alongside hashes if you ever
+mix algorithm versions in one catalog:
+
+| Type      | `name()`       |
+| --------- | -------------- |
+| `Wang`    | `"wang-v1"`    |
+| `Panako`  | `"panako-v2"`  |
 | `Haitsma` | `"haitsma-v1"` |
+| `NeuralEmbedder` | `"neural-onnx-v0"` |
 
-Persist these alongside hashes if you ever plan to mix algorithm versions in one database.
+`extract` runs, in order: NaN/Inf rejection (`NonFiniteSample`), the
+`max_input_samples` check (`InputTooLarge`), the sample-rate check
+(`UnsupportedSampleRate`), the `min_samples` check (`AudioTooShort`), then the
+algorithm itself. Cheap checks run before the O(n) finiteness scan.
 
 ### `StreamingFingerprinter` trait
 
-Incremental, low-latency extraction.
+Incremental, low-latency extraction:
 
-```rust
+```rust,ignore
+// Reference definition (see src/fp.rs).
 pub trait StreamingFingerprinter {
     type Frame;
 
@@ -185,55 +289,66 @@ pub trait StreamingFingerprinter {
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
     fn latency_ms(&self) -> u32;
 
-    // Provided methods — zero-allocation callback variants:
-    fn push_with<F>(&mut self, samples: &[f32], callback: F) -> usize
+    // Provided zero-allocation callback variants:
+    fn push_with<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
     where F: FnMut(TimestampMs, &Self::Frame);
-    fn flush_with<F>(&mut self, callback: F) -> usize
+    fn flush_with<F>(&mut self, callback: F) -> Result<usize>
     where F: FnMut(TimestampMs, &Self::Frame);
 }
 ```
 
-`required_sample_rate()` returns the sample rate (Hz) the stream expects —
-note this streaming trait still returns a plain `u32`, unlike the offline
-[`Fingerprinter`] trait which returns a [`SampleRate`]. Feed wrong-rate
-samples and you'll get garbage hashes silently — there's no runtime check on
-`push`, so callers should assert or resample upfront.
+Notes that matter in practice:
 
-`push()` is non-blocking and returns any frames whose anchors are *fully observable* (their full lookahead has elapsed). `flush()` drains everything still pending — call it at end-of-stream. `latency_ms()` is a conservative upper bound from sample-in to hash-out.
+- **All `push`/`flush` implementations are fallible** and return `Result`
+  (since 0.4.0). The classical streams (Wang/Panako/Haitsma) never error on
+  valid input; `StreamingNeuralEmbedder` propagates ONNX inference errors.
+- `push()` is non-blocking and returns only frames whose full lookahead has
+  elapsed. `flush()` drains everything still pending — call it at
+  end-of-stream.
+- **`flush` lifecycle contract** (all implementations):
+  - *Idempotent* — a second `flush` after the stream is drained returns an
+    empty `Vec`.
+  - *Push after flush is valid* — the stream does not enter a "finished"
+    state; continuation audio appends. Call `reset()` on the concrete type to
+    start a fresh stream.
+- There is **no runtime rate check on `push`** — feeding wrong-rate samples
+  produces garbage hashes silently. Assert or resample up front.
+- `latency_ms()` is a conservative upper bound from sample-in to hash-out.
+- `push_with` / `flush_with` invoke `callback(timestamp, &frame)` per emitted
+  frame and return the count — no intermediate `Vec` allocation.
 
-`push_with` and `flush_with` are **provided** zero-allocation callback variants: instead of returning a `Vec`, they invoke `callback(timestamp, &frame)` for each emitted frame and return the count. Use these when you want to avoid per-push heap allocation — the caller processes each frame inline without intermediate collection.
-
-> **Bit-exact guarantee.** Feeding the same audio in any chunking pattern (including 1-sample-per-push) produces the identical hash multiset as a single `Fingerprinter::extract` over the full buffer.
->
-> **0.2.0 incremental streaming.** Wang/Panako keep a rolling
-> `2·neighborhood_t + 1`-row spectrogram window and detect peaks
-> frame-by-frame as each ripens; Haitsma keeps a single previous-frame
-> band-energy vector. Per-push CPU is proportional to the new samples
-> only — independent of total stream length.
+> **Bit-exact guarantee.** Feeding the same audio in any chunking pattern
+> (including 1-sample-per-push) produces the identical hash *multiset* as a
+> single `Fingerprinter::extract` over the full buffer. This is pinned by
+> in-tree tests (`streaming_offline_equivalence`,
+> `streaming_chunk_size_invariant`, `streaming_with_one_sample_chunks_…`).
 
 ### Shared value types
 
 #### `SampleRate`
 
-Newtype around `NonZeroU32`. Construct from one of the canonical constants or via `new`:
+Newtype around `NonZeroU32`:
 
 ```rust
 use audiofp::SampleRate;
 
-let r = SampleRate::HZ_44100;        // 44_100
-let r = SampleRate::new(32_000).unwrap();
-assert!(SampleRate::new(0).is_none());
+fn main() {
+    let r = SampleRate::HZ_44100;              // 44_100
+    let r = SampleRate::new(32_000).unwrap();  // any non-zero rate
+    assert!(SampleRate::new(0).is_none());
+    println!("{r:?} runs at {} Hz", r.hz());
+}
 ```
 
-| Constant            | Hz     |
-| ------------------- | ------ |
-| `HZ_5000`           | 5 000  |
-| `HZ_8000`           | 8 000  |
-| `HZ_11025`          | 11 025 |
-| `HZ_16000`          | 16 000 |
-| `HZ_22050`          | 22 050 |
-| `HZ_44100`          | 44 100 |
-| `HZ_48000`          | 48 000 |
+| Constant   | Hz      | Used by                        |
+| ---------- | ------- | ------------------------------ |
+| `HZ_5000`  | 5 000   | Haitsma                        |
+| `HZ_8000`  | 8 000   | Wang, Panako                   |
+| `HZ_11025` | 11 025  | quarter-rate audio             |
+| `HZ_16000` | 16 000  | watermark + neural default     |
+| `HZ_22050` | 22 050  | half-rate audio                |
+| `HZ_44100` | 44 100  | CD audio                       |
+| `HZ_48000` | 48 000  | pro/video audio                |
 
 #### `TimestampMs`
 
@@ -241,288 +356,664 @@ assert!(SampleRate::new(0).is_none());
 pub struct TimestampMs(pub u64);
 ```
 
-Milliseconds since stream start. `u64` gives ≈ 584 million years of headroom.
+Milliseconds since stream start; `u64` gives ≈ 584 million years of headroom.
 
 #### `VERSION`
 
-```rust
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-```
-
-Crate version string, e.g. `"0.3.7"`. Useful for runtime sanity checks when the SDK is vendored.
+`audiofp::VERSION` is the compile-time crate version string (e.g.
+`"0.4.0"`). Useful for runtime sanity checks when the SDK is vendored.
 
 ---
 
-## Classical Fingerprinters
+## Algorithm Reference
+
+This section documents each fingerprinter at implement-it-by-hand depth. The
+constants below are the exact values used by the in-tree extractors; a
+faithful reimplementation following these steps produces byte-identical
+hashes.
+
+### Shared front-end
+
+Wang and Panako share an identical front-end up to (and including) peak
+picking:
+
+| Parameter        | Wang          | Panako        | Haitsma       |
+| ---------------- | ------------- | ------------- | ------------- |
+| Sample rate      | 8 000 Hz      | 8 000 Hz      | 5 000 Hz      |
+| `n_fft`          | 1 024         | 1 024         | 2 048         |
+| Hop              | 128 (16 ms)   | 128 (16 ms)   | 64 (12.8 ms)  |
+| Frame rate       | 62.5 fps      | 62.5 fps      | 78.125 fps    |
+| Window           | Hann, periodic (period = `n_fft`) | same | same |
+| Framaming        | non-centred: frame `i` starts at sample `i·hop`; tail samples short of a full frame are dropped (streaming buffers them) | same | same |
+| Bins             | 513 (`n_fft/2 + 1`) | 513     | 1 025         |
+
+Per frame the STFT computes the **power** spectrum `p[k] = Re² + Im²` (the
+per-bin `sqrt` is deliberately skipped). dB conversion is
+
+```text
+db[k] = 10 · log10( max(p[k], 1e-12) )      (Wang, Panako)
+```
+
+i.e. a magnitude floor of `1e-6` squared. (`10·log10(p) ≡ 20·log10(|X|)` —
+identical to computing dB from magnitudes, one `sqrt` cheaper.)
+
+Haitsma consumes band energies straight from the power spectrum (no dB step).
+
+#### Peak picking (Wang & Panako)
+
+Peaks are local maxima of the dB spectrogram under a
+`(2·15+1) × (2·15+1)` = **31×31** box (15 frames × 15 bins half-width),
+computed exactly as a 2-D rolling max (Lemire monotonic deque along each
+axis). A cell `(t, f)` survives iff:
+
+```text
+db[t][f] >  -50.0                    (min_anchor_mag_db)
+db[t][f] >= rolling_max_31x31(t, f)  (>= so flat plateaus emit every cell)
+```
+
+Then a **per-second adaptive cap** keeps only the top `30` peaks
+(`peaks_per_sec`) in each 1-second bucket. Bucket index =
+`floor(t_frame / 62.5)`. Ranking within a bucket is by magnitude descending,
+ties by `(t_frame, f_bin)` ascending — a total order, so the kept set is
+deterministic and identical offline vs streaming.
 
 ### Wang (landmark pairs)
 
-Avery Wang's "Shazam paper" algorithm: peaks in a log-mag spectrogram are paired into anchor-target landmarks; each pair packs into a 32-bit hash.
+Avery Wang's ISMIR-2003 "industrial-strength" algorithm (the Shazam paper;
+the underlying patent family expired 2024-01-07). Anchor peaks are paired
+with later target peaks; each pair packs into a 32-bit hash.
 
-#### Hash layout
+**Step-by-step:**
+
+1. Resample to 8 kHz mono (caller's responsibility).
+2. STFT per the [shared front-end](#shared-front-end); convert to dB.
+3. Pick peaks as above; sort survivors by `(t_frame, f_bin)`.
+4. For each anchor `a` (in time order), consider every later peak `b` with
+   `1 ≤ Δt ≤ 63` (`target_zone_t`) and `|Δf| ≤ 64` bins (`target_zone_f`).
+   Keep the top **10** (`fan_out`) targets ranked by magnitude descending,
+   ties by `(t_frame, f_bin)` ascending.
+5. Pack each surviving `(a, b)` pair:
 
 ```text
-[31..23]  f_a_q  9 bits, anchor frequency (quantised to 512 buckets)
-[22..14]  f_b_q  9 bits, target frequency (same quantisation)
-[13.. 0]  Δt    14 bits, frames between anchor and target (clamped 1..=16383)
+f_q(x)  = floor( f_bin · 512 / 513 )        — 513 bins → 9-bit bucket
+hash    = (f_q(a) << 23) | (f_q(b) << 14) | clamp(Δt, 1, 16383)
+
+[31..23]  f_q(a)   9 bits   anchor frequency bucket  (0..=511)
+[22..14]  f_q(b)   9 bits   target frequency bucket  (0..=511)
+[13.. 0]  Δt       14 bits  frames anchor → target   (1..=16383, clamped)
 ```
 
-#### `WangConfig`
+6. Output is sorted by `(t_anchor, hash)` — consumers may binary-search or
+   merge-join on it.
+
+**Decode** a hash with pure arithmetic:
 
 ```rust
-pub struct WangConfig {
-    pub fan_out: u16,            // default 10
-    pub target_zone_t: u16,      // default 63 frames
-    pub target_zone_f: u16,      // default 64 bins
-    pub peaks_per_sec: u16,      // default 30
-    pub min_anchor_mag_db: f32,  // default -50.0
-    pub max_input_samples: Option<usize>, // default 14_400_000; None to disable
-    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
-    pub max_pending_anchors: Option<usize>, // default None; streaming only
-    pub max_push_samples: Option<usize>,    // default None; truncate hostile push chunks
+fn main() {
+    let hash: u32 = 0x1234_5678;
+    let f_a = hash >> 23;              // 9 bits
+    let f_b = (hash >> 14) & 0x1FF;    // 9 bits
+    let dt = hash & 0x3FFF;            // 14 bits
+    println!("anchor bucket {f_a}, target bucket {f_b}, Δt {dt} frames");
 }
 ```
 
-| Field               | Default | Effect                                                     |
-| ------------------- | ------- | ---------------------------------------------------------- |
-| `fan_out`           | 10      | Targets paired with each anchor. Lower → smaller fingerprint, weaker recall |
-| `target_zone_t`     | 63      | Maximum Δt (frames) for valid pairs                        |
-| `target_zone_f`     | 64      | Maximum |Δf| (FFT bins) for valid pairs                    |
-| `peaks_per_sec`     | 30      | Peaks the picker keeps per 1 s bucket                      |
-| `min_anchor_mag_db` | -50.0   | Magnitude floor: peaks below this dB level are ignored     |
-| `max_input_samples` | 14 400 000 (30 min @ 8 kHz) | Rejects larger inputs early with `InputTooLarge`. `None` disables. |
-| `max_hashes` | 500 000 | Rejects extracts that would emit more hashes. `None` disables. |
-| `max_pending_anchors` | `None` | Streaming: oldest-first eviction when pending anchors exceed the cap. |
-| `max_push_samples` | `None` | Streaming: truncate a single `push` chunk to this many samples. |
-
-#### Output: `WangFingerprint`
-
-```rust
-pub struct WangFingerprint {
-    pub hashes: Vec<WangHash>,    // sorted by (t_anchor, hash)
-    pub frames_per_sec: f32,      // always 62.5 for wang-v1
-}
-
-#[repr(C)]
-#[derive(bytemuck::Pod, bytemuck::Zeroable)]
-pub struct WangHash {
-    pub hash: u32,
-    pub t_anchor: u32,
-}
-```
-
-#### Example: custom config
-
-```rust
-use audiofp::classical::{Wang, WangConfig};
-use audiofp::{Fingerprinter, SampleRate};
-
-fn main() -> Result<(), audiofp::AfpError> {
-    let cfg = WangConfig {
-        fan_out: 5,             // smaller fingerprint
-        peaks_per_sec: 20,      // fewer peaks → faster matching
-        ..Default::default()
-    };
-    let mut wang = Wang::new(cfg);
-
-    let samples = vec![0.0_f32; 8_000 * 4];
-    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
-    println!("{} hashes", fp.hashes.len());
-    Ok(())
-}
-```
+**Output sizes:** at the default config expect ~300 hashes/second of rich
+music (~2.4 KB/s at 8 bytes per `WangHash`). Silence produces zero hashes.
 
 ### Panako (triplet hashes)
 
-Joren Six's Panako algorithm: anchors are paired with **two** targets each; the ratio of their offsets gives a tempo-invariant β value robust to ±5 % time stretch.
+Joren Six's Panako algorithm (start-end fingerprinting). Each anchor is
+paired with **two** targets; the geometry of the triplet survives ±5 %
+time-stretch because the hash stores *ratios*, not absolute offsets.
 
-#### Hash layout
+**Step-by-step:**
+
+1. Resample to 8 kHz mono; STFT + dB + peak picking exactly as Wang
+   (same constants, same 31×31 neighbourhood, same 30/s cap).
+2. For each anchor `a`, collect later peaks as candidate targets with the
+   **strict** zone `1 ≤ Δt < 96` (`target_zone_t`) and `|Δf| < 96`
+   (`target_zone_f`). Candidates beyond `2·fan_out = 10` evict the
+   weakest-magnitude member (soft cap). This is provably lossless for the
+   top-K pair selection that follows: the best `fan_out` pairs by
+   `mag(b) + mag(c)` only ever use the `fan_out + 1` strongest candidates.
+3. Form candidate triplets `(a, b, c)` with `t_a < t_b < t_c` from the
+   surviving targets and keep the top `fan_out = 5` by
+   `mag(b) + mag(c)` (ties by position ascending).
+4. Pack:
 
 ```text
-[31..30]  sign       2 bits (sign of Δf_ab and Δf_bc)
-[29..28]  mag_order  2 bits (which of {a, b, c} has largest magnitude)
-[27..23]  β          5 bits, round((t_c − t_b) / (t_c − t_a) · 31)
-[22..15]  Δf_ab      8 bits signed, clamped to ±127
-[14.. 7]  Δf_bc      8 bits signed, clamped to ±127
-[ 6.. 0]  reserved   7 bits, zero
+Δf_ab = clamp(f_b − f_a, −127, 127)      Δf_bc = clamp(f_c − f_b, −127, 127)
+sign    = (f_b ≥ f_a) | ((f_c ≥ f_b) << 1)          — 2 bits
+mag_ord = 0 if a largest | 1 if b largest | 2 if c largest   — 2 bits
+β       = clamp( round( (t_c − t_b) / (t_c − t_a) · 31 ), 0, 31 )  — 5 bits
+
+hash = (sign    << 30)      — bits 31..30
+     | (mag_ord << 28)      — bits 29..28
+     | (β       << 23)      — bits 27..23
+     | ((Δf_ab as i8 as u8) << 15)   — bits 22..15 (two's complement byte)
+     | ((Δf_bc as i8 as u8) <<  7)   — bits 14.. 7
+                                    — bits  6.. 0 are zero (reserved)
 ```
 
-#### `PanakoConfig`
+5. The emitted struct keeps the raw frame indices `t_anchor`, `t_b`, `t_c`
+   alongside the packed hash — matching needs them to re-derive the local
+   time scale.
 
-```rust
-pub struct PanakoConfig {
-    pub fan_out: u16,            // default 5
-    pub target_zone_t: u16,      // default 96
-    pub target_zone_f: u16,      // default 96
-    pub peaks_per_sec: u16,      // default 30
-    pub min_anchor_mag_db: f32,  // default -50.0
-    pub max_input_samples: Option<usize>, // default 14 400 000; None to disable
-    pub max_hashes: Option<usize>,        // default Some(500_000); None to disable
-    pub max_pending_anchors: Option<usize>, // default None; streaming eviction
-    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
-}
-```
-
-#### Output: `PanakoFingerprint`
-
-```rust
-pub struct PanakoFingerprint {
-    pub hashes: Vec<PanakoHash>,
-    pub frames_per_sec: f32,    // 62.5
-}
-
-#[repr(C)]
-#[derive(bytemuck::Pod, bytemuck::Zeroable)]
-pub struct PanakoHash {
-    pub hash: u32,
-    pub t_anchor: u32,
-    pub t_b: u32,                // first target frame
-    pub t_c: u32,                // second target frame
-}
-```
-
-The extra `t_b`, `t_c` fields make tempo-aware time alignment possible during scoring.
+Why the divergences from Six's original: the original packs unsigned 6-bit
+`|Δf|` quantisations and a 4-bit sign/mag slot; this crate uses signed 8-bit
+`Δf` (clamped ±127) with the sign bits at the top. `target_zone_f` above 127
+collides distinct triplets onto the same clamped code — keep
+`target_zone_f ≤ 127` if you care (the default 96 is safe).
 
 ### Haitsma–Kalker (band-power sign bits)
 
-Philips robust hash: 33 logarithmically spaced bands from 300–2000 Hz, one bit per band per frame indicating whether the band-difference delta is positive between consecutive frames.
+The Philips robust hashing scheme (Haitsma & Kalker, 2002): extremely
+compact (32 bits per frame) and extremely cheap to match (popcount).
 
-#### Hash layout
+**Step-by-step:**
 
-Per frame `n ≥ 1`:
+1. Resample to **5 kHz** mono. STFT with `n_fft = 2048`, `hop = 64` →
+   78.125 fps, 1 025 bins.
+2. Build **33 band edges** logarithmically spaced between `fmin = 300 Hz`
+   and `fmax = 2000 Hz`:
 
 ```text
-F[n][b] = ((E[n][b] − E[n][b+1]) − (E[n−1][b] − E[n−1][b+1])) > 0   for b ∈ {0..=31}
+edge(k) = 300 · (2000 / 300)^(k / 32),      k = 0..=32
 ```
 
-Packed `u32` with **band 0 in the most significant bit** (the "MSB-zero" convention) and band 31 in the LSB.
+   Each FFT bin is assigned to the band whose edge-interval contains its
+   centre frequency; band `b`'s energy `E[n][b]` is the sum of the power
+   bins assigned to it (empty bands degrade to energy 0 — no error).
+3. For each frame `n ≥ 1` emit 32 sign bits — band 0 in the **most
+   significant bit**:
 
-#### `HaitsmaConfig`
-
-```rust
-pub struct HaitsmaConfig {
-    pub fmin: f32,    // default 300.0
-    pub fmax: f32,    // default 2000.0
-    pub max_input_samples: Option<usize>, // default 9 000 000; None to disable
-    pub max_push_samples: Option<usize>,  // default None; truncate hostile push chunks
-}
+```text
+bit[b] = ( (E[n][b] − E[n][b+1]) − (E[n−1][b] − E[n−1][b+1]) ) > 0,   b = 0..=31
+frame  = Σ bit[b] << (31 − b)        // MSB = band 0, LSB = band 31
 ```
 
-`Haitsma::new` returns `Err(AfpError::Config(...))` if `fmin <= 0`, `fmin >= fmax`, or `fmax >= sr / 2` (above Nyquist for the fixed 5 kHz operating rate). `StreamingHaitsma::new` performs the same validation.
+4. Frame 0 has no hash (it needs `n−1`). `frames[i]` therefore corresponds
+   to spectrogram frame `i + 1`.
 
-#### Output: `HaitsmaFingerprint`
-
-```rust
-pub struct HaitsmaFingerprint {
-    pub frames: Vec<u32>,         // one u32 per frame from n=1
-    pub frames_per_sec: f32,      // 78.125
-}
-```
-
-> Frame 0 has no hash (the algorithm needs frame n−1 for the delta). Frame indexing in `frames` is therefore offset by one relative to the spectrogram.
-
-### Progress Callbacks
-
-All three classical fingerprinters expose `extract_with_progress` for
-reporting extraction progress on long files (podcasts, DJ sets, etc.):
-
-```rust
-use audiofp::classical::Wang;
-use audiofp::{SampleRate};
-
-let samples = vec![0.0_f32; 8_000 * 60]; // 60 s
-let mut wang = Wang::default();
-
-
-let fp = wang.extract_with_progress(buf, |progress| {
-    // progress is monotonically non-decreasing in [0.0, 1.0]
-    println!("{:.0}%", progress * 100.0);
-}).unwrap();
-```
-
-The callback fires every ~500 ms of processed audio (every 32 frames for
-Wang/Panako at 62.5 fps, every 39 frames for Haitsma at 78 fps). The plain
-`extract()` delegates to `extract_with_progress` with a no-op closure — zero
-overhead when progress isn't needed.
-
-Signatures:
-```rust
-impl Wang {
-    pub fn extract_with_progress<F: FnMut(f32)>(
-        &mut self, samples: &[f32], rate: SampleRate, progress: F,
-    ) -> Result<WangFingerprint>;
-}
-// Same on Panako and Haitsma.
-```
+At 78.125 fps and 4 bytes/frame this is 312 B/s — roughly 8× smaller than
+Wang. The cost is a weaker notion of "hash identity": matching is per-frame
+bit-error rate, so it wants the whole frame sequence, not a hash set.
 
 ---
 
 ## Matching / Identification
 
-`audiofp::matching` scores a **query** fingerprint against one or more **references** entirely in memory. There is no persistence layer.
+`audiofp::matching` scores a **query** fingerprint against one or more
+**references** entirely in memory.
 
-| Matcher | Fingerprint | Strategy |
-| --- | --- | --- |
-| `WangMatcher` | `WangFingerprint` | Offset-histogram voter (Shazam-style) |
-| `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT) |
-| `NeuralMatcher` | `NeuralFingerprint` | Cosine similarity (`neural` feature) |
-| `PanakoMatcher` | `PanakoFingerprint` | 2-D Hough + optional RANSAC (tempo-invariant) |
+| Matcher          | Fingerprint          | Strategy                                       | Feature |
+| ---------------- | -------------------- | ---------------------------------------------- | ------- |
+| `WangMatcher`    | `WangFingerprint`    | Offset-histogram voter (Shazam-style)          | —       |
+| `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT)   | —       |
+| `PanakoMatcher`  | `PanakoFingerprint`  | 2-D Hough (scale × offset) + optional RANSAC   | —       |
+| `NeuralMatcher`  | `NeuralFingerprint`  | Cosine similarity (Global / SlidingMax / DTW)  | `neural`|
 
-### 1:1 Wang match
+All four implement the `Matcher` trait:
+
+```rust,ignore
+// Reference definition (src/matching/mod.rs).
+pub trait Matcher {
+    type Fingerprint;
+    type Config;
+
+    fn new(cfg: Self::Config) -> Self;
+    fn config(&self) -> &Self::Config;
+    fn match_one(&self, query: &Self::Fingerprint, reference: &Self::Fingerprint)
+        -> MatchResult;
+}
+```
+
+`match_one` never panics on any input (including empty fingerprints, NaN
+frame rates, or length-mismatched neural sequences — those soft-fail to
+`MatchResult::NONE`).
+
+### MatchResult semantics
+
+```rust,ignore
+// Reference definition (src/matching/mod.rs).
+pub struct MatchResult {
+    pub is_match: bool,        // cleared every configured threshold?
+    pub score: f32,            // normalised confidence in [0, 1]
+    pub votes: u32,            // raw aligned-evidence count
+    pub prominence: f32,       // peak ÷ background — the false-positive guard
+    pub offset: TimeOffset,    // query position within the reference
+    pub time_scale: f32,       // query_duration / reference_duration
+}
+
+pub struct TimeOffset {
+    pub frames: i64,           // offset in reference STFT frames (exact)
+    pub ms: i64,               // frames × 1000 / frames_per_sec (rounded)
+}
+```
+
+Field semantics per matcher — **prominence is not comparable across matcher
+types**, do not threshold it with one global constant:
+
+| Matcher | `score` | `votes` | `prominence` | `time_scale` |
+| --- | --- | --- | --- | --- |
+| Wang | distinct contributing query hashes ÷ query hash count | consolidated peak (±tol window) | `peak / (mean_rest + 1)` on the consolidated offset histogram | `1.0` |
+| Haitsma | `1 − BER` at the best alignment | aligned frame count (overlap) | `median_BER / (BER + ε)` (matcher) — index path uses `0.5 / BER` | `1.0` |
+| Panako | inliers ÷ query hash count | RANSAC inliers (or Hough peak) | `peak / (mean_rest + 1)` on the consolidated 2-D Hough grid | `1 / fitted_scale`, clamped `[0.5, 2.0]` |
+| Neural | cosine similarity (0..1) | depends on aggregation | relative cosine excess (SlidingMax) or `1.0` | `1.0` |
+
+`offset.frames` is positive when the query starts **later** in the reference
+(reference anchor at a larger frame index); `offset.ms` uses the *reference's*
+frame rate.
+
+### WangMatcher
+
+The canonical Shazam alignment: matching landmark hashes must agree on one
+**constant time offset**; random collisions scatter across offsets while a
+true match spikes at one.
+
+**Algorithm, step by step (defaults in parentheses):**
+
+1. **Index the reference** — `hash → [t_anchor]`, dropping hashes whose
+   posting list exceeds `max_postings_per_hash` (100). Internally a sorted
+   flat array with binary search (`SortedPostings`) — one allocation, no
+   per-hash `Vec`s.
+2. **Vote** — for each query hash that hits the index, compute
+   `δ = t_ref − t_query` and bump a dense histogram bin. The histogram spans
+   `[−q_max, r_max]`, capped at 10 000 000 bins (≈4 min × 62.5 fps is ~18 K
+   bins; the cap only engages on adversarial fingerprints).
+3. **Consolidate** — box-sum each bin over `±offset_tolerance_frames` (1)
+   so framing jitter coalesces into one peak. An O(1) sliding window — no
+   transient prefix array.
+4. **Peak** — take the max consolidated value; on a plateau of equal maxima,
+   pick the **middle** bin (deterministic, jitter-unbiased). Require
+   `≥ min_votes` (5).
+5. **Prominence** — `peak / (mean of other consolidated bins + 1)`; require
+   `≥ min_prominence` (5.0). This is the primary false-positive guard: a
+   true match is a sharp spike (≫ 10), random collisions are flat (~1).
+6. **Score** — count *distinct query hashes* with at least one vote within
+   ±tol of the winning offset, divide by the query hash count; require
+   `≥ min_score` (0.15).
 
 ```rust
-use audiofp::classical::Wang;
-use audiofp::io::decode_to_mono_at;
+use audiofp::classical::{Wang, WangFingerprint};
 use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 use audiofp::{Fingerprinter, SampleRate};
 
-fn fingerprint(path: &str) -> Result<audiofp::classical::WangFingerprint, Box<dyn std::error::Error>> {
-    let samples = decode_to_mono_at(path, 8_000)?;
-    
-    Ok(Wang::default().extract(&samples, SampleRate::HZ_8000)?)
-}
+fn main() {
+    // Build a query that is the reference shifted by 100 frames.
+    let mut ref_hashes = Vec::new();
+    let mut q_hashes = Vec::new();
+    for i in 0..40_u32 {
+        let t = 1000 + i * 10;
+        ref_hashes.push(audiofp::classical::WangHash { hash: 500 + i, t_anchor: t });
+        q_hashes.push(audiofp::classical::WangHash { hash: 500 + i, t_anchor: t - 100 });
+    }
+    let query = WangFingerprint { hashes: q_hashes, frames_per_sec: 62.5 };
+    let reference = WangFingerprint { hashes: ref_hashes, frames_per_sec: 62.5 };
 
-let query = fingerprint("clip.wav")?;
-let reference = fingerprint("catalog_track.flac")?;
-
-let matcher = WangMatcher::new(WangMatchConfig::default());
-let m = matcher.match_one(&query, &reference);
-if m.is_match {
-    println!("match: score={:.3} offset={} ms", m.score, m.offset.ms);
+    let m = WangMatcher::new(WangMatchConfig::default()).match_one(&query, &reference);
+    assert!(m.is_match);
+    assert_eq!(m.offset.frames, 100);
+    assert!((m.score - 1.0).abs() < 1e-6);
+    let _ = Wang::default(); // trait import stays exercised
+    let _ = SampleRate::HZ_8000;
 }
 ```
 
-Also see `cargo run --example match_two_files -- a.flac b.mp3`.
+#### `WangMatchConfig`
 
-### 1:N helpers
-
-- `match_best(matcher, query, refs)` — single best `(index, MatchResult)` (sequential; early-exits on perfect score)
-- `match_ranked(matcher, query, refs)` — all refs sorted by score descending
-- `WangIndex::build(refs, max_postings_per_hash)` — inverted-index accelerator for Wang catalogs
-- `HaitsmaIndex::build(refs, max_postings_per_hash)` — sub-fingerprint LUT accelerator for Haitsma
-- `PanakoIndex::build(refs, max_postings_per_hash)` — 2-D Hough accelerator for Panako catalogs
-
-All indexes are in-memory only. Matching itself has no `rayon` path; use indexes for large 1:N catalogs. The `rayon` feature parallelises batch fingerprinting (`fingerprint_batch_parallel`), not matching.
-
-### Benchmarks
-
-```bash
-cargo bench --bench matching
+```rust,ignore
+// Reference definition (src/matching/wang.rs).
+pub struct WangMatchConfig {
+    pub offset_tolerance_frames: u32, // default 1
+    pub min_votes: u32,               // default 5
+    pub min_score: f32,               // default 0.15
+    pub min_prominence: f32,          // default 5.0
+    pub max_postings_per_hash: u32,   // default 100
+}
 ```
+
+| Field | Raise it when … | Lower it when … |
+| --- | --- | --- |
+| `offset_tolerance_frames` | sources have unstable framing (analogue capture) | you need precise offsets |
+| `min_votes` | large catalogs (false positives cost more) | short queries (< 10 s) |
+| `min_score` | near-duplicate detection wants strictness | noisy phone-mic queries |
+| `min_prominence` | — | repetitive music (same hook twice) — the second hook is *background* for the first |
+| `max_postings_per_hash` | — | silence-heavy catalogs (stop-hash pruning) |
+
+The shipped defaults are calibrated on a real CC0 corpus
+(`tests/threshold_calibration.rs`): every same-track cross-codec pair is
+separated from every cross-track pair with the margins documented in
+`ROBUSTNESS.md`.
+
+### HaitsmaMatcher
+
+Haitsma is a dense per-frame 32-bit code; matching is **bit-error-rate (BER)
+minimisation** over alignments:
+
+```text
+BER(δ) = hamming(query, reference aligned at δ) / (overlap(δ) · 32)
+```
+
+**Two tiers:**
+
+- **Exact BER** — slide the query over the reference at every offset
+  `δ ∈ [−(q_len−1), r_len−1]`, computing Hamming distance via hardware
+  `POPCNT` with an early-abort. Runs when the reference has ≤ 512 frames or
+  `use_lut = false`.
+- **Sub-fingerprint LUT** — for larger references, build
+  `frame_u32 → [positions]` over reference frames and probe each query
+  frame's exact value (plus optional 1–2 bit-flip neighbours). Haitsma's
+  key property: at BER < ~0.35 at least one query frame is bit-exact, so
+  the probes discover the true offset(s), which are then verified with the
+  exact BER path. `O(Q + candidates·overlap)` instead of `O(Q·R)`.
+
+**Selection and pruning are BER-normalised.** The running best is compared
+by *rate*, not absolute Hamming totals, and the early-abort bound passed to
+each candidate is `best_BER × overlap × 32` — a short-overlap candidate with
+a small raw total but worse rate can no longer suppress a longer
+better-rate alignment. BER ties keep the first-found candidate; the exact
+path scans δ ascending, so ties resolve to the smallest offset.
+
+**Decision:** `is_match = BER ≤ max_ber (0.35) && overlap ≥
+min_overlap_frames (256)`. `score = 1 − BER`. Prominence samples ~40 offsets
+across the range to estimate a median background BER and reports
+`median_BER / (BER + ε)`.
+
+#### `HaitsmaMatchConfig`
+
+```rust,ignore
+// Reference definition (src/matching/haitsma.rs).
+pub struct HaitsmaMatchConfig {
+    pub max_ber: f32,             // default 0.35 (the paper's block threshold)
+    pub min_overlap_frames: u32,  // default 256 (~3.3 s at 78.125 fps)
+    pub use_lut: bool,            // default true; LUT for refs > 512 frames
+    pub probe_bit_flips: u8,      // default 0; 1 = +32 probes, 2 = +528 probes
+}
+```
+
+> **Recall caveat for the LUT path.** With `probe_bit_flips = 0` the LUT only
+> discovers an alignment when at least one query frame is *bit-exactly*
+> present in the reference. Under codec noise this can miss a match the
+> exhaustive path would find. Raise `probe_bit_flips`, or set `use_lut =
+> false`, when matching noisy queries.
+
+```rust
+use audiofp::classical::HaitsmaFingerprint;
+use audiofp::matching::{HaitsmaMatchConfig, HaitsmaMatcher, Matcher};
+
+fn main() {
+    // Deterministic pseudo-random frames.
+    let frames: Vec<u32> = (0..600)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761) ^ 0x5555_5555)
+        .collect();
+
+    let fp = HaitsmaFingerprint { frames: frames.clone(), frames_per_sec: 78.125 };
+    let query = HaitsmaFingerprint { frames, frames_per_sec: 78.125 };
+
+    let m = HaitsmaMatcher::new(HaitsmaMatchConfig::default()).match_one(&query, &fp);
+    assert!(m.is_match);           // self-match: BER = 0
+    assert_eq!(m.offset.frames, 0);
+    assert!((m.score - 1.0).abs() < 1e-6);
+
+    // Exhaustive path on a short reference:
+    let cfg = HaitsmaMatchConfig { use_lut: false, ..Default::default() };
+    let m2 = HaitsmaMatcher::new(cfg).match_one(&query, &fp);
+    assert!(m2.is_match);
+}
+```
+
+### PanakoMatcher
+
+The only matcher that produces a meaningful `time_scale`. Matching proceeds
+in five stages:
+
+1. **Index the reference** triplets by packed hash (posting cap
+   `max_postings_per_hash = 100`).
+2. **Vote into a 2-D Hough accumulator.** For each query triplet that hits
+   a reference triplet, compute the local scale and offset:
+
+```text
+s = (t_c_ref − t_a_ref) / max(1, t_c_query − t_a_query)    — local time scale
+b = t_a_ref − s · t_a_query                                — predicted offset
+s_bin = clamp( floor((s − scale_min) / scale_per_bin), 0, scale_bins − 1 )
+off_key = round(b)                                         — 1-frame granularity
+vote (s_bin, off_key) += 1
+```
+
+   The default grid is `s ∈ [0.80, 1.25]` over 24 bins (~2 % resolution),
+   i.e. the query may run up to 25 % slower / 20 % faster than the
+   reference and still match. Offset keys are 1-frame precise; the
+   consolidation window (±1 scale bin, ±`offset_tolerance_frames` offset
+   bins) is therefore exactly ±tol *frames*.
+
+3. **Consolidate & peak** — neighbourhood-sum the accumulator
+   (±1 scale bin × ±tol offset), find the max (first in sorted
+   `(s_bin, off_key)` order on ties), require `≥ min_votes` (5).
+4. **Prominence** — same `peak / (mean_rest + 1)` formula on the
+   consolidated grid; require `≥ min_prominence` (5.0).
+5. **RANSAC refinement** (`ransac_refine = true`, default) — the
+   `(t_query, t_ref)` anchor pairs collected during voting are re-fit with
+   a deterministic RANSAC (seed derived from the data, so results are
+   reproducible): sample 2 pairs, fit `t_ref = s·t_query + b`, count
+   inliers within ±tol frames, keep the best fit. The final `votes` is the
+   inlier count; `time_scale = 1/s` clamped to `[0.5, 2.0]`.
+
+```rust
+use audiofp::classical::{PanakoConfig, PanakoFingerprint, PanakoHash};
+use audiofp::matching::{Matcher, PanakoMatchConfig, PanakoMatcher};
+use audiofp::{Fingerprinter, SampleRate};
+
+fn main() {
+    // Ten reference triplets (spans of exactly 10 frames), query shifted
+    // by 7 frames — spans are preserved, so the local scale stays 1.0.
+    let mut r = Vec::new();
+    let mut q = Vec::new();
+    for i in 0..10_u32 {
+        let t = 100 + i * 10;
+        r.push(PanakoHash { hash: 1_000 + i, t_anchor: t, t_b: t + 5, t_c: t + 10 });
+        let tq = t - 7;
+        q.push(PanakoHash { hash: 1_000 + i, t_anchor: tq, t_b: tq + 5, t_c: tq + 10 });
+    }
+    let reference = PanakoFingerprint { hashes: r, frames_per_sec: 62.5 };
+    let query = PanakoFingerprint { hashes: q, frames_per_sec: 62.5 };
+
+    let m = PanakoMatcher::new(PanakoMatchConfig::default())
+        .match_one(&query, &reference);
+    assert!(m.is_match);
+    assert_eq!(m.offset.frames, 7); // frame-precise, RANSAC-refined
+    assert!((m.time_scale - 1.0).abs() < 1e-3);
+    let _ = (PanakoConfig::default(), SampleRate::HZ_8000); // imports exercised
+}
+```
+
+#### `PanakoMatchConfig`
+
+```rust,ignore
+// Reference definition (src/matching/panako.rs). Degenerate scale grids
+// (scale_bins = 0, inverted or non-finite bounds) are normalized to the
+// defaults at construction — in every build mode, not just debug.
+pub struct PanakoMatchConfig {
+    pub scale_min: f32,                // default 0.80 (internal s = ref/query)
+    pub scale_max: f32,                // default 1.25
+    pub scale_bins: u32,               // default 24 (~2% resolution)
+    pub offset_tolerance_frames: u32,  // default 1
+    pub min_votes: u32,                // default 5
+    pub min_score: f32,                // default 0.15
+    pub min_prominence: f32,           // default 5.0
+    pub max_postings_per_hash: u32,    // default 100
+    pub ransac_refine: bool,           // default true
+}
+```
+
+Widen `scale_min`/`scale_max` (and rebuild your catalog) to tolerate bigger
+tempo changes; `time_scale` reported to callers is `1/s` clamped to
+`[0.5, 2.0]` regardless of the search grid, so genuine large stretches are
+visible even when saturated.
+
+### NeuralMatcher
+
+Cosine-similarity matching over `NeuralFingerprint` sequences (`neural`
+feature). Three aggregation strategies:
+
+| `Aggregation` | Strategy |
+| ------------- | -------- |
+| `Global`      | Mean-pool both sequences to one vector each; a single cosine. Fast, weakest. |
+| `SlidingMax`  | Slide the query's embeddings over the reference's; report the max mean cosine. Default. |
+| `Dtw`         | Dynamic time warping — tempo-flexible sequence alignment. |
+
+```rust,ignore
+// Reference definitions (src/matching/neural.rs).
+pub struct NeuralMatchConfig {
+    pub min_cosine: f32,        // default 0.80 — MODEL-DEPENDENT, tune per model
+    pub aggregation: Aggregation, // default SlidingMax
+    pub assume_normalized: bool,  // default true (embedder L2-normalises)
+}
+
+pub enum Aggregation { Global, SlidingMax, Dtw }
+```
+
+`min_cosine` depends entirely on the embedding model's cosine distribution —
+calibrate on your own data (same-track vs cross-track) before trusting the
+default. Length-mismatched or empty sequences soft-fail to `NONE`.
+
+```rust
+use audiofp::matching::{Aggregation, Matcher, NeuralMatchConfig, NeuralMatcher};
+use audiofp::neural::{NeuralEmbedding, NeuralFingerprint};
+use audiofp::TimestampMs;
+
+fn main() {
+    // Two sequences of unit-norm 4-dim embeddings.
+    let mk = |v: [f32; 4]| NeuralEmbedding { vector: v.to_vec(), t_start: TimestampMs(0) };
+    let query = NeuralFingerprint {
+        embeddings: vec![mk([1.0, 0.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0, 0.0])],
+        embedding_dim: 4,
+        frames_per_sec: 1.0,
+    };
+    let reference = NeuralFingerprint {
+        embeddings: vec![mk([1.0, 0.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0, 0.0])],
+        embedding_dim: 4,
+        frames_per_sec: 1.0,
+    };
+
+    let m = NeuralMatcher::new(NeuralMatchConfig::default()).match_one(&query, &reference);
+    assert!(m.is_match); // identical unit vectors → cosine 1.0
+
+    let cfg = NeuralMatchConfig {
+        aggregation: Aggregation::Dtw,
+        assume_normalized: true,
+        ..Default::default()
+    };
+    let m2 = NeuralMatcher::new(cfg).match_one(&query, &reference);
+    assert!(m2.is_match);
+}
+```
+
+### 1:N helpers and in-memory indexes
+
+**Sequential helpers** — each reference scored independently with
+`matcher.match_one`:
+
+- `match_best(matcher, query, refs) -> Option<(usize, MatchResult)>` —
+  single best `is_match` result; early-exits on a perfect score. Iterates
+  references in slice order (deterministic).
+- `match_ranked(matcher, query, refs) -> Vec<(usize, MatchResult)>` — every
+  reference scored, sorted by score descending (ties by prominence
+  descending, then index order).
+
+**In-memory indexes** — build once, query many times. Each combines a whole
+catalog into one inverted index (hash → posting list) so per-query cost is
+paid once instead of per reference:
+
+```rust
+use audiofp::classical::{HaitsmaFingerprint, PanakoFingerprint, WangFingerprint};
+use audiofp::matching::{
+    HaitsmaIndex, HaitsmaMatchConfig, PanakoIndex, PanakoMatchConfig, WangIndex,
+    WangMatchConfig,
+};
+
+fn main() {
+    // --- Wang: hash → [(ref_id, t_anchor)] -----------------------------
+    let refs = vec![WangFingerprint {
+        hashes: vec![audiofp::classical::WangHash { hash: 7, t_anchor: 100 }],
+        frames_per_sec: 62.5,
+    }];
+    let index = WangIndex::build(&refs, /* max_postings_per_hash */ 100);
+    let query = WangFingerprint {
+        hashes: vec![audiofp::classical::WangHash { hash: 7, t_anchor: 50 }],
+        frames_per_sec: 62.5,
+    };
+    // query.hash hits ref 0 at δ = +50 frames.
+    let hit = index.query(&query, &WangMatchConfig::default());
+    let _ = hit; // Some((0, result)) once thresholds are met — see below
+
+    // --- Haitsma: frame u32 → [(ref_id, pos)] LUT -----------------------
+    let h_refs = vec![HaitsmaFingerprint {
+        frames: vec![42, 0xFFFF_FFFF, 7],
+        frames_per_sec: 78.125,
+    }];
+    let _ = HaitsmaIndex::build(&h_refs, 1_000);
+    let _ = HaitsmaMatchConfig::default();
+
+    // --- Panako: hash → [(ref_id, t_a, t_b, t_c)] -----------------------
+    let p_refs = vec![PanakoFingerprint {
+        hashes: vec![audiofp::classical::PanakoHash {
+            hash: 9, t_anchor: 10, t_b: 15, t_c: 20,
+        }],
+        frames_per_sec: 62.5,
+    }];
+    let _ = PanakoIndex::build(&p_refs, 100);
+    let _ = PanakoMatchConfig::default();
+}
+```
+
+Build/query cost and semantics:
+
+| Index | Build | Query | Notes |
+| ----- | ----- | ----- | ----- |
+| `WangIndex` | `O(Σ hashes)` | `O(Q × postings + C)` | per-reference offset histogram + consolidation, same formulas as the matcher; prominence uses the matcher's dense-range semantics |
+| `HaitsmaIndex` | `O(Σ frames)` | `O(Q + C × overlap)` | probes exact frames only (no bit-flips); verifies up to **8** most-hit offsets per reference with BER-normalized bounds |
+| `PanakoIndex` | `O(Σ hashes)` | `O(Q × postings + C)` | per-reference 2-D Hough; RANSAC **not** applied (coarse peak gives `time_scale`) |
+
+Guarantees worth knowing:
+
+- **Determinism:** candidates are visited in ascending reference id, so ties
+  and the perfect-score early-exit never depend on hash-map iteration order.
+- **Index vs matcher parity:** scores/prominence can differ marginally from
+  a direct `match_one` (sparse vs dense histograms); the *acceptance*
+  thresholds are the same. For exact 1:1 scores use the matcher.
+- **Memory:** postings are `u32`-packed (8–16 bytes per posting); a
+  10 000-track catalog at ~300 hashes/s is on the order of a few hundred MB.
+  Raise `max_postings_per_hash` or shard for larger catalogs.
+- Indexes are transient accelerators: never serialised, no file handles,
+  dropped with their owning scope.
+
+Matching itself has **no `rayon` path** — the `rayon` feature parallelises
+batch *fingerprinting* only (see
+[Async, batching, and models](#async-batching-and-models)).
+
+Benchmarks: `cargo bench --bench matching` (Criterion; Wang/Haitsma/Panako
+1:1 and a 100-reference `WangIndex`).
 
 ---
 
 ## Streaming Fingerprinters
 
-Each classical fingerprinter has a streaming sibling:
+Each classical fingerprinter has a streaming sibling; the neural embedder
+has one too:
 
-| Streaming                | `Frame`        | `latency_ms()` |
-| ------------------------ | -------------- | -------------- |
-| `StreamingWang`          | `WangHash`     | 2 256          |
-| `StreamingPanako`        | `PanakoHash`   | 2 784          |
-| `StreamingHaitsma`       | `u32`          | 409            |
+| Streaming           | `Frame`      | `latency_ms()` | Carry bound                    |
+| ------------------- | ------------ | -------------- | ------------------------------ |
+| `StreamingWang`     | `WangHash`   | 2 256          | `< n_fft + max_push` samples   |
+| `StreamingPanako`   | `PanakoHash` | 2 784          | same                           |
+| `StreamingHaitsma`  | `u32`        | 409            | one frame of band energies     |
+| `StreamingNeuralEmbedder` | `Vec<f32>` | window length (ms) | `< window_samples + max_push` |
 
-Each streaming variant also exposes `fn config(&self) -> &XConfig` for inspecting the configuration it was built with.
+Each streaming variant exposes `config() -> &XConfig`, `reset()` (clear all
+state — start a fresh stream), and (for the neural streamer) the
+fallible-semantic `try_push` / `try_push_with` described in the
+[Neural Embedder](#neural-embedder) section.
 
 ### Microphone-style usage
 
@@ -534,271 +1025,332 @@ fn main() {
     let mut s = StreamingWang::default();
     let mut all = Vec::new();
 
-    // Synthetic 8 kHz mono chunks (swap for mic / decoder frames).
-    // Real capture: read from cpal / rodio / your own ring buffer.
+    // Synthetic 8 kHz mono chunks — swap for cpal/rodio/decoder frames.
     let chunk = vec![0.0_f32; 128]; // ~16 ms at 8 kHz
     for _ in 0..200 {
+        // push returns only hashes whose full lookahead has elapsed.
         for (t, hash) in s.push(&chunk).unwrap() {
             all.push((t, hash));
         }
     }
 
-    // Drain whatever's pending at end-of-stream.
-    all.extend(s.flush());
+    // End-of-stream: drain pending material. Idempotent — calling flush
+    // again returns an empty Vec.
+    all.extend(s.flush().unwrap());
+    assert!(s.flush().unwrap().is_empty());
 
-    println!("{} hashes total, {} ms latency", all.len(), s.latency_ms());
+    println!("{} hashes total, {} ms upper-bound latency", all.len(), s.latency_ms());
+}
+```
+
+### Zero-allocation callback variant
+
+`push_with` / `flush_with` invoke a callback per frame instead of building a
+`Vec` — the allocation-free hot path for realtime threads:
+
+```rust
+use audiofp::classical::StreamingWang;
+use audiofp::StreamingFingerprinter;
+
+fn main() {
+    let mut s = StreamingWang::default();
+    let chunk = vec![0.0_f32; 8_000];
+
+    let mut count = 0usize;
+    let n = s
+        .push_with(&chunk, |_t, _hash| count += 1)
+        .unwrap();
+    let m = s
+        .flush_with(|_t, _hash| count += 1)
+        .unwrap();
+    assert_eq!(n + m, count);
+    println!("{count} hashes");
 }
 ```
 
 ### Why the latency differs
 
-- **Haitsma** depends only on the current and previous spectrogram frame → bounded by `n_fft / sr`.
-- **Wang / Panako** must wait for the full target zone to elapse *and* one full second of peaks to settle the per-second adaptive thresholding. Without the +1 s, hashes near the buffer tail would briefly survive only to be culled by later peaks competing in the same bucket.
+- **Haitsma** needs only the current and previous spectrogram frame →
+  bounded by `n_fft / sr` plus one hop.
+- **Wang / Panako** must wait for the peak-picker's ±15-frame lookahead
+  *and* one full second of peaks to settle the per-second adaptive
+  threshold, *and* the target zone (63 / 96 frames) before an anchor's
+  hashes are final. `latency_ms()` is the sum: `(zone + neighbourhood + 1
+  second)` for Wang ≈ 2 256 ms.
 
-### Bit-exact equivalence
+### Push-after-flush: contract and bounds
+
+A mid-stream `flush` is an early end-of-stream signal: it finalises the
+current 1-second bucket with whatever peaks it has. Continuation audio
+appends cleanly (no duplicate hashes — the stream tracks which rows have
+been emitted), but a bucket split across a flush can emit slightly more
+anchors than an uninterrupted run would. For offline equivalence, flush only
+at the true end of stream.
+
+### Bit-exact equivalence (offline vs streaming)
 
 ```rust
 use audiofp::classical::{StreamingWang, Wang};
-use audiofp::{Fingerprinter, StreamingFingerprinter, SampleRate};
+use audiofp::{Fingerprinter, SampleRate, StreamingFingerprinter};
 
-fn main() -> Result<(), audiofp::AfpError> {
-    // Your decoded mono PCM at 8 kHz (≥ ~2 s). Silence is fine for the API path.
+fn main() {
+    // Any 8 kHz mono buffer ≥ 2 s. Silence exercises the API path; real
+    // audio exercises the hashes.
     let whole_song: Vec<f32> = vec![0.0; 16_000];
 
     let offline = Wang::default()
-        .extract(&whole_song, SampleRate::HZ_8000)?;
+        .extract(&whole_song, SampleRate::HZ_8000)
+        .unwrap();
 
     let mut streaming = StreamingWang::default();
     let mut online = Vec::new();
     for chunk in whole_song.chunks(1024) {
         online.extend(streaming.push(chunk).unwrap().into_iter().map(|(_, h)| h));
     }
-    online.extend(streaming.flush().into_iter().map(|(_, h)| h));
+    online.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
 
     let mut a = offline.hashes;
     let mut b = online;
     a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
     b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
     assert_eq!(a, b); // guaranteed under arbitrary chunking
-    Ok(())
 }
 ```
+
+### Streaming error semantics
+
+- Classical streams never error on finite input. Non-finite samples (NaN /
+  ±Inf) are **sanitised to 0.0** on `push` (streaming must not crash an
+  audio callback); offline `extract` rejects them with `NonFiniteSample`
+  instead.
+- A single `push` larger than `max_push_samples` is **truncated** — excess
+  samples are dropped, no error. `Some(0)` is sanitised to `Some(1)` at
+  construction.
+- `max_pending_anchors` (default unbounded) evicts oldest-first under
+  adversarially dense input. Evicted anchors and their hashes are **lost,
+  not deferred** — output can shrink below offline extraction with no error
+  signal. Recommended for untrusted input: `Some(10_000)`.
 
 ---
 
 ## Fingerprint Serialization
 
-`audiofp` ships a lightweight binary format for persisting fingerprints to
-disk or wire without relying on the full matching wire format (planned for
-v0.4.0). Available on all three fingerprint types via `to_bytes` /
-`from_bytes`.
+All three classical fingerprint types round-trip through a compact,
+self-describing binary format. Useful for a fingerprint cache, IPC, or
+shipping enrolment artifacts to the matcher process.
 
-### Binary Format
+### Wire format (v1)
 
 ```text
-[magic: 8 bytes "AUDIOFP\0"] [version: u8 = 1] [alg_id: u8] [hash_count: u32 LE] [fps: f32 LE] [Pod hashes]
+offset  size  field
+0       8     magic       b"AUDIOFP\0"
+8       1     version     1
+9       1     alg_id      0 = Wang, 1 = Panako, 2 = Haitsma
+10      4     hash_count  u32, little-endian
+14      4     fps         f32, little-endian
+18      …     payload     bytemuck-cast Pod hash structs, packed
 ```
 
-Algorithm IDs: 0 = Wang, 1 = Panako, 2 = Haitsma.
+The payload is the raw `#[repr(C)]` little-endian representation of each
+hash struct (`WangHash` = 8 bytes, `PanakoHash` = 16 bytes, Haitsma frame =
+4 bytes). On little-endian hosts deserialisation is a single aligned copy.
+
+**Validation on read:** wrong magic, unsupported version, algorithm-ID
+mismatch, truncated payload (`checked_mul` sizing — no 32-bit wrap), and
+non-finite / non-positive `fps` all return `AfpError::Deserialize`. Trailing
+bytes after the payload are ignored (forward compatibility).
 
 ### Usage
 
 ```rust
-use audiofp::classical::Wang;
+use audiofp::classical::{Wang, WangFingerprint, WangHash};
 use audiofp::{Fingerprinter, SampleRate};
 
-let samples = vec![0.0_f32; 8_000 * 3];
-let mut wang = Wang::default();
-let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
+fn main() {
+    // A fingerprint with known content (extraction works too, of course).
+    let fp = WangFingerprint {
+        hashes: vec![
+            WangHash { hash: 0xDEAD_BEEF, t_anchor: 42 },
+            WangHash { hash: 0xCAFE_BABE, t_anchor: 100 },
+        ],
+        frames_per_sec: 62.5,
+    };
 
-// Serialize
-let bytes = fp.to_bytes();
+    // Serialize → 18-byte header + 2 × 8-byte hashes.
+    let bytes = fp.to_bytes();
+    assert_eq!(bytes.len(), 18 + 16);
 
-// Deserialize (validates magic, version, algorithm)
-let restored = audiofp::classical::WangFingerprint::from_bytes(&bytes).unwrap();
-assert_eq!(fp.hashes.len(), restored.hashes.len());
+    // Deserialize (validates magic, version, algorithm, fps, length).
+    let restored = WangFingerprint::from_bytes(&bytes).unwrap();
+    assert_eq!(fp.hashes, restored.hashes);
+    assert_eq!(fp.frames_per_sec, restored.frames_per_sec);
 
-// Inspect metadata without full deserialization
-let envelope = fp.envelope();
-println!("algorithm: {}", envelope.algorithm);    // "wang-v1"
-println!("version: {}", envelope.crate_version);  // audiofp::VERSION
-println!("hashes: {}", envelope.hash_count);
+    // Metadata on a parsed fingerprint…
+    let env = restored.envelope();
+    assert_eq!(env.algorithm, "wang-v1");
+    assert_eq!(env.sample_rate, 8_000);
+    assert_eq!(env.hash_count, 2);
+
+    // …or straight from raw bytes without touching the payload:
+    let peeked = audiofp::FingerprintEnvelope::peek(&bytes).unwrap();
+    assert_eq!(peeked.algorithm, "wang-v1");
+    assert_eq!(peeked.hash_count, 2);
+    assert_eq!(peeked.frames_per_sec, 62.5);
+}
 ```
 
 ### `FingerprintEnvelope`
 
-```rust
+```rust,ignore
+// Reference definition (src/serial.rs).
 pub struct FingerprintEnvelope {
-    pub algorithm: &'static str,     // Fingerprinter::name()
-    pub crate_version: &'static str, // audiofp::VERSION
+    pub algorithm: &'static str,     // "wang-v1" | "panako-v2" | "haitsma-v1"
+    pub crate_version: &'static str, // the READER's audiofp::VERSION (v1 blobs
+                                     // do not persist the producer version)
     pub sample_rate: u32,            // algorithm's native rate
-    pub frames_per_sec: f32,         // STFT frame rate
-    pub hash_count: usize,           // number of hashes/frames
+    pub frames_per_sec: f32,
+    pub hash_count: usize,
 }
 ```
 
-### Methods (all three types)
-
-| Type | `to_bytes()` | `from_bytes(&[u8])` | `envelope()` |
-|------|:------------:|:-------------------:|:------------:|
-| `WangFingerprint` | Yes | Yes | Yes |
-| `PanakoFingerprint` | Yes | Yes | Yes |
-| `HaitsmaFingerprint` | Yes | Yes | Yes |
-
-`from_bytes` returns `AfpError::Deserialize` on magic mismatch, unsupported
-version, wrong algorithm ID, or truncated payload.
+| API | On | Notes |
+| --- | --- | --- |
+| `to_bytes()` | all three fingerprint types | one allocation, exact size |
+| `from_bytes(&[u8])` | all three | validated; `Deserialize` on any defect |
+| `envelope()` | all three | metadata of a *parsed* fingerprint |
+| `FingerprintEnvelope::peek(&[u8])` | raw bytes | header-only — never touches the payload |
 
 ---
 
 ## Audio File Decoding
 
-Available with any `std-*` codec feature (e.g. `std-wav`), exposed as `audiofp::io`.
+Available with any `std-*` codec feature; exposed as `audiofp::io`. The
+decoder is symphonia-based: it probes magic bytes (extension-less files
+work), picks the default audio track, decodes packet-by-packet, converts to
+`f32` (symphonia handles i16/i24/i32/f32 scaling), and downmixes
+multi-channel to mono by per-frame averaging.
 
 ### `decode_to_mono`
 
-```rust
+```rust,ignore
 pub fn decode_to_mono<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, u32)>;
 ```
 
-Returns `(samples, native_sample_rate_hz)`. Multi-channel files are downmixed to mono by averaging channels per frame.
-
-```rust
-use audiofp::io::decode_to_mono;
-
-let (samples, sr) = decode_to_mono("song.flac")?;
-println!("{} samples at {sr} Hz", samples.len());
-```
+Returns `(samples, native_sample_rate_hz)`.
 
 ### `decode_to_mono_at`
 
+Decode and resample to the target rate in one step (pass-through when the
+file already matches). Internally `dsp::resample::SincResampler` at default
+quality (32 half-taps, Kaiser β = 8.6, 256 polyphase steps; cutoff
+`min(from, to)/2` to suppress aliasing).
+
 ```rust
-pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<f32>>;
+use audiofp::io::decode_to_mono_at;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let samples = decode_to_mono_at("song.mp3", 8_000)?; // Wang-ready
+    println!("{} samples at 8 kHz ({} s)", samples.len(), samples.len() / 8_000);
+    Ok(())
+}
 ```
 
-Decode and resample to `target_sr` in one step. Internally uses `dsp::resample::SincResampler` at default quality (32-tap Kaiser, β=8.6). Pass-through when the file already matches `target_sr`.
+### `decode_to_mono_limited` / `decode_to_mono_at_limited` — OOM & hang protection
 
-```rust
-// Get audio ready for Wang in one line:
-let samples = decode_to_mono_at("song.mp3", 8_000)?;
-```
-
-### `decode_to_mono_limited` / `decode_to_mono_at_limited` (OOM protection)
-
-```rust
+```rust,ignore
+// Reference definition (src/io/decoder.rs).
 pub struct DecodeLimits {
-    pub max_bytes: u64,              // 0 = unlimited
-    pub max_samples: Option<usize>,  // None = unlimited
-    pub integrity_mode: bool,        // default false; true = fail on corrupt packets
-    pub timeout: Option<Duration>,   // None = unlimited; checked per-packet
+    pub max_bytes: u64,              // 0 = unlimited; checked BEFORE opening
+    pub max_samples: Option<usize>,  // None = unlimited; bounds returned PCM
+    pub integrity_mode: bool,        // true = fail on any corrupt packet
+    pub timeout: Option<Duration>,   // wall-clock cap, checked per packet
 }
 
-pub fn decode_to_mono_limited<P: AsRef<Path>>(path: P, limits: DecodeLimits) -> Result<(Vec<f32>, u32)>;
-pub fn decode_to_mono_at_limited<P: AsRef<Path>>(path: P, target_sr: u32, limits: DecodeLimits) -> Result<Vec<f32>>;
+impl DecodeLimits {
+    pub const fn bytes(max_bytes: u64) -> Self;
+    pub const fn samples(max_samples: usize) -> Self;
+    pub const fn both(max_bytes: u64, max_samples: usize) -> Self;
+    pub const fn strict(self) -> Self;                    // integrity_mode = true
+    pub const fn with_timeout(self, d: Duration) -> Self; // timeout = Some(d)
+}
 ```
 
-`max_bytes` is checked via `fs::metadata()` **before** opening the stream —
-a malicious 4 GB upload is rejected in < 1 µs. Pass `max_bytes = 0` for
-unlimited. Oversized inputs return `AfpError::InputTooLarge`.
+Semantics:
 
-For **compressed** uploads, also set `max_samples` (use
-`DecodeLimits::both`) — on-disk size does not bound decoded PCM.
-
-```rust
-use audiofp::io::{decode_to_mono_limited, DecodeLimits};
-
-// Byte cap only:
-let (samples, sr) = decode_to_mono_limited("user_upload.mp3", DecodeLimits::bytes(50 * 1024 * 1024))?;
-
-// Production: byte + sample caps:
-let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000);
-let (samples, sr) = decode_to_mono_limited("user_upload.mp3", limits)?;
-```
-
-### Integrity Mode (strict decoding)
-
-By default, recoverable per-packet decode errors are silently skipped so a
-single corrupt block doesn't kill a whole-file decode. For forensic or
-compliance use cases where incomplete fingerprints are unacceptable, enable
-**integrity mode** via the `strict()` builder:
-
-```rust
-use audiofp::io::{decode_to_mono_limited, DecodeLimits};
-
-let limits = DecodeLimits::both(50_000_000, 10_000_000).strict();
-let result = decode_to_mono_limited("suspect.mp3", limits);
-// If ANY packet fails to decode → returns Err(AfpError::Io(...))
-```
-
-When `integrity_mode` is `true`, any per-packet `DecodeError` or `IoError`
-from Symphonia becomes a fatal `AfpError::Io` with message prefix
-`"decode integrity: ..."`. Default is `false` (backwards-compatible skip).
-
-### Decode Timeout (wall-clock bound)
-
-Symphonia can hang on adversarial inputs (degenerate container structures,
-infinite-loop-inducing headers). In multi-tenant services or Python FFI
-environments where a hung decode would block the calling worker
-indefinitely, set a **wall-clock timeout**:
+- `max_bytes` is checked via `fs::metadata()` **before** opening the stream
+  — a malicious 4 GB upload is rejected in < 1 µs.
+- `max_samples` bounds the **returned** buffer. In the `_at` variants it is
+  enforced at the native rate during decode and re-checked after resampling
+  (an upsample can grow the output by the resample ratio; over-limit output
+  is an `InputTooLarge` error, not a silent overshoot).
+- `timeout` is checked after every packet; exceeding it returns
+  `AfpError::Timeout { elapsed_ms, limit_ms }`.
+- Recoverable per-packet decode errors are **skipped** (one corrupt block
+  doesn't kill the file). With `integrity_mode = true` any such error is
+  fatal instead — for forensic/compliance pipelines.
+- A mid-stream codec-parameter change (AAC config update, track switch)
+  resets the decoder and retries the packet once; only a repeated failure
+  is fatal.
 
 ```rust
 use std::time::Duration;
-use audiofp::io::{decode_to_mono_at_limited, DecodeLimits};
 
-let limits = DecodeLimits::both(50_000_000, 30 * 60 * 8_000)
-    .with_timeout(Duration::from_secs(30));
+use audiofp::io::{decode_to_mono_at_limited, decode_to_mono_limited, DecodeLimits};
 
-// Returns AfpError::Timeout if decoding takes > 30 s.
-let samples = decode_to_mono_at_limited("user_upload.mp3", 8_000, limits)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Byte cap only:
+    let (samples, sr) =
+        decode_to_mono_limited("user_upload.mp3", DecodeLimits::bytes(50 * 1024 * 1024))?;
+    println!("{} samples at {sr} Hz", samples.len());
+
+    // Production: byte + PCM caps, wall-clock timeout, strict integrity:
+    let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 48_000)
+        .with_timeout(Duration::from_secs(60))
+        .strict();
+    let samples = decode_to_mono_at_limited("user_upload.mp3", 8_000, limits)?;
+    println!("{} samples at 8 kHz", samples.len());
+    Ok(())
+}
 ```
-
-The timeout is checked **per decoded packet** (sub-microsecond overhead).
-If the elapsed wall-clock time exceeds the configured duration, the decoder
-returns `AfpError::Timeout { elapsed_ms, limit_ms }` immediately.
-
-**Recommended production configuration (Python FFI / web worker):**
-
-```rust
-let limits = DecodeLimits::both(
-    50 * 1024 * 1024,       // 50 MB on-disk max
-    30 * 60 * 48_000,       // 30 min at 48 kHz max samples
-)
-.with_timeout(Duration::from_secs(60))  // 60 s wall-clock max
-.strict();                               // no silent packet skipping
-```
-
-Default: `None` (no timeout, backwards-compatible).
 
 ### Supported formats
 
-Whatever Symphonia provides with the features enabled in `Cargo.toml`:
+Whatever symphonia provides for the enabled features:
 
-| Format       | Extension(s)             |
-| ------------ | ------------------------ |
-| MP3          | `.mp3`                   |
-| AAC          | `.aac`, `.m4a` (in MP4)  |
-| FLAC         | `.flac`                  |
-| OGG-Vorbis   | `.ogg`, `.oga`           |
-| WAV / PCM    | `.wav`                   |
+| Feature      | Format / codec                          | Extensions          |
+| ------------ | --------------------------------------- | ------------------- |
+| `std-mp3`    | MP3                                     | `.mp3`              |
+| `std-aac`    | raw AAC                                 | `.aac`              |
+| `std-flac`   | FLAC                                    | `.flac`             |
+| `std-ogg`    | Ogg Vorbis                              | `.ogg`, `.oga`      |
+| `std-wav`    | WAV / PCM                               | `.wav`              |
+| `std-mp4`    | MP4/M4A (isomp4 demuxer **and** AAC)   | `.m4a`, `.mp4`      |
+| `std-aiff`   | AIFF (RIFF/AIFF demuxer + PCM)          | `.aiff`, `.aif`     |
+| `std-mkv`    | Matroska                                | `.mkv`, `.webm`     |
+| `std-adpcm`  | ADPCM                                   | —                   |
+| `std-alac`   | ALAC (in MP4/M4A)                       | `.m4a`              |
 
-The decoder probes magic bytes too — extension-less files still work as long as they're a recognised format.
+Each `std-<codec>` feature pulls its companion decoders — e.g. `std-mp4`
+without the AAC codec could demux M4A but not decode it, so both are
+enabled together.
 
 ### Error handling
 
-| Failure                                   | Error variant                    |
-| ----------------------------------------- | -------------------------------- |
-| File not found                            | `AfpError::Io`                   |
-| Format unrecognised                       | `AfpError::Io`                   |
-| Per-packet decode failure                 | (silently skipped — resilient)   |
-| Stream-fatal decode failure               | `AfpError::Io`                   |
-| File exceeds `max_bytes` / `max_samples` cap | `AfpError::InputTooLarge`        |
-
-Recoverable per-packet failures are silently skipped to keep one corrupt block from killing a whole-file decode; only stream-fatal errors propagate.
+| Failure                                     | Error variant              |
+| ------------------------------------------- | -------------------------- |
+| File not found / unreadable                 | `AfpError::Io(IoError)`    |
+| Format unrecognised (probe fails)           | `AfpError::Io(IoError)`    |
+| Per-packet decode failure                   | skipped (or `Io` in strict mode) |
+| Mid-stream spec change, reset fails         | `AfpError::Io(IoError)`    |
+| File exceeds `max_bytes` / `max_samples`    | `AfpError::InputTooLarge`  |
+| Wall-clock `timeout` exceeded               | `AfpError::Timeout`        |
 
 ---
 
 ## Watermark Detection
 
-Available with the `watermark` feature. Wraps `tract-onnx` to run an AudioSeal-compatible model.
+Available with the `watermark` feature. Wraps `tract-onnx` to run an
+AudioSeal-compatible detector; the model is **not** bundled.
 
 ```toml
 [dependencies]
@@ -807,115 +1359,88 @@ audiofp = { version = "0.4", features = ["watermark"] }
 
 ### `WatermarkConfig`
 
-```rust
+```rust,ignore
+// Reference definition (src/watermark/mod.rs).
 pub struct WatermarkConfig {
     pub model_path: String,
-    pub message_bits: u8,          // ≤ 32, default 16
-    pub threshold: f32,            // [0, 1], default 0.5
-    pub sample_rate: u32,          // default 16_000
-    pub max_input_samples: Option<usize>,  // None = unlimited (default)
+    pub message_bits: u8,                   // ≤ 32, default 16
+    pub threshold: f32,                     // [0, 1], default 0.5
+    pub sample_rate: u32,                   // default 16_000
+    pub max_input_samples: Option<usize>,   // default None (unlimited)
+}
+
+impl WatermarkConfig {
+    pub fn new(model_path: impl Into<String>) -> Self;
 }
 ```
 
-Set `max_input_samples` to bound inference cost for untrusted uploads:
-
-```rust
-let mut cfg = WatermarkConfig::new("model.onnx");
-cfg.max_input_samples = Some(30 * 60 * 16_000); // 30 min at 16 kHz
-```
-
-Constructor with AudioSeal defaults:
+### Detect
 
 ```rust
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-use audiofp::{SampleRate};
+use audiofp::SampleRate;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = WatermarkConfig::new("audioseal_v0.2.onnx");
-    // message_bits: 16, threshold: 0.5, sample_rate: 16_000
-
+    let cfg = WatermarkConfig::new("/models/audioseal_v0.2.onnx");
     let mut det = WatermarkDetector::new(cfg)?;
-    let audio = vec![0.0_f32; 16_000]; // 1 s mono @ 16 kHz
+
+    // 1 s of mono 16 kHz (a real detection wants ≥ a few seconds).
+    let audio = vec![0.0_f32; 16_000];
     let r = det.detect(&audio, SampleRate::HZ_16000)?;
 
-    println!(
-        "detected={} confidence={:.3} message={:#018b}",
-        r.detected, r.confidence, r.message
-    );
-    println!("localization length: {} (flattened ONNX output[0])", r.localization.len());
+    println!("detected={} confidence={:.3}", r.detected, r.confidence);
+    println!("message bits: {:#034b}", r.message); // LSB-first
+    println!("localization samples: {}", r.localization.len());
     Ok(())
 }
 ```
 
-### `WatermarkDetector`
-
-The detector caches the typed model after the first call, keyed by input
-length: subsequent calls with the same buffer length skip
-`with_input_fact + into_typed`. If a later call passes a different-length
-buffer, the typed plan is transparently rebuilt for the new length — no
-cryptic Tract shape error reaches the caller. For best performance,
-prefer batching at a fixed length.
-
-The detector also exposes `fn config(&self) -> &WatermarkConfig` for inspecting the configuration it was built with.
+Input validation order: rate check, `max_input_samples` check, empty check,
+then the NaN/Inf scan — cheap rejections before the O(n) pass.
 
 ### `WatermarkResult`
 
-| Field          | Type        | Meaning                                                                 |
-| -------------- | ----------- | ----------------------------------------------------------------------- |
-| `detected`     | `bool`      | `true` iff `confidence > threshold`                                     |
-| `confidence`   | `f32`       | Mean of the per-output detection scores                                 |
-| `message`      | `u32`       | Decoded message bits, LSB-first; bits at or above `message_bits` are 0  |
-| `localization` | `Vec<f32>`  | Flattened detection-score tensor (see contract below)                   |
+| Field          | Type       | Meaning                                                                 |
+| -------------- | ---------- | ----------------------------------------------------------------------- |
+| `detected`     | `bool`     | `true` iff `confidence > threshold`                                     |
+| `confidence`   | `f32`      | mean of the per-output detection scores                                 |
+| `message`      | `u32`      | decoded message bits, **LSB-first**; bits ≥ `message_bits` are 0        |
+| `localization` | `Vec<f32>` | flattened detection-score tensor (see below)                            |
 
-#### `localization` contract
-
-`localization` is the **flattened** first ONNX output (detection scores),
-copied element-wise with **no resampling, hop remapping, or time-axis
-alignment** applied by `audiofp`.
-
-| Property | Contract |
-| -------- | -------- |
-| Values | Model-emitted `f32` scores, typically in `[0, 1]` for AudioSeal-style detectors |
-| Length | Exactly the number of elements in output `[0]` after Tract flattens it — **not** guaranteed equal to `audio.samples.len()` |
-| Time axis | Model-dependent. AudioSeal detector exports often emit **one score per input sample** at the model rate (`sample_rate`, default 16 kHz), but other exports may emit per-frame / pooled maps. Treat length and hop as **part of the model card**, not part of the `audiofp` API |
-| Aggregation | `confidence = mean(localization)` (or `0.0` if empty); `detected = confidence > threshold` |
-| Stability | Shape is **not** semver-stable across model versions — only that `audiofp` forwards whatever Tract returns for output `[0]` |
-
-For “where in the clip is the watermark?”, plot or threshold `localization`
-against the model’s documented time base. Do not assume index `i` maps to
-sample `i` unless your specific ONNX export says so.
+**`localization` contract** — it is the flattened first ONNX output copied
+element-wise with **no resampling or time-axis alignment** applied. Its
+length equals whatever the model emits (often one score per input sample
+for AudioSeal exports, but this is a property of the *model*, not the API).
+`confidence = mean(localization)` (or 0.0 when empty). For "where in the
+clip is the watermark", threshold `localization` against your model card's
+documented time base.
 
 ### Model contract
 
-`audiofp::watermark` assumes the ONNX model has:
+1. **One input** accepting `[1, 1, T] f32` at `cfg.sample_rate`.
+2. **≥ 2 outputs**, in order: `[0]` detection scores (any shape),
+   `[1]` message-bit logits (any shape; the first `message_bits` values
+   are read, `logit ≥ 0` ⇒ bit set).
 
-1. **One input** that accepts `[1, 1, T] f32` audio samples at `sample_rate`.
-2. **At least two outputs**, in this order:
-   - `[0]`: detection scores tensor (any shape; flattened for the localization vector and confidence mean).
-   - `[1]`: message bit logits tensor (any shape; first `message_bits` values are read).
+**Plan caching:** the first `detect` at a given input length builds a typed
+*and optimised* tract plan, cached per length; same-length calls reuse it,
+different lengths rebuild transparently. Batch at a fixed length for best
+throughput.
 
-Bits are decoded as `logit ≥ 0`. If your AudioSeal export has a different layout, post-process accordingly before feeding it through this wrapper.
+Obtain a model from Meta's
+[AudioSeal](https://github.com/facebookresearch/audioseal) repository
+(ONNX export of `audioseal_detector_16khz`), then:
 
-### Obtaining a watermark model
-
-`audiofp` does **not** bundle the AudioSeal ONNX weights. Download / export
-them from Meta’s [AudioSeal](https://github.com/facebookresearch/audioseal)
-repository (follow their docs for `audioseal_detector_16khz` / ONNX export),
-then pass the filesystem path to `WatermarkConfig::new(...)`.
-
-```rust
-use audiofp::watermark::WatermarkConfig;
-
-let cfg = WatermarkConfig::new("/models/audioseal_detector.onnx");
+```bash
+cargo run --example watermark_detect --features watermark,std-wav -- /path/to/audioseal.onnx clip.wav
 ```
-
-Runnable starter: `cargo run --example watermark_detect --features watermark,std-wav -- /path/to/model.onnx`.
 
 ---
 
 ## Neural Embedder
 
-Available with the `neural` feature (added in 0.3.0). Wraps `tract-onnx` to run a generic ONNX log-mel audio embedder.
+Available with the `neural` feature. A generic ONNX log-mel audio embedder:
+you bring the model, `audiofp` runs the front-end + inference.
 
 ```toml
 [dependencies]
@@ -924,28 +1449,33 @@ audiofp = { version = "0.4", features = ["neural"] }
 
 ### Model contract
 
-`audiofp::neural` works with **any** ONNX model that satisfies:
+1. **Input 0** accepts `[1, n_mels, n_frames] f32` where `n_mels` is your
+   configured mel count and
+   `n_frames = (window_samples − n_fft) / hop + 1` (non-centred framing).
+2. **Output 0** is any tensor whose flat length is the embedding dimension
+   — discovered by a probe inference at construction.
 
-1. **Input 0** — accepts `[1, n_mels, n_frames] f32`. `n_mels` is whatever you set in `NeuralEmbedderConfig::n_mels`; `n_frames` is fully determined by `(window_samples − n_fft) / hop + 1` (non-centred STFT framing).
-2. **Output 0** — any tensor whose flat length is the embedding dimension. The crate reads `output[0].iter().copied().collect()` and treats the result as the embedding vector. The dimension is discovered automatically by a probe inference at construction time.
-
-The shape is concretised **once at construction** and the model is optimised + made runnable then; per-call work is just the front-end (windowed FFT + log-mel) plus the inference itself. The watermark detector's per-call `clone + optimize + runnable` cycle is explicitly avoided.
+The model is typed, optimised (`into_optimized`), and made runnable **once
+at construction**; per-call work is only the front-end (windowed FFT +
+log-mel) and inference. Public exports that fit: VGGish, YAMNet (channel
+dim removed), OpenL3, audio-MAE distillations.
 
 ### `NeuralEmbedderConfig`
 
-```rust
+```rust,ignore
+// Reference definition (src/neural/embedder.rs).
 pub struct NeuralEmbedderConfig {
     pub model_path: String,
     pub sample_rate: u32,        // default 16_000
-    pub n_fft: usize,            // default 1024
-    pub hop: usize,              // default 320 (20 ms at 16 kHz)
-    pub n_mels: usize,           // default 128
+    pub n_fft: usize,            // default 1024 (power of two, ≤ 2^20)
+    pub hop: usize,              // default 320 (20 ms @ 16 kHz; 0 < hop ≤ n_fft)
+    pub n_mels: usize,           // default 128 (1..=8192)
     pub fmin: f32,               // default 0.0
     pub fmax: f32,               // default sample_rate / 2
     pub mel_scale: MelScale,     // default Slaney (librosa default)
     pub window_kind: WindowKind, // default Hann
-    pub window_secs: f32,        // default 1.0  (analysis-window length)
-    pub hop_secs: f32,           // default 1.0  (between successive windows; non-overlapping)
+    pub window_secs: f32,        // default 1.0; analysis-window length (≤ 3600)
+    pub hop_secs: f32,           // default 1.0; between windows (≤ window_secs)
     pub l2_normalize: bool,      // default true
     pub max_input_samples: Option<usize>, // default None
     pub max_push_samples: Option<usize>,  // default None; streaming truncate
@@ -953,29 +1483,11 @@ pub struct NeuralEmbedderConfig {
 }
 ```
 
-Constructor with reasonable defaults:
-
-```rust
-use audiofp::neural::NeuralEmbedderConfig;
-
-let cfg = NeuralEmbedderConfig::new("my_model.onnx");
-```
-
-#### Batched Inference (`batch_size`)
-
-When processing long audio offline, set `batch_size > 1` to amortise ONNX
-runtime per-run overhead. The model is invoked once per batch with a
-`[batch_size, n_mels, n_frames]` tensor instead of one call per window:
-
-```rust
-let mut cfg = NeuralEmbedderConfig::new("model.onnx");
-cfg.batch_size = 8; // process 8 windows per model invocation
-```
-
-A dedicated `batch_runnable` plan is built at construction for the configured
-batch size. The streaming path always uses `batch_size = 1`. Partial tail
-batches (fewer windows remaining than `batch_size`) fall back to single-window
-inference. Output is bit-exact regardless of batch size.
+Construction validates the whole config up front — non-finite/degenerate
+values, upper bounds (`n_fft ≤ 2²⁰`, `n_mels ≤ 8192`, `window_secs ≤ 3600`,
+`n_mels × n_frames ≤ 2²⁸` cells) all fail with `AfpError::Config` instead
+of an OOM abort later. A degenerate-but-finite config can no longer take
+down the process.
 
 ### `NeuralEmbedder` (offline)
 
@@ -983,26 +1495,27 @@ inference. Output is bit-exact regardless of batch size.
 use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
 use audiofp::{Fingerprinter, SampleRate};
 
-let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Construction performs the probe inference; embedding_dim is known
+    // even before you feed real audio.
+    let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+    println!("dim={} window={} samples hop={} samples",
+             emb.embedding_dim(), emb.window_samples(), emb.hop_samples());
 
-// Query model properties:
-println!("embedding_dim={}", emb.embedding_dim());
-println!("window_samples={}", emb.window_samples());
-println!("hop_samples={}", emb.hop_samples());
+    // 16 kHz mono PCM (rate must match cfg.sample_rate).
+    let samples: Vec<f32> = vec![0.0; 16_000 * 5];
+    let fp = emb.extract(&samples, SampleRate::HZ_16000)?;
 
-let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-
-let fp = emb.extract(&samples, SampleRate::HZ_8000)?;
-
-println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
-for e in fp.embeddings.iter().take(3) {
-    println!("  t_start={} ms, dim={}", e.t_start.0, e.vector.len());
+    println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
+    for e in fp.embeddings.iter().take(3) {
+        println!("  t_start={} ms, |v| = {}", e.t_start.0, e.vector.len());
+    }
+    Ok(())
 }
 ```
 
-`NeuralFingerprint` carries one entry per analysis window:
-
-```rust
+```rust,ignore
+// Reference definitions (src/neural/embedder.rs).
 pub struct NeuralFingerprint {
     pub embeddings: Vec<NeuralEmbedding>,
     pub embedding_dim: usize,
@@ -1010,10 +1523,16 @@ pub struct NeuralFingerprint {
 }
 
 pub struct NeuralEmbedding {
-    pub vector: Vec<f32>,       // L2-normalised by default
+    pub vector: Vec<f32>,       // L2-normalised when l2_normalize = true
     pub t_start: TimestampMs,
 }
 ```
+
+`n_windows = (samples.len() − window_samples) / hop_samples + 1`; tail
+samples short of a window are dropped. `batch_size > 1` builds a second
+`[batch, n_mels, n_frames]` plan at construction and batches full groups in
+one inference; partial tails fall back to single-window calls. Output is
+bit-exact regardless of batch size.
 
 ### `StreamingNeuralEmbedder` (incremental)
 
@@ -1024,264 +1543,241 @@ use audiofp::StreamingFingerprinter;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
 
-    // Feed 16 kHz mono PCM in arbitrary-sized chunks.
-    // Prefer try_push / try_push_with in production (push panics on inference errors).
-    let chunk = vec![0.0_f32; 320]; // 20 ms at 16 kHz
-    for _ in 0..100 {
-        for (t, vector) in s.try_push(&chunk)? {
-            println!("t={} ms, dim={}", t.0, vector.len());
+    // Feed 16 kHz PCM in arbitrary chunks; push propagates inference errors.
+    let chunk = vec![0.0_f32; 320]; // 20 ms
+    for _ in 0..200 {
+        for (t, vector) in s.push(&chunk)? {
+            println!("t={} ms dim={}", t.0, vector.len());
         }
     }
-    // flush() is infallible at the trait layer; prefer draining via try_push
-    // with trailing silence if you need Result semantics end-to-end.
-    for (t, vector) in s.flush() {
-        println!("flush t={} ms, dim={}", t.0, vector.len());
-    }
+
+    // flush drops the sub-window tail (non-centred framing cannot emit a
+    // partial window) and is idempotent.
+    let drained = s.flush()?;
+    assert!(drained.is_empty());
     Ok(())
 }
 ```
 
-`StreamingNeuralEmbedder` exposes three push variants:
+| Method                                                | Per-emit allocation | Errors  |
+| ----------------------------------------------------- | ------------------- | ------- |
+| `push(&[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>>` | one `Vec<f32>`     | `Result` |
+| `try_push(&[f32]) -> Result<Vec<…>>`                  | one `Vec<f32>`     | `Result` |
+| `try_push_with(&[f32], |t, &[f32]|) -> Result<usize>` | **zero** (callback borrows a reused scratch) | `Result` |
 
-| Method                                             | Allocates per emit         | Errors          |
-| -------------------------------------------------- | -------------------------- | --------------- |
-| `push(samples) -> Result<Vec<(TimestampMs, Vec<f32>)>>` | One `Vec<f32>` per emit | `Result`        |
-| `try_push(samples) -> Result<Vec<…>>`              | One `Vec<f32>` per emit    | `Result`        |
-| `try_push_with(samples, |t, &[f32]| …) -> Result<usize>` | **Zero** (callback gets `&[f32]`) | `Result`        |
+Prefer `try_push_with` on realtime paths: the embedding scratch is sized
+once at construction (`embedding_dim`) and reused across every emit of
+every push. The sample carry compacts once per push call, so one large
+push costs O(N) total — not O(N²/hop) of front-drains. `reset()` clears
+the carry and the consumed-sample counter between independent streams.
 
-For realtime-friendly streaming, prefer `try_push_with` — the callback receives the embedding by reference, no `Vec` is created per emit, and the embedder reuses a single internal scratch buffer that is allocated **once at construction** (sized to `embedding_dim`) and reused across every emit *and* every push for the lifetime of the embedder. Per-push allocation is genuinely zero.
-
-Additional accessor methods:
-
-| Method                        | Returns                             |
-| ----------------------------- | ----------------------------------- |
-| `config()`                    | `&NeuralEmbedderConfig`             |
-| `embedding_dim()`             | `usize` — dimension of each vector  |
-| `window_samples()`            | `usize` — analysis window length    |
-| `hop_samples()`               | `usize` — hop between windows       |
-| `reset()`                     | Clears internal carry buffer and zero the consumed-sample counter; call this to restart a stream from a clean state |
-
-### Bit-exactness
-
-`StreamingNeuralEmbedder::push` is bit-exactly equivalent to `NeuralEmbedder::extract` over the same total input, regardless of how it's chunked. Verified end-to-end by the in-tree passthrough tract fixture across chunk sizes `[1, 7, 17, 256, 1024, 8 191]` and at `hop_secs < window_secs` (overlapping windows).
+**Bit-exactness:** streaming output equals offline `extract` for the same
+total input under any chunking (pinned by in-tree tests across chunk sizes
+`[1, 7, 17, 256, 1024, 8191]` and overlapping `hop_secs < window_secs`).
 
 ### Errors
 
-| Failure                                            | Variant                       |
-| -------------------------------------------------- | ----------------------------- |
-| Empty `model_path`, file missing                   | `AfpError::ModelNotFound(_)`  |
-| File present but not parseable as ONNX             | `AfpError::ModelLoad(_)`      |
-| Invalid config (n_fft, hop, sample_rate, …)        | `AfpError::Config(_)`         |
-| `sample_rate` mismatch between buffer and config   | `AfpError::UnsupportedSampleRate(_)` |
-| Buffer shorter than `window_samples`               | `AfpError::AudioTooShort { … }` |
-| Tract typing / optimise / run failure              | `AfpError::Inference(_)`      |
-
-### Notes on model selection
-
-`audiofp::neural` is the runtime; the model is yours. Common public ONNX exports that fit the `[1, n_mels, n_frames]` contract (or fit it after a small reshape op): VGGish, YAMNet (with channel dim removed), OpenL3, audio MAE distillations. For other shapes, a tiny preprocessing op in your ONNX graph is usually enough to make the contract hold.
+| Failure                                          | Variant                       |
+| ------------------------------------------------ | ----------------------------- |
+| Empty `model_path`, file missing                 | `ModelNotFound(_)`            |
+| File present but not parseable as ONNX           | `ModelLoad(_)`                |
+| Invalid config (bounds, ranges, batch_size = 0)  | `Config(_)`                   |
+| Rate mismatch                                    | `UnsupportedSampleRate(_)`    |
+| Buffer shorter than `window_samples`             | `AudioTooShort { … }`         |
+| Tract typing / optimise / run failure            | `Inference(_)`                |
 
 ---
 
 ## DSP Primitives
 
-For users wanting to build custom fingerprinters or analysis pipelines on top of `audiofp`'s building blocks. All available under `audiofp::dsp::*`.
+Everything the fingerprinters use internally is public under
+`audiofp::dsp::*` — build your own pipelines on the same blocks.
 
-### `dsp::stft`
+### `dsp::stft` — pre-planned STFT
 
 ```rust
 use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
 use audiofp::dsp::windows::WindowKind;
 
-let mut stft = ShortTimeFFT::new(StftConfig {
-    n_fft: 2048,                  // power of two
-    hop: 512,                     // 0 < hop ≤ n_fft
-    window: WindowKind::Hann,
-    center: true,                 // librosa-style reflect padding
-});
+fn main() {
+    let mut stft = ShortTimeFFT::new(StftConfig {
+        n_fft: 2048,             // non-zero power of two
+        hop: 512,                // 0 < hop ≤ n_fft
+        window: WindowKind::Hann,
+        center: true,            // librosa-style reflect padding
+    });
 
-let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin()).collect();
-let spec = stft.magnitude(&samples);   // Vec<Vec<f32>>: (n_frames, n_bins)
-println!("{} frames × {} bins", spec.len(), stft.n_bins());
+    let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin()).collect();
+
+    // Flat power spectrogram — single allocation, (n_frames, n_bins) row-major.
+    let (power, n_frames, n_bins) = stft.power_flat(&samples);
+    assert_eq!(power.len(), n_frames * n_bins);
+    assert_eq!(n_bins, 2048 / 2 + 1);
+
+    // Flat magnitude (|X|) spectrogram.
+    let (mag, n_frames2, _) = stft.magnitude_flat(&samples);
+    assert_eq!(mag.len(), n_frames2 * n_bins);
+
+    // Caller-owned buffer variant of power_flat (reuse across calls):
+    let mut buf = Vec::new();
+    let (nf, nb) = stft.power_flat_into(&samples, &mut buf);
+    assert_eq!(buf.len(), nf * nb);
+
+    // Streaming: one pre-windowed n_fft frame → one power spectrum.
+    // Zero allocations per call; reuses internal scratch.
+    let frame = vec![0.0_f32; 2048];
+    let mut out = vec![0.0_f32; stft.n_bins()];
+    stft.process_frame_power(&frame, &mut out).unwrap();
+    assert!(out.iter().all(|&p| p == 0.0)); // silence → zero power
+
+    let mut mag_out = vec![0.0_f32; stft.n_bins()];
+    stft.process_frame(&frame, &mut mag_out).unwrap();
+
+    let _ = stft.config(); // &StftConfig
+}
 ```
 
-Streaming `process_frame` / `process_frame_power` let you feed exactly
-`n_fft` samples and get one spectrum without allocating per call. Both
-return `Result` and reject mismatched frame/out lengths with
-`AfpError::Config` instead of panicking.
+- `StftConfig::new(n_fft)` builds `hop = n_fft/4`, Hann, centred.
+- `n_frames(n_samples)`: centred framing gives `1 + n_samples/hop`;
+  non-centred gives `1 + (n_samples − n_fft)/hop` (0 when shorter than
+  one frame).
+- `ShortTimeFFT::new` panics on invalid configs; `try_new` returns
+  `Result<Self, AfpError::Config>`.
+- Window application, power, and magnitude kernels are 8-lane SIMD
+  (`wide::f32x8`) with scalar tails.
+- The deprecated `magnitude()` (per-frame `Vec<Vec<f32>>`) remains for
+  compatibility; prefer `magnitude_flat`.
 
-**0.2.0 fast-path methods:**
-
-```rust
-use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
-
-let mut stft = ShortTimeFFT::new(StftConfig::new(2048));
-let samples: Vec<f32> = vec![0.0; 16_000];
-
-// Single contiguous Vec<f32> of shape (n_frames, n_bins).
-let (mag, n_frames, n_bins) = stft.magnitude_flat(&samples);
-assert_eq!(mag.len(), n_frames * n_bins);
-
-// Power (|X|²) — skips the per-bin sqrt. Pair with 10·log10(p) instead
-// of 20·log10(sqrt(p)) for an algebraically identical log result.
-let (pow, _, _) = stft.power_flat(&samples);
-assert_eq!(pow.len(), mag.len());
-
-// Per-frame streaming variant of power_flat.
-let frame = vec![0.0_f32; 2048];
-let mut out = vec![0.0_f32; stft.n_bins()];
-stft.process_frame_power(&frame, &mut out)?;
-```
-
-The classical fingerprinters all use `power_flat` / `process_frame_power`
-internally — they avoid `O(N · M)` `sqrt` calls per spectrogram, a
-notable win on the FFT-bound Haitsma path.
-
-Additional methods:
-
-```rust
-// Inspect the config the STFT was built with:
-let cfg = stft.config();
-
-// Write power spectrogram into a caller-provided Vec (avoids allocation):
-let mut buf = Vec::new();
-let (n_frames, n_bins) = stft.power_flat_into(&samples, &mut buf);
-
-// Streaming per-frame magnitude (with sqrt — use process_frame_power for power):
-let mut out = vec![0.0_f32; stft.n_bins()];
-stft.process_frame(&frame, &mut out)?;
-```
-
-### `dsp::mel`
+### `dsp::mel` — sparse mel filterbank
 
 ```rust
 use audiofp::dsp::mel::{MelFilterBank, MelScale};
 
-let fb = MelFilterBank::new(
-    /* n_mels */ 128,
-    /* n_fft  */ 2048,
-    /* sr     */ 22_050,
-    /* fmin   */ 0.0,
-    /* fmax   */ 11_025.0,
-    MelScale::Slaney,            // or MelScale::Htk
-);
+fn main() {
+    // 128 mel bands over 0–11 kHz at sr 22 050, n_fft 2048.
+    let fb = MelFilterBank::new(128, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney);
+    assert_eq!(fb.n_mels, 128);
+    assert_eq!(fb.n_bins(), 1025);
 
-let mut log_mel = vec![0.0_f32; 128];
-fb.log_mel(&magnitude_spectrum, &mut log_mel);
+    // One synthetic magnitude frame (n_bins long).
+    let magnitude: Vec<f32> = (0..fb.n_bins()).map(|b| (b % 17) as f32 * 0.01).collect();
+    let mut log_mel = vec![0.0_f32; 128];
+    fb.log_mel(&magnitude, &mut log_mel);        // log10(M·|X|² + 1e-10)
+
+    // Power-spectrum variant — skips the per-bin square:
+    let power: Vec<f32> = magnitude.iter().map(|m| m * m).collect();
+    let mut log_mel2 = vec![0.0_f32; 128];
+    fb.log_mel_from_power(&power, &mut log_mel2);
+
+    // Dense row-major weight matrix (n_mels × n_bins) for inspection.
+    let weights: Vec<f32> = fb.matrix();
+    assert_eq!(weights.len(), 128 * 1025);
+}
 ```
 
-All DSP constructors (`MelFilterBank`, `ShortTimeFFT`, `SincResampler`) also provide a **`try_new()`** variant that returns `Result<Self, AfpError::Config>` instead of panicking on invalid parameters:
+- Slaney-normalised triangles (unit area in linear Hz), matching librosa's
+  `melspectrogram` defaults; `MelScale::Htk` selects the HTK formula.
+- Internally CSR: each band iterates only its ~20–40 non-zero bins.
+- Silence floors at `log10(1e-10) = −10.0`.
+- `try_new` is the fallible constructor; panicking `new` documents its
+  conditions (`n_mels > 0`, even `n_fft ≥ 2`, `0 ≤ fmin < fmax`).
 
-```rust
-// Fallible — returns Err on bad params:
-let fb = MelFilterBank::try_new(128, 2048, 22_050, 0.0, 11_025.0, MelScale::Slaney)?;
-let stft = ShortTimeFFT::try_new(StftConfig { n_fft: 1024, hop: 128, .. })?;
-let resampler = SincResampler::try_new(44_100, 8_000)?;
-```
-
-Slaney-normalised triangular filters; matches librosa's `feature.melspectrogram` defaults. Internally stores a compressed sparse row (CSR) representation so `log_mel` and `log_mel_from_power` iterate only the ~20–40 non-zero bins per mel band instead of all `n_bins`.
-
-Additional methods:
-
-```rust
-// Number of FFT bins (n_fft / 2 + 1):
-let n = fb.n_bins();
-
-// Apply log-mel to a power spectrum directly (skips the per-bin sqrt):
-fb.log_mel_from_power(&power_spectrum, &mut log_mel);
-
-// Borrow the row-major weight matrix (n_mels × n_bins):
-let weights: &[f32] = fb.matrix();
-```
-
-### `dsp::peaks`
+### `dsp::peaks` — 2-D peak picking
 
 ```rust
 use audiofp::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
 
-let picker = PeakPicker::new(PeakPickerConfig {
-    neighborhood_t: 7,
-    neighborhood_f: 7,
-    min_magnitude_db: f32::NEG_INFINITY,
-    min_magnitude_linear: Some(1e-3),
-    target_per_sec: 30,
-});
+fn main() {
+    // 8 frames × 8 bins with a single peak at (3, 4).
+    let mut spec = vec![0.0_f32; 64];
+    spec[3 * 8 + 4] = 1.0;
 
-let peaks: Vec<Peak> = picker.pick(&magnitude_spec, n_frames, n_bins, frames_per_sec);
-```
+    let mut picker = PeakPicker::new(PeakPickerConfig {
+        neighborhood_t: 1,                       // half-width, frames
+        neighborhood_f: 1,                       // half-width, bins
+        min_magnitude_db: f32::NEG_INFINITY,     // dB floor (input is dB here)
+        min_magnitude_linear: Some(0.1),         // optional linear floor
+        target_per_sec: 0,                       // 0 disables the per-second cap
+    });
 
-#### `Peak` fields
-
-```rust
-pub struct Peak {
-    pub t_frame: u32,  // STFT frame index of the peak
-    pub f_bin: u16,    // FFT bin index of the peak
-    pub _pad: u16,     // explicit padding (required by bytemuck::Pod)
-    pub mag: f32,      // magnitude at the peak
+    let peaks: Vec<Peak> = picker.pick(&spec, 8, 8, /* frames_per_sec */ 100.0);
+    assert_eq!(peaks.len(), 1);
+    assert_eq!((peaks[0].t_frame, peaks[0].f_bin), (3, 4));
 }
 ```
 
-The picker also exposes `fn config(&self) -> &PeakPickerConfig` for inspecting the configuration it was built with.
+- A cell survives iff it clears both magnitude floors **and**
+  `v ≥ rolling_max` over the `(2t+1)×(2f+1)` box — `>=` so flat plateaus
+  emit every cell (matches streaming semantics).
+- `target_per_sec > 0` keeps the top-K peaks per 1-second bucket
+  (bucket = `floor(t_frame / frames_per_sec)`), ranked by magnitude
+  descending then `(t, f)` ascending — deterministic.
+- Output sorted by `(t_frame, f_bin)`. The picker is `&mut self` and pools
+  all scratch — reuse one instance per producing thread or put it behind a
+  `Mutex`.
+- `IncrementalPeakDetector` (same module) is the streaming equivalent:
+  `push_row` per spectrogram row, returns each row's 2-D max as it
+  ripens; `flush` drains the tail **idempotently**.
 
-2-D rolling max via Lemire's monotonic deque, amortised O(N · M) regardless of neighbourhood size.
-
-> **0.2.0 breaking change.** `PeakPicker::pick` now takes `&mut self` so
-> it can re-use its rolling-max scratch across calls. If you previously
-> held a `PeakPicker` behind `&self`, store it as `Mutex<PeakPicker>` or
-> use one picker per producing thread.
-
-### `dsp::resample`
-
-```rust
-use audiofp::dsp::resample::{linear, SincQuality, SincResampler};
-
-// Cheap and aliased on downsamples — only use for non-critical paths.
-let y = linear(&x, 44_100, 8_000);
-
-// Default quality (32-tap, β=8.6).
-let r = SincResampler::new(44_100, 8_000);
-let y = r.process(&x);
-
-// Higher quality.
-let r = SincResampler::with_quality(
-    44_100,
-    8_000,
-    SincQuality { half_taps: 64, kaiser_beta: 12.0, polyphase_steps: 256 },
-);
-let y = r.process(&x);
-```
-
-Cutoff is automatically `min(from, to) / 2` to suppress aliasing on downsamples.
-
-The resampler also exposes `fn quality(&self) -> &SincQuality` for inspecting the quality parameters it was built with.
-
-For zero-allocation resampling in a hot loop, use `process_into`:
+### `dsp::resample` — linear & windowed-sinc
 
 ```rust
-use audiofp::dsp::resample::SincResampler;
+use audiofp::dsp::resample::{SincQuality, SincResampler, linear};
 
 fn main() {
-    let r = SincResampler::new(44_100, 16_000);
+    let x: Vec<f32> = (0..1_000).map(|i| (i as f32 * 0.05).sin()).collect();
+
+    // Linear: cheap, aliases on downsamples — baseline only.
+    let y = linear(&x, 44_100, 8_000);
+
+    // Sinc (default: 32 half-taps, Kaiser β 8.6, 256 polyphase steps).
+    let r = SincResampler::new(44_100, 8_000);
+    let y2 = r.process(&x);
+    let _ = r.quality(); // &SincQuality
+
+    // Higher quality (≈ -120 dB stopband).
+    let hq = SincResampler::with_quality(
+        44_100,
+        8_000,
+        SincQuality { half_taps: 64, kaiser_beta: 12.0, polyphase_steps: 256 },
+    );
+    let y3 = hq.process(&x);
+
+    // Hot-loop, allocation-free variant: reuse the output Vec.
     let mut out = Vec::new();
-    // Replace with your decoder / capture chunks at 44.1 kHz.
-    let audio_chunks: [Vec<f32>; 2] = [vec![0.0; 1024], vec![0.0; 1024]];
-    for chunk in &audio_chunks {
-        r.process_into(chunk, &mut out);
-        // `out` is reused across chunks — capacity is preserved,
-        // no re-allocation after the largest chunk.
-        let _ = out.len();
+    for chunk in [x.as_slice(), y2.as_slice()] {
+        hq.process_into(chunk, &mut out);
+        let _ = out.len(); // capacity preserved across chunks
     }
+    let _ = y;
+    let _ = y3;
 }
 ```
 
-### `dsp::windows`
+- Output length is `ceil(n_in · to / from)`; out-of-range taps are
+  zero-padded; DC gain normalised to 1.
+- Cutoff is `min(from, to) / 2` in the input's frame — suppresses aliasing
+  on downsamples and images on upsamples.
+- `try_new` / `try_with_quality` are the fallible constructors.
+- **Do not use `linear` for production downsamples** — the aliasing
+  measurably degrades fingerprints.
+
+### `dsp::windows` — periodic windows
 
 ```rust
 use audiofp::dsp::windows::{make_window, WindowKind};
 
-let w = make_window(WindowKind::Hann, 1024);
+fn main() {
+    let hann = make_window(WindowKind::Hann, 1024);
+    assert_eq!(hann.len(), 1024);
+    assert!((hann[0] - 0.0).abs() < 1e-6);  // periodic: w[0] = 0, not w[1] = 0
+    let _ = make_window(WindowKind::Hamming, 1024);
+    let _ = make_window(WindowKind::Blackman, 1024);
+}
 ```
 
-Periodic windows (period N, not N-1) — matches librosa / `scipy.signal.get_window(..., fftbins=True)`.
+Periodic (period `N`, not `N−1`) — matches librosa /
+`scipy.signal.get_window(..., fftbins=True)`.
 
 ---
 
@@ -1289,21 +1785,18 @@ Periodic windows (period N, not N-1) — matches librosa / `scipy.signal.get_win
 
 ### Async usage
 
-`audiofp` is **synchronous**. From `tokio` (or any async runtime), offload
-CPU-heavy extract/decode onto a blocking pool:
+`audiofp` is synchronous. From `tokio` (or any runtime), offload the
+CPU-heavy work onto the blocking pool:
 
 ```rust
-use std::sync::{Arc, Mutex};
-
 use audiofp::classical::Wang;
 use audiofp::{Fingerprinter, SampleRate};
 
 async fn fingerprint_blocking(
     samples: Vec<f32>,
 ) -> Result<audiofp::classical::WangFingerprint, audiofp::AfpError> {
-    let wang = Arc::new(Mutex::new(Wang::default()));
     tokio::task::spawn_blocking(move || {
-        let mut wang = wang.lock().unwrap();
+        let mut wang = Wang::default();
         wang.extract(&samples, SampleRate::HZ_8000)
     })
     .await
@@ -1311,18 +1804,20 @@ async fn fingerprint_blocking(
 }
 ```
 
-Keep fingerprinters off the async executor thread: STFT + peak picking
-are CPU-bound and would stall the runtime.
+Keep extraction off the async executor threads — STFT + peak picking are
+CPU-bound and would stall the runtime.
 
 ### Batching files
 
-Reuse one fingerprinter across paths (plans and scratch stay warm):
+Reuse one fingerprinter across paths — the FFT plan, window, and scratch
+buffers stay warm:
 
 ```rust
+use std::path::PathBuf;
+
 use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
-use std::path::PathBuf;
 
 fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     let mut wang = Wang::default();
@@ -1330,101 +1825,81 @@ fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
         let samples = decode_to_mono_at(path, 8_000)?;
         let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
         println!("{} → {} hashes", path.display(), fp.hashes.len());
-        // db.insert(track_id, &fp.hashes);
+        // your_store.insert(track_id, &fp.hashes);
     }
     Ok(())
 }
 ```
 
-For true parallelism enable the `rayon` feature and use
-[`fingerprint_batch_parallel`](https://docs.rs/audiofp/latest/audiofp/fn.fingerprint_batch_parallel.html),
-or wrap your loop in `rayon::iter::ParallelIterator`.
+For process-level parallelism enable the `rayon` feature and use
+`audiofp::fingerprint_batch_parallel`, which fingerprints many buffers
+across cores (it parallelises extraction only — matching stays sequential
+by design; use the indexes for large 1:N).
 
-### Watermark / neural model download
+### Model sourcing
 
 Neither `watermark` nor `neural` ships ONNX weights:
 
-| Feature | Where to get a model |
-| ------- | -------------------- |
-| `watermark` | Meta [AudioSeal](https://github.com/facebookresearch/audioseal) — export / download an ONNX detector (e.g. 16 kHz) and pass the path to `WatermarkConfig::new` |
-| `neural` | Bring your own log-mel embedder ONNX that matches the Neural Embedder model contract above |
-
-```bash
-cargo run --example watermark_detect --features watermark,std-wav -- /path/to/audioseal.onnx
-cargo run --example neural_embed --features neural -- /path/to/embedder.onnx
-```
+| Feature    | Model source                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------- |
+| `watermark`| Meta [AudioSeal](https://github.com/facebookresearch/audioseal) ONNX detector export      |
+| `neural`   | Any log-mel embedder matching the [model contract](#neural-embedder) (VGGish, YAMNet, …) |
 
 ---
 
 ## Error Handling
 
-All fallible APIs return `Result<T, AfpError>`:
+All fallible APIs return `Result<T, AfpError>`; `AfpError` is
+`#[non_exhaustive]` — always keep a catch-all arm:
 
-```rust
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
+```rust,ignore
+// Reference definition (src/error.rs) — abridged.
 pub enum AfpError {
-    #[error("audio too short: needed at least {needed} samples, got {got}")]
     AudioTooShort { needed: usize, got: usize },
-
-    #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
-
-    #[error("unsupported channel count: {0}")]
     UnsupportedChannels(u16),
-
-    #[error("model not found at {0}")]
     ModelNotFound(String),
-
-    #[error("model load failed: {0}")]
     ModelLoad(String),
-
-    #[error("inference failed: {0}")]
     Inference(String),
-
-    #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun { dropped: usize },
-
-    #[error("audio contains non-finite sample (NaN or Inf) at index {index}")]
-    NonFiniteSample { index: usize },
-
-    #[error("input too large: {provided} exceeds maximum {limit}")]
+    NonFiniteSample { index: usize },   // first offending sample's index
     InputTooLarge { limit: usize, provided: usize },
-
-    #[error("invalid configuration: {0}")]
     Config(String),
-
-    #[error("deserialization failed: {0}")]
     Deserialize(String),
-
-    #[error("io: {0}")]
-    Io(String),
+    Timeout { elapsed_ms: u64, limit_ms: u64 },  // std only
+    Io(IoError),                                  // std only
 }
 ```
 
-**PCM policy:** offline `extract` / watermark `detect` return `NonFiniteSample` on NaN/Inf. Streaming `push` replaces non-finite samples with `0.0` (API is infallible until 0.4).
+`IoError` carries `path: Option<PathBuf>`, `kind: std::io::ErrorKind`, and
+the underlying `std::io::Error` as `source`.
 
-`#[non_exhaustive]` — match exhaustively only inside the crate. Add a `_` arm to keep your match safe across SDK upgrades.
+**PCM policy:**
 
-### Typical error paths
+- Offline `extract` and watermark `detect` **reject** NaN/Inf with
+  `NonFiniteSample { index }` (first offending index).
+- Streaming `push` **sanitises** non-finite samples to `0.0` — an audio
+  callback must not die mid-stream.
 
 ```rust
-use audiofp::{AfpError, Fingerprinter, SampleRate, classical::Wang};
+use audiofp::classical::Wang;
+use audiofp::{AfpError, Fingerprinter, SampleRate};
 
-let mut wang = Wang::default();
+fn main() {
+    let samples = vec![0.0_f32; 8_000];
+    let mut wang = Wang::default();
 
-
-match wang.extract(&samples, SampleRate::HZ_8000) {
-    Ok(fp) => println!("{} hashes", fp.hashes.len()),
-
-    Err(AfpError::UnsupportedSampleRate(hz)) => {
-        eprintln!("Wang needs 8 kHz, got {hz}. Resample first.");
+    match wang.extract(&samples, SampleRate::HZ_8000) {
+        Ok(fp) => println!("{} hashes", fp.hashes.len()),
+        Err(AfpError::AudioTooShort { needed, got }) => {
+            eprintln!("need {needed} samples ({:.1} s), got {got}",
+                      needed as f32 / 8_000.0);
+        }
+        Err(AfpError::UnsupportedSampleRate(hz)) => {
+            eprintln!("Wang needs 8 kHz, got {hz} — resample first");
+        }
+        Err(e) => eprintln!("unexpected: {e}"),
     }
-    Err(AfpError::AudioTooShort { needed, got }) => {
-        eprintln!("Need {needed} samples ({:.1} s), got {got}.", needed as f32 / 8_000.0);
-    }
-
-    Err(e) => eprintln!("Unexpected error: {e}"),
 }
 ```
 
@@ -1432,202 +1907,135 @@ match wang.extract(&samples, SampleRate::HZ_8000) {
 
 ## Performance Tips
 
-### 1. Reuse the `Fingerprinter` across calls
+1. **Reuse the fingerprinter across calls.** `Wang::new` allocates an FFT
+   plan, window table, and scratch; recreating per file wastes all of it.
+   Same for `Panako`, `Haitsma`, `WatermarkDetector`, and the peak picker.
 
-`Wang::new` allocates an FFT plan, window table, and scratch buffers. Don't recreate one per file:
+2. **Pick the algorithm for the workload.** Wang for music ID; Panako when
+   tempo robustness matters; Haitsma for smallest fingerprints and lowest
+   streaming latency; neural for semantic/cover similarity.
 
-```rust
-use audiofp::classical::Wang;
-use audiofp::io::decode_to_mono_at;
-use audiofp::{Fingerprinter, SampleRate};
-use std::path::Path;
+3. **Tune `fan_out` / `peaks_per_sec` to your index.** Wang 5–10 is the
+   useful range (3 for tight storage, ≥ 15 wastes index space). Halving
+   `peaks_per_sec` roughly halves both hashes and recall.
 
-fn enroll(paths: &[&Path]) -> Result<(), Box<dyn std::error::Error>> {
-    // Fast: one Wang, many extractions
-    let mut wang = Wang::default();
-    for path in paths {
-        let samples = decode_to_mono_at(path, 8_000)?;
-        let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
-        let _ = fp.hashes.len();
-    }
-    Ok(())
-}
-```
+4. **Never use the `linear` resampler in production** — aliasing on
+   downsamples degrades fingerprint quality. `SincResampler` default
+   quality is the right default.
 
-Same applies to `Panako`, `Haitsma`, and `WatermarkDetector`.
+5. **`mimalloc`** installs `mimalloc::MiMalloc` process-wide when your own
+   binary doesn't pick an allocator:
 
-### 2. Pick the right algorithm for the workload
+   ```toml
+   [dependencies]
+   audiofp = { version = "0.4", features = ["mimalloc"] }
+   ```
 
-| Goal                                             | Algorithm   |
-| ------------------------------------------------ | ----------- |
-| Music identification (Shazam-style)              | Wang        |
-| Music identification with tempo robustness       | Panako      |
-| Frame-aligned dense IDs / streaming with low lag | Haitsma     |
-| Smallest fingerprints                            | Haitsma     |
+6. **The streaming hot path is incremental and allocation-free** after
+   warmup: per-push CPU is proportional to the new samples only. The
+   neural streamer additionally reuses one embedding scratch and compacts
+   its carry once per push.
 
-### 3. Tune `fan_out` and `peaks_per_sec` to match your index
+7. **Build with LTO.** The crate ships `lto = "fat"`, `codegen-units = 1`
+   in its release profile; if you consume it as a library, set the same in
+   your binary's `[profile.release]` — cross-crate inlining of the DSP
+   kernels is worth ~10–15 %.
 
-A larger `fan_out` (more hashes per anchor) increases recall but balloons storage. For Wang, 5–10 is the typical range; 3 is acceptable for tight constraints, ≥ 15 wastes index space.
-
-### 4. Avoid the `linear` resampler for production
-
-It's there as a baseline. Use `SincResampler` for anything user-facing — the aliasing in `linear` will degrade fingerprint quality on rate conversions like 44.1k → 8k.
-
-### 5. Opt in to `mimalloc` if your downstream binary doesn't pick an allocator
-
-```toml
-[dependencies]
-audiofp = { version = "0.4", features = ["mimalloc"] }
-```
-
-This installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]`. Off by default because libraries shouldn't pick the allocator on behalf of their consumers — flip it on in your binary if you're vendoring `audiofp`.
-
-### 6. Streaming hot path is allocation-free and truly incremental (0.2.0+)
-
-After the first push warms up internal scratch buffers,
-`StreamingFingerprinter::push` does no allocations on the hot path.
-**The streaming impls are now genuinely incremental** — Wang and Panako
-maintain a rolling spectrogram window of `2·neighborhood_t + 1` rows
-and detect peaks frame-by-frame as each becomes ripe; Haitsma keeps
-just one previous-frame band-energy array. Per-push CPU is proportional
-to the number of new samples, **not** to total stream length. Safe to
-call from realtime audio threads.
-
-### 7. Build with LTO for production (0.3.6+)
-
-`audiofp` ships a `[profile.release]` with `lto = "fat"` and
-`codegen-units = 1`. If you depend on `audiofp` as a library, your
-binary's release profile controls whether these apply — they do if
-you inherit the default `release` profile. For maximum throughput:
-
-```toml
-[profile.release]
-lto           = "fat"
-codegen-units = 1
-```
-
-This enables cross-crate inlining of hot-path DSP functions (`log10f`,
-`norm_sqr`, the mel-matrix dot product, rolling-max deque operations)
-and typically yields **10–15 % throughput improvement** on the
-classical fingerprinters.
-
-### 8. Sparse mel filterbank benefits the neural frontend (0.3.6+)
-
-`MelFilterBank::log_mel_from_power` and `log_mel` now use a compressed
-sparse row (CSR) representation internally: each triangular filter
-iterates only its ~20–40 non-zero bins instead of all `n_bins` (513+).
-This is a **~15× reduction** in the inner-loop iteration count per mel
-band. The dense `matrix()` getter is preserved for callers that need
-the full weight matrix. Affects `NeuralEmbedder` and
-`StreamingNeuralEmbedder` where `log_mel_from_power` is called once
-per STFT frame per analysis window.
+8. **Batch neural inference.** `batch_size > 1` amortises per-run ONNX
+   overhead; fixed-length watermark inputs reuse the cached plan.
 
 ---
 
 ## Feature Flags
 
-> **0.4.0 change:** the monolithic `std` feature is split into per-codec
-> sub-features, and `default` is now `[]`. Pick the codecs you actually
-> decode:
+Default = `[]` (no_std + alloc, no codecs):
 
-| Feature      | Default | Brings in                                                                       |
-| ------------ | :-----: | ------------------------------------------------------------------------------- |
-| `std`        |         | Symphonia itself (no codecs). Bare `std` without a codec feature is a compile error when you touch `audiofp::io`. |
-| `std-mp3`    |         | MP3 decoding (`symphonia/mp3`)                                                  |
-| `std-aac`    |         | AAC decoding (`symphonia/aac`)                                                  |
-| `std-flac`   |         | FLAC decoding (`symphonia/flac`)                                                |
-| `std-ogg`    |         | Ogg container + Vorbis (`symphonia/ogg`, `symphonia/vorbis`)                     |
-| `std-wav`    |         | WAV + raw PCM (`symphonia/wav`, `symphonia/pcm`)                                 |
-| `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF (`symphonia/isomp4`, `symphonia/aac`)                      |
-| `std-aiff`   |         | AIFF + PCM payloads (`symphonia/aiff`, `symphonia/pcm`)                          |
-| `std-mkv`    |         | Matroska (`symphonia/mkv`)                                                       |
-| `std-adpcm`  |         | ADPCM (`symphonia/adpcm`)                                                        |
-| `std-alac`   |         | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                           |
-| `all-codecs` |         | Every format/codec above at once — the pre-0.4.0 monolithic `std` behavior        |
-| `watermark`  |         | `tract-onnx` + `ndarray`; enables `audiofp::watermark` (implies `std`)           |
-| `neural`     |         | `tract-onnx`; enables `audiofp::neural` (generic ONNX log-mel embedder, BYO model; implies `std`) |
-| `mimalloc`   |         | Installs `mimalloc` as the process-wide `#[global_allocator]` (implies `std`)    |
+| Feature      | Brings in                                                                    |
+| ------------ | ---------------------------------------------------------------------------- |
+| `std`        | Symphonia itself, no codecs. Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
+| `std-mp3`    | MP3 (`symphonia/mp3`)                                                        |
+| `std-aac`    | raw AAC (`symphonia/aac`)                                                    |
+| `std-flac`   | FLAC (`symphonia/flac`)                                                      |
+| `std-ogg`    | Ogg + Vorbis (`symphonia/ogg`, `symphonia/vorbis`)                           |
+| `std-wav`    | WAV + PCM (`symphonia/wav`, `symphonia/pcm`)                                 |
+| `std-mp4`    | AAC-in-MP4 / ISO-BMFF (`symphonia/isomp4`, `symphonia/aac`)                  |
+| `std-aiff`   | AIFF + PCM payloads (`symphonia/aiff`, `symphonia/pcm`)                      |
+| `std-mkv`    | Matroska (`symphonia/mkv`)                                                   |
+| `std-adpcm`  | ADPCM (`symphonia/adpcm`)                                                    |
+| `std-alac`   | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                       |
+| `all-codecs` | every codec feature above — the pre-0.4.0 monolithic `std`                    |
+| `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` (implies std) |
+| `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`)                   |
+| `neural`     | `tract-onnx`; enables `audiofp::neural` (implies `std`)                      |
+| `mimalloc`   | `mimalloc` as process-wide `#[global_allocator]` (implies `std`)             |
 
-### WAV-only decoding (typical case)
+`all-codecs` deliberately excludes the heavyweight subsystems (`neural`,
+`watermark`, `rayon`, `mimalloc`) — enable those explicitly.
 
 ```toml
-[dependencies]
+# WAV-only decoding (typical embedded-service case):
 audiofp = { version = "0.4", features = ["std-wav"] }
-```
 
-### All formats at once (pre-0.4.0 behavior)
-
-```toml
-[dependencies]
+# Everything the pre-0.4.0 `std` feature decoded:
 audiofp = { version = "0.4", features = ["all-codecs"] }
-```
 
-`all-codecs` enables every codec feature (`std-mp3`, `std-aac`,
-`std-flac`, `std-ogg`, `std-wav`, `std-mp4`, `std-aiff`, `std-mkv`,
-`std-adpcm`, `std-alac`) — the drop-in equivalent of the old monolithic
-`std`. It deliberately does **not** pull in the heavyweight optional
-subsystems (`neural`, `watermark`, `rayon`, `mimalloc`); enable those
-explicitly if you need them.
-
-### Minimal build (no_std + alloc)
-
-```toml
-[dependencies]
+# Minimal no_std + alloc build (no io at all):
 audiofp = { version = "0.4", default-features = false }
-```
 
-The default build now ships **no codecs at all** — `audiofp::io` is absent
-unless you opt into at least one `std-*` feature. DSP primitives and
-classical fingerprinters all remain available.
-
-### Watermark detection only
-
-```toml
-[dependencies]
+# Watermark only:
 audiofp = { version = "0.4", default-features = false, features = ["watermark"] }
 ```
-
-`watermark` implies `std`; you get `audiofp::watermark` plus the rest of the SDK, without any file-decode codecs.
 
 ---
 
 ## no_std / Embedded
 
-The DSP primitives and classical fingerprinters compile under `no_std + alloc`:
-
-```toml
-[dependencies]
-audiofp = { version = "0.4", default-features = false }
-```
-
-In your crate root:
+The DSP primitives, classical fingerprinters, matching, and serialisation
+compile under `no_std + alloc`:
 
 ```rust
 #![no_std]
 extern crate alloc;
 
-use audiofp::{Fingerprinter, SampleRate, classical::Wang};
-// ... use audiofp APIs as usual.
+use audiofp::classical::Wang;
+use audiofp::{Fingerprinter, SampleRate};
+
+fn fingerprint_here(samples: &[f32]) -> audiofp::Result<audiofp::classical::WangFingerprint> {
+    let mut wang = Wang::default();
+    wang.extract(samples, SampleRate::HZ_8000)
+}
 ```
 
-> **Note — bare-metal.** `rustfft` (used by the STFT primitive) transitively pulls `num-traits` with the `std` feature, so the no_std build currently only runs on hosted targets where `std` is reachable for *dependencies* (even if your own crate is `no_std`). True Cortex-M support will require a `microfft`-backed swap — on the roadmap.
+| Module                | no_std status                                                       |
+| --------------------- | ------------------------------------------------------------------- |
+| `audiofp::dsp` / `classical` / `matching` / `serial` | host-only no_std (rustfft transitively reaches std; your crate itself is `#![no_std]`) |
+| `audiofp::io`         | requires a `std-*` codec feature or `all-codecs`                    |
+| `audiofp::neural` / `watermark` | require `std`                                              |
 
-What works without `std` today:
-
-| Module                | Status                                                  |
-| --------------------- | ------------------------------------------------------- |
-| `audiofp::dsp::*`         | host-only no_std (rustfft transitive issue)          |
-| `audiofp::classical::*`   | same                                                 |
-| `audiofp::io`             | requires a `std-*` codec feature (`std-wav`, `std-mp3`, …) or `all-codecs` |
-| `audiofp::watermark`      | requires `std` + `watermark`                          |
+> **Bare-metal caveat.** `rustfft` (the STFT backend) transitively pulls
+> `num-traits` with `std`, so the no_std build runs on hosted targets where
+> dependencies may reach std even though *your* crate is `no_std`. True
+> Cortex-M support needs a `microfft`-backed FFT swap (on the roadmap).
 
 ---
 
-## Determinism guarantees
+## Determinism Guarantees
 
-- **Identical inputs → identical outputs.** Same audio, same fingerprinter, same config → bit-for-bit identical hashes on every call and on every supported target.
-- **Stable algorithm IDs.** `Fingerprinter::name()` returns a versioned string (e.g. `"wang-v1"`); a future major bump that changes hash bytes will change the version suffix.
-- **Stable hash layouts.** Bit positions in `WangHash::hash`, `PanakoHash::hash`, and Haitsma frames are stable across patch and minor versions inside `0.x`.
+- **Identical inputs → identical outputs.** Same audio, fingerprinter, and
+  config produce bit-identical hashes on every call, every run, every
+  supported target. No RNG, no time, no hash-order leakage anywhere in the
+  extract path — including streaming under arbitrary chunking.
+- **Deterministic matching.** All matchers and indexes break ties by total
+  orders (offset, `(t, f)` position, reference id) — never by hash-map
+  iteration order. Repeated 1:N queries return the same winner every run.
+- **Stable algorithm IDs.** `name()` returns a versioned string
+  (`"wang-v1"`); a future change to hash bytes bumps the suffix.
+- **Stable hash layouts.** Bit positions in `WangHash::hash`,
+  `PanakoHash::hash`, Haitsma frames, and the v1 serialisation format are
+  stable across patch and minor versions inside `0.x`.
+- **Serialisation is self-describing** and validated on read; blobs written
+  by any 0.4.x reader remain readable (trailing bytes are ignored for
+  forward compatibility).
 
 ---
 
@@ -1637,17 +2045,17 @@ MIT. See [LICENSE](LICENSE).
 
 ## Examples
 
-Runnable starters under `examples/` (also listed in the README):
+Runnable starters under `examples/`:
 
-| Example | Features | Command |
-| ------- | -------- | ------- |
-| `enroll_file` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example enroll_file --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
-| `match_two_files` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example match_two_files --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- a.flac b.mp3` |
-| `compare_algorithms` | `std-mp3`, `std-flac`, `std-ogg`, `std-wav`, `std-mp4` | `cargo run --example compare_algorithms --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
-| `stream_buffer` | none | `cargo run --example stream_buffer` |
-| `dsp_starter` | none | `cargo run --example dsp_starter` |
-| `neural_embed` | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
-| `watermark_detect` | `watermark`, `std-wav` | `cargo run --example watermark_detect --features watermark,std-wav -- model.onnx [audio.wav]` |
+| Example            | Features | Command |
+| ------------------ | -------- | ------- |
+| `enroll_file`      | `std-mp3,std-flac,std-ogg,std-wav,std-mp4` | `cargo run --example enroll_file --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
+| `match_two_files`  | `std-mp3,std-flac,std-ogg,std-wav,std-mp4` | `cargo run --example match_two_files --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- a.flac b.mp3` |
+| `compare_algorithms` | `std-mp3,std-flac,std-ogg,std-wav,std-mp4` | `cargo run --example compare_algorithms --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
+| `stream_buffer`    | none | `cargo run --example stream_buffer` |
+| `dsp_starter`      | none | `cargo run --example dsp_starter` |
+| `neural_embed`     | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
+| `watermark_detect` | `watermark,std-wav` | `cargo run --example watermark_detect --features watermark,std-wav -- model.onnx [audio.wav]` |
 
 ## Links
 
@@ -1655,3 +2063,4 @@ Runnable starters under `examples/` (also listed in the README):
 - [Documentation](https://docs.rs/audiofp)
 - [Repository](https://github.com/themankindproject/audiofp)
 - [Changelog](CHANGELOG.md)
+- [ROBUSTNESS.md](ROBUSTNESS.md) — measured cross-codec/noise margins
