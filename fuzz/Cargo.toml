@@ -75,3 +75,10 @@ path = "fuzz_targets/decode_resample.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "serial_roundtrip"
+path = "fuzz_targets/serial_roundtrip.rs"
+test = false
+doc = false
+bench = false

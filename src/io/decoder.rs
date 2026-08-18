@@ -44,6 +44,12 @@ pub struct DecodeLimits {
     /// Recommended for Python FFI / multi-tenant services where a hung
     /// decode would block the calling worker indefinitely.
     ///
+    /// **Limitation:** the deadline is cooperative — it is only checked
+    /// between packets. Time spent inside container probing, a single
+    /// packet decode, or the resample step is not interruptible, so a
+    /// pathological stream can still exceed the timeout. For a hard
+    /// wall-clock guarantee, run the decode on a watchdog thread.
+    ///
     /// [`AfpError::Timeout`]: crate::AfpError::Timeout
     pub timeout: Option<std::time::Duration>,
 }
@@ -254,12 +260,27 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     if sr == target_sr {
         Ok(samples)
     } else {
-        let out = SincResampler::new(sr, target_sr).process(&samples);
         // `DecodeLimits::max_samples` is documented to bound the
         // *returned* buffer. It is enforced at the native rate during
         // decode, so an upsample can legally grow the output by the
-        // resample ratio (≤ ~6× for 8k→48k) — re-check here and fail
-        // rather than silently returning more than the caller allowed.
+        // resample ratio. Project the post-resample length and enforce
+        // the limit *before* allocating the upsampled buffer: a hostile
+        // container can claim a native rate far below `target_sr`
+        // (e.g. 1 Hz → 48 kHz is a 48,000× blow-up), and resampling
+        // first would allocate the giant buffer before any check runs.
+        // (`sr` is guaranteed non-zero by `decode_inner`.)
+        if let Some(limit) = limits.max_samples {
+            let projected = (samples.len() as u64 * target_sr as u64).div_ceil(sr as u64);
+            if projected > limit as u64 {
+                return Err(AfpError::InputTooLarge {
+                    limit,
+                    provided: usize::try_from(projected).unwrap_or(usize::MAX),
+                });
+            }
+        }
+        let out = SincResampler::new(sr, target_sr).process(&samples);
+        // Defensive re-check: projection and actual length must agree;
+        // fail rather than silently returning more than the caller allowed.
         if let Some(limit) = limits.max_samples
             && out.len() > limit
         {
@@ -316,6 +337,14 @@ fn decode_inner(
             "missing sample rate",
         )))
     })?;
+    // Reject a zero sample rate: it is never valid audio and would panic
+    // the resampler (`SincResampler::new(0, _)`) downstream. Treat it as a
+    // malformed container instead of crashing on untrusted input.
+    if sample_rate == 0 {
+        return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+            "sample rate is zero (malformed container)",
+        ))));
+    }
 
     let codecs = symphonia::default::get_codecs();
     let decoder_factory = codecs
@@ -359,12 +388,20 @@ fn decode_inner(
 
         // Wall-clock timeout check: bail if the configured timeout has
         // elapsed. Checked per-packet (~1 ns overhead from Instant::elapsed).
+        //
+        // Note: this is a *cooperative* deadline — it is only observed
+        // between packets, so time spent inside a single `probe()`,
+        // `next_packet()`, or `decode()` call (and the resample step in
+        // `decode_to_mono_at_limited`) is not interruptible. A pathological
+        // stream that hangs inside one of those calls can still exceed the
+        // timeout; callers needing a hard wall-clock guarantee should run
+        // the decode on a watchdog thread.
         if let Some((start, limit)) = deadline {
             let elapsed = start.elapsed();
             if elapsed > limit {
                 return Err(AfpError::Timeout {
-                    elapsed_ms: elapsed.as_millis() as u64,
-                    limit_ms: limit.as_millis() as u64,
+                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
                 });
             }
         }
@@ -410,6 +447,20 @@ fn decode_inner(
             }
         };
 
+        // Bound decoded PCM growth *before* allocating the conversion
+        // buffer: a malformed packet can report a huge frame count, and
+        // allocating `AudioBuffer::new(spec, frames)` first would blow the
+        // memory budget regardless of `max_samples`.
+        if let Some(limit) = max_samples {
+            let next = samples.len().saturating_add(decoded.frames());
+            if next > limit {
+                return Err(AfpError::InputTooLarge {
+                    limit,
+                    provided: next,
+                });
+            }
+        }
+
         // Lazily allocate the f32 conversion buffer once the first packet
         // tells us the channel layout / capacity. Reallocate if a later
         // packet decodes to more frames than the current buffer can hold
@@ -441,17 +492,6 @@ fn decode_inner(
         // corrupt). Avoids division by zero and `.plane(0).unwrap()` panic.
         if n_chans == 0 {
             continue;
-        }
-
-        // Bound decoded PCM growth before allocating more samples.
-        if let Some(limit) = max_samples {
-            let next = samples.len().saturating_add(n_frames);
-            if next > limit {
-                return Err(AfpError::InputTooLarge {
-                    limit,
-                    provided: next,
-                });
-            }
         }
 
         if n_chans == 1 {
@@ -892,5 +932,101 @@ mod tests {
         assert_eq!(limits.timeout, Some(std::time::Duration::from_secs(30)));
         assert_eq!(limits.max_bytes, 1_000_000);
         assert_eq!(limits.max_samples, Some(480_000));
+    }
+
+    /// Write a valid mono WAV then zero out the sample-rate field in the
+    /// `fmt ` chunk (bytes 24..28 of a canonical PCM WAV). Produces a
+    /// container that claims `sample_rate = 0`.
+    fn write_zero_rate_wav(len: usize) -> std::path::PathBuf {
+        let path = write_test_wav(1, 8_000, len);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        // sample rate is the little-endian u32 at offset 24.
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    // Regression (A3): a container reporting `sample_rate = 0` used to flow
+    // into `decode_to_mono_at` and panic inside `SincResampler::new(0, _)`.
+    // It must now surface as an error, never a panic.
+    #[test]
+    fn zero_sample_rate_returns_error_not_panic() {
+        let path = write_zero_rate_wav(1_000);
+        // `decode_to_mono_at` is the path that resamples and would have
+        // constructed `SincResampler::new(0, target)`.
+        let result = std::panic::catch_unwind(|| decode_to_mono_at(&path, 8_000));
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(_) => panic!("decode_to_mono_at panicked on zero sample rate"),
+            Ok(Ok(_)) => panic!("zero sample rate should not decode successfully"),
+            Ok(Err(e)) => {
+                // Either the new explicit zero-rate rejection or an earlier
+                // probe/codec rejection is acceptable — the invariant is
+                // "error, not panic".
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("sample rate") || matches!(e, AfpError::Io(_)),
+                    "unexpected error for zero sample rate: {e:?}"
+                );
+            }
+        }
+    }
+
+    // Regression (A3): the plain (non-resampling) decode path must also
+    // reject a zero sample rate instead of returning `(samples, 0)` for
+    // callers to divide by.
+    #[test]
+    fn zero_sample_rate_plain_decode_errors() {
+        let path = write_zero_rate_wav(1_000);
+        let result = std::panic::catch_unwind(|| decode_to_mono(&path));
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(_) => panic!("decode_to_mono panicked on zero sample rate"),
+            Ok(Ok((_, sr))) => panic!("zero sample rate should not succeed, got sr={sr}"),
+            Ok(Err(_)) => {} // expected
+        }
+    }
+
+    // Regression (H3): `decode_to_mono_at_limited` must enforce
+    // `max_samples` against the *projected* post-resample length before
+    // allocating the upsampled buffer. A low-rate file upsampled to a much
+    // higher target can legally exceed the cap even when the native-rate
+    // decode is under it.
+    #[test]
+    fn resample_limit_enforced_on_projected_length() {
+        // 1000 samples at 8 kHz. Native decode is under the cap...
+        let path = write_test_wav(1, 8_000, 1_000);
+        // ...but upsampling 8k → 48k projects 6000 samples, over the cap.
+        let limits = DecodeLimits::samples(1_500);
+        let result = decode_to_mono_at_limited(&path, 48_000, limits);
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(AfpError::InputTooLarge { limit, provided }) => {
+                assert_eq!(limit, 1_500);
+                // Projected = ceil(1000 * 48000 / 8000) = 6000.
+                assert_eq!(provided, 6_000, "should report the projected length");
+            }
+            other => panic!("expected InputTooLarge with projected length, got {other:?}"),
+        }
+    }
+
+    // Companion to the above: when the projected length is under the cap,
+    // the resample proceeds normally.
+    #[test]
+    fn resample_limit_allows_when_projected_under_cap() {
+        let path = write_test_wav(1, 8_000, 1_000);
+        // 8k → 16k projects 2000 samples; cap of 4000 leaves headroom.
+        let limits = DecodeLimits::samples(4_000);
+        let result = decode_to_mono_at_limited(&path, 16_000, limits);
+        std::fs::remove_file(&path).ok();
+        let samples = result.expect("projected length under cap should succeed");
+        assert!(
+            (samples.len() as i64 - 2_000).abs() < 16,
+            "resampled len = {}",
+            samples.len()
+        );
     }
 }

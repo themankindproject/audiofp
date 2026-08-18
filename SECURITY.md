@@ -100,7 +100,8 @@ These are tracked as non-breaking issues; this document will be updated as they 
 
 | Version | Supported |
 | --- | --- |
-| Latest `0.3.x` on crates.io / `main` | Yes |
-| Older `0.3.x` / `0.2.x` | Best-effort; please upgrade |
+| Latest `0.4.x` on crates.io / `main` | Yes |
+| Latest `0.3.x` | Best-effort; please upgrade to `0.4.x` |
+| Older `0.3.x` / `0.2.x` | No; please upgrade |
 
 Security fixes are released as patch or minor versions on the current major line (`0.x` pre-1.0 may include necessary API notes in the changelog).

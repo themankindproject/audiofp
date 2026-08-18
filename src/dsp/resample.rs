@@ -272,15 +272,21 @@ impl SincResampler {
 
         // Determine the output-sample range where the kernel is fully
         // inside the input buffer (no bounds check needed).
-        let n_safe_start = ((half as f64) / ratio).ceil() as usize;
+        //
+        // The three regions (left boundary / middle / right boundary) must
+        // form an exact partition of `[0, n_out)`. For inputs shorter than
+        // the filter width the raw bounds can cross (`n_safe_start > n_out`
+        // or `n_safe_end < n_safe_start`), which used to make the boundary
+        // loops double-emit samples — clamp so that can't happen.
+        let n_safe_start = (((half as f64) / ratio).ceil() as usize).min(n_out);
         let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
-        let n_safe_end = n_safe_end.min(n_out);
+        let n_safe_end = n_safe_end.min(n_out).max(n_safe_start);
 
         out.clear();
         out.reserve(n_out);
 
         // Left boundary: kernel may extend past the start of input.
-        for n in 0..n_safe_start.min(n_out) {
+        for n in 0..n_safe_start {
             let pos = n as f64 * ratio;
             let i_centre = pos.floor() as isize;
             let frac = (pos - pos.floor()) as f32;
@@ -630,5 +636,50 @@ mod tests {
             polyphase_steps: 0,
         };
         let _ = SincResampler::with_quality(8_000, 16_000, q);
+    }
+
+    // Regression: inputs shorter than the filter width (2 * half_taps + 1)
+    // used to make the left/middle/right region bounds cross, so the
+    // boundary loops double-emitted samples and `process` returned more
+    // than the documented `ceil(n_in * to_sr / from_sr)` outputs.
+    #[test]
+    fn sinc_resampler_short_input_honours_output_length_contract() {
+        for &(from, to, n_in) in &[
+            (48_000u32, 8_000u32, 10usize), // downsample, n_in << filter width
+            (48_000, 8_000, 40),
+            (8_000, 48_000, 10), // upsample, n_in << filter width
+            (8_000, 48_000, 40),
+            (44_100, 16_000, 1), // single sample
+            (16_000, 44_100, 1),
+            (48_000, 8_000, 65), // exactly 2*half_taps+1 with default quality
+        ] {
+            let r = SincResampler::new(from, to);
+            let x = vec![1.0_f32; n_in];
+            let y = r.process(&x);
+            let expect = (n_in as u64 * to as u64).div_ceil(from as u64) as usize;
+            assert_eq!(
+                y.len(),
+                expect,
+                "{from}->{to} n_in={n_in}: got {} samples, contract says {expect}",
+                y.len()
+            );
+        }
+    }
+
+    #[test]
+    fn sinc_resampler_short_input_stays_bounded() {
+        // Weaker-but-always-true property for short inputs: every output is
+        // finite and bounded by the input peak plus the Kaiser window's
+        // Gibbs overshoot on the zero-padded step edges (β = 8.6 → ~9%).
+        // A regression of the region-overlap bug would double-emit samples
+        // and push values far past this envelope.
+        let r = SincResampler::new(48_000, 8_000);
+        let x = vec![0.5_f32; 10];
+        let y = r.process(&x);
+        assert_eq!(y.len(), 2);
+        for &s in &y {
+            assert!(s.is_finite(), "non-finite sample {s}");
+            assert!(s.abs() <= 0.55, "gain beyond Gibbs envelope: {s}");
+        }
     }
 }

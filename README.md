@@ -73,6 +73,7 @@ once (the pre-0.4.0 `std` behavior).
 | `std-mp4` | No | AAC-in-MP4 / ISO-BMFF decoding via Symphonia |
 | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
 | `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
+| `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` (implies `std`) |
 | `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`) |
 | `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
 | `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |

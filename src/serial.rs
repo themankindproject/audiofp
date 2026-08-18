@@ -172,6 +172,15 @@ fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)>
     }
     let hash_count = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
     let fps = f32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]);
+    // Validate the frame rate here (in the header) rather than only in
+    // `read_payload`, so `FingerprintEnvelope::peek` — which stops at the
+    // header — honours its documented contract of rejecting a non-finite /
+    // non-positive frame rate.
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(AfpError::Deserialize(format!(
+            "invalid frame rate in header: {fps} (must be finite and > 0)"
+        )));
+    }
     Ok((alg_id, hash_count, fps))
 }
 
@@ -191,16 +200,19 @@ fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
 }
 
 /// Serialize a Pod hash slice with the standard header into a `Vec<u8>`.
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`. The header stores the hash
+/// count as a `u32`, so a larger slice cannot be represented; silently
+/// truncating the count would produce a corrupt blob. This is unreachable
+/// in practice (billions of hashes) but must fail loudly if it ever occurs.
 fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
     let value_bytes: &[u8] = cast_slice(values);
-    debug_assert!(values.len() <= u32::MAX as usize);
+    let count = u32::try_from(values.len())
+        .expect("fingerprint hash count exceeds u32::MAX and cannot be serialized");
     let mut buf = Vec::with_capacity(HEADER_SIZE + value_bytes.len());
-    write_header(
-        &mut buf,
-        alg_id,
-        values.len().min(u32::MAX as usize) as u32,
-        fps,
-    );
+    write_header(&mut buf, alg_id, count, fps);
     buf.extend_from_slice(value_bytes);
     buf
 }
@@ -210,12 +222,8 @@ fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
 /// Trailing bytes beyond the payload are intentionally ignored (forward
 /// compatibility for envelope extensions).
 fn read_payload<T: bytemuck::Pod>(bytes: &[u8], alg_id: u8, kind: &str) -> Result<(Vec<T>, f32)> {
+    // `read_header` already validates the frame rate (finite and > 0).
     let (_alg, hash_count, fps) = read_header(bytes, Some(alg_id))?;
-    if !fps.is_finite() || fps <= 0.0 {
-        return Err(AfpError::Deserialize(format!(
-            "invalid frame rate in header: {fps} (must be finite and > 0)"
-        )));
-    }
     let payload = &bytes[HEADER_SIZE..];
     let expected_len = (hash_count as usize).checked_mul(core::mem::size_of::<T>());
     let expected_len = expected_len.filter(|&len| payload.len() >= len);
@@ -562,6 +570,30 @@ mod tests {
         bytes[0] = b'X';
         assert!(FingerprintEnvelope::peek(&bytes).is_err());
         assert!(FingerprintEnvelope::peek(&[0u8; 4]).is_err());
+    }
+
+    // Regression (A2/M3): `peek` documents that it rejects a non-finite /
+    // non-positive frame rate, but the check used to live only in
+    // `read_payload` (full parse). `peek` on a NaN/zero-fps blob returned
+    // garbage metadata. Validation now lives in `read_header`, so `peek`
+    // must reject these too.
+    #[test]
+    fn peek_rejects_non_finite_or_non_positive_fps() {
+        for bad_fps in [0.0_f32, -62.5, f32::NAN, f32::INFINITY] {
+            let fp = WangFingerprint {
+                hashes: vec![],
+                frames_per_sec: 62.5,
+            };
+            let mut bytes = fp.to_bytes();
+            // fps is the last 4 header bytes (LE).
+            let fps_bytes = bad_fps.to_le_bytes();
+            bytes[HEADER_SIZE - 4..HEADER_SIZE].copy_from_slice(&fps_bytes);
+            let err = FingerprintEnvelope::peek(&bytes).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid frame rate"),
+                "fps={bad_fps}: {err}"
+            );
+        }
     }
 
     #[test]

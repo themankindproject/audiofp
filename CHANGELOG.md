@@ -310,6 +310,13 @@ cargo build --features std-wav   # codec picker works
   rate, short input, clipping, determinism, empty catalog, no false
   positives), backed by four deterministic audio generators in
   `tests/common/audio_gen.rs`.
+- **`serial_roundtrip` fuzz target (0.4.0 audit).** Exercises the
+  binary serialization layer against untrusted bytes — every public
+  deserializer (`WangFingerprint` / `PanakoFingerprint` /
+  `HaitsmaFingerprint` `from_bytes`, `FingerprintEnvelope::peek`) must
+  return `Ok`/`Err` and never panic — plus roundtrip integrity for all
+  three algorithms and cross-algorithm blob rejection. Registered in
+  `fuzz/Cargo.toml` and the CI fuzz-smoke loop (9 → 10 targets).
 
 ### Changed
 
@@ -323,6 +330,12 @@ cargo build --features std-wav   # codec picker works
 - **`match_best` early-exits** when a reference scores 1.0.
 - **`PanakoMatcher` soft-fails on frame-rate mismatch** instead of
   silently converting offsets with the reference rate.
+- **`wide` pinned to exactly `=1.6.0` (0.4.0 audit).** 1.6.1 (and
+  1.5.0) are broken with `safe_arch` 1.1.0 (missing AVX-512
+  intrinsics); 1.6.0 is yanked upstream but is the only known-good
+  release. A caret requirement would let a fresh downstream
+  `cargo update` resolve to broken 1.6.1 — the exact pin (already
+  allow-listed in `deny.toml`) prevents that.
 
 ### Performance
 - **5.5× faster Haitsma BER computation** — `hamming_at_offset` now
@@ -432,6 +445,16 @@ cargo build --features std-wav   # codec picker works
   `fp` module doc referenced modules that never existed
   (`fp_classical::Wang`, `neural::ResonaFp`); the feature table omitted
   `rayon`; the neural/watermark doc TOML snippets said `version = "0.3"`.
+- **`DecodeLimits::timeout` documents its cooperative nature (0.4.0
+  audit).** The deadline is only checked between packets; time spent
+  inside container probing, a single packet decode, or the resample
+  step is not interruptible, so a pathological stream can still exceed
+  the timeout. The field doc and the check site now say so explicitly
+  and point callers needing a hard wall-clock guarantee at a watchdog
+  thread.
+- **README feature table gained the missing `rayon` row** and
+  **SECURITY.md's supported-versions table now lists 0.4.x** (0.4.0
+  audit).
 
 ### Fixed
 
@@ -543,6 +566,51 @@ cargo build --features std-wav   # codec picker works
 - **Cheap checks before the O(n) finiteness scan** — the neural
   embedder and watermark detector now reject wrong-rate / oversized
   input before scanning every sample for NaN.
+- **`SincResampler` honours the output-length contract on short inputs
+  (0.4.0 audit).** For inputs shorter than the filter width
+  (`2 * half_taps + 1`), the left/middle/right output regions could
+  overlap, so the boundary loops double-emitted samples and `process`
+  returned more than the documented `ceil(n_in * to_sr / from_sr)`
+  outputs (e.g. 48 kHz→8 kHz on 10 samples returned 3 instead of 2;
+  8 kHz→48 kHz on 10 samples returned 119 instead of 60). The region
+  bounds are now clamped into an exact partition of the output range.
+  Long-input behaviour is unchanged. Pinned by length-contract and
+  bounded-gain regression tests.
+- **Decoder rejects a zero sample rate instead of panicking (0.4.0
+  audit).** A malformed container reporting `sample_rate = 0` flowed
+  into `decode_to_mono_at` and panicked inside
+  `SincResampler::new(0, _)`. It now surfaces as an I/O error
+  ("sample rate is zero (malformed container)"). Pinned by a crafted
+  zero-rate WAV regression test.
+- **`decode_to_mono_at_limited` projects the post-resample size before
+  allocating (0.4.0 audit).** The post-resample `max_samples` re-check
+  above ran *after* the upsampled buffer was allocated, so a hostile
+  container claiming a tiny native rate (e.g. 1 Hz → 48 kHz, a
+  48,000× blow-up) could OOM the process before any limit fired. The
+  projected output length is now checked before resampling; the
+  post-resample check remains as a defensive re-verification.
+- **Decoder enforces the sample budget before allocating the conversion
+  buffer (0.4.0 audit).** The `max_samples` check ran after the f32
+  conversion buffer was allocated for the packet, so a malformed packet
+  reporting a huge frame count could blow the memory budget regardless
+  of the limit. The budget is now checked against the decoded frame
+  count first.
+- **`FingerprintEnvelope::peek` rejects corrupt frame rates (0.4.0
+  audit).** The finite-and-positive frame-rate validation lived only in
+  the full-parse path, so `peek` — which stops at the 18-byte header —
+  returned garbage metadata for NaN/zero/negative-fps blobs despite its
+  documented contract. Validation now lives in the shared header read,
+  so `peek` and `from_bytes` enforce it identically.
+- **Serialization fails loudly instead of silently truncating huge hash
+  counts (0.4.0 audit).** `to_bytes` stores the hash count as a `u32`
+  and used to silently clamp larger counts in release builds (only a
+  `debug_assert` guarded it), producing a corrupt blob. It now panics
+  with an explicit message — unreachable in practice (billions of
+  hashes) but no longer silent corruption. Documented in a `# Panics`
+  section.
+- **Timeout error fields use saturating conversions (0.4.0 audit).**
+  `AfpError::Timeout`'s `elapsed_ms` / `limit_ms` are now built with
+  saturating `u128 → u64` conversions instead of truncating `as` casts.
 
 ## [0.3.9] - 2026-08-02
 

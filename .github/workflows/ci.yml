@@ -193,9 +193,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
-      - name: fuzz smoke test (all 9 targets, 30s each)
+      - name: fuzz smoke test (all 10 targets, 30s each)
         run: |
-          for target in streaming_wang_equiv streaming_panako_equiv streaming_haitsma_equiv wang_hash_roundtrip panako_hash_roundtrip haitsma_hash_roundtrip sinc_resampler decode_bytes decode_resample; do
+          for target in streaming_wang_equiv streaming_panako_equiv streaming_haitsma_equiv wang_hash_roundtrip panako_hash_roundtrip haitsma_hash_roundtrip sinc_resampler decode_bytes decode_resample serial_roundtrip; do
             echo "=== Fuzzing $target ==="
             cargo +nightly fuzz run --sanitizer=none "$target" -- -max_total_time=30 -runs=1000
           done
