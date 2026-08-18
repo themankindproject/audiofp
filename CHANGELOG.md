@@ -330,12 +330,15 @@ cargo build --features std-wav   # codec picker works
 - **`match_best` early-exits** when a reference scores 1.0.
 - **`PanakoMatcher` soft-fails on frame-rate mismatch** instead of
   silently converting offsets with the reference rate.
-- **`wide` pinned to exactly `=1.6.0` (0.4.0 audit).** 1.6.1 (and
-  1.5.0) are broken with `safe_arch` 1.1.0 (missing AVX-512
-  intrinsics); 1.6.0 is yanked upstream but is the only known-good
-  release. A caret requirement would let a fresh downstream
-  `cargo update` resolve to broken 1.6.1 — the exact pin (already
-  allow-listed in `deny.toml`) prevents that.
+- **`wide` moved to 1.6.1 with `safe_arch` ≥ 1.2.0 (0.4.0 audit).**
+  The lockfile previously held yanked `wide` 1.6.0 + `safe_arch`
+  1.1.0. 1.6.1 is the current release and builds cleanly with
+  `safe_arch` 1.2.0 (the 1.6.1 + 1.1.0 combo is broken — missing
+  AVX-512 intrinsics — but `wide` declares `safe_arch = "^1.0.0"`, so
+  the lockfile must stay on ≥ 1.2.0; fresh resolves pick 1.2.0
+  automatically). An exact `=1.6.0` pin was evaluated and rejected:
+  pinning a yanked version fails every fresh downstream resolve,
+  including the USAGE.md snippet checker's scratch crate.
 
 ### Performance
 - **5.5× faster Haitsma BER computation** — `hamming_at_offset` now

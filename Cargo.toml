@@ -134,11 +134,12 @@ libm        = "0.2.16"
 num-traits  = { version = "0.2.19", default-features = false }
 num-complex = { version = "0.4.6", default-features = false }
 realfft     = { version = "3.5.0", default-features = false }
-# Pinned to exactly 1.6.0: 1.6.1 (and 1.5.0) are broken with safe_arch 1.1.0
-# (missing AVX-512 intrinsics). 1.6.0 is yanked upstream but is the only
-# known-good release; a caret requirement would let fresh downstream
-# `cargo update` resolve to broken 1.6.1. See deny.toml for the ignore.
-wide        = { version = "=1.6.0", default-features = false }
+# wide 1.6.1 requires safe_arch >= 1.2.0 (1.6.1 + safe_arch 1.1.0 is
+# broken: missing AVX-512 intrinsics). A fresh resolve picks safe_arch
+# 1.2.0 automatically; 1.6.0 is yanked upstream, so it must not be
+# pinned here — an exact pin on a yanked version fails every fresh
+# downstream resolve.
+wide        = { version = "1.6.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive", "extern_crate_alloc"] }
 ahash       = { version = "0.8.11", default-features = false, features = ["compile-time-rng"], optional = true }
 symphonia   = { version = "0.6", default-features = false, optional = true }

@@ -5,10 +5,11 @@ all-features = true
 version = 2
 yanked  = "deny"
 ignore  = [
-    # wide 1.6.0 is yanked but 1.6.1 and 1.5.0 are broken with safe_arch
-    # 1.1.0 (missing AVX-512 intrinsics on CI runners). Pin the yanked
-    # 1.6.0 until upstream publishes a compatible release.
-    { crate = "wide@1.6.0", reason = "1.6.1 broken with safe_arch 1.1.0 (missing AVX-512 fns)" },
+    # wide 1.6.1 is broken with safe_arch 1.1.0 (missing AVX-512
+    # intrinsics) but fine with safe_arch >= 1.2.0. wide declares
+    # `safe_arch = "^1.0.0"`, so a lockfile can land on the broken
+    # combo — keep Cargo.lock on safe_arch >= 1.2.0 (CI builds from
+    # the committed lockfile; fresh resolves pick 1.2.0 automatically).
 ]
 
 [licenses]
