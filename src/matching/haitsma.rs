@@ -206,22 +206,6 @@ fn probe_exact(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&V
     }
 }
 
-// audit C3: coarse-to-fine bounds for the exhaustive BER path. Inputs
-// with `q_len + r_len >= COARSE_TO_FINE_THRESHOLD` total frames run the
-// sampled sweep first; anything smaller keeps the untouched exhaustive
-// scan (identical results to pre-C3 code).
-const COARSE_TO_FINE_THRESHOLD: usize = 4096;
-/// Frames skipped between consecutive probe frames inside one coarse
-/// hamming estimate.
-const COARSE_DELTA_SAMPLE_STRIDE: usize = 8;
-/// Cap on the number of deltas sampled by the coarse sweep.
-const COARSE_MAX_PROBES: usize = 2048;
-/// How many top coarse candidates get full-resolution verification.
-const COARSE_REFINE_CANDIDATES: usize = 8;
-/// Full-resolution refinement window around the best coarse delta,
-/// as a multiple of the coarse stride.
-const COARSE_REFINE_WINDOW: i64 = 2;
-
 /// Configuration for [`HaitsmaMatcher`].
 #[derive(Clone, Debug)]
 pub struct HaitsmaMatchConfig {
@@ -247,25 +231,6 @@ pub struct HaitsmaMatchConfig {
     /// the LUT and exact paths are only guaranteed to agree when a
     /// bit-exact query frame exists at the true offset.
     pub probe_bit_flips: u8,
-    /// Use the coarse-to-fine accelerator on the exact-BER path (audit
-    /// C3). Default false.
-    ///
-    /// When `true` and `query.frames + reference.frames ≥ 4096`, the
-    /// exhaustive O(q·r) delta scan is replaced by a stride-sampled
-    /// sweep over the delta grid, a full-resolution refinement window
-    /// around the best coarse peak, and individual verification of the
-    /// top coarse candidates. For the typical no-match / weak-match
-    /// case this is orders of magnitude faster than the exhaustive
-    /// scan.
-    ///
-    /// **Result caveat:** sampling can miss a needle-in-haystack
-    /// bit-exact alignment that the exhaustive scan would find (a
-    /// self-match whose true delta falls between coarse grid points
-    /// scores ~0.5 on its neighbours). Results are therefore not
-    /// guaranteed to match the exhaustive path. Leave this off unless
-    /// you deliberately disable the LUT on very long references and
-    /// accept the tradeoff.
-    pub coarse_to_fine: bool,
 }
 
 impl Default for HaitsmaMatchConfig {
@@ -275,7 +240,6 @@ impl Default for HaitsmaMatchConfig {
             min_overlap_frames: 256,
             use_lut: true,
             probe_bit_flips: 0,
-            coarse_to_fine: false,
         }
     }
 }
@@ -364,79 +328,13 @@ impl Matcher for HaitsmaMatcher {
 
         // Exact BER path (scan all offsets, ascending delta so
         // BER ties resolve to the smallest offset deterministically).
-        //
-        // audit C3: for very long references the exhaustive scan is
-        // O(q·r·32) over ALL offsets — the early-abort only helps when a
-        // good alignment exists. Inputs at or above
-        // COARSE_TO_FINE_THRESHOLD total frames first run a cheap
-        // sampled sweep over a stride-sampled delta grid, then verify a
-        // narrow full-resolution window around the best coarse peak plus
-        // the top coarse candidates individually. Below the threshold
-        // the scan is exactly the original exhaustive loop, so all
-        // small/medium inputs are bit-identical to before.
         let dmin: i64 = -((q_len as i64).saturating_sub(1));
         let dmax: i64 = (r_len as i64).saturating_sub(1);
 
         let mut best = BestAlignment::new();
 
-        let use_coarse = self.cfg.coarse_to_fine && q_len + r_len >= COARSE_TO_FINE_THRESHOLD;
-        if use_coarse {
-            // ── Coarse sweep: stride-sampled deltas, thinned hamming ──
-            let delta_stride = ((dmax - dmin + 1) as usize / COARSE_MAX_PROBES).max(1) as i64;
-            let mut coarse: Vec<(f64, i64)> = Vec::new(); // (ber, delta)
-            let mut delta = dmin;
-            while delta <= dmax {
-                let overlap = overlap_at(q_len, r_len, delta);
-                if overlap >= min_overlap {
-                    let (q_off, r_off) = if delta >= 0 {
-                        (0usize, delta as usize)
-                    } else {
-                        ((-delta) as usize, 0usize)
-                    };
-                    // Hamming over every COARSE_DELTA_SAMPLE_STRIDE-th
-                    // frame of the overlap — a cheap rate estimate.
-                    let mut h: u64 = 0;
-                    let mut n_sampled: usize = 0;
-                    let mut f = 0usize;
-                    while f < overlap {
-                        h += (q_frames[q_off + f] ^ r_frames[r_off + f]).count_ones() as u64;
-                        n_sampled += 1;
-                        f += COARSE_DELTA_SAMPLE_STRIDE;
-                    }
-                    let ber = h as f64 / (n_sampled.max(1) * 32) as f64;
-                    coarse.push((ber, delta));
-                }
-                delta += delta_stride;
-            }
-            if coarse.is_empty() {
-                return MatchResult::NONE;
-            }
-            coarse.sort_unstable_by(|a, b| {
-                a.0.partial_cmp(&b.0)
-                    .unwrap_or(core::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-
-            // ── Refine: full-resolution window around the best coarse
-            //     peak, then the remaining top candidates. ──
-            let best_delta = coarse[0].1;
-            let win = delta_stride * COARSE_REFINE_WINDOW;
-            let lo = (best_delta - win).max(dmin);
-            let hi = (best_delta + win).min(dmax);
-            for delta in lo..=hi {
-                best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-            }
-            for &(_, delta) in coarse.iter().take(COARSE_REFINE_CANDIDATES) {
-                if delta < lo || delta > hi {
-                    best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-                }
-            }
-        } else {
-            // Exhaustive scan (unchanged) for anything below the
-            // threshold: identical results to pre-C3 behaviour.
-            for delta in dmin..=dmax {
-                best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-            }
+        for delta in dmin..=dmax {
+            best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
         }
 
         if !best.found() {
@@ -604,7 +502,6 @@ mod tests {
         // flips and is covered by its own tests).
         let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
             use_lut: false,
-            coarse_to_fine: true,
             ..Default::default()
         });
         let res = m.match_one(&query, &reference);
@@ -630,7 +527,6 @@ mod tests {
         assert_eq!(c.min_overlap_frames, 256);
         assert!(c.use_lut);
         assert_eq!(c.probe_bit_flips, 0);
-        assert!(!c.coarse_to_fine, "coarse-to-fine must be opt-in");
     }
 
     #[test]
@@ -897,99 +793,6 @@ mod tests {
                 true_result.prominence
             );
         }
-    }
-
-    // ── Coarse-to-fine path (audit C3) ──
-    //
-    // Only inputs with q_len + r_len >= COARSE_TO_FINE_THRESHOLD (4096)
-    // exercise the sampled sweep + refinement; everything below keeps the
-    // exhaustive scan, so the tests above are unchanged pre-C3 behaviour.
-
-    #[test]
-    fn coarse_path_recovers_true_offset_on_long_reference() {
-        let ref_len = 4000usize;
-        let query_len = 3000usize;
-        assert!(ref_len + query_len >= super::COARSE_TO_FINE_THRESHOLD);
-
-        let mut rng = XorShift(0xC0A5_E5ED);
-        let reference: Vec<u32> = (0..ref_len).map(|_| rng.next() | 1).collect();
-        // True delta 496 is ON the coarse grid (stride 3: dmin = -2999,
-        // 496 + 2999 = 3495 ≡ 0 mod 3), so the sampled sweep sees the
-        // low-BER spike and the refinement window recovers it exactly.
-        let query = flip_bits(&reference[496..496 + query_len], 4, &mut rng);
-
-        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
-            use_lut: false,
-            coarse_to_fine: true,
-            ..Default::default()
-        });
-        let res = m.match_one(&make_fp(&query), &make_fp(&reference));
-        assert!(res.is_match, "coarse path must find the true alignment");
-        assert_eq!(
-            res.offset.frames, 496,
-            "coarse path must recover delta +496, got {}",
-            res.offset.frames
-        );
-        assert!(
-            res.score > 0.90 && res.score < 0.98,
-            "score {} should reflect BER ≈ 0.04",
-            res.score
-        );
-    }
-
-    #[test]
-    fn coarse_path_self_match_is_perfect() {
-        // n = 4097 keeps the true delta (0) ON the coarse grid: stride =
-        // (2n - 1) / 2048 = 4 and dmin = -4096 ≡ 0 mod 4.
-        let n = 4097usize;
-        assert!(2 * n >= super::COARSE_TO_FINE_THRESHOLD);
-        let frames: Vec<u32> = (0..n)
-            .map(|i| (i as u32).wrapping_mul(2_654_435_761))
-            .collect();
-        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
-            use_lut: false,
-            coarse_to_fine: true,
-            ..Default::default()
-        });
-        let res = m.match_one(&make_fp(&frames), &make_fp(&frames));
-        assert!(res.is_match, "long self-match must be positive");
-        assert!((res.score - 1.0).abs() < 0.001, "BER must be ~0");
-        assert_eq!(res.offset.frames, 0);
-    }
-
-    #[test]
-    fn coarse_path_no_match_on_unrelated_long_reference() {
-        let mut rng = XorShift(0xDEADBEEF);
-        let q: Vec<u32> = (0..3000).map(|_| rng.next() | 1).collect();
-        let r: Vec<u32> = (0..4000).map(|_| rng.next() | 1).collect();
-        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
-            use_lut: false,
-            coarse_to_fine: true,
-            ..Default::default()
-        });
-        let res = m.match_one(&make_fp(&q), &make_fp(&r));
-        // Random-vs-random BER ≈ 0.5 >> max_ber 0.35.
-        assert!(!res.is_match);
-    }
-
-    #[test]
-    fn coarse_path_is_deterministic() {
-        let ref_len = 5000usize;
-        let query_len = 3000usize;
-        let mut rng = XorShift(0x5EED_CAFE);
-        let reference: Vec<u32> = (0..ref_len).map(|_| rng.next() | 1).collect();
-        let query = flip_bits(&reference[1000..1000 + query_len], 3, &mut rng);
-
-        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
-            use_lut: false,
-            coarse_to_fine: true,
-            ..Default::default()
-        });
-        let a = m.match_one(&make_fp(&query), &make_fp(&reference));
-        let b = m.match_one(&make_fp(&query), &make_fp(&reference));
-        assert_eq!(a, b, "coarse path must be deterministic");
-        assert!(a.is_match);
-        assert_eq!(a.offset.frames, 1000);
     }
 
     /// Trivial xorshift32 for test reproducibility (no dependency, no_std safe).
