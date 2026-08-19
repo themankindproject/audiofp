@@ -143,9 +143,9 @@ where
 ///
 /// Every reference is scored in parallel and the results are returned
 /// sorted by descending score (ties broken by descending prominence).
-/// `rayon`'s ordered collect preserves the reference order, and the
-/// stable sort keeps ties in reference order, so the output is
-/// element-for-element identical to the sequential [`match_ranked`].
+/// `rayon`'s ordered collect preserves the reference order, and
+/// [`Vec::sort_by`] is stable, so the output is element-for-element
+/// identical to the sequential [`match_ranked`].
 ///
 /// # Panics
 ///

@@ -10,9 +10,11 @@ use std::hint::black_box;
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
 use audiofp::classical::{Haitsma, Panako, Wang, WangFingerprint};
+#[cfg(feature = "rayon")]
+use audiofp::matching::par_match_ranked;
 use audiofp::matching::{
     HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangIndex,
-    WangMatchConfig, WangMatcher, WangRefIndex,
+    WangMatchConfig, WangMatcher, WangRefIndex, match_ranked,
 };
 
 fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
@@ -175,6 +177,24 @@ fn bench_wang_index(c: &mut Criterion) {
     g.throughput(Throughput::Elements(catalog.len() as u64));
     g.bench_function("n100_query", |b| {
         b.iter(|| black_box(index.query(black_box(&query), black_box(&cfg))));
+    });
+    g.finish();
+
+    // audit C5: sequential vs rayon-parallel 1:N ranking on the same
+    // catalog (bench compiles without the feature; the par case is
+    // cfg'd out). Requires `cargo bench --features rayon`.
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let mut g = c.benchmark_group("matching/wang_ranked_n100");
+    g.bench_function("sequential", |b| {
+        b.iter(|| {
+            black_box(match_ranked(&matcher, &query, &catalog));
+        });
+    });
+    #[cfg(feature = "rayon")]
+    g.bench_function("parallel", |b| {
+        b.iter(|| {
+            black_box(par_match_ranked(&matcher, &query, &catalog));
+        });
     });
     g.finish();
 }
