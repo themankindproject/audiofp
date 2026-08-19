@@ -63,6 +63,70 @@ impl Default for WangMatchConfig {
     }
 }
 
+/// Prebuilt single-reference index for [`WangMatcher`].
+///
+/// [`WangMatcher::match_one`] rebuilds the reference's inverted index on
+/// **every call** (`SortedPostings::build` is O(R log R) per match —
+/// audit C1). When the same reference is matched repeatedly (batch 1:1,
+/// query loops against a fixed catalog, streaming identification), build
+/// the [`WangRefIndex`] once and call
+/// [`WangMatcher::match_one_prebuilt`]; the per-query cost then drops to
+/// the pure O(Q log U + range) voting pass, and the index applies the
+/// same stop-hash filter the 1:1 path would.
+///
+/// The two entry points are guaranteed to agree: `match_one` is defined
+/// as build-then-`match_one_prebuilt`, so results are identical by
+/// construction.
+///
+/// ```ignore
+/// let index = WangRefIndex::build(&reference, cfg).unwrap();
+/// let m = matcher.match_one_prebuilt(&query, &index);
+/// ```
+pub struct WangRefIndex {
+    postings: SortedPostings,
+    r_max: i64,
+    frames_per_sec: f32,
+    hash_count: usize,
+}
+
+impl WangRefIndex {
+    /// Build the index for `reference` using the stop-hash policy from
+    /// `cfg` (`max_postings_per_hash`). Returns `None` when the reference
+    /// has no hashes or every hash is filtered out — the same conditions
+    /// under which `match_one` returns [`MatchResult::NONE`].
+    #[must_use]
+    pub fn build(reference: &WangFingerprint, cfg: &WangMatchConfig) -> Option<Self> {
+        if reference.hashes.is_empty() {
+            return None;
+        }
+        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
+            .hashes
+            .iter()
+            .map(|h| (h.hash, h.t_anchor))
+            .collect();
+        let postings = SortedPostings::build(&r_hashes, cfg.max_postings_per_hash)?;
+        let r_max = r_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
+        Some(Self {
+            postings,
+            r_max,
+            frames_per_sec: reference.frames_per_sec,
+            hash_count: reference.hashes.len(),
+        })
+    }
+
+    /// Number of hashes in the (unfiltered) reference fingerprint.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hash_count
+    }
+
+    /// `true` when the reference fingerprint was empty / non-matchable.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hash_count == 0
+    }
+}
+
 /// Offline 1:1 Wang matcher (Shazam-style offset-histogram voter).
 pub struct WangMatcher {
     cfg: WangMatchConfig,
@@ -90,25 +154,47 @@ impl Matcher for WangMatcher {
             return MatchResult::NONE;
         }
 
-        let cfg = &self.cfg;
-
-        // --- 1. Index the reference (sorted flat arrays, zero per-hash allocs) ---
-        let q_hashes: alloc::vec::Vec<(u32, u32)> =
-            query.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
-        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
-            .hashes
-            .iter()
-            .map(|h| (h.hash, h.t_anchor))
-            .collect();
-        let index = match SortedPostings::build(&r_hashes, cfg.max_postings_per_hash) {
-            Some(sp) => sp,
+        // audit C1: the prebuilt index path and the 1:1 path must agree;
+        // `match_one` is exactly build-then-`match_one_prebuilt`.
+        let index = match WangRefIndex::build(reference, &self.cfg) {
+            Some(index) => index,
             None => return MatchResult::NONE,
         };
+        self.match_one_prebuilt(query, &index)
+    }
+}
+
+impl WangMatcher {
+    /// Match `query` against a reference whose index was built once
+    /// (`WangRefIndex::build`), skipping the per-call O(R log R) index
+    /// rebuild (audit C1).
+    ///
+    /// Produces exactly the [`Matcher::match_one`] result for the same
+    /// query/reference pair.
+    #[must_use]
+    pub fn match_one_prebuilt(
+        &self,
+        query: &WangFingerprint,
+        reference: &WangRefIndex,
+    ) -> MatchResult {
+        // Soft-fail on fps mismatch in all builds (audit 67-5).
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
+            return MatchResult::NONE;
+        }
+
+        if query.hashes.is_empty() || reference.is_empty() {
+            return MatchResult::NONE;
+        }
+
+        let cfg = &self.cfg;
+        let index = &reference.postings;
 
         // --- 2. Vote into dense offset histogram ---
         // δ = t_ref − t_query ∈ [−q_max, r_max]
+        let q_hashes: alloc::vec::Vec<(u32, u32)> =
+            query.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
         let q_max = q_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
-        let r_max = r_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
+        let r_max = reference.r_max;
 
         let dmin: i64 = -q_max;
         let dmax: i64 = r_max;
@@ -437,6 +523,131 @@ mod tests {
             result.is_match,
             "jittered votes should consolidate: {:?}",
             result
+        );
+    }
+
+    // ── WangRefIndex (audit C1) ──
+    //
+    // `match_one_prebuilt` must agree with `match_one` for every query /
+    // reference pair and configuration, and reusing one built index
+    // across queries must stay deterministic.
+
+    fn parity_cases() -> alloc::vec::Vec<(
+        WangFingerprint,
+        WangFingerprint,
+        WangMatchConfig,
+        &'static str,
+    )> {
+        alloc::vec![
+            (
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                WangMatchConfig::default(),
+                "self match",
+            ),
+            (
+                make_fp(&[100, 200, 300, 400, 500, 600, 700, 800], 0),
+                make_fp(&[150, 250, 350, 450, 550, 650, 750, 850], 0),
+                WangMatchConfig::default(),
+                "positive offset",
+            ),
+            (
+                make_fp(&[150, 250, 350, 450, 550, 650, 750, 850], 0),
+                make_fp(&[100, 200, 300, 400, 500, 600, 700, 800], 0),
+                WangMatchConfig::default(),
+                "negative offset",
+            ),
+            (
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 1000),
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                WangMatchConfig::default(),
+                "unrelated hashes",
+            ),
+            (
+                make_fp(&[10, 20, 30, 40, 50], 0),
+                make_fp(&[10, 20, 30, 40, 50], 0),
+                WangMatchConfig {
+                    max_postings_per_hash: 1,
+                    min_votes: 3,
+                    min_prominence: 2.0,
+                    ..Default::default()
+                },
+                "stop-hash filtered",
+            ),
+            (
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                WangMatchConfig {
+                    offset_tolerance_frames: 0,
+                    ..Default::default()
+                },
+                "zero tolerance",
+            ),
+        ]
+    }
+
+    #[test]
+    fn prebuilt_matches_one_to_one_for_all_cases() {
+        for (query, reference, cfg, name) in parity_cases() {
+            let matcher = WangMatcher::new(cfg.clone());
+            let direct = matcher.match_one(&query, &reference);
+            let index = WangRefIndex::build(&reference, &cfg)
+                .expect("reference with hashes must build an index");
+            let prebuilt = matcher.match_one_prebuilt(&query, &index);
+            assert_eq!(
+                direct, prebuilt,
+                "match_one_prebuilt diverged from match_one for case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn prebuilt_reuse_across_queries_is_deterministic() {
+        let reference = make_fp(&[100, 200, 300, 400, 500, 600, 700, 800], 0);
+        let cfg = WangMatchConfig::default();
+        let matcher = WangMatcher::new(cfg.clone());
+        let index = WangRefIndex::build(&reference, &cfg).unwrap();
+
+        for query in [10u32, 60, 110, 160, 210] {
+            let q = make_fp(&[query, query + 100, query + 200, query + 300], 0);
+            // Same query → same result, no matter how many times the
+            // index has been reused.
+            let a = matcher.match_one_prebuilt(&q, &index);
+            let b = matcher.match_one_prebuilt(&q, &index);
+            assert_eq!(a, b, "prebuilt matching must be deterministic");
+            let c = matcher.match_one(&q, &reference);
+            assert_eq!(a, c, "prebuilt must equal the 1:1 path");
+        }
+    }
+
+    #[test]
+    fn prebuilt_handles_empty_and_fps_mismatch() {
+        let cfg = WangMatchConfig::default();
+        let matcher = WangMatcher::new(cfg.clone());
+        let empty = WangFingerprint {
+            hashes: alloc::vec![],
+            frames_per_sec: 62.5,
+        };
+        assert!(WangRefIndex::build(&empty, &cfg).is_none());
+
+        let reference = make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        let index = WangRefIndex::build(&reference, &cfg).unwrap();
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 8);
+
+        // fps mismatch → NONE even with a prebuilt index.
+        let mismatched = WangFingerprint {
+            hashes: reference.hashes.clone(),
+            frames_per_sec: 31.25,
+        };
+        assert_eq!(
+            matcher.match_one_prebuilt(&mismatched, &index),
+            MatchResult::NONE
+        );
+        // Empty query → NONE.
+        assert_eq!(
+            matcher.match_one_prebuilt(&empty, &index),
+            MatchResult::NONE
         );
     }
 }
