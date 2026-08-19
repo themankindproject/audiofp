@@ -77,10 +77,16 @@ impl Default for WangMatchConfig {
 /// The two entry points are guaranteed to agree: `match_one` is defined
 /// as build-then-`match_one_prebuilt`, so results are identical by
 /// construction.
+///
+/// ```ignore
+/// let index = WangRefIndex::build(&reference, cfg).unwrap();
+/// let m = matcher.match_one_prebuilt(&query, &index);
+/// ```
 pub struct WangRefIndex {
     postings: SortedPostings,
     r_max: i64,
     frames_per_sec: f32,
+    hash_count: usize,
 }
 
 impl WangRefIndex {
@@ -104,7 +110,20 @@ impl WangRefIndex {
             postings,
             r_max,
             frames_per_sec: reference.frames_per_sec,
+            hash_count: reference.hashes.len(),
         })
+    }
+
+    /// Number of hashes in the (unfiltered) reference fingerprint.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hash_count
+    }
+
+    /// `true` when the reference fingerprint was empty / non-matchable.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hash_count == 0
     }
 }
 
@@ -163,7 +182,7 @@ impl WangMatcher {
             return MatchResult::NONE;
         }
 
-        if query.hashes.is_empty() {
+        if query.hashes.is_empty() || reference.is_empty() {
             return MatchResult::NONE;
         }
 
@@ -544,6 +563,26 @@ mod tests {
                 WangMatchConfig::default(),
                 "unrelated hashes",
             ),
+            (
+                make_fp(&[10, 20, 30, 40, 50], 0),
+                make_fp(&[10, 20, 30, 40, 50], 0),
+                WangMatchConfig {
+                    max_postings_per_hash: 1,
+                    min_votes: 3,
+                    min_prominence: 2.0,
+                    ..Default::default()
+                },
+                "stop-hash filtered",
+            ),
+            (
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0),
+                WangMatchConfig {
+                    offset_tolerance_frames: 0,
+                    ..Default::default()
+                },
+                "zero tolerance",
+            ),
         ]
     }
 
@@ -592,8 +631,9 @@ mod tests {
         assert!(WangRefIndex::build(&empty, &cfg).is_none());
 
         let reference = make_fp(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
-        let index = WangRefIndex::build(&reference, &cfg)
-            .expect("reference with hashes must build an index");
+        let index = WangRefIndex::build(&reference, &cfg).unwrap();
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 8);
 
         // fps mismatch → NONE even with a prebuilt index.
         let mismatched = WangFingerprint {
