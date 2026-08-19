@@ -113,7 +113,9 @@ neural = ["std", "dep:tract-onnx"]
 # AudioSeal-compatible watermark detector. Requires std.
 watermark = ["std", "dep:tract-onnx"]
 
-# Multi-threaded batch fingerprinting via rayon. Requires std.
+# Multi-threaded batch fingerprinting via rayon, plus the
+# parallel matcher entry points par_match_best / par_match_ranked.
+# Requires std.
 rayon = ["std", "dep:rayon"]
 
 # Install mimalloc as the process-wide #[global_allocator]. Requires std.
