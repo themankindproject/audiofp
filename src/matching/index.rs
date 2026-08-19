@@ -9,11 +9,15 @@
 //! # Parallel / large 1:N
 //!
 //! [`match_best`] and [`match_ranked`] are sequential pairwise loops.
-//! Matching itself has **no** `rayon` path — the `rayon` feature only
-//! parallelises batch *fingerprinting* (`fingerprint_batch_parallel`).
-//! For large catalogs, prefer the in-memory index types
-//! ([`WangIndex`], [`HaitsmaIndex`], [`PanakoIndex`]) which amortise one
-//! inverted-index build across many queries.
+//! With the `rayon` feature, [`par_match_best`] and [`par_match_ranked`]
+//! evaluate every reference in parallel and return **deterministically
+//! identical** results to their sequential counterparts (ties resolve to
+//! the lowest reference id; ranking order is preserved). The `rayon`
+//! feature also parallelises batch *fingerprinting*
+//! (`fingerprint_batch_parallel`). For very large catalogs, prefer the
+//! in-memory index types ([`WangIndex`], [`HaitsmaIndex`],
+//! [`PanakoIndex`]) which amortise one inverted-index build across many
+//! queries.
 
 use crate::matching::{MatchResult, Matcher};
 
@@ -91,6 +95,76 @@ pub fn match_ranked<M: Matcher>(
 ) -> Vec<(usize, MatchResult)> {
     let mut results: Vec<(usize, MatchResult)> = refs
         .iter()
+        .enumerate()
+        .map(|(i, r)| (i, matcher.match_one(query, r)))
+        .collect();
+    results.sort_by(|a, b| crate::matching::match_result_compare_desc(&a.1, &b.1));
+    results
+}
+
+/// Rayon-parallel [`match_best`] (requires the `rayon` feature, audit
+/// C5).
+///
+/// Every reference is scored in parallel, then the best match is picked
+/// deterministically: higher score, then higher prominence, then the
+/// lowest reference id — identical to the sequential scan (which keeps
+/// the first-encountered winner on ties, i.e. the lowest id, since it
+/// iterates ascending). There is no perfect-score early exit, so very
+/// large catalogs with an early 1.0 hit may run slightly longer than
+/// the sequential version.
+///
+/// # Panics
+///
+/// Panics if the rayon thread pool panics while scoring references.
+#[cfg(feature = "rayon")]
+#[must_use]
+pub fn par_match_best<M>(
+    matcher: &M,
+    query: &M::Fingerprint,
+    refs: &[M::Fingerprint],
+) -> Option<(usize, MatchResult)>
+where
+    M: Matcher + Sync,
+    M::Fingerprint: Sync,
+{
+    use rayon::prelude::*;
+
+    refs.par_iter()
+        .enumerate()
+        .map(|(i, r)| (i, matcher.match_one(query, r)))
+        .filter(|(_, res)| res.is_match)
+        .min_by(|(ia, a), (ib, b)| {
+            crate::matching::match_result_compare_desc(a, b).then_with(|| ia.cmp(ib))
+        })
+}
+
+/// Rayon-parallel [`match_ranked`] (requires the `rayon` feature, audit
+/// C5).
+///
+/// Every reference is scored in parallel and the results are returned
+/// sorted by descending score (ties broken by descending prominence).
+/// `rayon`'s ordered collect preserves the reference order, and the
+/// stable sort keeps ties in reference order, so the output is
+/// element-for-element identical to the sequential [`match_ranked`].
+///
+/// # Panics
+///
+/// Panics if the rayon thread pool panics while scoring references.
+#[cfg(feature = "rayon")]
+#[must_use]
+pub fn par_match_ranked<M>(
+    matcher: &M,
+    query: &M::Fingerprint,
+    refs: &[M::Fingerprint],
+) -> Vec<(usize, MatchResult)>
+where
+    M: Matcher + Sync,
+    M::Fingerprint: Sync,
+{
+    use rayon::prelude::*;
+
+    let mut results: Vec<(usize, MatchResult)> = refs
+        .par_iter()
         .enumerate()
         .map(|(i, r)| (i, matcher.match_one(query, r)))
         .collect();
@@ -909,6 +983,100 @@ mod tests {
     use crate::matching::{HaitsmaMatchConfig, PanakoMatchConfig, WangMatchConfig, WangMatcher};
 
     // --- match_best / match_ranked ---
+
+    // ── Rayon parallel matching (audit C5) ──
+    //
+    // par_match_best / par_match_ranked must produce results identical
+    // to their sequential counterparts, including deterministic tie
+    // resolution (lowest ref id) and preserved ranking order.
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn par_match_ranked_equals_sequential() {
+        let cfg = WangMatchConfig {
+            min_votes: 0,
+            min_score: -1.0,
+            min_prominence: -1.0,
+            ..Default::default()
+        };
+        let matcher = WangMatcher::new(cfg);
+        let query = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        // Distinct scores per ref: each ref shares more anchors with the
+        // query as the offset grows.
+        let refs: Vec<WangFingerprint> = (0..64u32)
+            .map(|i| {
+                let mut anchors: Vec<u32> = (0..(8u32 + i % 9)).map(|k| 10 + k * 10).collect();
+                anchors.extend((1000..1000 + i * 13).map(|t| t % 5000));
+                mk(&anchors, 1)
+            })
+            .collect();
+
+        let seq = match_ranked(&matcher, &query, &refs);
+        let par = par_match_ranked(&matcher, &query, &refs);
+        assert_eq!(par, seq, "parallel ranking must match sequential exactly");
+        assert_eq!(par.len(), refs.len());
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn par_match_best_equals_sequential() {
+        let cfg = WangMatchConfig {
+            min_votes: 0,
+            min_score: -1.0,
+            min_prominence: -1.0,
+            ..Default::default()
+        };
+        let matcher = WangMatcher::new(cfg);
+        let query = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        let refs: Vec<WangFingerprint> = (0..64u32)
+            .map(|i| {
+                let mut anchors: Vec<u32> = (0..(8u32 + i % 9)).map(|k| 10 + k * 10).collect();
+                anchors.extend((1000..1000 + i * 13).map(|t| t % 5000));
+                mk(&anchors, 1)
+            })
+            .collect();
+
+        let seq = match_best(&matcher, &query, &refs);
+        let par = par_match_best(&matcher, &query, &refs);
+        assert_eq!(par, seq, "parallel best must match sequential exactly");
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn par_match_best_tie_resolves_to_lowest_ref_id() {
+        let cfg = WangMatchConfig {
+            min_votes: 0,
+            min_score: -1.0,
+            min_prominence: -1.0,
+            ..Default::default()
+        };
+        let matcher = WangMatcher::new(cfg);
+        let fp = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        let refs = alloc::vec![fp.clone(), fp.clone(), fp.clone()];
+        for _ in 0..8 {
+            let (id, res) =
+                par_match_best(&matcher, &fp, &refs).expect("identical references must match");
+            assert_eq!(id, 0, "perfect-score tie must resolve to ref 0");
+            assert!(res.is_match);
+        }
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn par_match_empty_and_no_match() {
+        let cfg = WangMatchConfig::default();
+        let matcher = WangMatcher::new(cfg);
+        let fp = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 0);
+        assert!(par_match_best(&matcher, &fp, &[]).is_none());
+        assert!(par_match_ranked(&matcher, &fp, &[]).is_empty());
+
+        // No reference matches (unrelated hashes) → best is None and
+        // ranked returns only non-matches.
+        let unrelated = mk(&[10, 20, 30, 40, 50, 60, 70, 80], 9_000);
+        let refs = alloc::vec![mk(&[10, 20, 30, 40, 50, 60, 70, 80], 5_000)];
+        assert!(par_match_best(&matcher, &unrelated, &refs).is_none());
+        assert_eq!(par_match_ranked(&matcher, &unrelated, &refs).len(), 1);
+    }
 
     #[test]
     fn match_ranked_empty_refs() {

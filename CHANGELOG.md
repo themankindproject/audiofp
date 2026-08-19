@@ -317,6 +317,20 @@ cargo build --features std-wav   # codec picker works
   return `Ok`/`Err` and never panic — plus roundtrip integrity for all
   three algorithms and cross-algorithm blob rejection. Registered in
   `fuzz/Cargo.toml` and the CI fuzz-smoke loop (9 → 10 targets).
+- **`WangRefIndex` — prebuilt single-reference Wang index (audit C1).**
+  Builds a reference's inverted index once (stop-hash filtered per
+  `WangMatchConfig`); repeated matching against the same reference via
+  `WangMatcher::match_one_prebuilt` skips the per-call O(R log R)
+  `SortedPostings::build`. `Matcher::match_one` is defined as
+  build-then-`match_one_prebuilt`, so both paths agree by construction
+  (pinned by parity tests).
+- **`par_match_best` / `par_match_ranked` (rayon, audit C5).**
+  Rayon-parallel counterparts of `match_best` / `match_ranked` under
+  the existing `rayon` feature. Deterministic: results are identical to
+  the sequential entry points — `par_match_best` breaks exact ties by
+  lowest reference id (matching the sequential first-wins scan),
+  `par_match_ranked` preserves order via rayon's ordered collect + a
+  stable sort. No perfect-score early exit in the parallel best scan.
 
 ### Changed
 
@@ -421,6 +435,22 @@ cargo build --features std-wav   # codec picker works
   overwrote it with `copy_from_slice`; it now builds the `Vec<T>` with
   a single copy via `bytemuck::pod_collect_to_vec` (bytemuck's
   `extern_crate_alloc` feature).
+- **Prebuilt Wang 1:1 matching (audit C1)** — `WangRefIndex` removes
+  the per-call `SortedPostings::build` (O(R log R)) from repeated
+  matching against a fixed reference. Criterion, 20 queries vs one
+  5 s reference: 1.71 ms → 585 µs (**~2.9×**).
+- **Ring-buffered streaming spectrogram window (audit C2)** — the
+  rolling log-power window no longer memmoves its full contents one
+  row down at every frame past capacity; rows are addressed logically
+  (`spec_tail + row` mod capacity), so the shift is O(1) and no data
+  moves. Purely a layout change — streaming output is bit-identical
+  (pinned by the offline-equivalence / chunk-size / flush-idempotency /
+  property / real-audio suites) and memory traffic on long streams is
+  bounded.
+- **Rayon-parallel 1:N matching (audit C5)** — `par_match_best` /
+  `par_match_ranked` score references in parallel with results
+  identical to the sequential scans. Criterion, Wang ranking of 100
+  references: 4.95 ms → 1.16 ms (**~4.3×**).
 
 ### Documentation
 

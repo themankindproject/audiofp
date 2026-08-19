@@ -10,9 +10,11 @@ use std::hint::black_box;
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
 use audiofp::classical::{Haitsma, Panako, Wang, WangFingerprint};
+#[cfg(feature = "rayon")]
+use audiofp::matching::par_match_ranked;
 use audiofp::matching::{
     HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoMatchConfig, PanakoMatcher, WangIndex,
-    WangMatchConfig, WangMatcher,
+    WangMatchConfig, WangMatcher, WangRefIndex, match_ranked,
 };
 
 fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
@@ -46,11 +48,37 @@ fn bench_wang_one(c: &mut Criterion) {
     let query = wang_fp(1, 5);
     let reference = query.clone();
     let matcher = WangMatcher::new(WangMatchConfig::default());
+    let index = WangRefIndex::build(&reference, &WangMatchConfig::default()).unwrap();
 
     let mut g = c.benchmark_group("matching/wang_1to1");
     g.throughput(Throughput::Elements(query.hashes.len() as u64));
     g.bench_function("self_match_5s", |b| {
         b.iter(|| black_box(matcher.match_one(black_box(&query), black_box(&reference))));
+    });
+    // audit C1: same operation with a prebuilt reference index — the
+    // per-call O(R log R) `SortedPostings::build` is paid once up front.
+    g.bench_function("self_match_5s_prebuilt", |b| {
+        b.iter(|| black_box(matcher.match_one_prebuilt(black_box(&query), black_box(&index))));
+    });
+    g.finish();
+
+    // Repeated single-reference matching against fixed audio: the exact
+    // 1:1 use case C1 optimises.
+    let queries: Vec<WangFingerprint> = (1..20u32).map(|i| wang_fp(100 + i, 5)).collect();
+    let mut g = c.benchmark_group("matching/wang_1to1_reuse");
+    g.bench_function("20_queries_vs_one_ref", |b| {
+        b.iter(|| {
+            for q in &queries {
+                black_box(matcher.match_one(black_box(q), black_box(&reference)));
+            }
+        });
+    });
+    g.bench_function("20_queries_vs_one_ref_prebuilt", |b| {
+        b.iter(|| {
+            for q in &queries {
+                black_box(matcher.match_one_prebuilt(black_box(q), black_box(&index)));
+            }
+        });
     });
     g.finish();
 }
@@ -105,6 +133,24 @@ fn bench_wang_index(c: &mut Criterion) {
     g.throughput(Throughput::Elements(catalog.len() as u64));
     g.bench_function("n100_query", |b| {
         b.iter(|| black_box(index.query(black_box(&query), black_box(&cfg))));
+    });
+    g.finish();
+
+    // audit C5: sequential vs rayon-parallel 1:N ranking on the same
+    // catalog (bench compiles without the feature; the par case is
+    // cfg'd out). Requires `cargo bench --features rayon`.
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let mut g = c.benchmark_group("matching/wang_ranked_n100");
+    g.bench_function("sequential", |b| {
+        b.iter(|| {
+            black_box(match_ranked(&matcher, &query, &catalog));
+        });
+    });
+    #[cfg(feature = "rayon")]
+    g.bench_function("parallel", |b| {
+        b.iter(|| {
+            black_box(par_match_ranked(&matcher, &query, &catalog));
+        });
     });
     g.finish();
 }

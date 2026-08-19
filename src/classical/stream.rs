@@ -62,10 +62,20 @@ pub(crate) struct StreamCore<F> {
     pub(crate) stft: ShortTimeFFT,
     pub(crate) sample_carry: Vec<f32>,
 
-    // Rolling log-power spectrogram window (contiguous, row-major).
+    // Rolling log-power spectrogram window (ring buffer, row-major).
+    //
+    // audit C2: `append_frame_scratch_row` used to memmove the whole
+    // window down one row at every frame past capacity (~4 MB/s of
+    // `copy_within` at 62.5 fps for Wang's 31×513×4B window). The buffer
+    // is now a ring of rows: the new row overwrites the oldest, and rows
+    // are addressed logically (`spec_tail + row` mod capacity) so there
+    // is no data movement at all. Each row stays contiguous in memory,
+    // so the bin loops are unchanged apart from the base offset.
     pub(crate) spec: Vec<f32>,
     pub(crate) spec_n_rows: usize,
     pub(crate) spec_n_bins: usize,
+    /// Ring index of the logical row 0 (the oldest row in `spec`).
+    pub(crate) spec_tail: usize,
     pub(crate) spec_first_frame: u32,
 
     pub(crate) n_frames_total: u32,
@@ -120,6 +130,7 @@ impl<F> StreamCore<F> {
             spec: vec![0.0_f32; window_capacity * n_bins],
             spec_n_rows: 0,
             spec_n_bins: n_bins,
+            spec_tail: 0,
             spec_first_frame: 0,
             n_frames_total: 0,
             last_pd_frame: -1,
@@ -144,6 +155,7 @@ impl<F> StreamCore<F> {
         self.sample_carry.clear();
         self.peak_det.reset();
         self.spec_n_rows = 0;
+        self.spec_tail = 0;
         self.spec_first_frame = 0;
         self.n_frames_total = 0;
         self.last_pd_frame = -1;
@@ -154,22 +166,41 @@ impl<F> StreamCore<F> {
         self.emitted.clear();
     }
 
-    /// Append `self.frame_scratch` to the rolling spec buffer, dropping
-    /// the oldest row if at capacity. Avoids the per-frame `Vec::clone`.
+    /// Capacity of the spec ring buffer, in rows.
+    #[inline]
+    fn spec_capacity(&self) -> usize {
+        2 * self.neighborhood + 1
+    }
+
+    /// Base offset of logical row `row` (0 = oldest) inside `spec`.
+    ///
+    /// Rows live at contiguous `n_bins`-long slots addressed by
+    /// `(spec_tail + row) % capacity`; no data movement ever occurs,
+    /// even when the ring wraps (audit C2).
+    #[inline]
+    fn spec_row_base(&self, row: usize) -> usize {
+        (self.spec_tail + row) % self.spec_capacity() * self.spec_n_bins
+    }
+
+    /// Append `self.frame_scratch` to the rolling spec ring, overwriting
+    /// the oldest row at capacity. Avoids both the per-frame `Vec::clone`
+    /// and the per-frame full-window memmove (audit C2).
     fn append_frame_scratch_row(&mut self) {
         let n_bins = self.spec_n_bins;
         debug_assert_eq!(self.frame_scratch.len(), n_bins);
-        let cap = 2 * self.neighborhood + 1;
+        let cap = self.spec_capacity();
         if self.spec_n_rows == cap {
-            self.spec.copy_within(n_bins.., 0);
+            // Drop the oldest row by advancing the ring — O(1), no
+            // `copy_within` of the (cap-1) older rows.
+            self.spec_tail = (self.spec_tail + 1) % cap;
             self.spec_first_frame += 1;
-            self.spec_n_rows -= 1;
+        } else {
+            self.spec_n_rows += 1;
         }
-        let dst_start = self.spec_n_rows * n_bins;
+        let dst_start = self.spec_row_base(self.spec_n_rows - 1);
         // Disjoint borrow: `self.spec` (mut) and `self.frame_scratch`
         // (shared) are different fields of `self`, so this is sound.
         self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
-        self.spec_n_rows += 1;
     }
 
     /// Peak-detect rows `[from_row, to_row]` (spec-relative) and push
@@ -179,13 +210,16 @@ impl<F> StreamCore<F> {
             return;
         }
         let n_bins = self.spec_n_bins;
+        let spec_tail = self.spec_tail;
+        let spec_cap = self.spec_capacity();
         for row in from_row..=to_row {
             if row >= self.spec_n_rows {
                 break;
             }
             let abs_f = self.spec_first_frame + row as u32;
             let bucket = (abs_f as f32 / self.frames_per_sec) as u32;
-            let row_start = row * n_bins;
+            // Ring addressing: logical row → slot offset (audit C2).
+            let row_start = (spec_tail + row) % spec_cap * n_bins;
             let spec_row = &self.spec[row_start..row_start + n_bins];
             let peak_max = &self.peak_row_max[..n_bins];
             for bin in 0..n_bins {
@@ -404,6 +438,8 @@ impl<F> StreamCore<F> {
     ) {
         let n_bins = self.spec_n_bins;
         let spec = &self.spec;
+        let spec_tail = self.spec_tail;
+        let spec_cap = 2 * self.neighborhood + 1;
         let spec_first_frame = self.spec_first_frame;
         let bucket_pending = &mut self.bucket_pending;
         let last_pd = &mut self.last_pd_frame;
@@ -415,7 +451,7 @@ impl<F> StreamCore<F> {
                 let row_idx = (ripe_abs - spec_first_frame) as usize;
                 let bucket = (ripe_abs as f32 / frames_per_sec) as u32;
                 for (bin, &row_max) in max_row.iter().enumerate() {
-                    let idx = row_idx * n_bins + bin;
+                    let idx = (spec_tail + row_idx) % spec_cap * n_bins + bin;
                     let v = spec[idx];
                     if v > min_mag && v >= row_max {
                         let peak = Peak {
@@ -453,5 +489,59 @@ impl<F> StreamCore<F> {
             emit_anchor(anchor, cfg, &mut emitted);
         }
         self.emitted = emitted;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_ring_overwrites_oldest_row_at_capacity() {
+        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive);
+        assert_eq!(core.spec_capacity(), 5);
+        let n_bins = core.spec_n_bins;
+        core.frame_scratch = alloc::vec![0.0f32; n_bins];
+
+        // Push 12 rows into a 5-row ring: rows 0..7 must be gone,
+        // rows 8..12 must be readable as logical rows 0..4.
+        for f in 0..12u32 {
+            core.frame_scratch.fill(f as f32 / 10.0);
+            core.append_frame_scratch_row();
+        }
+
+        assert_eq!(core.spec_n_rows, 5, "ring stays at capacity");
+        assert_eq!(core.spec_first_frame, 7, "seven oldest frames dropped");
+        for row in 0..5usize {
+            let base = core.spec_row_base(row);
+            let expect = (7 + row) as f32 / 10.0;
+            assert!(
+                core.spec[base..base + n_bins].iter().all(|&v| v == expect),
+                "logical row {row} must hold frame data {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_ring_reset_clears_tail() {
+        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive);
+        core.frame_scratch = alloc::vec![1.0f32; core.spec_n_bins];
+        for _ in 0..12 {
+            core.append_frame_scratch_row();
+        }
+        assert_eq!(core.spec_first_frame, 7);
+        core.reset();
+        assert_eq!(core.spec_first_frame, 0);
+        assert_eq!(core.spec_n_rows, 0);
+        assert_eq!(core.spec_tail, 0, "ring tail must restart at slot 0");
+
+        // And appending after reset still lands in slot 0.
+        core.frame_scratch.fill(2.0);
+        core.append_frame_scratch_row();
+        assert_eq!(core.spec_row_base(0), 0);
+        assert!(
+            core.spec[..core.spec_n_bins].iter().all(|&v| v == 2.0),
+            "post-reset append must write the first slot"
+        );
     }
 }

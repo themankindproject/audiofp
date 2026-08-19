@@ -40,7 +40,7 @@ extern crate alloc;
 use core::cmp::Ordering;
 
 mod wang;
-pub use wang::{WangMatchConfig, WangMatcher};
+pub use wang::{WangMatchConfig, WangMatcher, WangRefIndex};
 
 mod panako;
 pub use panako::{PanakoMatchConfig, PanakoMatcher};
@@ -55,6 +55,8 @@ pub use neural::{Aggregation, NeuralMatchConfig, NeuralMatcher};
 
 mod index;
 pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
+#[cfg(feature = "rayon")]
+pub use index::{par_match_best, par_match_ranked};
 
 mod maps;
 
