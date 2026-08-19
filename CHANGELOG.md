@@ -331,6 +331,12 @@ cargo build --features std-wav   # codec picker works
   lowest reference id (matching the sequential first-wins scan),
   `par_match_ranked` preserves order via rayon's ordered collect + a
   stable sort. No perfect-score early exit in the parallel best scan.
+- **`HaitsmaMatchConfig::coarse_to_fine` (audit C3).** Opt-in sampled
+  sweep + refinement accelerator for the exact-BER path on inputs with
+  ≥ 4096 total frames; off by default so existing results are
+  unchanged. Documented tradeoff: sampling can miss a
+  needle-in-haystack bit-exact alignment the exhaustive scan would
+  find.
 
 ### Changed
 
@@ -447,6 +453,11 @@ cargo build --features std-wav   # codec picker works
   (pinned by the offline-equivalence / chunk-size / flush-idempotency /
   property / real-audio suites) and memory traffic on long streams is
   bounded.
+- **Coarse-to-fine Haitsma exact path (audit C3)** — opt-in
+  (`coarse_to_fine`) stride-sampled delta sweep with a
+  full-resolution refinement window and top-candidate verification.
+  Forced-exact 24k-frame no-match: 214.9 ms → 7.28 ms (**~29.5×**);
+  inputs under 4096 total frames keep the untouched exhaustive scan.
 - **Rayon-parallel 1:N matching (audit C5)** — `par_match_best` /
   `par_match_ranked` score references in parallel with results
   identical to the sequential scans. Criterion, Wang ranking of 100
