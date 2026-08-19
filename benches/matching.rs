@@ -100,6 +100,50 @@ fn bench_haitsma_one(c: &mut Criterion) {
         b.iter(|| black_box(matcher.match_one(black_box(&fp), black_box(&fp))));
     });
     g.finish();
+
+    // audit C3: the pathological case the coarse-to-fine path targets —
+    // a huge forced-exact reference with NO alignment (every delta's
+    // hamming runs near its full length because no good BER exists to
+    // early-abort on). The exhaustive scan is O(q·r·32) here; the
+    // sampled sweep + refinement is O(probes·overlap/8 + window·overlap).
+    let huge_q: Vec<u32> = (0..12_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761))
+        .collect();
+    let huge_r: Vec<u32> = (0..12_000u32).map(|i| i.wrapping_mul(7_919_021)).collect();
+    let exhaustive = HaitsmaMatcher::new(HaitsmaMatchConfig {
+        use_lut: false,
+        min_overlap_frames: 256,
+        ..Default::default()
+    });
+    let coarse = HaitsmaMatcher::new(HaitsmaMatchConfig {
+        use_lut: false,
+        coarse_to_fine: true,
+        min_overlap_frames: 256,
+        ..Default::default()
+    });
+    let mut g = c.benchmark_group("matching/haitsma_1to1_no_match_24k_frames");
+    g.bench_function("exhaustive", |b| {
+        b.iter(|| {
+            black_box(
+                exhaustive.match_one(black_box(&fp_plain(&huge_q)), black_box(&fp_plain(&huge_r))),
+            )
+        });
+    });
+    g.bench_function("coarse_to_fine", |b| {
+        b.iter(|| {
+            black_box(
+                coarse.match_one(black_box(&fp_plain(&huge_q)), black_box(&fp_plain(&huge_r))),
+            )
+        });
+    });
+    g.finish();
+}
+
+fn fp_plain(frames: &[u32]) -> audiofp::classical::HaitsmaFingerprint {
+    audiofp::classical::HaitsmaFingerprint {
+        frames: frames.to_vec(),
+        frames_per_sec: 78.125,
+    }
 }
 
 fn bench_panako_one(c: &mut Criterion) {
