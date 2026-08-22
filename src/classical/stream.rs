@@ -16,6 +16,31 @@
 //! become thin wrappers that configure the knobs and supply their emit
 //! closure. Output parity is pinned by the existing
 //! `streaming_offline_*` tests in each file.
+//!
+//! # Continuous-stream frame limit
+//!
+//! Frame indices are `u32` throughout — `Peak::t_frame`,
+//! `WangHash::t_anchor`, and `PanakoHash::t_anchor`/`t_b`/`t_c` are all
+//! `u32` because they are part of the `bytemuck::Pod` wire layout (8 bytes
+//! for Wang, 16 for Panako). Widening them would grow the persisted hash
+//! format and force a serialization version bump, which 0.4.0 explicitly
+//! declined.
+//!
+//! The practical consequence is a bound on how long a *single* stream may
+//! run without [`StreamCore::reset`]:
+//!
+//! | Algorithm     | Frame rate   | `u32` frame budget      |
+//! |---------------|--------------|-------------------------|
+//! | Wang / Panako | 62.5 fps     | ~795 days of audio      |
+//! | Haitsma       | 78.125 fps   | ~636 days of audio      |
+//!
+//! Past that point the frame counter wraps: debug builds panic on the
+//! overflowing `+= 1`, release builds silently emit hashes with wrapped
+//! `t_anchor` values. Long-lived capture processes (24/7 broadcast
+//! monitoring) should call `reset()` on a segment boundary — e.g. hourly
+//! or daily — which is normal practice anyway, since matching operates on
+//! bounded windows rather than an unbounded stream. Re-creating the
+//! streamer, or calling `reset()`, returns the counters to zero.
 
 use alloc::vec;
 use alloc::vec::Vec;

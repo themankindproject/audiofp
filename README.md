@@ -260,7 +260,7 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
   > In practice, 5–10 matching hashes suffice for confident identification.
 
 - **Two-track discrimination verified** — different songs produce <0.1% hash overlap (random collision floor), while the same song across codecs produces 25–80% overlap.
-- **421 tests** including adversarial stress tests, real-audio E2E across 6 codecs, and property-based streaming/offline parity checks. See [ROBUSTNESS.md](ROBUSTNESS.md) for full methodology.
+- **606 tests** including adversarial stress tests, real-audio E2E across 6 codecs, and property-based streaming/offline parity checks. See [ROBUSTNESS.md](ROBUSTNESS.md) for full methodology.
 
 ## Comparison with Alternatives
 
