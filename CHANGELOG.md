@@ -365,11 +365,32 @@ cargo build --features std-wav   # codec picker works
 - **Branchless RANSAC inlier counting** in `PanakoMatcher` — extracted
   into `count_inliers_wide()` using `(condition) as u32` accumulation.
   LLVM auto-vectorizes with `target-cpu=native`. Panako 1:1: 264 → 261 µs.
-- **`target-cpu=native`** in `.cargo/config.toml` for bench/release
-  builds — unlocks hardware POPCNT, AVX2, and FMA for `wide` and FFT.
+- **`target-cpu=native` documented as a consumer build flag** — unlocks
+  hardware POPCNT, AVX2, and FMA for `wide` and the FFT. The crate does
+  **not** ship a `.cargo/config.toml` setting it: a committed
+  `target-cpu=native` would make this repository's own CI artifacts
+  non-portable (a binary built on one runner can `SIGILL` on another).
+  The flag is a per-consumer decision and is documented under
+  "Performance Tips" in `USAGE.md`. Benchmark figures in this changelog
+  were measured with it enabled via `RUSTFLAGS`.
 
 - **Pre-sized `HashMap` in `WangMatcher::match_one` and `WangIndex::build`**
   — eliminates repeated rehashing during index construction.
+- **`WangMatcher` drops the per-call query projection.**
+  `match_one_prebuilt` built a `Vec<(u32, u32)>` copy of every query hash
+  on entry, purely to read back the two fields `WangHash` already stores.
+  Both the voting pass and the contribution pass now iterate
+  `query.hashes` directly, removing one allocation plus a full memcpy of
+  the query per match.
+- **`WangMatcher` contribution counting is `O(log P)` per hash.** The
+  score pass asked "does any posting for this hash land within ±tol of
+  δ*" with a linear walk over the hash's whole posting list. Postings are
+  already sorted ascending inside `SortedPostings`, so the test is now a
+  `partition_point` binary search for the window's lower edge. Criterion:
+  Wang 1:1 self-match on 5 s audio 112 µs (−6.7 %), prebuilt 65 µs
+  (−5.7 %), 20 queries vs one reference 1.41 ms (−10.0 %). Output is
+  unchanged — pinned by the golden, matching, real-audio and
+  threshold-calibration suites.
 - **O(B²) → O(B) consolidation** in `WangIndex::query` via sorted
   sliding window (previously quadratic in number of distinct offsets;
   now linear regardless of hash-collision density).
@@ -491,6 +512,19 @@ cargo build --features std-wav   # codec picker works
 
 ### Fixed
 
+- **`WangMatcher` consolidation no longer narrows through a truncating
+  cast.** The ±tolerance sliding window accumulates into a `u64` (it sums
+  up to `2·tol + 1` `u32` bins) but stored each result back with
+  `window as u32`. A crafted fingerprint whose bin sum exceeds
+  `u32::MAX` would wrap a large peak down to a small value and silently
+  drop the match. The narrowing now saturates.
+- **Documented the `u32` continuous-stream frame budget.** Frame indices
+  are `u32` because they are part of the Pod hash layout (see #66), which
+  bounds a *single* uninterrupted stream at ~795 days of audio for
+  Wang/Panako (62.5 fps) and ~636 days for Haitsma (78.125 fps) before
+  the counter wraps — debug builds panic, release builds emit wrapped
+  `t_anchor` values. `src/classical/stream.rs` now states the limit and
+  the `reset()`-on-segment-boundary remedy explicitly.
 - **Haitsma BER selection is rate-normalized across offsets.** Both the
   exact-BER path and the LUT verification path compared candidates by
   **absolute** Hamming totals (and passed that total as the

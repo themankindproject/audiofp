@@ -26,10 +26,12 @@
 - [Matching / Identification](#matching--identification)
   - [MatchResult semantics](#matchresult-semantics)
   - [WangMatcher](#wangmatcher)
-  - [HaitsmaMatcher](#haitsmamatcher)
-  - [PanakoMatcher](#panakomatcher)
-  - [NeuralMatcher](#neuralmatcher)
-  - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
+  - [Prebuilt index for repeated 1:1 matches](#prebuilt-index-for-repeated-11-matches)
+- [HaitsmaMatcher](#haitsmamatcher)
+- [PanakoMatcher](#panakomatcher)
+- [NeuralMatcher](#neuralmatcher)
+- [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
+- [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Fingerprint Serialization](#fingerprint-serialization)
 - [Audio File Decoding](#audio-file-decoding)
@@ -661,6 +663,44 @@ fn main() {
 }
 ```
 
+#### Prebuilt index for repeated 1:1 matches
+
+`matcher.match_one` rebuilds the reference's inverted index on **every
+call** (`SortedPostings` is sorted per match — O(R log R)). When the same
+reference is matched against many queries (batch 1:1, query loops against a
+fixed catalog, streaming identification), build a [`WangRefIndex`] once and
+reuse it via [`WangMatcher::match_one_prebuilt`]; the per-query cost drops
+to the pure O(Q log U + range) voting pass. Both entry points agree by
+construction — `match_one` is exactly build-then-`match_one_prebuilt`.
+
+```rust
+use audiofp::classical::{WangHash, WangFingerprint};
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher, WangRefIndex};
+
+fn fp(offset: u32) -> WangFingerprint {
+    WangFingerprint {
+        hashes: (0..40)
+            .map(|i| WangHash { hash: 500 + i, t_anchor: 1000 + i * 10 + offset })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    let reference = fp(0);
+    let query = fp(100); // the reference shifted by 100 frames
+
+    let cfg = WangMatchConfig::default();
+    let matcher = WangMatcher::new(cfg.clone());
+    let index = WangRefIndex::build(&reference, &cfg).expect("reference has hashes");
+
+    let m = matcher.match_one_prebuilt(&query, &index);
+    assert_eq!(m.offset.frames, 100);
+    // Same result as the plain 1:1 path, without the per-call rebuild.
+    assert_eq!(m, matcher.match_one(&query, &reference));
+}
+```
+
 #### `WangMatchConfig`
 
 ```rust,ignore
@@ -989,8 +1029,48 @@ Guarantees worth knowing:
 - Indexes are transient accelerators: never serialised, no file handles,
   dropped with their owning scope.
 
-Matching itself has **no `rayon` path** — the `rayon` feature parallelises
-batch *fingerprinting* only (see
+### Parallel 1:N matching (rayon)
+
+With the `rayon` feature, [`par_match_best`] and [`par_match_ranked`] score
+every reference in parallel and return **result-identical** output to
+`match_best` / `match_ranked` (parallel best breaks exact ties by lowest
+reference id — same winner as the sequential scan; parallel ranking
+preserves the sequential order). Unlike `match_best`, the parallel scan has
+**no perfect-score early exit** — every reference is scored.
+
+```rust
+use audiofp::classical::{WangHash, WangFingerprint};
+use audiofp::matching::{
+    Matcher, WangMatchConfig, WangMatcher, match_ranked, par_match_best, par_match_ranked,
+};
+
+fn fp(offset: u32) -> WangFingerprint {
+    WangFingerprint {
+        hashes: (0..40)
+            .map(|i| WangHash { hash: 500 + i, t_anchor: 1000 + i * 10 + offset })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    let refs: Vec<WangFingerprint> = (0..8).map(|i| fp(i * 10)).collect();
+    let query = fp(0); // exact copy of refs[0]
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+
+    let best = par_match_best(&matcher, &query, &refs).expect("ref 0 matches");
+    assert_eq!(best.0, 0);
+
+    // Ranking is element-for-element equal to the sequential helpers.
+    assert_eq!(
+        par_match_ranked(&matcher, &query, &refs),
+        match_ranked(&matcher, &query, &refs),
+    );
+}
+```
+
+The `rayon` feature also parallelises batch *fingerprinting* via
+`fingerprint_batch_parallel` (see
 [Async, batching, and models](#async-batching-and-models)).
 
 Benchmarks: `cargo bench --bench matching` (Criterion; Wang/Haitsma/Panako
@@ -1944,6 +2024,24 @@ fn main() {
 8. **Batch neural inference.** `batch_size > 1` amortises per-run ONNX
    overhead; fixed-length watermark inputs reuse the cached plan.
 
+9. **Consider `target-cpu=native` for a single-machine deployment.** The
+   SIMD kernels (`wide::f32x8`) and the FFT dispatch at runtime on a
+   portable baseline; compiling for the host CPU additionally unlocks
+   hardware POPCNT, AVX2, and FMA. Measure before adopting — the win is
+   workload-dependent (Haitsma BER and RANSAC inlier counting benefit
+   most).
+
+   ```bash
+   RUSTFLAGS="-C target-cpu=native" cargo build --release
+   ```
+
+   The crate deliberately does **not** ship this in a `.cargo/config.toml`:
+   a binary built with `target-cpu=native` can fault with an illegal
+   instruction on a different CPU, so it is unsafe for portable release
+   artifacts and container images that may run on heterogeneous hosts.
+   Enable it only when the build host and the run host are the same
+   microarchitecture.
+
 ---
 
 ## Feature Flags
@@ -1964,7 +2062,7 @@ Default = `[]` (no_std + alloc, no codecs):
 | `std-adpcm`  | ADPCM (`symphonia/adpcm`)                                                    |
 | `std-alac`   | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                       |
 | `all-codecs` | every codec feature above — the pre-0.4.0 monolithic `std`                    |
-| `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` (implies std) |
+| `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` + parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies std) |
 | `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`)                   |
 | `neural`     | `tract-onnx`; enables `audiofp::neural` (implies `std`)                      |
 | `mimalloc`   | `mimalloc` as process-wide `#[global_allocator]` (implies `std`)             |

@@ -152,6 +152,14 @@ impl PeakPicker {
     ///
     /// Panics if `spec.len() != n_frames * n_bins`.
     ///
+    /// # Bin-index range
+    ///
+    /// [`Peak::f_bin`] is a `u16`, so `n_bins` must not exceed
+    /// `u16::MAX + 1` (65 536) or the reported bin index wraps. `n_bins`
+    /// is `n_fft / 2 + 1`, so this bounds `n_fft` at 131 070 — far above
+    /// any sane analysis window (the built-in fingerprinters use 1 024 and
+    /// 2 048). A debug build asserts the bound.
+    ///
     /// # Note
     ///
     /// This method takes `&mut self` to re-use scratch buffers across calls.
@@ -168,6 +176,12 @@ impl PeakPicker {
             return Vec::new();
         }
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
+        // `Peak::f_bin` is a u16; a larger spectrogram would wrap the bin
+        // index. Unreachable for any realistic n_fft (see "Bin-index range").
+        debug_assert!(
+            n_bins <= u16::MAX as usize + 1,
+            "n_bins {n_bins} exceeds u16 range of Peak::f_bin"
+        );
 
         #[inline]
         fn prepare_vec(v: &mut Vec<f32>, new_len: usize) {

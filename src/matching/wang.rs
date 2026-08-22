@@ -172,9 +172,17 @@ impl WangMatcher {
 
         // --- 2. Vote into dense offset histogram ---
         // δ = t_ref − t_query ∈ [−q_max, r_max]
-        let q_hashes: alloc::vec::Vec<(u32, u32)> =
-            query.hashes.iter().map(|h| (h.hash, h.t_anchor)).collect();
-        let q_max = q_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
+        //
+        // `query.hashes` is iterated directly: the previous
+        // `Vec<(u32, u32)>` projection allocated and memcpy'd the whole
+        // query on every call for no benefit — `WangHash` already stores
+        // exactly `(hash, t_anchor)`.
+        let q_max = query
+            .hashes
+            .iter()
+            .map(|h| h.t_anchor as i64)
+            .max()
+            .unwrap_or(0);
         let r_max = reference.r_max;
 
         let dmin: i64 = -q_max;
@@ -191,8 +199,9 @@ impl WangMatcher {
         let capped = capped_u64 as usize;
         let mut hist: Vec<u32> = vec![0u32; capped];
 
-        for &(q_hash, q_t) in &q_hashes {
-            for &tr in index.get(q_hash) {
+        for h in &query.hashes {
+            let q_t = h.t_anchor;
+            for &tr in index.get(h.hash) {
                 let d = tr as i64 - q_t as i64;
                 let idx = (d - dmin) as u64;
                 if idx < capped_u64 {
@@ -208,6 +217,11 @@ impl WangMatcher {
         // Equivalent to a ±tol box filter, but O(1) per bin with no
         // transient O(range)-byte u64 prefix array (the previous
         // prefix-sum approach peaked at ~3× the histogram's memory).
+        //
+        // The running `window` sum is `u64` because it adds up to
+        // `2·tol + 1` `u32` bins; narrowing back to `u32` saturates so a
+        // crafted fingerprint whose bin sum overflows cannot wrap a huge
+        // peak down to a small value (which would silently drop a match).
         let tol = cfg.offset_tolerance_frames as usize;
         let consolidated: Vec<u32> = if tol > 0 {
             let mut out = vec![0u32; capped];
@@ -217,7 +231,7 @@ impl WangMatcher {
             for &v in &hist[..=init_hi] {
                 window += v as u64;
             }
-            out[0] = window as u32;
+            out[0] = u32::try_from(window).unwrap_or(u32::MAX);
             for i in 1..capped {
                 let enter = i + tol;
                 if enter < capped {
@@ -227,7 +241,7 @@ impl WangMatcher {
                 if i > tol {
                     window -= hist[i - tol - 1] as u64;
                 }
-                out[i] = window as u32;
+                out[i] = u32::try_from(window).unwrap_or(u32::MAX);
             }
             out
         } else {
@@ -259,16 +273,25 @@ impl WangMatcher {
         }
 
         // --- 6. Score ---
+        // Counts how many distinct query hashes contribute at least one
+        // vote to the winning offset. `SortedPostings::get` returns the
+        // group sorted ascending, so the "is there a posting whose δ lands
+        // within ±tol of δ*" test is a binary search for the first anchor
+        // at or past the window's lower edge — O(log P) instead of the
+        // previous O(P) linear scan over every posting.
         let tol_i64 = cfg.offset_tolerance_frames as i64;
         let delta_star = peak_idx as i64 + dmin;
         let mut contrib_count: u32 = 0;
-        for &(q_hash, q_t) in &q_hashes {
-            for &tr in index.get(q_hash) {
-                let d = tr as i64 - q_t as i64;
-                if (d - delta_star).abs() <= tol_i64 {
-                    contrib_count += 1;
-                    break;
-                }
+        for h in &query.hashes {
+            let postings = index.get(h.hash);
+            // t_ref must satisfy |(t_ref − q_t) − δ*| ≤ tol, i.e.
+            // t_ref ∈ [q_t + δ* − tol, q_t + δ* + tol].
+            let centre = h.t_anchor as i64 + delta_star;
+            let lo = centre - tol_i64;
+            let hi = centre + tol_i64;
+            let start = postings.partition_point(|&tr| (tr as i64) < lo);
+            if start < postings.len() && (postings[start] as i64) <= hi {
+                contrib_count += 1;
             }
         }
 
