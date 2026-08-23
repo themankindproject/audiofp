@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **docs.rs build fix** — removed obsolete `feature(doc_auto_cfg)` gate
+  from `src/lib.rs`. The feature was removed in Rust 1.92 (merged into
+  stable `doc_cfg`); docs.rs nightly 1.100 rejects it as a hard error.
+
 ## [0.4.0] - 2026-08-23
 
 ### Breaking

@@ -107,7 +107,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// doc_auto_cfg is stable since Rust 1.92 (merged into doc_cfg) — no
+// feature gate needed. The `docsrs` cfg is set by docs.rs and by our
+// `package.metadata.docs.rs` rustdoc-args.
 
 // The `std` feature is a bare dependency on Symphonia; codec support is
 // opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, …) or the
