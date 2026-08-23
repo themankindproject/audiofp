@@ -1126,6 +1126,9 @@ mod tests {
             frames_per_sec: 31.25, // different rate
         };
         let matcher = PanakoMatcher::new(cfg);
-        assert_eq!(matcher.match_one_prebuilt(&query, &index), MatchResult::NONE);
+        assert_eq!(
+            matcher.match_one_prebuilt(&query, &index),
+            MatchResult::NONE
+        );
     }
 }
