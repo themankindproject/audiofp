@@ -29,6 +29,7 @@
   - [Prebuilt index for repeated 1:1 matches](#prebuilt-index-for-repeated-11-matches)
 - [HaitsmaMatcher](#haitsmamatcher)
 - [PanakoMatcher](#panakomatcher)
+  - [Prebuilt index for repeated 1:1 Panako matches](#prebuilt-index-for-repeated-11-panako-matches)
 - [NeuralMatcher](#neuralmatcher)
 - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
@@ -892,6 +893,46 @@ Widen `scale_min`/`scale_max` (and rebuild your catalog) to tolerate bigger
 tempo changes; `time_scale` reported to callers is `1/s` clamped to
 `[0.5, 2.0]` regardless of the search grid, so genuine large stretches are
 visible even when saturated.
+
+#### Prebuilt index for repeated 1:1 Panako matches
+
+Like [`WangRefIndex`], `PanakoRefIndex` builds the reference's inverted
+HashMap once so repeated matching against the same reference skips the
+per-call O(R) construction:
+
+```rust
+use audiofp::classical::{PanakoHash, PanakoFingerprint};
+use audiofp::matching::{Matcher, PanakoMatchConfig, PanakoMatcher, PanakoRefIndex};
+
+fn fp(offset: u32) -> PanakoFingerprint {
+    PanakoFingerprint {
+        hashes: (0..20)
+            .map(|i| PanakoHash {
+                hash: 500 + i,
+                t_anchor: 100 + i * 10 + offset,
+                t_b: 105 + i * 10 + offset,
+                t_c: 110 + i * 10 + offset,
+            })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    let reference = fp(0);
+    let query = fp(0); // self-match
+
+    let cfg = PanakoMatchConfig::default();
+    let matcher = PanakoMatcher::new(cfg.clone());
+    let index = PanakoRefIndex::build(&reference, &cfg).expect("reference has hashes");
+
+    let m = matcher.match_one_prebuilt(&query, &index);
+    assert!(m.is_match);
+    assert!((m.time_scale - 1.0).abs() < 0.1);
+    // Same result as the plain 1:1 path, without the per-call rebuild.
+    assert_eq!(m, matcher.match_one(&query, &reference));
+}
+```
 
 ### NeuralMatcher
 

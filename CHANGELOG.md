@@ -324,6 +324,12 @@ cargo build --features std-wav   # codec picker works
   `SortedPostings::build`. `Matcher::match_one` is defined as
   build-then-`match_one_prebuilt`, so both paths agree by construction
   (pinned by parity tests).
+- **`PanakoRefIndex` — prebuilt single-reference Panako index.**
+  Mirrors the `WangRefIndex` pattern for the tempo-invariant Panako
+  matcher. Builds the reference's stop-hash-filtered inverted map once;
+  repeated matching via `PanakoMatcher::match_one_prebuilt` skips the
+  per-call O(R) HashMap construction. `match_one` delegates to
+  build-then-`match_one_prebuilt` for parity by construction.
 - **`par_match_best` / `par_match_ranked` (rayon, audit C5).**
   Rayon-parallel counterparts of `match_best` / `match_ranked` under
   the existing `rayon` feature. Deterministic: results are identical to
