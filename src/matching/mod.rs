@@ -43,7 +43,7 @@ mod wang;
 pub use wang::{WangMatchConfig, WangMatcher, WangRefIndex};
 
 mod panako;
-pub use panako::{PanakoMatchConfig, PanakoMatcher};
+pub use panako::{PanakoMatchConfig, PanakoMatcher, PanakoRefIndex};
 
 mod haitsma;
 pub use haitsma::{HaitsmaMatchConfig, HaitsmaMatcher};

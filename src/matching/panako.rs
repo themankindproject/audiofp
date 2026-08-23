@@ -102,6 +102,63 @@ pub struct PanakoMatcher {
     cfg: PanakoMatchConfig,
 }
 
+/// Prebuilt reference index for [`PanakoMatcher::match_one_prebuilt`].
+///
+/// Holds the stop-hash-filtered inverted map
+/// `hash → Vec<(t_anchor, t_b, t_c)>` plus the reference's
+/// `frames_per_sec`. Build once with [`PanakoRefIndex::build`], then
+/// match many queries against the same reference without the per-call
+/// O(R) HashMap construction.
+///
+/// The two entry points are guaranteed to agree: `match_one` is defined
+/// as build-then-`match_one_prebuilt`, so results are identical by
+/// construction.
+pub struct PanakoRefIndex {
+    index: HashMap<u32, Vec<(u32, u32, u32)>>,
+    frames_per_sec: f32,
+    hash_count: usize,
+}
+
+impl PanakoRefIndex {
+    /// Build the index for `reference` using the stop-hash policy from
+    /// `cfg` (`max_postings_per_hash`). Returns `None` when the reference
+    /// has no hashes or every hash is filtered out.
+    #[must_use]
+    pub fn build(reference: &PanakoFingerprint, cfg: &PanakoMatchConfig) -> Option<Self> {
+        if reference.hashes.is_empty() {
+            return None;
+        }
+        let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = hashmap_new();
+        for h in &reference.hashes {
+            index
+                .entry(h.hash)
+                .or_default()
+                .push((h.t_anchor, h.t_b, h.t_c));
+        }
+        index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
+        if index.is_empty() {
+            return None;
+        }
+        Some(Self {
+            index,
+            frames_per_sec: reference.frames_per_sec,
+            hash_count: reference.hashes.len(),
+        })
+    }
+
+    /// Number of hashes in the (unfiltered) reference fingerprint.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hash_count
+    }
+
+    /// `true` when the reference fingerprint was empty / non-matchable.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hash_count == 0
+    }
+}
+
 impl Matcher for PanakoMatcher {
     type Fingerprint = PanakoFingerprint;
     type Config = PanakoMatchConfig;
@@ -127,22 +184,39 @@ impl Matcher for PanakoMatcher {
             return MatchResult::NONE;
         }
 
-        let cfg = &self.cfg;
+        // Delegate to build-then-prebuilt so both paths agree by construction.
+        let index = match PanakoRefIndex::build(reference, &self.cfg) {
+            Some(index) => index,
+            None => return MatchResult::NONE,
+        };
+        self.match_one_prebuilt(query, &index)
+    }
+}
 
-        // --- 1. Index reference hashes ---
-        // Keyed by hash; each posting stores the full triplet timestamps.
-        let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = hashmap_new();
-        for h in &reference.hashes {
-            index
-                .entry(h.hash)
-                .or_default()
-                .push((h.t_anchor, h.t_b, h.t_c));
-        }
-        index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
-
-        if index.is_empty() {
+impl PanakoMatcher {
+    /// Match `query` against a reference whose index was built once
+    /// ([`PanakoRefIndex::build`]), skipping the per-call O(R) HashMap
+    /// construction.
+    ///
+    /// Produces exactly the [`Matcher::match_one`] result for the same
+    /// query/reference pair.
+    #[must_use]
+    pub fn match_one_prebuilt(
+        &self,
+        query: &PanakoFingerprint,
+        reference: &PanakoRefIndex,
+    ) -> MatchResult {
+        // Soft-fail on fps mismatch.
+        if !frames_per_sec_compatible(query.frames_per_sec, reference.frames_per_sec) {
             return MatchResult::NONE;
         }
+
+        if query.hashes.is_empty() || reference.is_empty() {
+            return MatchResult::NONE;
+        }
+
+        let cfg = &self.cfg;
+        let index = &reference.index;
 
         // --- 2. Match → (scale, offset) vote pairs ---
         //
@@ -991,5 +1065,67 @@ mod tests {
             res.is_match,
             "self-match must survive normalization: {res:?}"
         );
+    }
+
+    #[test]
+    fn prebuilt_matches_one_to_one_parity() {
+        // Same technique as Wang's parity tests: the prebuilt path
+        // must produce exactly the same result as the plain path.
+        let fp = PanakoFingerprint {
+            hashes: (0..20_u32)
+                .map(|i| crate::classical::PanakoHash {
+                    hash: 500 + i,
+                    t_anchor: 100 + i * 10,
+                    t_b: 105 + i * 10,
+                    t_c: 110 + i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let cfg = PanakoMatchConfig::default();
+        let matcher = PanakoMatcher::new(cfg.clone());
+
+        let plain = matcher.match_one(&fp, &fp);
+        let index = PanakoRefIndex::build(&fp, &cfg).expect("fp has hashes");
+        let prebuilt = matcher.match_one_prebuilt(&fp, &index);
+
+        assert_eq!(plain, prebuilt);
+        assert!(plain.is_match);
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 20);
+    }
+
+    #[test]
+    fn prebuilt_empty_reference_returns_none() {
+        let empty = PanakoFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        };
+        let cfg = PanakoMatchConfig::default();
+        assert!(PanakoRefIndex::build(&empty, &cfg).is_none());
+    }
+
+    #[test]
+    fn prebuilt_fps_mismatch_returns_none() {
+        let fp = PanakoFingerprint {
+            hashes: (0..10_u32)
+                .map(|i| crate::classical::PanakoHash {
+                    hash: 500 + i,
+                    t_anchor: 100 + i * 10,
+                    t_b: 105 + i * 10,
+                    t_c: 110 + i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let cfg = PanakoMatchConfig::default();
+        let index = PanakoRefIndex::build(&fp, &cfg).unwrap();
+
+        let query = PanakoFingerprint {
+            hashes: fp.hashes.clone(),
+            frames_per_sec: 31.25, // different rate
+        };
+        let matcher = PanakoMatcher::new(cfg);
+        assert_eq!(matcher.match_one_prebuilt(&query, &index), MatchResult::NONE);
     }
 }
