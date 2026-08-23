@@ -688,14 +688,15 @@ fn fp(offset: u32) -> WangFingerprint {
 
 fn main() {
     let reference = fp(0);
-    let query = fp(100); // the reference shifted by 100 frames
+    let query = fp(100); // the query shifted +100 frames later
 
     let cfg = WangMatchConfig::default();
     let matcher = WangMatcher::new(cfg.clone());
     let index = WangRefIndex::build(&reference, &cfg).expect("reference has hashes");
 
     let m = matcher.match_one_prebuilt(&query, &index);
-    assert_eq!(m.offset.frames, 100);
+    // offset = t_ref − t_query = 0 − 100 = −100 frames.
+    assert_eq!(m.offset.frames, -100);
     // Same result as the plain 1:1 path, without the per-call rebuild.
     assert_eq!(m, matcher.match_one(&query, &reference));
 }
@@ -1044,18 +1045,19 @@ use audiofp::matching::{
     Matcher, WangMatchConfig, WangMatcher, match_ranked, par_match_best, par_match_ranked,
 };
 
-fn fp(offset: u32) -> WangFingerprint {
+fn fp(hash_base: u32, offset: u32) -> WangFingerprint {
     WangFingerprint {
         hashes: (0..40)
-            .map(|i| WangHash { hash: 500 + i, t_anchor: 1000 + i * 10 + offset })
+            .map(|i| WangHash { hash: hash_base + i, t_anchor: 1000 + i * 10 + offset })
             .collect(),
         frames_per_sec: 62.5,
     }
 }
 
 fn main() {
-    let refs: Vec<WangFingerprint> = (0..8).map(|i| fp(i * 10)).collect();
-    let query = fp(0); // exact copy of refs[0]
+    // Each reference has a unique hash base — only refs[0] shares hashes with the query.
+    let refs: Vec<WangFingerprint> = (0..8).map(|i| fp(500 + i * 1000, 0)).collect();
+    let query = fp(500, 0); // exact copy of refs[0]
     let matcher = WangMatcher::new(WangMatchConfig::default());
 
     let best = par_match_best(&matcher, &query, &refs).expect("ref 0 matches");
