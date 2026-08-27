@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`SortedPostings` build allocates less** — the internal inverted-index
+  build (run per Wang match) now sorts a single buffer in place instead
+  of five O(n) temporaries, cutting peak scratch memory and making the
+  gather contiguous. Internal only: no API, hash, or score changes.
+
 ### Fixed
 
+- **`peaks_per_sec` rejects 0** — the config sanitizer now clamps to
+  `1..=500` instead of only capping at 500, so a zero value can no
+  longer silently produce an empty fingerprint.
 - **docs.rs build fix** — removed obsolete `feature(doc_auto_cfg)` gate
   from `src/lib.rs`. The feature was removed in Rust 1.92 (merged into
   stable `doc_cfg`); docs.rs nightly 1.100 rejects it as a hard error.

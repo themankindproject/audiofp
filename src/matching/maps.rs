@@ -45,7 +45,6 @@ pub(crate) fn hashmap_new<K: Ord, V>() -> HashMap<K, V> {
     HashMap::new()
 }
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// A sorted inverted index for `(hash, t_anchor)` pairs.
@@ -83,25 +82,12 @@ impl SortedPostings {
 
         let n = pairs.len();
 
-        // Copy to mutable working buffer.
-        let mut keys: Vec<u32> = Vec::with_capacity(n);
-        let mut vals: Vec<u32> = Vec::with_capacity(n);
-        for &(hash, t_anchor) in pairs {
-            keys.push(hash);
-            vals.push(t_anchor);
-        }
-
-        // Sort by hash, then by t_anchor (secondary sort within hash).
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| keys[a].cmp(&keys[b]).then(vals[a].cmp(&vals[b])));
-
-        // Permute to sorted order in-place.
-        let mut sorted_keys = vec![0u32; n];
-        let mut sorted_vals = vec![0u32; n];
-        for (dst, &idx) in indices.iter().enumerate() {
-            sorted_keys[dst] = keys[idx];
-            sorted_vals[dst] = vals[idx];
-        }
+        // Copy to a single working buffer and sort in place by
+        // (hash, t_anchor). Sorting the pairs directly — instead of an
+        // index permutation over split key/val arrays — uses one O(n)
+        // allocation instead of five and keeps the gather contiguous.
+        let mut sorted = pairs.to_vec();
+        sorted.sort_unstable_by_key(|&(hash, t_anchor)| (hash, t_anchor));
 
         // Build hash → range index, filtering stop-hashes in one pass.
         let mut hashes = Vec::new();
@@ -110,9 +96,9 @@ impl SortedPostings {
 
         let mut i = 0;
         while i < n {
-            let hash = sorted_keys[i];
+            let hash = sorted[i].0;
             let run_start = i;
-            while i < n && sorted_keys[i] == hash {
+            while i < n && sorted[i].0 == hash {
                 i += 1;
             }
             let run_end = i;
@@ -121,7 +107,11 @@ impl SortedPostings {
             if count <= max_postings {
                 hashes.push(hash);
                 starts.push(anchors.len() as u32);
-                anchors.extend_from_slice(&sorted_vals[run_start..run_end]);
+                anchors.extend(
+                    sorted[run_start..run_end]
+                        .iter()
+                        .map(|&(_, t_anchor)| t_anchor),
+                );
             }
         }
 
@@ -251,5 +241,66 @@ mod tests {
         assert_eq!(sp.hashes.len(), 50); // 50 unique hashes
         assert_eq!(sp.anchors.len(), 500);
         assert!(!sp.is_empty());
+    }
+
+    #[test]
+    fn build_matches_naive_reference_on_random_input() {
+        // Regression test for the in-place-sort build path: compare
+        // against a naive BTreeMap grouping (the obvious reference
+        // semantics) across randomized inputs, duplicate hashes,
+        // duplicate pairs, and several stop-hash thresholds.
+        let mut x: u32 = 0x9E37_79B9;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+
+        for max_postings in [0u32, 1, 2, 3, 10, u32::MAX] {
+            for n in [1usize, 2, 7, 64, 1000] {
+                let pairs: Vec<(u32, u32)> = (0..n)
+                    .map(|_| {
+                        // Small hash space forces collisions and runs.
+                        (next() % 20, next() % 500)
+                    })
+                    .collect();
+
+                // Naive reference: group by hash, sort anchors, drop
+                // stop-hashes.
+                let mut groups: alloc::collections::BTreeMap<u32, Vec<u32>> =
+                    alloc::collections::BTreeMap::new();
+                for &(h, t) in &pairs {
+                    groups.entry(h).or_default().push(t);
+                }
+                let expected: Vec<(u32, Vec<u32>)> = groups
+                    .into_iter()
+                    .filter(|(_, v)| v.len() as u32 <= max_postings)
+                    .map(|(h, mut v)| {
+                        v.sort_unstable();
+                        (h, v)
+                    })
+                    .collect();
+
+                let sp = SortedPostings::build(&pairs, max_postings);
+                if expected.is_empty() {
+                    assert!(sp.is_none(), "n={n} max_postings={max_postings}");
+                    continue;
+                }
+                let sp = sp.expect("non-empty reference must build");
+                assert_eq!(
+                    sp.num_hashes(),
+                    expected.len(),
+                    "n={n} max_postings={max_postings}"
+                );
+                for (h, anchors) in &expected {
+                    assert_eq!(
+                        sp.get(*h),
+                        anchors.as_slice(),
+                        "hash={h} n={n} max_postings={max_postings}"
+                    );
+                }
+            }
+        }
     }
 }

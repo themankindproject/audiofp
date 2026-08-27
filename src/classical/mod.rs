@@ -38,7 +38,7 @@ macro_rules! sanitize_cfg {
     ($cfg:expr) => {{
         $cfg.target_zone_t = $cfg.target_zone_t.clamp(1, 512);
         $cfg.fan_out = $cfg.fan_out.clamp(1, 64);
-        $cfg.peaks_per_sec = $cfg.peaks_per_sec.min(500);
+        $cfg.peaks_per_sec = $cfg.peaks_per_sec.clamp(1, 500);
         if $cfg.max_input_samples == Some(0) {
             $cfg.max_input_samples = Some(1);
         }
