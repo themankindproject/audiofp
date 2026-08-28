@@ -132,26 +132,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Streaming Mode
 
 ```rust
-use audiofp::classical::StreamingWang;
 use audiofp::StreamingFingerprinter;
+use audiofp::classical::StreamingWang;
+use std::f32::consts::PI;
 
 fn main() {
     let mut s = StreamingWang::default();
 
-    // Synthetic 8 kHz mono chunks (16 ms ≈ 128 samples). Swap for mic/file chunks.
-    let chunk = vec![0.0_f32; 128];
-    for _ in 0..100 {
-        for (timestamp, hash) in s.push(&chunk).unwrap() {
-            println!("{:?} {:08x}", timestamp, hash.hash);
+    // 8 kHz mono, fed in 200 ms chunks — swap for mic/file chunks.
+    let sr = s.required_sample_rate(); // 8_000
+    let chunk_len = (sr / 5) as usize;
+    let mut total = 0usize;
+    for i in 0..25 {
+        // 5 s of a two-tone signal (silence emits nothing).
+        let chunk: Vec<f32> = (0..chunk_len)
+            .map(|j| {
+                let t = (i * chunk_len + j) as f32 / sr as f32;
+                0.5 * (2.0 * PI * 880.0 * t).sin() + 0.3 * (2.0 * PI * 1320.0 * t).sin()
+            })
+            .collect();
+
+        // push returns hashes that finalised during this chunk.
+        for (ts, hash) in s.push(&chunk).unwrap() {
+            println!("t={} ms hash={:08x}", ts.0, hash.hash);
+            total += 1;
         }
     }
 
-    // Drain whatever's pending at end-of-stream.
-    for (timestamp, hash) in s.flush() {
-        println!("{:?} {:08x}", timestamp, hash.hash);
+    // Drain whatever is pending at end-of-stream.
+    for (ts, hash) in s.flush().unwrap() {
+        println!("t={} ms hash={:08x}", ts.0, hash.hash);
+        total += 1;
     }
 
-    println!("latency: {} ms", s.latency_ms());
+    println!("{total} hashes; latency {} ms", s.latency_ms());
 }
 ```
 
