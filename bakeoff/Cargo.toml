@@ -1,0 +1,16 @@
+# Dev-only chromaprint bakeoff harness (issue #88). NOT a workspace member,
+# not published, excluded from the crates.io pack (see root Cargo.toml).
+[package]
+name = "audiofp-bakeoff"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+audiofp = { path = "..", features = ["all-codecs"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
