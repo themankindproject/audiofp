@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Chromaprint bakeoff** (#88) — `bakeoff/` harness measures overlap,
+  1:N identification, and latency vs chromaprint 1.6 on the robustness
+  corpus; results published in `BENCHMARKS.md`.
 - **`.afp` fingerprint cache files (`std`)** (#119) — `audiofp::cache`:
   `cache_to_file` / `load_from_cache` / `load_all_cached` persist any
   classical fingerprint as the #117 v1 blob (byte-identical — no new

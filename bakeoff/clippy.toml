@@ -1,0 +1,5 @@
+# Deliberately present: clippy resolves clippy.toml by walking up from the
+# crate's workspace root, so without this file it would inherit the repo
+# root's disallowed-methods (Instant::now is banned there for library
+# testability). This crate is a measurement harness — wall-clock timing is
+# its purpose, so the local (empty) config stops the search.
