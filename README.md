@@ -173,34 +173,6 @@ fn main() {
 
 For complete API reference and usage examples, see [USAGE.md](USAGE.md).
 
-## Architecture
-
-### Fingerprint Types
-
-Each algorithm emits a strongly-typed, `bytemuck::Pod`-castable result:
-
-```
-Wang offline                         Panako offline
-┌──────────────────────────┐         ┌──────────────────────────┐
-│ WangFingerprint          │         │ PanakoFingerprint        │
-│   hashes: Vec<WangHash>  │         │   hashes: Vec<PanakoHash>│
-│   frames_per_sec: f32    │         │   frames_per_sec: f32    │
-└──────────────────────────┘         └──────────────────────────┘
-
-WangHash (8 bytes, repr(C))          PanakoHash (16 bytes, repr(C))
-├── hash: u32                        ├── hash: u32
-└── t_anchor: u32                    ├── t_anchor: u32
-                                     ├── t_b: u32
-                                     └── t_c: u32
-
-Haitsma offline
-┌──────────────────────────┐
-│ HaitsmaFingerprint       │
-│   frames: Vec<u32>       │   one u32 per spectrogram frame ≥ 1
-│   frames_per_sec: f32    │
-└──────────────────────────┘
-```
-
 ## Performance
 
 Offline extract (`cargo bench --bench extract`, 30 s of synthetic audio):
@@ -292,26 +264,6 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 | `bytemuck::Pod` hash types | Yes | No | N/A |
 | Built-in resampler | Yes | No | No |
 | In-memory matcher (Wang/Haitsma) | Yes | No | Yes (Dejavu) |
-
-## Examples
-
-The `examples/` directory contains complete working programs that can be run with `cargo run --example <name>`:
-
-- `enroll_file` — fingerprint a single audio file and print the unique Wang landmark count (`--features` default / `std`).
-- `match_two_files` — print the number of Wang hash collisions between two files (the canonical "is this the same recording?" check).
-- `compare_algorithms` — run Wang, Panako, and Haitsma–Kalker over the same file and report per-algorithm timing and hash counts.
-- `stream_buffer` — feed Wang's streaming fingerprinter from an `io::Read` chunk-by-chunk.
-- `dsp_starter` — STFT → mel → peaks pipeline on synthetic audio (no file, no optional features).
-- `neural_embed` — load a BYO ONNX embedder and print embedding dim (`--features neural`).
-- `watermark_detect` — load an AudioSeal-compatible ONNX model and print confidence (`--features watermark`).
-
-```bash
-cargo run --example dsp_starter
-cargo run --example neural_embed --features neural -- path/to/model.onnx
-cargo run --example watermark_detect --features watermark,std-wav -- path/to/audioseal.onnx [audio.wav]
-```
-
-The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.
 
 ## Security
 
