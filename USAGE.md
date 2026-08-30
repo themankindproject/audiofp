@@ -35,6 +35,7 @@
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Fingerprint Serialization](#fingerprint-serialization)
+  - [Cache files (.afp)](#cache-files-afp)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
 - [Neural Embedder](#neural-embedder)
@@ -192,7 +193,8 @@ All three classical fingerprinters:
 the 1:N indexes instead of naive hash-set overlap.
 
 **Persistence is out of scope** beyond a simple self-describing binary blob
-([Fingerprint Serialization](#fingerprint-serialization)). There is no
+([Fingerprint Serialization](#fingerprint-serialization)) and its `.afp`
+file-cache helper ([Cache files](#cache-files-afp)). There is no
 on-disk index, RPC wire format, or database adapter. A typical production
 pipeline is:
 
@@ -1343,6 +1345,40 @@ pub struct FingerprintEnvelope {
 | `envelope()` | all three | metadata of a *parsed* fingerprint |
 | `FingerprintEnvelope::peek(&[u8])` | raw bytes | header-only — never touches the payload |
 
+### Cache files (.afp)
+
+A `.afp` file is a v1 blob (above) written to disk — exactly
+`fs::write(path, fp.to_bytes())`. `audiofp::cache` (available whenever any
+`std`-implying feature is on) wraps the file I/O for the *parallel extract →
+serial ingest* workflow: extraction is CPU-bound and runs on rayon; storage
+and indexing are single-writer and serial.
+
+```rust
+use audiofp::cache::{cache_to_file, load_from_cache};
+use audiofp::classical::{Wang, WangFingerprint};
+use audiofp::{Fingerprinter, SampleRate};
+
+fn main() -> audiofp::Result<()> {
+    let samples = vec![0.0_f32; 8_000 * 3];
+    let fp = Wang::default().extract(&samples, SampleRate::HZ_8000)?;
+    let path = std::env::temp_dir().join("t.afp");
+    cache_to_file(&fp, &path)?;
+
+    let restored: WangFingerprint = load_from_cache(&path)?;
+    assert_eq!(restored.hashes, fp.hashes);
+    std::fs::remove_file(&path).ok();
+    Ok(())
+}
+```
+
+| API | Notes |
+| --- | --- |
+| `cache_to_file(&fp, &path)` | any of the 3 classical fingerprints; overwrites; parent dirs not created |
+| `load_from_cache::<T>(&path)` | `Io` on read failure, `Deserialize` on corrupt blob |
+| `load_all_cached(&dir)` | all `*.afp` (non-recursive, path-sorted); `CachedFingerprint` enum per file — mixed-algorithm dirs work; fails on the first bad file (error names it) |
+
+End-to-end demo: `cargo run --example cache_workflow --features rayon -- <dir>`.
+
 ---
 
 ## Audio File Decoding
@@ -1957,7 +1993,9 @@ fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
 For process-level parallelism enable the `rayon` feature and use
 `audiofp::fingerprint_batch_parallel`, which fingerprints many buffers
 across cores (it parallelises extraction only — matching stays sequential
-by design; use the indexes for large 1:N).
+by design; use the indexes for large 1:N). To decouple parallel extraction
+from single-writer storage/indexing, cache each result to a `.afp` file
+([Cache files](#cache-files-afp)) and ingest the directory serially.
 
 ### Model sourcing
 
@@ -2093,7 +2131,7 @@ Default = `[]` (no_std + alloc, no codecs):
 
 | Feature      | Brings in                                                                    |
 | ------------ | ---------------------------------------------------------------------------- |
-| `std`        | Symphonia itself, no codecs. Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
+| `std`        | Symphonia itself, no codecs; also enables `audiofp::cache` (`.afp` fingerprint files). Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
 | `std-mp3`    | MP3 (`symphonia/mp3`)                                                        |
 | `std-aac`    | raw AAC (`symphonia/aac`)                                                    |
 | `std-flac`   | FLAC (`symphonia/flac`)                                                      |

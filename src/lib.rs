@@ -86,7 +86,7 @@
 //!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |         | Symphonia itself (no codecs; combine with a `std-*` feature).     |
+//! | `std`        |         | Symphonia itself (no codecs; combine with a `std-*` feature). Also enables the `cache` module (`.afp` fingerprint files).     |
 //! | `std-wav`    |         | WAV + raw PCM decoding → [`io`].                                  |
 //! | `std-mp3`    |         | MP3 decoding → [`io`].                                            |
 //! | `std-flac`   |         | FLAC decoding → [`io`].                                           |
@@ -149,6 +149,8 @@ extern crate alloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "std")]
+pub mod cache;
 pub mod classical;
 pub mod dsp;
 #[cfg(any(
