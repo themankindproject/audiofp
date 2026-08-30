@@ -149,6 +149,8 @@ extern crate alloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "std")]
+pub mod cache;
 pub mod classical;
 pub mod dsp;
 #[cfg(any(
