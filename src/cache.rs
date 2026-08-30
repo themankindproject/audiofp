@@ -86,6 +86,9 @@ impl CachedFingerprint {
             "wang-v1" => Ok(Self::Wang(WangFingerprint::from_bytes(bytes)?)),
             "panako-v2" => Ok(Self::Panako(PanakoFingerprint::from_bytes(bytes)?)),
             "haitsma-v1" => Ok(Self::Haitsma(HaitsmaFingerprint::from_bytes(bytes)?)),
+            // Unreachable today: `peek` validates the algorithm id against
+            // the known table first. Defensive: a future `serial` version
+            // adding an algorithm must not be misparsed here.
             other => Err(AfpError::Deserialize(format!(
                 "unknown algorithm tag: {other}"
             ))),
@@ -201,6 +204,11 @@ pub fn load_all_cached(dir: &Path) -> Result<Vec<(PathBuf, CachedFingerprint)>> 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
         let bytes = fs::read(&path).map_err(|e| AfpError::io_with_path(&path, e))?;
+        // `from_blob` yields `Deserialize` on every failure path today
+        // (header + payload validation); name the offending file. The
+        // `other` arm is defensive — it cannot fire while `from_blob`
+        // only constructs `Deserialize`, but if a future error variant
+        // is added there it must still propagate with its own context.
         let fp = CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
             AfpError::Deserialize(msg) => {
                 AfpError::Deserialize(format!("{}: {msg}", path.display()))
@@ -434,5 +442,95 @@ mod tests {
         cache_to_file(&fp, &path).unwrap();
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(on_disk, fp.to_bytes());
+    }
+
+    #[test]
+    fn cached_fingerprint_partial_eq_per_variant() {
+        use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, PanakoHash};
+
+        let panako = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 5,
+                t_anchor: 1,
+                t_b: 2,
+                t_c: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![7, 8],
+            frames_per_sec: 78.125,
+        };
+
+        // Same-variant equality (Panako and Haitsma arms)…
+        assert_eq!(
+            CachedFingerprint::Panako(panako.clone()),
+            CachedFingerprint::Panako(panako.clone())
+        );
+        assert_eq!(
+            CachedFingerprint::Haitsma(haitsma.clone()),
+            CachedFingerprint::Haitsma(haitsma.clone())
+        );
+        // …and field-wise inequality inside each variant.
+        let panako_other = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 6,
+                t_anchor: 1,
+                t_b: 2,
+                t_c: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        assert_ne!(
+            CachedFingerprint::Panako(panako),
+            CachedFingerprint::Panako(panako_other)
+        );
+        let haitsma_other = HaitsmaFingerprint {
+            frames: vec![7, 9],
+            frames_per_sec: 78.125,
+        };
+        assert_ne!(
+            CachedFingerprint::Haitsma(haitsma.clone()),
+            CachedFingerprint::Haitsma(haitsma_other)
+        );
+        // Cross-variant inequality (the `_ => false` arm).
+        assert_ne!(
+            CachedFingerprint::Wang(WangFingerprint {
+                hashes: vec![],
+                frames_per_sec: 62.5
+            }),
+            CachedFingerprint::Haitsma(haitsma)
+        );
+    }
+
+    #[test]
+    fn envelope_per_variant() {
+        use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, PanakoHash};
+
+        let panako = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 5,
+                t_anchor: 1,
+                t_b: 2,
+                t_c: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![7, 8, 9],
+            frames_per_sec: 78.125,
+        };
+
+        let p_env = CachedFingerprint::Panako(panako).envelope();
+        assert_eq!(p_env.algorithm, "panako-v2");
+        assert_eq!(p_env.sample_rate, 8_000);
+        assert_eq!(p_env.hash_count, 1);
+        assert_eq!(p_env.frames_per_sec, 62.5);
+
+        let h_env = CachedFingerprint::Haitsma(haitsma).envelope();
+        assert_eq!(h_env.algorithm, "haitsma-v1");
+        assert_eq!(h_env.sample_rate, 5_000);
+        assert_eq!(h_env.hash_count, 3);
+        assert_eq!(h_env.frames_per_sec, 78.125);
     }
 }
