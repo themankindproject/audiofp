@@ -22,7 +22,8 @@
 //! cache_to_file(&fp, &path)?;
 //!
 //! // 2. Serial ingest reads them back:
-//! let restored: Wang::Output = load_from_cache(&path)?;
+//! let restored: <Wang as Fingerprinter>::Output =
+//!     load_from_cache(&path)?;
 //! assert_eq!(restored.hashes, fp.hashes);
 //! assert_eq!(restored.frames_per_sec, fp.frames_per_sec);
 //! # std::fs::remove_file(&path).ok();
@@ -255,5 +256,183 @@ mod tests {
         let restored: WangFingerprint = load_from_cache(&path).unwrap();
         assert_eq!(restored.hashes, fp.hashes);
         assert_eq!(restored.frames_per_sec, fp.frames_per_sec);
+    }
+
+    #[test]
+    fn roundtrip_panako_and_haitsma_cache_files() {
+        use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, PanakoHash};
+
+        let panako = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 0x1234_5678,
+                t_anchor: 10,
+                t_b: 15,
+                t_c: 20,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![0xAAAA_BBBB, 0x1111_2222],
+            frames_per_sec: 78.125,
+        };
+
+        let dir = TempDir::new("roundtrip_pa");
+        let p_path = dir.0.join("p.afp");
+        let h_path = dir.0.join("h.afp");
+        cache_to_file(&panako, &p_path).unwrap();
+        cache_to_file(&haitsma, &h_path).unwrap();
+
+        let p_restored: PanakoFingerprint = load_from_cache(&p_path).unwrap();
+        assert_eq!(p_restored.hashes, panako.hashes);
+        assert_eq!(p_restored.frames_per_sec, panako.frames_per_sec);
+
+        let h_restored: HaitsmaFingerprint = load_from_cache(&h_path).unwrap();
+        assert_eq!(h_restored.frames, haitsma.frames);
+        assert_eq!(h_restored.frames_per_sec, haitsma.frames_per_sec);
+    }
+
+    #[test]
+    fn load_all_cached_sorts_and_ignores_other_extensions() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("scan");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&fp, &dir.0.join("c.afp")).unwrap();
+        std::fs::write(dir.0.join("notes.txt"), "not a fingerprint").unwrap();
+        // Subdirectory with an .afp inside — must be skipped (non-recursive).
+        let sub = dir.0.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        cache_to_file(&fp, &sub.join("b.afp")).unwrap();
+
+        let loaded = load_all_cached(&dir.0).unwrap();
+        let names: Vec<&str> = loaded
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a.afp", "c.afp"]);
+        // Sortedness (not a fixed global order — Windows sorts differently).
+        let sorted = {
+            let mut v = loaded.clone();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(loaded, sorted);
+        // Every entry is the fingerprint we cached.
+        for (_, cached) in &loaded {
+            assert_eq!(cached, &CachedFingerprint::Wang(fp.clone()));
+        }
+    }
+
+    #[test]
+    fn load_all_cached_empty_dir_is_ok() {
+        let dir = TempDir::new("empty");
+        let loaded = load_all_cached(&dir.0).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_all_cached_missing_dir_is_io_error() {
+        let missing = TempDir::new("missing").0.join("does_not_exist");
+        let err = load_all_cached(&missing).unwrap_err();
+        assert!(err.to_string().contains("does_not_exist"), "got: {err}");
+    }
+
+    #[test]
+    fn load_all_cached_corrupt_file_fails_with_path_in_error() {
+        let fp = WangFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("corrupt");
+        cache_to_file(&fp, &dir.0.join("good.afp")).unwrap();
+        std::fs::write(dir.0.join("bad.afp"), b"garbage bytes, no magic").unwrap();
+
+        let err = load_all_cached(&dir.0).unwrap_err();
+        assert!(
+            err.to_string().contains("bad.afp"),
+            "error must name the corrupt file: {err}"
+        );
+    }
+
+    #[test]
+    fn load_all_cached_mixed_algorithms() {
+        use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, PanakoHash};
+
+        let wang = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 9,
+                t_anchor: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let panako = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 5,
+                t_anchor: 1,
+                t_b: 2,
+                t_c: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![7, 8],
+            frames_per_sec: 78.125,
+        };
+
+        let dir = TempDir::new("mixed");
+        cache_to_file(&wang, &dir.0.join("w.afp")).unwrap();
+        cache_to_file(&panako, &dir.0.join("p.afp")).unwrap();
+        cache_to_file(&haitsma, &dir.0.join("h.afp")).unwrap();
+
+        let loaded = load_all_cached(&dir.0).unwrap();
+        assert_eq!(loaded.len(), 3);
+        for (path, cached) in &loaded {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            match cached {
+                CachedFingerprint::Wang(fp) => {
+                    assert_eq!(name, "w.afp");
+                    assert_eq!(fp.hashes, wang.hashes);
+                }
+                CachedFingerprint::Panako(fp) => {
+                    assert_eq!(name, "p.afp");
+                    assert_eq!(fp.hashes, panako.hashes);
+                }
+                CachedFingerprint::Haitsma(fp) => {
+                    assert_eq!(name, "h.afp");
+                    assert_eq!(fp.frames, haitsma.frames);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_from_cache_missing_file_is_io_error_with_path() {
+        let dir = TempDir::new("missing_file");
+        let missing = dir.0.join("nope.afp");
+        let err = load_from_cache::<WangFingerprint>(&missing).unwrap_err();
+        assert!(err.to_string().contains("nope.afp"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_file_bytes_identical_to_to_bytes() {
+        // Pins the "no extra wrapper bytes" contract: a .afp file on disk
+        // is exactly fp.to_bytes().
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0xFF,
+                t_anchor: 7,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("identical");
+        let path = dir.0.join("bytes.afp");
+        cache_to_file(&fp, &path).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, fp.to_bytes());
     }
 }
