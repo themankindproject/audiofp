@@ -1,0 +1,37 @@
+# Chromaprint bakeoff runner — manual only.
+#
+# Deliberately NOT on push/pull_request: the harness links the system
+# libchromaprint package (version varies by distro) and its latency numbers
+# are CPU-bound, so it must not gate PRs.
+#
+# The report step writes BENCHMARKS-DRIFT.txt (an artifact), never the
+# committed BENCHMARKS.md: silently swapping machine-dependent numbers into
+# the published file would make it unattributable. The portable gate is the
+# --check invariant suite, which fails the run on gross drift.
+name: bakeoff
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  chromaprint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install libchromaprint
+        run: sudo apt-get update && sudo apt-get install -y libchromaprint-dev
+      - name: run invariants
+        working-directory: bakeoff
+        run: cargo run --release -- --check
+      - name: regenerate report
+        working-directory: bakeoff
+        run: cargo run --release --quiet -- --report > ../BENCHMARKS-DRIFT.txt
+      - name: upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakeoff-report
+          path: |
+            BENCHMARKS-DRIFT.txt
+            bakeoff/Cargo.lock
