@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`.afp` fingerprint cache files (`std`)** (#119) — `audiofp::cache`:
+  `cache_to_file` / `load_from_cache` / `load_all_cached` persist any
+  classical fingerprint as the #117 v1 blob (byte-identical — no new
+  format), enabling parallel extraction → serial index ingest. See the
+  `cache_workflow` example.
+
 ## [0.4.1] - 2026-08-28
 
 ### Changed

@@ -73,10 +73,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Deterministic synthetic "track" (~2 s of mono 8 kHz audio): bass line
-/// + sustained chord + stepped melody, all derived from the seed, so
-/// different seeds produce different landmark configurations. Real
-/// applications would decode files via `audiofp::io` instead.
+/// Deterministic synthetic "track": bass line + sustained chord + stepped
+/// melody, all derived from the seed, so different seeds produce different
+/// landmark configurations (~2 s of mono 8 kHz audio). Real applications
+/// would decode files via `audiofp::io` instead.
 fn synth_track(seed: u64) -> Vec<f32> {
     const SR: f32 = 8_000.0;
     const SECS: usize = 2;

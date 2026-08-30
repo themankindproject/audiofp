@@ -130,6 +130,32 @@ fn parallel_extract_then_serial_ingest() {
 }
 
 // =========================================================================
+// Directory scan without rayon (also keeps `load_all_cached` exercised in
+// non-rayon feature combos).
+// =========================================================================
+
+#[test]
+fn cache_dir_load_matches_single_file_load() {
+    let dir = TempDir::new("dir_scan");
+    for seed in [21_u64, 22, 23] {
+        let pcm = synth_8k(seed, 2.0);
+        let fp = Wang::default().extract(&pcm, SampleRate::HZ_8000).unwrap();
+        cache_to_file(&fp, &dir.0.join(format!("{seed}.afp"))).unwrap();
+    }
+
+    let all = load_all_cached(&dir.0).unwrap();
+    assert_eq!(all.len(), 3);
+    for (path, entry) in &all {
+        let single: WangFingerprint = load_from_cache(path).unwrap();
+        let CachedFingerprint::Wang(from_dir) = entry else {
+            panic!("expected Wang for {path:?}");
+        };
+        assert_eq!(from_dir.hashes, single.hashes);
+        assert_eq!(from_dir.frames_per_sec, single.frames_per_sec);
+    }
+}
+
+// =========================================================================
 // Envelope survives the cache round-trip
 // =========================================================================
 
