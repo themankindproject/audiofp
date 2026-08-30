@@ -42,7 +42,7 @@ pub const AFP_EXT: &str = "afp";
 
 /// A fingerprint loaded from an arbitrary `.afp` blob.
 ///
-/// [`load_all_cached`](self::load_all_cached) returns this enum because a
+/// [`load_all_cached`] returns this enum because a
 /// cache directory may mix algorithms.
 #[derive(Clone, Debug)]
 pub enum CachedFingerprint {

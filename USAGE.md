@@ -35,6 +35,7 @@
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Fingerprint Serialization](#fingerprint-serialization)
+  - [Cache files (.afp)](#cache-files-afp)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
 - [Neural Embedder](#neural-embedder)
@@ -192,7 +193,8 @@ All three classical fingerprinters:
 the 1:N indexes instead of naive hash-set overlap.
 
 **Persistence is out of scope** beyond a simple self-describing binary blob
-([Fingerprint Serialization](#fingerprint-serialization)). There is no
+([Fingerprint Serialization](#fingerprint-serialization)) and its `.afp`
+file-cache helper ([Cache files](#cache-files-afp)). There is no
 on-disk index, RPC wire format, or database adapter. A typical production
 pipeline is:
 
@@ -1991,7 +1993,9 @@ fn enroll_batch(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
 For process-level parallelism enable the `rayon` feature and use
 `audiofp::fingerprint_batch_parallel`, which fingerprints many buffers
 across cores (it parallelises extraction only — matching stays sequential
-by design; use the indexes for large 1:N).
+by design; use the indexes for large 1:N). To decouple parallel extraction
+from single-writer storage/indexing, cache each result to a `.afp` file
+([Cache files](#cache-files-afp)) and ingest the directory serially.
 
 ### Model sourcing
 
@@ -2127,7 +2131,7 @@ Default = `[]` (no_std + alloc, no codecs):
 
 | Feature      | Brings in                                                                    |
 | ------------ | ---------------------------------------------------------------------------- |
-| `std`        | Symphonia itself, no codecs. Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
+| `std`        | Symphonia itself, no codecs; also enables `audiofp::cache` (`.afp` fingerprint files). Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
 | `std-mp3`    | MP3 (`symphonia/mp3`)                                                        |
 | `std-aac`    | raw AAC (`symphonia/aac`)                                                    |
 | `std-flac`   | FLAC (`symphonia/flac`)                                                      |
