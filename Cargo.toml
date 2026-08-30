@@ -199,6 +199,10 @@ required-features = ["std-mp3", "std-flac", "std-ogg", "std-wav", "std-mp4"]
 name = "stream_buffer"
 
 [[example]]
+name = "cache_workflow"
+required-features = ["rayon"]
+
+[[example]]
 name = "dsp_starter"
 
 [[example]]
