@@ -28,6 +28,10 @@ exclude      = [
     # Fuzz harnesses.
     "fuzz/",
 
+    # Chromaprint bakeoff harness (dev-only, system-lib dep) + its report.
+    "bakeoff/",
+    "BENCHMARKS.md",
+
     # Benchmarks (users run their own; bench code references test helpers).
     "benches/",
 

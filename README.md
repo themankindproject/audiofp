@@ -265,6 +265,9 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 | Built-in resampler | Yes | No | No |
 | In-memory matcher (Wang/Haitsma) | Yes | No | Yes (Dejavu) |
 
+Measured head-to-head on a shared corpus (overlap, 1:N identification,
+latency): [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `DecodeLimits` with `decode_to_mono_limited` for untrusted uploads.
