@@ -1343,6 +1343,40 @@ pub struct FingerprintEnvelope {
 | `envelope()` | all three | metadata of a *parsed* fingerprint |
 | `FingerprintEnvelope::peek(&[u8])` | raw bytes | header-only — never touches the payload |
 
+### Cache files (.afp)
+
+A `.afp` file is a v1 blob (above) written to disk — exactly
+`fs::write(path, fp.to_bytes())`. `audiofp::cache` (available whenever any
+`std`-implying feature is on) wraps the file I/O for the *parallel extract →
+serial ingest* workflow: extraction is CPU-bound and runs on rayon; storage
+and indexing are single-writer and serial.
+
+```rust
+use audiofp::cache::{cache_to_file, load_from_cache};
+use audiofp::classical::{Wang, WangFingerprint};
+use audiofp::{Fingerprinter, SampleRate};
+
+fn main() -> audiofp::Result<()> {
+    let samples = vec![0.0_f32; 8_000 * 3];
+    let fp = Wang::default().extract(&samples, SampleRate::HZ_8000)?;
+    let path = std::env::temp_dir().join("t.afp");
+    cache_to_file(&fp, &path)?;
+
+    let restored: WangFingerprint = load_from_cache(&path)?;
+    assert_eq!(restored.hashes, fp.hashes);
+    std::fs::remove_file(&path).ok();
+    Ok(())
+}
+```
+
+| API | Notes |
+| --- | --- |
+| `cache_to_file(&fp, &path)` | any of the 3 classical fingerprints; overwrites; parent dirs not created |
+| `load_from_cache::<T>(&path)` | `Io` on read failure, `Deserialize` on corrupt blob |
+| `load_all_cached(&dir)` | all `*.afp` (non-recursive, path-sorted); `CachedFingerprint` enum per file — mixed-algorithm dirs work; fails on the first bad file (error names it) |
+
+End-to-end demo: `cargo run --example cache_workflow --features rayon -- <dir>`.
+
 ---
 
 ## Audio File Decoding

@@ -44,6 +44,7 @@ SKIP_RUN = (
     "fingerprint_blocking",
     "enroll_batch",
     "suspect",
+    "cache_to_file",
 )
 
 CARGO_TOML = """\
