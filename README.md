@@ -8,101 +8,85 @@
 ![Crates.io Downloads](https://img.shields.io/crates/d/audiofp)
 ![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 
-Pure-Rust audio fingerprinting — **Wang (Shazam) landmarks, Panako tempo-robust triplets, and Haitsma–Kalker band hashes** with bit-exact streaming, in-memory matching, and BYO ONNX for neural/watermark.
+Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, and **AudioSeal-compatible watermark detection**.
 
-> `no_std + alloc` by default. File decoding, neural, and watermark are opt-in.
+## Overview
 
----
+`audiofp` provides three complementary classical fingerprinters for music identification, each with offline and streaming variants, plus an in-memory matching layer for identification:
 
-## Contents
+| Method | Use Case | Sample Rate | Frame Rate | Output Size |
+|--------|----------|-------------|------------|-------------|
+| **Wang** | Music ID, Shazam-style matching | 8 kHz | 62.5 fps | ~2.4 KB/s (fan-out 10) |
+| **Panako** | Music ID with ±5 % tempo robustness | 8 kHz | 62.5 fps | ~2.0 KB/s (fan-out 5) |
+| **Haitsma** | Compact dense IDs, fastest extraction | 5 kHz | 78.125 fps | 312 B/s |
+| **Matching** | In-memory ID (`WangMatcher`, `HaitsmaMatcher`, …) | — | — | — |
+| **Streaming** | Real-time hash emission | (per algorithm) | (per algorithm) | Bit-exact offline parity |
+| **Watermark** | AudioSeal detection (BYO ONNX) | 16 kHz | (per model) | Detection + 16-bit message |
 
-- [Why audiofp](#why-audiofp)
-- [Features](#features)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Architecture](#architecture)
-- [Performance](#performance)
-- [Robustness](#robustness)
-- [Comparison](#comparison-with-alternatives)
-- [Examples](#examples)
-- [Security](#security)
-- [Contributing](#contributing)
-
-Full API reference and bit-layout specs: **[USAGE.md](USAGE.md)** · Codec methodology: **[ROBUSTNESS.md](ROBUSTNESS.md)** · Threat model: **[SECURITY.md](SECURITY.md)**
-
----
-
-## Why audiofp
-
-| You need | Use |
-|---|---|
-| "What is this song?" (Shazam-style) | **Wang** — ~300 hashes/s, 62.5 fps |
-| Same but survives ±5% time-stretch | **Panako** — 2-D Hough + RANSAC, same rate |
-| Ultra-compact ID / lowest latency | **Haitsma** — 312 B/s, 409 ms latency |
-| Cover / remix similarity | **Neural** BYO ONNX log-mel embedder |
-| Generative-AI provenance | **Watermark** AudioSeal-compatible detector |
-
-Also: deduplication at scale, royalty enforcement, `bytemuck::Pod` persistence, real-time mic identification.
-
-**Out of scope:** on-disk index / DB adapter / wire format beyond a tiny `to_bytes` blob (`src/serial.rs:10`). Persist with your store, match in-memory via `WangMatcher` / `WangIndex`.
-
----
+Perfect for:
+- Music identification ("what is this song?")
+- Audio deduplication at scale
+- Royalty / rights enforcement against re-encoded content
+- Embedding-based similarity search and cover/remix detection (BYO ONNX model via the `neural` feature)
+- Watermark verification on generative-AI audio
 
 ## Features
 
-- **3 classical algorithms** + streaming twins with **bit-exact offline parity** down to 1-sample-per-push
-- **In-memory matching** — `WangMatcher` (offset histogram) / `HaitsmaMatcher` (BER + LUT) / `PanakoMatcher` (2-D Hough + RANSAC) + `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` for 1:N
-- **Deterministic** — same PCM → same hashes, every time; `name()` version contract (`wang-v1`, `panako-v2`, `haitsma-v1`)
-- **`bytemuck::Pod` hashes** — `WangHash` 8 B / `PanakoHash` 16 B `src/classical/wang.rs:65` — mmap/FFI without serialization; `to_bytes` blob `AUDIOFP\0` v1 also available
-- **File decoding** via Symphonia (MP3/FLAC/WAV/OGG/AAC-in-MP4/…) + **Kaiser windowed-sinc resampler** with auto anti-alias cutoff
-- **Watermark / Neural** — Tract ONNX; model cached per input length, streaming `try_push_with` zero-alloc after warmup
-- **DSP primitives** — `dsp::stft` / `mel` / `peaks` / `resample` / `windows` all public and `no_std + alloc`
-- **Hardened** — `DecodeLimits`, `max_input_samples` / `max_hashes` / `max_pending_anchors`, `InputTooLarge`, `NonFiniteSample`, cooperative `Timeout`
-
----
+- **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
+- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC) / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` accelerators for 1:N identification. No persistence or DB adapters.
+- **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` (verified by the test suite at every chunk size).
+- **Bit-Exact Determinism** - Same input always produces the same hashes; verified down to 1-sample-per-push streaming chunks
+- **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization
+- **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
+- **High-Quality Resampling** - Built-in windowed-sinc Kaiser resampler with auto anti-aliasing cutoff
+- **Watermark Detection** - AudioSeal-compatible ONNX wrapper (Tract backend); typed model is cached per input length and rebuilt automatically when the length changes
+- **Neural Embedder** - Generic ONNX log-mel embedder with offline + streaming modes; build-once-runnable, zero-alloc `try_push_with` callback (scratch is allocated at construction, reused on every push)
+- **DSP Primitives Reusable** - Public `dsp::stft`, `dsp::mel`, `dsp::peaks`, `dsp::resample`, `dsp::windows`
+- **Allocation-Free Hot Path** - Streaming `push` reuses pre-allocated scratch after warmup
+- **`no_std + alloc` Capable** - DSP and classical fingerprinters compile without std (host-only today; bare-metal in roadmap)
+- **Feature-Gated Heavy Deps** - Symphonia and Tract both opt-in via Cargo features
+- **Optional `mimalloc`** - Single-flag opt-in to install `mimalloc` as the global allocator
 
 ## Installation
 
 ```toml
 [dependencies]
-# Minimal — no codecs, no_std + alloc (DSP + classical only)
-audiofp = { version = "0.4.1", default-features = false }
-
-# File decoding — pick only what you decode:
-audiofp = { version = "0.4.1", features = ["std-wav", "std-mp3"] }
-audiofp = { version = "0.4.1", features = ["std-flac", "std-ogg", "std-mp4"] }
-audiofp = { version = "0.4.1", features = ["all-codecs"] }  # every codec (pre-0.4 std)
-
-# Heavy optional subsystems (each implies std, no codecs on their own):
-audiofp = { version = "0.4.1", features = ["neural"] }      # ONNX embedder
-audiofp = { version = "0.4.1", features = ["watermark", "std-wav"] }
-audiofp = { version = "0.4.1", features = ["rayon"] }       # par_match_* + fingerprint_batch_parallel
+# WAV + MP3 decoding for the quick-start below (pick the codecs you need):
+audiofp = { version = "0.4", features = ["std-wav", "std-mp3"] }
 ```
 
-Default build is `no_std + alloc` with no codecs. `audiofp::io` exists only with at least one `std-*` / `all-codecs` — bare `std` alone is a `compile_error!` `src/lib.rs:139`.
+The default build is `no_std + alloc` with **no codecs**. Decoding helpers
+(`audiofp::io`) are opt-in per codec: `std-wav`, `std-mp3`, `std-flac`,
+`std-ogg`, `std-aac`, `std-mp4`, plus `std-aiff` / `std-mkv` / `std-adpcm` /
+`std-alac` for the extended formats — or `all-codecs` for every codec at
+once (the pre-0.4.0 `std` behavior).
 
-### Feature flags
+### Feature Flags
 
-| Feature | Description |
-|---|---|
-| `std-wav` | WAV + raw PCM → `audiofp::io` |
-| `std-mp3` | MP3 |
-| `std-flac` | FLAC |
-| `std-ogg` | Ogg Vorbis |
-| `std-aac` | AAC |
-| `std-mp4` | AAC-in-MP4 / ISOBMFF (pulls AAC demuxer + decoder) |
-| `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | Extended codecs |
-| `all-codecs` | All of the above at once |
-| `rayon` | `fingerprint_batch_parallel` + `par_match_best` / `par_match_ranked` |
-| `watermark` | `audiofp::watermark` (Tract) |
-| `neural` | `audiofp::neural` (Tract, BYO model) |
-| `mimalloc` | `mimalloc` as `#[global_allocator]` |
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std-wav` | No | WAV + raw PCM decoding via Symphonia (`audiofp::io`) |
+| `std-mp3` | No | MP3 decoding via Symphonia |
+| `std-flac` | No | FLAC decoding via Symphonia |
+| `std-ogg` | No | Ogg-Vorbis decoding via Symphonia |
+| `std-aac` | No | AAC decoding via Symphonia |
+| `std-mp4` | No | AAC-in-MP4 / ISO-BMFF decoding via Symphonia |
+| `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
+| `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
+| `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` (implies `std`) |
+| `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`) |
+| `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
+| `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |
 
----
+Minimal build (no_std + alloc, DSP and classical only):
+```toml
+[dependencies]
+audiofp = { version = "0.4", default-features = false }
+```
 
-## Quick start
+## Quick Start
 
-### 1) Fingerprint a file
+### Fingerprint a file
 
 ```rust
 use audiofp::classical::Wang;
@@ -110,7 +94,8 @@ use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Resampled to Wang's native 8 kHz; needs ≥2 s or returns AudioTooShort.
+    // Decode any supported file format and resample to Wang's 8 kHz.
+    // Needs ≥ ~2 s of audio or extract returns AudioTooShort.
     let samples = decode_to_mono_at("song.mp3", 8_000)?;
 
     let mut wang = Wang::default();
@@ -118,42 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{} hashes at {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
     for h in fp.hashes.iter().take(5) {
-        println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
+        println!("  t_anchor={.0} hash={:08x}", h.t_anchor, h.hash);
     }
+
     Ok(())
 }
 ```
 
-Untrusted uploads — bound both phases:
-
-```rust,no_run
-use audiofp::io::{DecodeLimits, decode_to_mono_at_limited};
-use std::time::Duration;
-let limits = DecodeLimits::both(50_000_000, 14_400_000) // 50 MB on-disk, 30 min @8 kHz
-    .with_timeout(Duration::from_secs(30));
-let samples = decode_to_mono_at_limited("upload.mp3", 8_000, limits)?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-### 2) Raw PCM (no `io` feature needed)
-
-```rust
-use audiofp::classical::Wang;
-use audiofp::{Fingerprinter, SampleRate};
-
-fn main() -> audiofp::Result<()> {
-    let samples = vec![0.0_f32; 8_000 * 3]; // 3 s silence @8 kHz
-    let mut wang = Wang::default();
-    let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
-    assert_eq!(fp.frames_per_sec, 62.5);
-    assert!(fp.hashes.is_empty()); // silence → 0 hashes
-    Ok(())
-}
-```
-
-Decode `SampleRate` mismatch is `Err(UnsupportedSampleRate)`; NaN/Inf is `Err(NonFiniteSample)` offline, `0.0`-sanitized on streaming `push` `src/pcm.rs:28`.
-
-### 3) Match two recordings
+### Match two fingerprints (Wang)
 
 ```rust
 use audiofp::classical::Wang;
@@ -162,184 +119,207 @@ use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 use audiofp::{Fingerprinter, SampleRate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let q = {
-        let s = decode_to_mono_at("query.wav", 8_000)?;
-        Wang::default().extract(&s, SampleRate::HZ_8000)?
-    };
-    let r = {
-        let s = decode_to_mono_at("reference.flac", 8_000)?;
-        Wang::default().extract(&s, SampleRate::HZ_8000)?
-    };
+    let samples = decode_to_mono_at("clip.wav", 8_000)?;
+    let query = Wang::default().extract(&samples, SampleRate::HZ_8000)?;
+    let reference = query.clone(); // same recording
 
-    let m = WangMatcher::new(WangMatchConfig::default()).match_one(&q, &r);
-    println!("is_match={} score={:.3} offset={}ms prominence={:.1}", m.is_match, m.score, m.offset.ms, m.prominence);
+    let m = WangMatcher::new(WangMatchConfig::default()).match_one(&query, &reference);
+    println!("is_match={} score={:.3} offset={} ms", m.is_match, m.score, m.offset.ms);
     Ok(())
 }
 ```
 
-Repeated 1:1 against a fixed catalog — build once, reuse:
-
-```rust
-use audiofp::classical::{WangFingerprint, WangHash};
-use audiofp::matching::{WangMatchConfig, WangMatcher, WangRefIndex, Matcher};
-
-let reference = WangFingerprint { hashes: vec![WangHash{hash:1,t_anchor:0}], frames_per_sec:62.5 };
-let cfg = WangMatchConfig::default();
-let matcher = WangMatcher::new(cfg.clone());
-let index = WangRefIndex::build(&reference, &cfg).unwrap();
-let query = reference.clone();
-assert_eq!(matcher.match_one(&query, &reference), matcher.match_one_prebuilt(&query, &index));
-```
-
-### 4) Streaming (mic / chunked file)
+### Streaming Mode
 
 ```rust
 use audiofp::StreamingFingerprinter;
 use audiofp::classical::StreamingWang;
 use std::f32::consts::PI;
 
-fn main() -> audiofp::Result<()> {
+fn main() {
     let mut s = StreamingWang::default();
-    let sr = s.required_sample_rate(); // 8_000 — push has no runtime rate check
-    let chunk_len = (sr / 5) as usize; // 200 ms
+
+    // 8 kHz mono, fed in 200 ms chunks — swap for mic/file chunks.
+    let sr = s.required_sample_rate(); // 8_000
+    let chunk_len = (sr / 5) as usize;
     let mut total = 0usize;
-
     for i in 0..25 {
-        let chunk: Vec<f32> = (0..chunk_len).map(|j| {
-            let t = (i * chunk_len + j) as f32 / sr as f32;
-            0.5*(2.0*PI*880.0*t).sin() + 0.3*(2.0*PI*1320.0*t).sin()
-        }).collect();
+        // 5 s of a two-tone signal (silence emits nothing).
+        let chunk: Vec<f32> = (0..chunk_len)
+            .map(|j| {
+                let t = (i * chunk_len + j) as f32 / sr as f32;
+                0.5 * (2.0 * PI * 880.0 * t).sin() + 0.3 * (2.0 * PI * 1320.0 * t).sin()
+            })
+            .collect();
 
-        // Zero-alloc variant also available: s.push_with(&chunk, |ts, hash| …)?
-        for (ts, hash) in s.push(&chunk)? {
-            let _ = (ts.0, hash.hash);
+        // push returns hashes that finalised during this chunk.
+        for (ts, hash) in s.push(&chunk).unwrap() {
+            println!("t={} ms hash={:08x}", ts.0, hash.hash);
             total += 1;
         }
     }
-    total += s.flush()?.len();          // idempotent; push after flush is valid — use reset() for a fresh stream
-    println!("{total} hashes; latency {} ms", s.latency_ms()); // 2256 ms Wang, 2784 Panako, 409 Haitsma
-    Ok(())
+
+    // Drain whatever is pending at end-of-stream.
+    for (ts, hash) in s.flush().unwrap() {
+        println!("t={} ms hash={:08x}", ts.0, hash.hash);
+        total += 1;
+    }
+
+    println!("{total} hashes; latency {} ms", s.latency_ms());
 }
 ```
 
-Bit-exact: any chunking (even 1 sample per `push`) yields the identical hash multiset as offline `extract`.
+## Documentation
 
-Compact alternative for audio callbacks: `push_with` / `flush_with` — no `Vec` allocation.
-
----
+For complete API reference and usage examples, see [USAGE.md](USAGE.md).
 
 ## Architecture
 
-### Fingerprint types (`bytemuck::Pod`, `repr(C)`)
+### Fingerprint Types
+
+Each algorithm emits a strongly-typed, `bytemuck::Pod`-castable result:
 
 ```
-Wang          8 B  { hash: u32, t_anchor: u32 }           frames_per_sec 62.5 (8000/128)
-Panako       16 B  { hash: u32, t_anchor, t_b, t_c }      frames_per_sec 62.5
-Haitsma       4 B  frames: Vec<u32>  (32 bits / frame)    frames_per_sec 78.125 (5000/64)
-Neural        variable  Vec<NeuralEmbedding { vector, t_start }>  frames_per_sec = 1/hop_secs
+Wang offline                         Panako offline
+┌──────────────────────────┐         ┌──────────────────────────┐
+│ WangFingerprint          │         │ PanakoFingerprint        │
+│   hashes: Vec<WangHash>  │         │   hashes: Vec<PanakoHash>│
+│   frames_per_sec: f32    │         │   frames_per_sec: f32    │
+└──────────────────────────┘         └──────────────────────────┘
+
+WangHash (8 bytes, repr(C))          PanakoHash (16 bytes, repr(C))
+├── hash: u32                        ├── hash: u32
+└── t_anchor: u32                    ├── t_anchor: u32
+                                     ├── t_b: u32
+                                     └── t_c: u32
+
+Haitsma offline
+┌──────────────────────────┐
+│ HaitsmaFingerprint       │
+│   frames: Vec<u32>       │   one u32 per spectrogram frame ≥ 1
+│   frames_per_sec: f32    │
+└──────────────────────────┘
 ```
-
-Wang hashes sorted `(t_anchor, hash)` `src/classical/wang.rs:312`; Panako `(t_anchor,t_b,t_c,hash)` `src/classical/panako.rs:323`; Haitsma temporal order. Hash layouts, STFT params, and peak-picker contract are pinned in **[USAGE.md](USAGE.md)** — reimplementing from there is byte-identical.
-
-### Pipeline (all three classical share the front-end to dB)
-
-```
-PCM @ native rate → Hann STFT (non-centered) → power |X|² → 10·log10 → 31×31 peak picker → adaptive top-30/s → pairing
-```
-
-Wang pairs `Δt≤63, |Δf|≤64` top-10; Panako triplets `β=(t_c-t_b)/(t_c-t_a)·31`; Haitsma 33 log-bands 300–2000 Hz → 32 sign bits `src/classical/haitsma.rs:33`.
-
----
 
 ## Performance
 
-Measured on 30 s synthetic audio (`cargo bench --bench extract`), Intel i5-1135G7 with `RUSTFLAGS="-C target-cpu=native"` (enables POPCNT/AVX2/FMA for `wide`+FFT). Reproduce: `cargo bench --bench extract -- --save-baseline main`.
+Offline extract (`cargo bench --bench extract`, 30 s of synthetic audio):
 
-| Algorithm | 30 s audio | Realtime | Streaming push (10 s) | Latency |
-|---|---|---|---|---|
-| **Wang** | 79 ms | 380× | 10.5 ms | 2256 ms |
-| **Panako** | 81 ms | 370× | 11.6 ms | 2784 ms |
-| **Haitsma** | 42 ms | 714× | 6.3 ms | 409 ms |
+| Algorithm  | 30 s of audio | Realtime factor |
+| ---------- | ------------- | --------------- |
+| `Wang`     |  79 ms        | 380×            |
+| `Panako`   |  81 ms        | 370×            |
+| `Haitsma`  |  42 ms        | 714×            |
 
-Matching (5 s fingerprints, `cargo bench --bench matching`):
+Streaming push (`cargo bench --bench streaming`, 10 s of synthetic audio):
 
-| Path | Time | Notes |
-|---|---|---|
-| `WangMatcher` 1:1 | ~111 µs | histogram + prominence |
-| `HaitsmaMatcher` 1:1 | ~18 µs | BER + POPCNT |
-| `PanakoMatcher` 1:1 | ~264 µs | 2-D Hough + RANSAC |
-| `WangIndex` N=100 | ~102 µs | ~9.8k q/s, scales ~linearly |
+| Streaming type      | Small chunks (256 samples) | Large chunks (1 s) | `latency_ms()` |
+| ------------------- | -------------------------: | ------------------:| --------------- |
+| `StreamingWang`     | 10.5 ms                    | 10.6 ms            | 2 256 ms        |
+| `StreamingPanako`   | 11.6 ms                    | 11.4 ms            | 2 784 ms        |
+| `StreamingHaitsma`  |  6.3 ms                    |  6.7 ms            | 409 ms          |
 
-> For >10k tracks shard the index or raise `min_votes`/`min_score`. Full tables in [USAGE.md](USAGE.md).
+Neural front-end (`cargo bench --features neural --bench neural_frontend`):
 
-Neural front-end (`--features neural --bench neural_frontend`): `log_mel 1s window` 297 µs, `strided write` 7.6 µs.
+| Path                          | Time       |
+|-------------------------------|:----------:|
+| `log_mel_pipeline_1s_window`  | 297 µs     |
+| `strided_tensor_write`        | 7.6 µs     |
+| `l2_normalize_1024d`          | 2.5 µs     |
 
----
+Matching (`cargo bench --bench matching`, 5 s synthetic fingerprints):
+
+| Path                           | Time       | Notes                                      |
+|--------------------------------|:----------:|--------------------------------------------|
+| `WangMatcher` 1:1 self-match  | ~111 µs    | Offset-histogram voting + prominence       |
+| `HaitsmaMatcher` 1:1 exact    | ~18 µs     | Exhaustive BER at best alignment           |
+| `PanakoMatcher` 1:1           | ~264 µs    | 2-D Hough + RANSAC line-fitting            |
+| `WangIndex` N=100 query       | ~102 µs    | Inverted index + sliding-window peak       |
+
+Latency budget (per query, default configs, Intel i5-1135G7):
+
+| Catalog size | `WangIndex` query | Throughput  |
+|:------------:|:-----------------:|:-----------:|
+| 100 tracks   | ~102 µs           | ~9 800 q/s  |
+| 1 000 tracks | ~1 ms (est.)      | ~1 000 q/s  |
+| 10 000 tracks| ~10 ms (est.)     | ~100 q/s    |
+
+> Index query scales approximately linearly with catalog size (one
+> candidate-scoring pass per reference with hash hits). For catalogs
+> above ~10 000 tracks, use `min_votes` / `min_score` pre-filters or
+> shard the index.
+
+Run benchmarks for your own host:
+```bash
+cargo bench --bench extract
+cargo bench --bench streaming
+cargo bench --bench extract -- --save-baseline main   # save for diffing later
+```
 
 ## Robustness
 
-Spectral-peak (Wang/Panako) and band-delta (Haitsma) designs survive lossy transcoding. Verified on **"Galway" / "Furious Freak" (CC-BY, 16 s, 6 codecs)** — same-track Jaccard 0.36–0.54 (Wang/Panako) and bit-sim 0.77–0.93 (Haitsma) at 128 kbps; cross-track <0.001. Thresholds (`Wang ≥0.25`, `Panako ≥0.20`, `Haitsma ≥0.75`) calibrated so 600+ tests separate every same-track vs cross-track pair with margin ≥0.35.
+- **Codec-tolerant by design** — Wang and Panako are spectral-peak based; Haitsma is band-power-difference based. All three survive lossy re-encoding, verified by the test suite on real music:
 
-Reproduce: `cargo test --test codec_roundtrip --all-features -- --nocapture` · Full methodology and numbers: **[ROBUSTNESS.md](ROBUSTNESS.md)** · Threshold sweep: `tests/threshold_calibration.rs`.
+  | Codec | Wang (Jaccard) | Panako (Jaccard) | Haitsma (bit-sim) |
+  |-------|---------------|-----------------|-------------------|
+  | WAV/FLAC (lossless) | 1.000 | — | 1.000 |
+  | MP3 128 kbps | 0.40 | 0.45 | 0.93 |
+  | OGG-Vorbis | 0.36 | 0.42 | 0.91 |
+  | AAC (M4A) | 0.50 | 0.54 | 0.77 |
+  | AIFF (lossless) | 1.000 | — | — |
+  | **Cross-track (different song)** | **0.001** | — | — |
 
----
+  > Test audio: "Galway" and "Furious Freak" by Kevin MacLeod, 16 s each, 6 codec variants.
+  > Thresholds: Wang ≥ 0.25, Panako ≥ 0.20, Haitsma ≥ 0.75.
+  > In practice, 5–10 matching hashes suffice for confident identification.
 
-## Comparison with alternatives
+- **Two-track discrimination verified** — different songs produce <0.1% hash overlap (random collision floor), while the same song across codecs produces 25–80% overlap.
+- **606 tests** including adversarial stress tests, real-audio E2E across 6 codecs, and property-based streaming/offline parity checks. See [ROBUSTNESS.md](ROBUSTNESS.md) for full methodology.
+
+## Comparison with Alternatives
 
 | Feature | audiofp | chromaprint-rust | dejavu (Python) |
-|---|---|---|---|
-| Pure Rust | Yes | No (FFI) | No |
+|---------|-----|------------------|-----------------|
+| Pure Rust | Yes | No (FFI to C lib) | No |
 | Wang landmarks | Yes | No | Yes |
 | Panako triplets (tempo-robust) | Yes | No | No |
 | Haitsma–Kalker | Yes | No | No |
-| Streaming + bit-exact parity | Yes | Limited | No |
-| File decoding | Yes (Symphonia) | Limited | FFmpeg |
-| Watermark (AudioSeal) | Yes | No | No |
-| `no_std + alloc` | Yes (host) | No | — |
-| `Pod` hash types | Yes | No | — |
+| Streaming variants | Yes | Limited | No |
+| Bit-exact streaming/offline parity | Yes | No | N/A |
+| File decoding included | Yes (Symphonia) | Yes (limited) | Yes (FFmpeg) |
+| Watermark detection | Yes (AudioSeal) | No | No |
+| `no_std + alloc` capable | Yes (host) | No | N/A |
+| `bytemuck::Pod` hash types | Yes | No | N/A |
 | Built-in resampler | Yes | No | No |
-| In-memory matcher | Yes (3 algos) | No | Yes |
-
----
+| In-memory matcher (Wang/Haitsma) | Yes | No | Yes (Dejavu) |
 
 ## Examples
 
-`examples/` are runnable with `cargo run --example <name>`:
+The `examples/` directory contains complete working programs that can be run with `cargo run --example <name>`:
 
-| Example | What it does | Features |
-|---|---|---|
-| `dsp_starter` | STFT→mel→peaks on synthetic audio | none |
-| `stream_buffer` | `StreamingWang` from `io::Read` chunks | none |
-| `enroll_file` | Wang hash count for one file | `all-codecs` |
-| `match_two_files` | Hash collisions between two files | `all-codecs` |
-| `compare_algorithms` | Wang vs Panako vs Haitsma on one file | `all-codecs` |
-| `neural_embed` | BYO ONNX embedding dim | `neural` |
-| `watermark_detect` | AudioSeal confidence + message | `watermark,std-wav` |
+- `enroll_file` — fingerprint a single audio file and print the unique Wang landmark count (`--features` default / `std`).
+- `match_two_files` — print the number of Wang hash collisions between two files (the canonical "is this the same recording?" check).
+- `compare_algorithms` — run Wang, Panako, and Haitsma–Kalker over the same file and report per-algorithm timing and hash counts.
+- `stream_buffer` — feed Wang's streaming fingerprinter from an `io::Read` chunk-by-chunk.
+- `dsp_starter` — STFT → mel → peaks pipeline on synthetic audio (no file, no optional features).
+- `neural_embed` — load a BYO ONNX embedder and print embedding dim (`--features neural`).
+- `watermark_detect` — load an AudioSeal-compatible ONNX model and print confidence (`--features watermark`).
 
 ```bash
 cargo run --example dsp_starter
-cargo run --example compare_algorithms --features all-codecs -- song.flac
-cargo run --example neural_embed --features neural -- model.onnx
-cargo run --example watermark_detect --features watermark,std-wav -- audioseal.onnx audio.wav
+cargo run --example neural_embed --features neural -- path/to/model.onnx
+cargo run --example watermark_detect --features watermark,std-wav -- path/to/audioseal.onnx [audio.wav]
 ```
 
-Doctests in `src/` + [USAGE.md](USAGE.md) cover the full surface.
-
----
+The doctests across the public API and [USAGE.md](USAGE.md) cover the full surface for users wiring `audiofp` into their own binary.
 
 ## Security
 
-Fingerprints are **perceptual**, not cryptographic. See [SECURITY.md](SECURITY.md) for trust boundaries and disclosure.
-
-- **Untrusted audio:** always use `DecodeLimits` + `decode_to_mono_limited` / `decode_to_mono_at_limited` (`max_bytes` + `max_samples` + optional `Timeout`). Without it a tiny compressed file can expand to GiB of PCM and OOM.
-- **Untrusted PCM / ONNX:** offline `extract`/`detect` reject NaN/Inf (`NonFiniteSample`); streaming `push` sanitizes to `0.0`. ONNX path is `unsafe` tensor init only where noted `src/neural/embedder.rs:3`.
-- **Hash outputs:** not MACs — don't use for authenticity.
-
----
+See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `DecodeLimits` with `decode_to_mono_limited` for untrusted uploads.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Quick start:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Quick start:
 
 ```bash
 git clone https://github.com/themankindproject/audiofp && cd audiofp
@@ -348,19 +328,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI runs `fmt` + `clippy` + `test` on Ubuntu/macOS/Windows per push/PR. MSRV 1.93.
-
----
+CI runs `fmt`, `clippy`, and `test` on ubuntu/macOS/Windows on every push and PR.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
----
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## References
 
-- Wang, A. *An Industrial-Strength Audio Search Algorithm* (ISMIR 2003) — exp. 2024-01-07, free to use
-- Six, J. & Leman, M. *Panako — A Scalable Acoustic Fingerprinting System* (ISMIR 2014) + 2021 update — triplet β
-- Haitsma, J. & Kalker, T. *A Highly Robust Audio Fingerprinting System* (ISMIR 2002)
-- San Roman et al. *Proactive Detection of Voice Cloning with Localized Watermarking* (AudioSeal, arXiv:2401.17264)
+- Avery Wang, *An Industrial-Strength Audio Search Algorithm* (ISMIR 2003) — Wang landmarks
+- Joren Six & Marc Leman, *Panako: A Scalable Acoustic Fingerprinting System* (ISMIR 2014); 2021 update — triplet β hash
+- Jaap Haitsma & Ton Kalker, *A Highly Robust Audio Fingerprinting System* (ISMIR 2002) — band-power sign bits
+- San Roman, R., Fernandez, P., Elsahar, H., Défossez, A., Furon, T. & Tran, T. *Proactive Detection of Voice Cloning with Localized Watermarking.* arXiv:2401.17264, 2024 (AudioSeal) — watermark model. <https://arxiv.org/abs/2401.17264>
