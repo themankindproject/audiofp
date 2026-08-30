@@ -490,7 +490,8 @@ const METHODOLOGY: &str = "\
   path returns a single winner).
 - **Latency** (M3): median of 3, release (lto=fat), single-threaded both
   systems. Kernel = fingerprint on already-decoded PCM (resample included);
-  e2e = decode + kernel.";
+  e2e = decode + kernel.
+";
 
 fn hash_ids(w: &WangFingerprint) -> Vec<u32> {
     w.hashes.iter().map(|h| h.hash).collect()
@@ -834,7 +835,7 @@ fn main() {
         ));
         out.push_str("\n## Methodology\n");
         out.push_str(METHODOLOGY);
-        out.push_str("## Results\n");
+        out.push_str("\n## Results\n\n");
         out.push_str(&m1_table(&tracks, &fmap, &dmap));
         out.push_str(&format!(
             "\n### Identification (top-1, {} queries / 9-track catalog)\n",
