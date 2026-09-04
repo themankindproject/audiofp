@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Vectorized k=15 sliding-max fast path in the peak picker** — the
+  Lemire deque in `dsp::peaks::rolling_max_1d` is bypassed for the
+  neighbourhood-15 case (Wang/Panako) in favour of a direct 31-tap
+  `f32x8` max. Bit-exact vs the deque (pure pairwise `f32::max`;
+  pinned by `max31_fast_path_matches_naive`). No API, hash, or score
+  changes. Criterion `wang/extract` vs `pre-wang-perf` (release,
+  same box):
+
+  | target | before (ms) | after (ms) | delta |
+  |---|---|---|---|
+  | wang/extract/2s | 4.266 | 4.307 | +1.0% (noise) |
+  | wang/extract/5s | 11.609 | 10.550 | −9.1% |
+  | wang/extract/30s | 81.976 | 66.271 | −19.2% |
+
 - **Internal DSP dedup, no API/hash/score changes** — the seven
   duplicated 8-wide `wide::f32x8` loops now delegate to one
   `dsp::simd` module; `log_mel`/`log_mel_from_power`,
