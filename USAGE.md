@@ -30,6 +30,7 @@
 - [HaitsmaMatcher](#haitsmamatcher)
 - [PanakoMatcher](#panakomatcher)
   - [Prebuilt index for repeated 1:1 Panako matches](#prebuilt-index-for-repeated-11-panako-matches)
+  - [Tuning match thresholds](#tuning-match-thresholds)
 - [NeuralMatcher](#neuralmatcher)
 - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
@@ -935,6 +936,124 @@ fn main() {
     assert_eq!(m, matcher.match_one(&query, &reference));
 }
 ```
+
+### Tuning match thresholds
+
+The shipped defaults (`WangMatchConfig`, `HaitsmaMatchConfig`,
+`PanakoMatchConfig`) are calibrated on a real CC0 corpus
+(`tests/threshold_calibration.rs`, margins in
+[ROBUSTNESS.md](ROBUSTNESS.md#threshold-calibration)): every same-track
+cross-codec pair clears them and every cross-track pair fails them,
+with score margins ≥ 0.35. Recalibrate on your own catalog when your
+audio differs (short clips, phone-mic noise, genre skew) — the
+procedure is the same one the test uses:
+
+1. Collect **positive** pairs (same recording, different codec/crop/noise)
+   and **negative** pairs (different recordings).
+2. Match every pair with the decision thresholds zeroed (accept-all
+   config) and record `(score, prominence)`.
+3. Take `min_pos` (worst positive) and `max_neg` (best negative) per
+   field. Any threshold between them separates your data with zero
+   FP/FN; pick the midpoint so both sides keep headroom.
+4. If the intervals overlap, the features don't separate your data —
+   loosen the query side (longer clips, lower `min_votes`) before
+   touching thresholds.
+
+```rust
+use audiofp::classical::{WangFingerprint, WangHash};
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
+
+fn fp(hashes: &[(u32, u32)]) -> WangFingerprint {
+    WangFingerprint {
+        hashes: hashes
+            .iter()
+            .map(|&(hash, t_anchor)| WangHash { hash, t_anchor })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    // Accept-all config: thresholds zeroed so raw score/prominence is
+    // observable instead of gated into is_match.
+    let probe = WangMatcher::new(WangMatchConfig {
+        min_votes: 1,
+        min_score: 0.0,
+        min_prominence: 0.0,
+        ..Default::default()
+    });
+
+    // Two "same recording" variants (shared hashes) and one unrelated track.
+    // 10 shared landmarks: enough consolidated votes to clear the default
+    // prominence floor (each vote lands in 3 ±tol bins, diluting the peak).
+    let a = fp(&[
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
+        (7, 70),
+        (8, 80),
+        (9, 90),
+        (10, 100),
+        (11, 110),
+        (12, 120),
+    ]);
+    let b = fp(&[
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
+        (7, 70),
+        (8, 80),
+        (9, 90),
+        (10, 100),
+        (13, 130),
+        (14, 140),
+    ]);
+    let other = fp(&[
+        (101, 10),
+        (102, 20),
+        (103, 30),
+        (104, 40),
+        (105, 50),
+        (106, 60),
+        (107, 70),
+        (108, 80),
+        (109, 90),
+        (110, 100),
+        (111, 110),
+        (112, 120),
+    ]);
+
+    let pos = probe.match_one(&a, &b); // same track
+    let neg = probe.match_one(&a, &other); // different tracks
+    println!("positive: score {:.3} prom {:.1}", pos.score, pos.prominence);
+    println!("negative: score {:.3} prom {:.1}", neg.score, neg.prominence);
+
+    // Threshold = midpoint of the margin. Here the positive scores 10/12
+    // shared hashes and the negative scores 0, so ~0.42 separates them
+    // with headroom on both sides.
+    let min_score = (pos.score + neg.score) / 2.0;
+    assert!((min_score - 0.417).abs() < 0.01);
+
+    let tuned = WangMatcher::new(WangMatchConfig {
+        min_score,
+        ..Default::default()
+    });
+    assert!(tuned.match_one(&a, &b).is_match);
+    assert!(!tuned.match_one(&a, &other).is_match);
+}
+```
+
+Which knob to move follows the margin shape: positives scoring low
+means the evidence is weak (raise `min_votes` cautiously, or lengthen
+queries); negatives scoring high means collisions (raise
+`min_prominence` for Wang/Panako, lower `max_ber` for Haitsma). Move
+one knob at a time and re-sweep — the margins interact.
 
 ### NeuralMatcher
 
