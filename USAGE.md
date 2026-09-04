@@ -2116,6 +2116,80 @@ by design; use the indexes for large 1:N). To decouple parallel extraction
 from single-writer storage/indexing, cache each result to a `.afp` file
 ([Cache files](#cache-files-afp)) and ingest the directory serially.
 
+#### Enrolling a directory: skip corrupt, abort on resource pressure
+
+The batch loop above bails on the first error (`?` inside the loop) —
+wrong for a 10k-file ingest where one corrupt upload must not kill the
+run. Classify per-file failures instead: **skip** corrupt content,
+**abort** on resource signals (the rest of the directory will hit the
+same wall):
+
+```rust
+use std::path::{Path, PathBuf};
+
+use audiofp::classical::Wang;
+use audiofp::io::{DecodeLimits, decode_to_mono_at_limited};
+use audiofp::{AfpError, Fingerprinter, SampleRate};
+
+fn enroll_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let limits = DecodeLimits::both(50_000_000, 8_000 * 600).strict();
+    let mut wang = Wang::default();
+    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    paths.sort();
+    for path in &paths {
+        let r: Result<(), AfpError> = (|| {
+            let samples = decode_to_mono_at_limited(path, 8_000, limits)?;
+            let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
+            println!("{} → {} hashes", path.display(), fp.hashes.len());
+            // your_store.insert(track_id, &fp.hashes);
+            Ok(())
+        })();
+        match r {
+            Ok(()) => ok += 1,
+            // Corrupt content: log and continue with the next file.
+            Err(AfpError::Io(_)) | Err(AfpError::Deserialize(_)) => {
+                eprintln!("{}: corrupt, skipping", path.display());
+                skipped += 1;
+            }
+            // Too short / wrong shape for this fingerprinter: data issue,
+            // not a crash — skip unless your catalog guarantees otherwise.
+            Err(AfpError::AudioTooShort { .. }) | Err(AfpError::NonFiniteSample { .. }) => {
+                eprintln!("{}: unusable audio, skipping", path.display());
+                skipped += 1;
+            }
+            // Resource pressure or config error: abort, the rest of the
+            // directory will hit the same wall.
+            Err(e @ (AfpError::InputTooLarge { .. } | AfpError::Timeout { .. }
+                | AfpError::Config(_))) => {
+                eprintln!("{}: aborting ingest: {e}", path.display());
+                failed += 1;
+                break;
+            }
+            Err(e) => {
+                eprintln!("{}: skipping: {e}", path.display());
+                skipped += 1;
+            }
+        }
+    }
+    println!("enrolled={ok} skipped={skipped} failed={failed}");
+    Ok(())
+}
+```
+
+Notes:
+
+- `.strict()` makes per-packet decode errors fatal *for that file* so a
+  half-decoded buffer never enters your index silently; the loop above
+  still continues with the next file.
+- `InputTooLarge` carries `{ limit, provided }` — log both when
+  aborting so the operator knows which cap to raise.
+- `AfpError` is `#[non_exhaustive]`: keep the trailing catch-all arm so
+  future variants don't break your enroll loop on upgrade.
+
 ### Model sourcing
 
 Neither `watermark` nor `neural` ships ONNX weights:
