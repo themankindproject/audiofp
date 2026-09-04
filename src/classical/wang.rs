@@ -251,24 +251,13 @@ impl Wang {
         rate: SampleRate,
         mut progress: F,
     ) -> Result<WangFingerprint> {
-        crate::pcm::reject_non_finite(samples)?;
-        if let Some(limit) = self.cfg.max_input_samples
-            && samples.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: samples.len(),
-            });
-        }
-        if rate.hz() != WANG_SR {
-            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
-        }
-        if samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: samples.len(),
-            });
-        }
+        crate::classical::landmark_common::check_extract_preamble(
+            samples,
+            rate,
+            WANG_SR,
+            self.min_samples(),
+            self.cfg.max_input_samples,
+        )?;
 
         progress(0.0);
 
@@ -287,17 +276,12 @@ impl Wang {
         // Report progress through the STFT phase (~70% of total work).
         // Since power_flat_into is a bulk operation, report proportional
         // progress at intervals based on frame count.
-        let total_frames = n_frames;
-        let stft_weight = 0.7_f32;
-        let interval = WANG_PROGRESS_INTERVAL;
-        {
-            let mut reported = 0usize;
-            while reported + interval < total_frames {
-                reported += interval;
-                progress(stft_weight * (reported as f32 / total_frames as f32));
-            }
-        }
-        progress(stft_weight);
+        crate::classical::landmark_common::report_stft_progress(
+            n_frames,
+            0.7,
+            WANG_PROGRESS_INTERVAL,
+            &mut progress,
+        );
 
         // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
         power_to_db_wide(&mut self.log_spec, WANG_LOG_FLOOR_POWER);

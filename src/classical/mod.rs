@@ -22,6 +22,7 @@
 //! boundary without serialisation.
 
 pub mod haitsma;
+pub(crate) mod landmark_common;
 pub mod panako;
 pub(crate) mod stream;
 pub mod wang;
