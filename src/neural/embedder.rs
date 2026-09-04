@@ -24,28 +24,7 @@ use super::frontend::LogMelFrontend;
 /// SIMD sum-of-squares over a slice via `wide::f32x8`.
 #[inline]
 pub(crate) fn sumsq_wide(v: &[f32]) -> f32 {
-    use wide::f32x8;
-
-    let n = v.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    let mut acc = f32x8::ZERO;
-    for i in 0..chunks {
-        let off = i * 8;
-        let x = f32x8::new(
-            v[off..off + 8]
-                .try_into()
-                .expect("v chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
-        );
-        acc = x.mul_add(x, acc);
-    }
-
-    let mut sumsq = acc.reduce_add();
-    for &x in &v[tail_start..] {
-        sumsq += x * x;
-    }
-    sumsq
+    crate::dsp::simd::sumsq_core(v)
 }
 
 /// In-place L2 normalisation: scales `v` so its Euclidean norm is 1.

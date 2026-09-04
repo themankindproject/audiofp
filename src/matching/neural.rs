@@ -276,34 +276,7 @@ impl NeuralMatcher {
 /// valuable SIMD site in the neural matcher.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    use wide::f32x8;
-
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    let mut acc = f32x8::ZERO;
-    for i in 0..chunks {
-        let off = i * 8;
-        let va = f32x8::new(
-            a[off..off + 8]
-                .try_into()
-                .expect("a chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
-        );
-        let vb = f32x8::new(
-            b[off..off + 8]
-                .try_into()
-                .expect("b chunk is exactly 8 elements: loop iterates n/8 complete chunks"),
-        );
-        acc = va.mul_add(vb, acc);
-    }
-
-    let mut sum = acc.reduce_add();
-    for i in tail_start..n {
-        sum += a[i] * b[i];
-    }
-    sum
+    crate::dsp::simd::dot_core(a, b)
 }
 
 /// Cosine similarity. When `assume_norm` is `true` the inputs are taken

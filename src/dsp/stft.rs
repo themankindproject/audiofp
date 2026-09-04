@@ -12,7 +12,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use libm::sqrtf;
 use num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 
@@ -350,34 +349,7 @@ impl ShortTimeFFT {
     /// assert!(out.iter().all(|&p| p == 0.0)); // silent input → zero power
     /// ```
     pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
-        if frame.len() != self.cfg.n_fft {
-            return Err(crate::AfpError::Config(alloc::format!(
-                "frame length must equal n_fft: got {}, expected {}",
-                frame.len(),
-                self.cfg.n_fft
-            )));
-        }
-        if out.len() != self.n_bins() {
-            return Err(crate::AfpError::Config(alloc::format!(
-                "out length must equal n_bins: got {}, expected {}",
-                out.len(),
-                self.n_bins()
-            )));
-        }
-
-        apply_window_wide(frame, &self.window, &mut self.scratch_in);
-
-        self.fft
-            .process_with_scratch(
-                &mut self.scratch_in,
-                &mut self.scratch_out,
-                &mut self.fft_scratch,
-            )
-            .expect("FFT process: input/output length mismatch");
-
-        compute_power_wide(&self.scratch_out, out);
-
-        Ok(())
+        self.run_frame(frame, out, compute_power_wide)
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
@@ -388,6 +360,18 @@ impl ShortTimeFFT {
     /// Returns [`AfpError::Config`](crate::AfpError::Config) if
     /// `frame.len() != n_fft` or `out.len() != n_bins`.
     pub fn process_frame(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
+        self.run_frame(frame, out, compute_magnitude_wide)
+    }
+
+    /// Shared single-frame pipeline: validate lengths, apply the window,
+    /// run the FFT, then reduce the complex spectrum with `compute`
+    /// ([`compute_power_wide`] or [`compute_magnitude_wide`]).
+    fn run_frame(
+        &mut self,
+        frame: &[f32],
+        out: &mut [f32],
+        compute: fn(&[Complex<f32>], &mut [f32]),
+    ) -> crate::Result<()> {
         if frame.len() != self.cfg.n_fft {
             return Err(crate::AfpError::Config(alloc::format!(
                 "frame length must equal n_fft: got {}, expected {}",
@@ -413,7 +397,7 @@ impl ShortTimeFFT {
             )
             .expect("FFT process: input/output length mismatch");
 
-        compute_magnitude_wide(&self.scratch_out, out);
+        compute(&self.scratch_out, out);
 
         Ok(())
     }
@@ -461,34 +445,7 @@ impl ShortTimeFFT {
 /// Processes 8 elements at a time via `f32x8` (AVX2/SSE/NEON depending on
 /// target), with a scalar tail for the remainder. Entirely safe code.
 fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    use wide::f32x8;
-
-    debug_assert_eq!(src.len(), win.len());
-    debug_assert_eq!(src.len(), dst.len());
-
-    let n = src.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let s = f32x8::new(
-            src[off..off + 8]
-                .try_into()
-                .expect("src chunk is exactly 8 elements: loop iterates complete chunks of n/8"),
-        );
-        let w = f32x8::new(
-            win[off..off + 8]
-                .try_into()
-                .expect("win chunk is exactly 8 elements: loop iterates complete chunks of n/8"),
-        );
-        let r = s * w;
-        dst[off..off + 8].copy_from_slice(r.as_array());
-    }
-
-    for i in tail_start..n {
-        dst[i] = src[i] * win[i];
-    }
+    crate::dsp::simd::mul_into(src, win, dst);
 }
 
 /// SIMD-accelerated magnitude computation: `dst[i] = sqrt(re² + im²)` using
@@ -501,45 +458,7 @@ fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
 /// builds the `mul_add` fuses one rounding, matching the existing
 /// `compute_power_wide` behaviour.
 fn compute_magnitude_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
-    use wide::f32x8;
-
-    debug_assert_eq!(complex.len(), dst.len());
-
-    let n = complex.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let re = f32x8::new([
-            complex[off].re,
-            complex[off + 1].re,
-            complex[off + 2].re,
-            complex[off + 3].re,
-            complex[off + 4].re,
-            complex[off + 5].re,
-            complex[off + 6].re,
-            complex[off + 7].re,
-        ]);
-        let im = f32x8::new([
-            complex[off].im,
-            complex[off + 1].im,
-            complex[off + 2].im,
-            complex[off + 3].im,
-            complex[off + 4].im,
-            complex[off + 5].im,
-            complex[off + 6].im,
-            complex[off + 7].im,
-        ]);
-        let power = re.mul_add(re, im * im);
-        dst[off..off + 8].copy_from_slice(power.sqrt().as_array());
-    }
-
-    // Scalar tail.
-    for i in tail_start..n {
-        let c = &complex[i];
-        dst[i] = sqrtf(c.re * c.re + c.im * c.im);
-    }
+    crate::dsp::simd::complex_magnitude_into(complex, dst);
 }
 
 /// SIMD-accelerated power computation: `dst[i] = complex[i].re² + complex[i].im²`
@@ -548,45 +467,7 @@ fn compute_magnitude_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
 /// Processes 8 power values at a time via `f32x8` by separately loading
 /// the real and imaginary parts, then computing `re * re + im * im`.
 fn compute_power_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
-    use wide::f32x8;
-
-    debug_assert_eq!(complex.len(), dst.len());
-
-    let n = complex.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let re = f32x8::new([
-            complex[off].re,
-            complex[off + 1].re,
-            complex[off + 2].re,
-            complex[off + 3].re,
-            complex[off + 4].re,
-            complex[off + 5].re,
-            complex[off + 6].re,
-            complex[off + 7].re,
-        ]);
-        let im = f32x8::new([
-            complex[off].im,
-            complex[off + 1].im,
-            complex[off + 2].im,
-            complex[off + 3].im,
-            complex[off + 4].im,
-            complex[off + 5].im,
-            complex[off + 6].im,
-            complex[off + 7].im,
-        ]);
-        let power = re.mul_add(re, im * im);
-        dst[off..off + 8].copy_from_slice(power.as_array());
-    }
-
-    // Scalar tail.
-    for i in tail_start..n {
-        let c = &complex[i];
-        dst[i] = c.re * c.re + c.im * c.im;
-    }
+    crate::dsp::simd::complex_power_into(complex, dst);
 }
 
 /// Reflect `i` into `[0, len)` using the convention `numpy.pad(mode="reflect")`

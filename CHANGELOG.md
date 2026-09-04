@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal DSP dedup, no API/hash/score changes** — the seven
+  duplicated 8-wide `wide::f32x8` loops now delegate to one
+  `dsp::simd` module; `log_mel`/`log_mel_from_power`,
+  `process_frame`/`process_frame_power`, the resampler's boundary
+  loops, and the Haitsma band-energy loops share one implementation
+  each. Criterion benches vs `pre-simd` show no regression (all
+  extract targets within ±3.5%, noise floor on a loaded box).
+
 ### Added
 
 - **Chromaprint bakeoff** (#88) — `bakeoff/` harness measures overlap,

@@ -288,20 +288,7 @@ impl SincResampler {
         // Left boundary: kernel may extend past the start of input.
         for n in 0..n_safe_start {
             let pos = n as f64 * ratio;
-            let i_centre = pos.floor() as isize;
-            let frac = (pos - pos.floor()) as f32;
-            let step = ((frac * steps as f32) as usize).min(steps - 1);
-            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
-
-            let mut acc = 0.0_f32;
-            for (k, &coeff) in kernel.iter().enumerate() {
-                let idx = i_centre + k as isize - half as isize;
-                if idx < 0 || (idx as usize) >= n_in {
-                    continue;
-                }
-                acc += input[idx as usize] * coeff;
-            }
-            out.push(acc);
+            self.convolve_bounded(input, pos, taps, steps, half, out);
         }
 
         // Middle: kernel is fully inside input — no bounds check.
@@ -322,21 +309,37 @@ impl SincResampler {
         // Right boundary: kernel may extend past the end of input.
         for n in n_safe_end..n_out {
             let pos = n as f64 * ratio;
-            let i_centre = pos.floor() as isize;
-            let frac = (pos - pos.floor()) as f32;
-            let step = ((frac * steps as f32) as usize).min(steps - 1);
-            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
-
-            let mut acc = 0.0_f32;
-            for (k, &coeff) in kernel.iter().enumerate() {
-                let idx = i_centre + k as isize - half as isize;
-                if idx < 0 || (idx as usize) >= n_in {
-                    continue;
-                }
-                acc += input[idx as usize] * coeff;
-            }
-            out.push(acc);
+            self.convolve_bounded(input, pos, taps, steps, half, out);
         }
+    }
+
+    /// Single output sample with bounds-checked kernel gather. Shared by
+    /// the left/right boundary loops (whose bodies were identical); the
+    /// middle region keeps its own unchecked `dot_wide` fast path.
+    fn convolve_bounded(
+        &self,
+        input: &[f32],
+        pos: f64,
+        taps: usize,
+        steps: usize,
+        half: usize,
+        out: &mut Vec<f32>,
+    ) {
+        let n_in = input.len();
+        let i_centre = pos.floor() as isize;
+        let frac = (pos - pos.floor()) as f32;
+        let step = ((frac * steps as f32) as usize).min(steps - 1);
+        let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
+
+        let mut acc = 0.0_f32;
+        for (k, &coeff) in kernel.iter().enumerate() {
+            let idx = i_centre + k as isize - half as isize;
+            if idx < 0 || (idx as usize) >= n_in {
+                continue;
+            }
+            acc += input[idx as usize] * coeff;
+        }
+        out.push(acc);
     }
 }
 

@@ -291,10 +291,7 @@ impl Haitsma {
         self.energies_buf.reserve(n_frames);
         for f in 0..n_frames {
             let row = &power_flat[f * n_bins..(f + 1) * n_bins];
-            let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
-                e[b] = row[start..end].iter().sum();
-            }
+            let e = band_energies(row, &self.band_ranges);
             self.energies_buf.push(e);
 
             // Report progress during band energy computation (~30% of work).
@@ -350,6 +347,20 @@ impl Fingerprinter for Haitsma {
     }
 }
 
+/// Sum one power-spectrum row into the 33 Haitsma band energies.
+/// Shared by the offline extractor and the streaming push path (whose
+/// loops were identical). Kept scalar: the ranges are short and
+/// non-contiguous, so this stays a plain sum — the SIMD site remains
+/// `pack_frame_bits`.
+#[inline]
+fn band_energies(power_row: &[f32], band_ranges: &[(usize, usize)]) -> [f32; HAITSMA_N_BANDS] {
+    let mut e = [0.0_f32; HAITSMA_N_BANDS];
+    for (b, &(start, end)) in band_ranges.iter().enumerate() {
+        e[b] = power_row[start..end].iter().sum();
+    }
+    e
+}
+
 /// Pack 32 sign bits comparing band-difference deltas between frame `n`
 /// and frame `n−1`.
 #[inline]
@@ -364,30 +375,14 @@ fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS])
     // Compute all 32 diffs in 4 SIMD iterations, then extract sign bits.
     // Each iteration reads curr[off..off+8] and curr[off+1..off+9] to
     // compute 8 adjacent-band differences from the 33-band array.
-    use wide::f32x8;
+    use crate::dsp::simd::load8;
 
     for chunk in 0..4 {
         let off = chunk * 8;
-        let curr_lo = f32x8::new(
-            curr[off..off + 8]
-                .try_into()
-                .expect("curr[off..off+8] is exactly 8 elements: 33-band array with chunk<4"),
-        );
-        let curr_hi = f32x8::new(
-            curr[off + 1..off + 9]
-                .try_into()
-                .expect("curr[off+1..off+9] is exactly 8 elements: 33-band array with chunk<4"),
-        );
-        let prev_lo = f32x8::new(
-            prev[off..off + 8]
-                .try_into()
-                .expect("prev[off..off+8] is exactly 8 elements: 33-band array with chunk<4"),
-        );
-        let prev_hi = f32x8::new(
-            prev[off + 1..off + 9]
-                .try_into()
-                .expect("prev[off+1..off+9] is exactly 8 elements: 33-band array with chunk<4"),
-        );
+        let curr_lo = load8(curr, off);
+        let curr_hi = load8(curr, off + 1);
+        let prev_lo = load8(prev, off);
+        let prev_hi = load8(prev, off + 1);
 
         // diff[i] = (curr[i] - curr[i+1]) - (prev[i] - prev[i+1])
         let diff = (curr_lo - curr_hi) - (prev_lo - prev_hi);
@@ -582,10 +577,7 @@ impl StreamingHaitsma {
                     &mut self.frame_power,
                 )
                 .expect("frame_power is sized n_bins and frames are exactly n_fft");
-            let mut e = [0.0_f32; HAITSMA_N_BANDS];
-            for (b, &(start, end)) in self.band_ranges.iter().enumerate() {
-                e[b] = self.frame_power[start..end].iter().sum();
-            }
+            let e = band_energies(&self.frame_power, &self.band_ranges);
 
             if self.has_prev {
                 let hash = pack_frame_bits(&e, &self.prev_energy);

@@ -326,16 +326,8 @@ impl MelFilterBank {
         );
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
-        // Use the sparse representation: only iterate non-zero bins per band.
         // Square magnitude to power inline while accumulating via SIMD.
-        for (k, slot) in out.iter_mut().enumerate() {
-            let band = &self.sparse[k];
-            let acc = super::dot_sq_wide(
-                &band.weights,
-                &magnitude[band.start_bin..band.start_bin + band.weights.len()],
-            );
-            *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
-        }
+        self.log_mel_core(magnitude, out, super::dot_sq_wide);
     }
 
     /// Compute one log-mel frame from a **power** spectrum
@@ -356,14 +348,24 @@ impl MelFilterBank {
         assert_eq!(power.len(), self.n_bins(), "power length must equal n_bins");
         assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
 
+        self.log_mel_core(power, out, super::dot_wide);
+    }
+
+    /// Shared sparse band accumulation: `out[k] = log10(dot(band, spec) +
+    /// 1e-10)` per librosa. The `dot` param selects the accumulation —
+    /// [`super::dot_sq_wide`] (squares magnitude to power inline) for
+    /// [`log_mel`](Self::log_mel), [`super::dot_wide`] for
+    /// [`log_mel_from_power`](Self::log_mel_from_power) where the input
+    /// is already power.
+    fn log_mel_core(&self, spec: &[f32], out: &mut [f32], dot: fn(&[f32], &[f32]) -> f32) {
         // Use the sparse representation: only iterate non-zero bins per band.
         // Each triangular filter spans ~20-40 bins instead of all n_bins.
         // The dot product is vectorized 8-wide via `wide::f32x8`.
         for (k, slot) in out.iter_mut().enumerate() {
             let band = &self.sparse[k];
-            let acc = super::dot_wide(
+            let acc = dot(
                 &band.weights,
-                &power[band.start_bin..band.start_bin + band.weights.len()],
+                &spec[band.start_bin..band.start_bin + band.weights.len()],
             );
             *slot = core::f32::consts::LOG10_2 * log2f(acc + 1e-10);
         }
