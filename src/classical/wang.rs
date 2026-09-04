@@ -38,10 +38,9 @@
 
 use alloc::vec::Vec;
 
+use crate::classical::landmark_common::FrontEnd;
 use crate::classical::stream;
-use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
-use crate::dsp::stft::{ShortTimeFFT, StftConfig};
-use crate::dsp::windows::WindowKind;
+use crate::dsp::peaks::Peak;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target landmark pair packed into a 32-bit hash.
@@ -162,7 +161,6 @@ const WANG_LOG_FLOOR: f32 = 1e-6;
 /// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
 /// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
 const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
-use crate::dsp::power_to_db_wide;
 
 /// Wang offline fingerprinter.
 ///
@@ -182,12 +180,7 @@ use crate::dsp::power_to_db_wide;
 /// ```
 pub struct Wang {
     cfg: WangConfig,
-    stft: ShortTimeFFT,
-    /// Cached peak picker — pools its scratch buffers across calls so
-    /// repeated `extract` invocations don't re-allocate.
-    picker: PeakPicker,
-    /// Pooled log-magnitude buffer reused between calls.
-    log_spec: Vec<f32>,
+    frontend: FrontEnd,
 }
 
 impl Default for Wang {
@@ -206,27 +199,14 @@ impl Wang {
     #[must_use]
     pub fn new(mut cfg: WangConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: WANG_N_FFT,
-            hop: WANG_HOP,
-            window: WindowKind::Hann,
-            // No reflect-padding: hashes are most stable when the first
-            // frame starts at sample 0 of the input buffer.
-            center: false,
-        });
-        let picker = PeakPicker::new(PeakPickerConfig {
-            neighborhood_t: WANG_PEAK_NEIGHBOURHOOD,
-            neighborhood_f: WANG_PEAK_NEIGHBOURHOOD,
-            min_magnitude_db: cfg.min_anchor_mag_db,
-            min_magnitude_linear: None,
-            target_per_sec: cfg.peaks_per_sec as usize,
-        });
-        Self {
-            cfg,
-            stft,
-            picker,
-            log_spec: Vec::new(),
-        }
+        let frontend = FrontEnd::new(
+            WANG_N_FFT,
+            WANG_HOP,
+            WANG_PEAK_NEIGHBOURHOOD,
+            cfg.min_anchor_mag_db,
+            cfg.peaks_per_sec as usize,
+        );
+        Self { cfg, frontend }
     }
 }
 
@@ -261,10 +241,12 @@ impl Wang {
 
         progress(0.0);
 
-        // Compute power (|X|²) directly from the FFT — skips a per-bin
+        // Compute power (|X|2) directly from the FFT — skips a per-bin
         // sqrt that the dB conversion would immediately undo.
         // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
-        let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.log_spec);
+        let (n_frames, peaks) =
+            self.frontend
+                .pick_peaks(samples, WANG_FRAMES_PER_SEC, WANG_LOG_FLOOR_POWER);
         if n_frames == 0 {
             progress(1.0);
             return Ok(WangFingerprint {
@@ -282,14 +264,7 @@ impl Wang {
             WANG_PROGRESS_INTERVAL,
             &mut progress,
         );
-
-        // 10·log10(power) ≡ DB_LOG2_FACTOR·log2(power).
-        power_to_db_wide(&mut self.log_spec, WANG_LOG_FLOOR_POWER);
         progress(0.80);
-
-        let peaks = self
-            .picker
-            .pick(&self.log_spec, n_frames, n_bins, WANG_FRAMES_PER_SEC);
         progress(0.90);
 
         let mut hashes = build_hashes(&peaks, &self.cfg);

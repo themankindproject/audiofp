@@ -65,10 +65,9 @@
 
 use alloc::vec::Vec;
 
+use crate::classical::landmark_common::FrontEnd;
 use crate::classical::stream;
-use crate::dsp::peaks::{Peak, PeakPicker, PeakPickerConfig};
-use crate::dsp::stft::{ShortTimeFFT, StftConfig};
-use crate::dsp::windows::WindowKind;
+use crate::dsp::peaks::Peak;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// One anchor-target-target triplet packed into a 32-bit hash plus the
@@ -185,7 +184,6 @@ const PANAKO_PEAK_NEIGHBOURHOOD: usize = 15;
 const PANAKO_LOG_FLOOR: f32 = 1e-6;
 /// Squared form of the magnitude floor — see Wang for rationale.
 const PANAKO_LOG_FLOOR_POWER: f32 = PANAKO_LOG_FLOOR * PANAKO_LOG_FLOOR;
-use crate::dsp::power_to_db_wide;
 
 /// Panako offline fingerprinter.
 ///
@@ -204,9 +202,7 @@ use crate::dsp::power_to_db_wide;
 /// ```
 pub struct Panako {
     cfg: PanakoConfig,
-    stft: ShortTimeFFT,
-    picker: PeakPicker,
-    log_spec: Vec<f32>,
+    frontend: FrontEnd,
 }
 
 impl Default for Panako {
@@ -225,25 +221,14 @@ impl Panako {
     #[must_use]
     pub fn new(mut cfg: PanakoConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: PANAKO_N_FFT,
-            hop: PANAKO_HOP,
-            window: WindowKind::Hann,
-            center: false,
-        });
-        let picker = PeakPicker::new(PeakPickerConfig {
-            neighborhood_t: PANAKO_PEAK_NEIGHBOURHOOD,
-            neighborhood_f: PANAKO_PEAK_NEIGHBOURHOOD,
-            min_magnitude_db: cfg.min_anchor_mag_db,
-            min_magnitude_linear: None,
-            target_per_sec: cfg.peaks_per_sec as usize,
-        });
-        Self {
-            cfg,
-            stft,
-            picker,
-            log_spec: Vec::new(),
-        }
+        let frontend = FrontEnd::new(
+            PANAKO_N_FFT,
+            PANAKO_HOP,
+            PANAKO_PEAK_NEIGHBOURHOOD,
+            cfg.min_anchor_mag_db,
+            cfg.peaks_per_sec as usize,
+        );
+        Self { cfg, frontend }
     }
 }
 
@@ -278,7 +263,9 @@ impl Panako {
 
         progress(0.0);
 
-        let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.log_spec);
+        let (n_frames, peaks) =
+            self.frontend
+                .pick_peaks(samples, PANAKO_FRAMES_PER_SEC, PANAKO_LOG_FLOOR_POWER);
         if n_frames == 0 {
             progress(1.0);
             return Ok(PanakoFingerprint {
@@ -294,13 +281,7 @@ impl Panako {
             PANAKO_PROGRESS_INTERVAL,
             &mut progress,
         );
-
-        power_to_db_wide(&mut self.log_spec, PANAKO_LOG_FLOOR_POWER);
         progress(0.80);
-
-        let peaks = self
-            .picker
-            .pick(&self.log_spec, n_frames, n_bins, PANAKO_FRAMES_PER_SEC);
         progress(0.90);
 
         let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
