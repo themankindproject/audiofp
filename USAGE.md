@@ -2085,6 +2085,56 @@ async fn fingerprint_blocking(
 Keep extraction off the async executor threads — STFT + peak picking are
 CPU-bound and would stall the runtime.
 
+#### Sharing an extractor across tasks
+
+`extract` takes `&mut self`, so a shared fingerprinter needs a lock —
+or skip sharing entirely with one extractor per task. Both are safe:
+every public type is asserted `Send + Sync` at compile time
+(`send_sync_assertions` in `src/lib.rs`), so they can cross task and
+thread boundaries:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+use audiofp::classical::Wang;
+use audiofp::{Fingerprinter, SampleRate};
+
+// One extractor behind a lock: FFT plan and scratch stay warm, tasks
+// serialise on the mutex. Fine when extraction is not the bottleneck.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let wang = Arc::new(Mutex::new(Wang::default()));
+    let w2 = Arc::clone(&wang);
+    let samples = vec![0.0_f32; 8_000 * 3];
+    let fp = w2.lock().unwrap().extract(&samples, SampleRate::HZ_8000)?;
+    assert!(fp.hashes.is_empty()); // silence → no hashes
+    Ok(())
+}
+```
+
+Prefer one extractor per `spawn_blocking` task when throughput matters
+— no lock contention, and each task keeps its own warm scratch:
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{Fingerprinter, SampleRate};
+
+async fn fingerprint_blocking_each(
+    samples: Vec<f32>,
+) -> Result<audiofp::classical::WangFingerprint, audiofp::AfpError> {
+    tokio::task::spawn_blocking(move || {
+        let mut wang = Wang::default(); // fresh plan per task
+        wang.extract(&samples, SampleRate::HZ_8000)
+    })
+    .await
+    .expect("blocking task join")
+}
+```
+
+Rules of thumb: decode (`symphonia` packets + resample) and extract go
+on the blocking pool; 1:1 matching is single-digit milliseconds and can
+run inline unless you batch it. Streaming `push` follows the same
+`&mut self` rule — drive one streamer per source from a single task.
+
 ### Batching files
 
 Reuse one fingerprinter across paths — the FFT plan, window, and scratch
