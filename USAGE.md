@@ -295,7 +295,7 @@ pub trait StreamingFingerprinter {
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
     fn latency_ms(&self) -> u32;
 
-    // Provided zero-allocation callback variants:
+    // Provided callback variants (see warning below):
     fn push_with<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
     where F: FnMut(TimestampMs, &Self::Frame);
     fn flush_with<F>(&mut self, callback: F) -> Result<usize>
@@ -322,6 +322,12 @@ Notes that matter in practice:
 - `latency_ms()` is a conservative upper bound from sample-in to hash-out.
 - `push_with` / `flush_with` invoke `callback(timestamp, &frame)` per emitted
   frame and return the count — no intermediate `Vec` allocation.
+  > **Warning — the defaults allocate.** The provided `push_with` /
+  > `flush_with` bodies just call `push` / `flush` and iterate, so they
+  > allocate exactly like the `Vec`-returning methods. Only impls marked
+  > [`ZeroAllocStreaming`](#zeroallocstreaming-guarantee) override both with
+  > true allocation-free paths. Generic code that must not allocate (audio
+  > callbacks) should bound on that trait, not this one.
 
 > **Bit-exact guarantee.** Feeding the same audio in any chunking pattern
 > (including 1-sample-per-push) produces the identical hash *multiset* as a
@@ -1247,12 +1253,12 @@ Benchmarks: `cargo bench --bench matching` (Criterion; Wang/Haitsma/Panako
 Each classical fingerprinter has a streaming sibling; the neural embedder
 has one too:
 
-| Streaming           | `Frame`      | `latency_ms()` | Carry bound                    |
-| ------------------- | ------------ | -------------- | ------------------------------ |
-| `StreamingWang`     | `WangHash`   | 2 256          | `< n_fft + max_push` samples   |
-| `StreamingPanako`   | `PanakoHash` | 2 784          | same                           |
-| `StreamingHaitsma`  | `u32`        | 409            | one frame of band energies     |
-| `StreamingNeuralEmbedder` | `Vec<f32>` | window length (ms) | `< window_samples + max_push` |
+| Streaming           | `Frame`      | `latency_ms()` | Carry bound                    | `ZeroAllocStreaming` |
+| ------------------- | ------------ | -------------- | ------------------------------ | -------------------- |
+| `StreamingWang`     | `WangHash`   | 2 256          | `< n_fft + max_push` samples   | yes |
+| `StreamingPanako`   | `PanakoHash` | 2 784          | same                           | yes |
+| `StreamingHaitsma`  | `u32`        | 409            | one frame of band energies     | yes |
+| `StreamingNeuralEmbedder` | `Vec<f32>` | window length (ms) | `< window_samples + max_push` | no — see below |
 
 Each streaming variant exposes `config() -> &XConfig`, `reset()` (clear all
 state — start a fresh stream), and (for the neural streamer) the
@@ -1290,7 +1296,10 @@ fn main() {
 ### Zero-allocation callback variant
 
 `push_with` / `flush_with` invoke a callback per frame instead of building a
-`Vec` — the allocation-free hot path for realtime threads:
+`Vec` — but only impls marked [`ZeroAllocStreaming`](#zeroallocstreaming-guarantee)
+do so without allocating (the trait defaults call `push` / `flush` and
+iterate). On the marked types this is the allocation-free hot path for
+realtime threads:
 
 ```rust
 use audiofp::classical::StreamingWang;
@@ -1311,6 +1320,45 @@ fn main() {
     println!("{count} hashes");
 }
 ```
+
+### `ZeroAllocStreaming` guarantee
+
+`audiofp::ZeroAllocStreaming` (also in the prelude) is the bound realtime
+code should require. It marks the impls whose `push_with` / `flush_with`
+drain pre-allocated buffers and allocate nothing after warmup:
+
+```rust
+use audiofp::{StreamingFingerprinter, ZeroAllocStreaming};
+
+fn mic_loop<S: ZeroAllocStreaming>(s: &mut S, chunks: &[Vec<f32>]) {
+    for c in chunks {
+        // Guaranteed allocation-free after warmup — safe on the audio
+        // thread. A plain `StreamingFingerprinter` bound cannot promise
+        // this (the defaults allocate per call).
+        s.push_with(c, |_, _| {}).unwrap();
+    }
+}
+```
+
+Per-algorithm notes:
+
+- **Wang / Panako** share one `StreamCore` pipeline (rolling spectrogram +
+  per-second buckets + per-anchor target lists). Warmup covers buffer growth
+  plus pooled target/bucket buffers and Panako's pooled triplet heap.
+- **Haitsma** is a separate, simpler pipeline (STFT frame → band energies →
+  sign bits); warmup covers the carry and pending-frame buffers.
+- **Neural is excluded by design**: `StreamingNeuralEmbedder::Frame` is
+  `Vec<f32>`, so every emit allocates through the `StreamingFingerprinter`
+  interface. Its zero-alloc path is the inherent `try_push_with`, whose
+  callback borrows internal scratch (`&[f32]`) — use that directly on
+  realtime neural paths.
+
+Warmup rule (all three marked types): construction may allocate, and the
+first pushes may grow buffers (`Vec` amortised growth). Feed representative
+chunk sizes — including one full-backlog `flush_with` — before the realtime
+section; steady state after that allocates zero. This is pinned by
+`tests/zero_alloc.rs` (thread-local counting allocator: warmup, then 40
+pushes + flush asserting zero allocations).
 
 ### Why the latency differs
 
