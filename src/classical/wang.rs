@@ -1371,10 +1371,8 @@ mod tests {
             let _ = s.push_with(c, |_, _| {});
         }
         let (hits1, misses1) = (s.core.pool_hits, s.core.pool_misses);
-        eprintln!(
-            "pool hits={hits0}->{hits1} misses={misses0}->{misses1} pool_len={}",
-            s.core.targets_pool.len()
-        );
+        // NOTE: no `eprintln!` here — `std` I/O macros are unavailable in
+        // the `no_std` lib-test build (`cargo test --no-default-features`).
         assert_eq!(
             misses1, misses0,
             "steady-state anchors must reuse pooled buffers"

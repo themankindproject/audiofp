@@ -8,9 +8,11 @@
 //! fails these tests.
 //!
 //! Requires `std` (custom global allocator + threads are out of scope for
-//! the `no_std` build).
+//! the `no_std` build). Incompatible with the `mimalloc` feature (both
+//! install a `#[global_allocator]`), so the whole file is compiled out
+//! when `mimalloc` is enabled — CI's `--all-features` runs skip it.
 
-#![cfg(feature = "std")]
+#![cfg(all(feature = "std", not(feature = "mimalloc")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
