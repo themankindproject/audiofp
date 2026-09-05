@@ -30,6 +30,6 @@
 pub mod decoder;
 
 pub use decoder::{
-    DecodeLimits, decode_to_mono, decode_to_mono_at, decode_to_mono_at_limited,
-    decode_to_mono_limited,
+    DecodeLimits, DecodeReport, DecodeStats, decode_to_mono, decode_to_mono_at,
+    decode_to_mono_at_limited, decode_to_mono_limited, decode_to_mono_report,
 };

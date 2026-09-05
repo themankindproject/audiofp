@@ -41,6 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classical fingerprint as the #117 v1 blob (byte-identical — no new
   format), enabling parallel extraction → serial index ingest. See the
   `cache_workflow` example.
+- **Observable decode + strict streaming push** (#135) — new
+  `audiofp::io::decode_to_mono_report` returns `DecodeReport { samples,
+  sample_rate, stats }` where `DecodeStats` counts audio-track
+  `packets_total`, silently-skipped `packets_skipped` (recoverable decode
+  failures + malformed 0-channel packets), and container `resets`.
+  Accept/reject behaviour is byte-identical to `decode_to_mono_limited`
+  (shared `open_source` prologue + instrumented `decode_inner_report`);
+  it only reports what the lenient path already did silently, enabling
+  enroll / enroll+flag / quarantine triage on corrupt uploads. New
+  defaulted `StreamingFingerprinter::push_strict` pre-scans with the same
+  check offline `extract` uses and returns `NonFiniteSample { index }`
+  (same index) instead of zeroing NaN/Inf — existing and future impls get
+  it free. Pinned by a healthy-file parity test, a damaged-MP3 skip-count
+  test (5/5 stable), and a `push_strict` index-parity test. No API, hash,
+  or behavior changes — additive only.
 - **`ZeroAllocStreaming` marker trait + true steady-state zero-alloc
   streaming** (#134) — new `audiofp::ZeroAllocStreaming` bound (also in the
   prelude) separates the streaming impls whose `push_with` / `flush_with`
