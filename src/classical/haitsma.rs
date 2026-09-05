@@ -644,6 +644,10 @@ impl StreamingFingerprinter for StreamingHaitsma {
     }
 }
 
+// `push_with` / `flush_with` drain the pre-allocated `pending` buffer —
+// allocation-free after warmup (pinned by counting-allocator tests).
+impl crate::ZeroAllocStreaming for StreamingHaitsma {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

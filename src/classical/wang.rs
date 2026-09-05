@@ -457,7 +457,7 @@ impl StreamingWang {
     pub fn new(mut cfg: WangConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
         Self {
-            cfg,
+            cfg: cfg.clone(),
             core: stream::StreamCore::new(
                 WANG_N_FFT,
                 WANG_HOP,
@@ -465,6 +465,11 @@ impl StreamingWang {
                 WANG_PEAK_NEIGHBOURHOOD,
                 WANG_LOG_FLOOR_POWER,
                 stream::Zone::Inclusive,
+                // Pool buffers pre-reserved at the pop-time size
+                // (`2·fan_out + 2`, see `StreamCore::new`) so they never
+                // regrow — not even on first use.
+                2 * cfg.fan_out as usize + 2,
+                stream::TARGETS_POOL_PREFILL,
             ),
         }
     }
@@ -514,12 +519,14 @@ impl StreamingWang {
     }
 
     /// Emit Wang hashes for a finalised anchor: linear walk over its
-    /// top-K target list.
+    /// top-K target list. Returns the consumed target buffer for the
+    /// [`StreamCore`](stream::StreamCore) free-list (steady-state
+    /// zero-alloc: the buffer keeps its capacity for the next anchor).
     fn emit_anchor(
         anchor: stream::PendingAnchor,
         _cfg: stream::PeakCfg,
         out: &mut alloc::vec::Vec<(TimestampMs, WangHash)>,
-    ) {
+    ) -> Vec<Peak> {
         let f_a_q = quantise_freq(anchor.peak.f_bin);
         for target in &anchor.targets {
             let f_b_q = quantise_freq(target.f_bin);
@@ -534,6 +541,7 @@ impl StreamingWang {
                 },
             ));
         }
+        anchor.targets
     }
 }
 
@@ -596,6 +604,10 @@ impl StreamingFingerprinter for StreamingWang {
         (self.lookahead_frames() * WANG_HOP as u32 * 1000) / WANG_SR
     }
 }
+
+// `push_with` / `flush_with` drain the pre-allocated `emitted` buffer —
+// allocation-free after warmup (pinned by counting-allocator tests).
+impl crate::ZeroAllocStreaming for StreamingWang {}
 
 #[cfg(test)]
 mod tests {
@@ -1343,6 +1355,32 @@ mod tests {
     }
 
     // ── Performance regression: zero-alloc push_with contract ──
+
+    #[test]
+    fn targets_pool_covers_steady_state() {
+        // After warmup, every anchor creation must pop from the pool
+        // (misses stop growing). A miss allocates one fresh buffer.
+        let mut s = StreamingWang::default();
+        let audio = synthetic_audio(0xABCD, 8_000 * 20);
+        for c in audio.chunks(1024) {
+            let _ = s.push_with(c, |_, _| {});
+        }
+        let (hits0, misses0) = (s.core.pool_hits, s.core.pool_misses);
+        assert!(hits0 > 0, "warmup must exercise the pool");
+        for c in audio.chunks(1024) {
+            let _ = s.push_with(c, |_, _| {});
+        }
+        let (hits1, misses1) = (s.core.pool_hits, s.core.pool_misses);
+        eprintln!(
+            "pool hits={hits0}->{hits1} misses={misses0}->{misses1} pool_len={}",
+            s.core.targets_pool.len()
+        );
+        assert_eq!(
+            misses1, misses0,
+            "steady-state anchors must reuse pooled buffers"
+        );
+        assert!(hits1 > hits0, "second pass must pop from the pool");
+    }
 
     #[test]
     fn push_with_matches_push_output_count() {
