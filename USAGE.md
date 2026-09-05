@@ -30,6 +30,7 @@
 - [HaitsmaMatcher](#haitsmamatcher)
 - [PanakoMatcher](#panakomatcher)
   - [Prebuilt index for repeated 1:1 Panako matches](#prebuilt-index-for-repeated-11-panako-matches)
+  - [Tuning match thresholds](#tuning-match-thresholds)
 - [NeuralMatcher](#neuralmatcher)
 - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
@@ -935,6 +936,124 @@ fn main() {
     assert_eq!(m, matcher.match_one(&query, &reference));
 }
 ```
+
+### Tuning match thresholds
+
+The shipped defaults (`WangMatchConfig`, `HaitsmaMatchConfig`,
+`PanakoMatchConfig`) are calibrated on a real CC0 corpus
+(`tests/threshold_calibration.rs`, margins in
+[ROBUSTNESS.md](ROBUSTNESS.md#threshold-calibration)): every same-track
+cross-codec pair clears them and every cross-track pair fails them,
+with score margins ≥ 0.35. Recalibrate on your own catalog when your
+audio differs (short clips, phone-mic noise, genre skew) — the
+procedure is the same one the test uses:
+
+1. Collect **positive** pairs (same recording, different codec/crop/noise)
+   and **negative** pairs (different recordings).
+2. Match every pair with the decision thresholds zeroed (accept-all
+   config) and record `(score, prominence)`.
+3. Take `min_pos` (worst positive) and `max_neg` (best negative) per
+   field. Any threshold between them separates your data with zero
+   FP/FN; pick the midpoint so both sides keep headroom.
+4. If the intervals overlap, the features don't separate your data —
+   loosen the query side (longer clips, lower `min_votes`) before
+   touching thresholds.
+
+```rust
+use audiofp::classical::{WangFingerprint, WangHash};
+use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
+
+fn fp(hashes: &[(u32, u32)]) -> WangFingerprint {
+    WangFingerprint {
+        hashes: hashes
+            .iter()
+            .map(|&(hash, t_anchor)| WangHash { hash, t_anchor })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    // Accept-all config: thresholds zeroed so raw score/prominence is
+    // observable instead of gated into is_match.
+    let probe = WangMatcher::new(WangMatchConfig {
+        min_votes: 1,
+        min_score: 0.0,
+        min_prominence: 0.0,
+        ..Default::default()
+    });
+
+    // Two "same recording" variants (shared hashes) and one unrelated track.
+    // 10 shared landmarks: enough consolidated votes to clear the default
+    // prominence floor (each vote lands in 3 ±tol bins, diluting the peak).
+    let a = fp(&[
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
+        (7, 70),
+        (8, 80),
+        (9, 90),
+        (10, 100),
+        (11, 110),
+        (12, 120),
+    ]);
+    let b = fp(&[
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
+        (7, 70),
+        (8, 80),
+        (9, 90),
+        (10, 100),
+        (13, 130),
+        (14, 140),
+    ]);
+    let other = fp(&[
+        (101, 10),
+        (102, 20),
+        (103, 30),
+        (104, 40),
+        (105, 50),
+        (106, 60),
+        (107, 70),
+        (108, 80),
+        (109, 90),
+        (110, 100),
+        (111, 110),
+        (112, 120),
+    ]);
+
+    let pos = probe.match_one(&a, &b); // same track
+    let neg = probe.match_one(&a, &other); // different tracks
+    println!("positive: score {:.3} prom {:.1}", pos.score, pos.prominence);
+    println!("negative: score {:.3} prom {:.1}", neg.score, neg.prominence);
+
+    // Threshold = midpoint of the margin. Here the positive scores 10/12
+    // shared hashes and the negative scores 0, so ~0.42 separates them
+    // with headroom on both sides.
+    let min_score = (pos.score + neg.score) / 2.0;
+    assert!((min_score - 0.417).abs() < 0.01);
+
+    let tuned = WangMatcher::new(WangMatchConfig {
+        min_score,
+        ..Default::default()
+    });
+    assert!(tuned.match_one(&a, &b).is_match);
+    assert!(!tuned.match_one(&a, &other).is_match);
+}
+```
+
+Which knob to move follows the margin shape: positives scoring low
+means the evidence is weak (raise `min_votes` cautiously, or lengthen
+queries); negatives scoring high means collisions (raise
+`min_prominence` for Wang/Panako, lower `max_ber` for Haitsma). Move
+one knob at a time and re-sweep — the margins interact.
 
 ### NeuralMatcher
 
@@ -1966,6 +2085,56 @@ async fn fingerprint_blocking(
 Keep extraction off the async executor threads — STFT + peak picking are
 CPU-bound and would stall the runtime.
 
+#### Sharing an extractor across tasks
+
+`extract` takes `&mut self`, so a shared fingerprinter needs a lock —
+or skip sharing entirely with one extractor per task. Both are safe:
+every public type is asserted `Send + Sync` at compile time
+(`send_sync_assertions` in `src/lib.rs`), so they can cross task and
+thread boundaries:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+use audiofp::classical::Wang;
+use audiofp::{Fingerprinter, SampleRate};
+
+// One extractor behind a lock: FFT plan and scratch stay warm, tasks
+// serialise on the mutex. Fine when extraction is not the bottleneck.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let wang = Arc::new(Mutex::new(Wang::default()));
+    let w2 = Arc::clone(&wang);
+    let samples = vec![0.0_f32; 8_000 * 3];
+    let fp = w2.lock().unwrap().extract(&samples, SampleRate::HZ_8000)?;
+    assert!(fp.hashes.is_empty()); // silence → no hashes
+    Ok(())
+}
+```
+
+Prefer one extractor per `spawn_blocking` task when throughput matters
+— no lock contention, and each task keeps its own warm scratch:
+
+```rust
+use audiofp::classical::Wang;
+use audiofp::{Fingerprinter, SampleRate};
+
+async fn fingerprint_blocking_each(
+    samples: Vec<f32>,
+) -> Result<audiofp::classical::WangFingerprint, audiofp::AfpError> {
+    tokio::task::spawn_blocking(move || {
+        let mut wang = Wang::default(); // fresh plan per task
+        wang.extract(&samples, SampleRate::HZ_8000)
+    })
+    .await
+    .expect("blocking task join")
+}
+```
+
+Rules of thumb: decode (`symphonia` packets + resample) and extract go
+on the blocking pool; 1:1 matching is single-digit milliseconds and can
+run inline unless you batch it. Streaming `push` follows the same
+`&mut self` rule — drive one streamer per source from a single task.
+
 ### Batching files
 
 Reuse one fingerprinter across paths — the FFT plan, window, and scratch
@@ -1996,6 +2165,80 @@ across cores (it parallelises extraction only — matching stays sequential
 by design; use the indexes for large 1:N). To decouple parallel extraction
 from single-writer storage/indexing, cache each result to a `.afp` file
 ([Cache files](#cache-files-afp)) and ingest the directory serially.
+
+#### Enrolling a directory: skip corrupt, abort on resource pressure
+
+The batch loop above bails on the first error (`?` inside the loop) —
+wrong for a 10k-file ingest where one corrupt upload must not kill the
+run. Classify per-file failures instead: **skip** corrupt content,
+**abort** on resource signals (the rest of the directory will hit the
+same wall):
+
+```rust
+use std::path::{Path, PathBuf};
+
+use audiofp::classical::Wang;
+use audiofp::io::{DecodeLimits, decode_to_mono_at_limited};
+use audiofp::{AfpError, Fingerprinter, SampleRate};
+
+fn enroll_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let limits = DecodeLimits::both(50_000_000, 8_000 * 600).strict();
+    let mut wang = Wang::default();
+    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    paths.sort();
+    for path in &paths {
+        let r: Result<(), AfpError> = (|| {
+            let samples = decode_to_mono_at_limited(path, 8_000, limits)?;
+            let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
+            println!("{} → {} hashes", path.display(), fp.hashes.len());
+            // your_store.insert(track_id, &fp.hashes);
+            Ok(())
+        })();
+        match r {
+            Ok(()) => ok += 1,
+            // Corrupt content: log and continue with the next file.
+            Err(AfpError::Io(_)) | Err(AfpError::Deserialize(_)) => {
+                eprintln!("{}: corrupt, skipping", path.display());
+                skipped += 1;
+            }
+            // Too short / wrong shape for this fingerprinter: data issue,
+            // not a crash — skip unless your catalog guarantees otherwise.
+            Err(AfpError::AudioTooShort { .. }) | Err(AfpError::NonFiniteSample { .. }) => {
+                eprintln!("{}: unusable audio, skipping", path.display());
+                skipped += 1;
+            }
+            // Resource pressure or config error: abort, the rest of the
+            // directory will hit the same wall.
+            Err(e @ (AfpError::InputTooLarge { .. } | AfpError::Timeout { .. }
+                | AfpError::Config(_))) => {
+                eprintln!("{}: aborting ingest: {e}", path.display());
+                failed += 1;
+                break;
+            }
+            Err(e) => {
+                eprintln!("{}: skipping: {e}", path.display());
+                skipped += 1;
+            }
+        }
+    }
+    println!("enrolled={ok} skipped={skipped} failed={failed}");
+    Ok(())
+}
+```
+
+Notes:
+
+- `.strict()` makes per-packet decode errors fatal *for that file* so a
+  half-decoded buffer never enters your index silently; the loop above
+  still continues with the next file.
+- `InputTooLarge` carries `{ limit, provided }` — log both when
+  aborting so the operator knows which cap to raise.
+- `AfpError` is `#[non_exhaustive]`: keep the trailing catch-all arm so
+  future variants don't break your enroll loop on upgrade.
 
 ### Model sourcing
 

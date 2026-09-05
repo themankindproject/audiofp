@@ -132,6 +132,16 @@ pub(crate) struct StreamCore<F> {
     pub(crate) zone: Zone,
 }
 
+/// Push `peak` into the per-second bucket map, creating the bucket entry
+/// if absent. Shared by the steady-state peak scan and the flush drain
+/// so the bucket-insertion order stays identical on both paths.
+fn push_peak(bucket_pending: &mut Vec<(u32, Vec<Peak>)>, bucket: u32, peak: Peak) {
+    match bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
+        Ok(idx) => bucket_pending[idx].1.push(peak),
+        Err(idx) => bucket_pending.insert(idx, (bucket, vec![peak])),
+    }
+}
+
 impl<F> StreamCore<F> {
     pub(crate) fn new(
         n_fft: usize,
@@ -256,10 +266,7 @@ impl<F> StreamCore<F> {
                         _pad: 0,
                         mag: v,
                     };
-                    match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                        Ok(idx) => self.bucket_pending[idx].1.push(peak),
-                        Err(idx) => self.bucket_pending.insert(idx, (bucket, vec![peak])),
-                    }
+                    push_peak(&mut self.bucket_pending, bucket, peak);
                 }
             }
         }
@@ -485,10 +492,7 @@ impl<F> StreamCore<F> {
                             _pad: 0,
                             mag: v,
                         };
-                        match bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
-                            Ok(idx) => bucket_pending[idx].1.push(peak),
-                            Err(idx) => bucket_pending.insert(idx, (bucket, vec![peak])),
-                        }
+                        push_peak(bucket_pending, bucket, peak);
                     }
                 }
                 *last_pd = ripe_abs as i32;
