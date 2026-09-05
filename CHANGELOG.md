@@ -42,17 +42,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format), enabling parallel extraction → serial index ingest. See the
   `cache_workflow` example.
 - **Mutable catalog indexes** (#133) — `WangIndex` / `HaitsmaIndex` /
-  `PanakoIndex` gain additive `insert` / `remove` / `live_count` /
-  `estimated_bytes`. `insert` is O(hashes) amortised (single map lookup per
-  posting, touched-list-only stop-hash pruning, pre-reserved capacity, reused
-  scratch); `remove` is physical (in-place `retain` per list, Haitsma frame
-  vector freed) so `query` needs no liveness guard and its throughput is
-  unchanged. `build(all)` ≡ `build(prefix)` + `insert(rest)` on query outputs
-  (tested per index); vacated ids are reused LIFO. No API, hash, or score
-  changes — `build` / `query` / `len` untouched. Criterion
-  `matching/wang_index_insert` (release, same box): `insert_one_into_n100`
-  2.61 ms vs `rebuild_n101` 6.14 ms (~2.4× at n=100; gap grows linearly
-  since insert is O(hashes) and rebuild is O(catalog)).
+  `PanakoIndex` gain additive `insert` / `insert_many` / `remove` /
+  `remove_many` / `live_count` / `estimated_bytes`. `insert` is O(hashes)
+  amortised: single map lookup per posting (AHash-bound, ~52 ns/key
+  measured), stop-hash prune pass eliminated in the common case
+  (over-limit keys recorded inline while the list is borrowed — zero
+  second lookups), pre-reserved capacity, reused scratch. `remove` is
+  physical (read-only SIMD-friendly pre-scan per list, in-place `retain`
+  only on hit lists, Haitsma frame vector freed) so `query` needs no
+  liveness guard and its throughput is unchanged. `remove_many` /
+  `insert_many` batch K erasures/enrolls into one map pass (single reserve,
+  sorted-id binary-search membership). `build(all)` ≡
+  `build(prefix)` + `insert(rest)` on query outputs (tested per index);
+  vacated ids are reused LIFO (single `remove`) or smallest-first
+  (`remove_many`, documented). No API, hash, or score changes — `build` /
+  `query` / `len` untouched. Measured (release, same box, n=300 catalog,
+  481-hash fingerprints): steady `insert` 25 µs/op; `remove_many` × 20 in
+  one 5.7 ms pass vs 15.4 ms looped (~2.7×, gap grows with K since looped
+  is K passes). Criterion `matching/wang_index_insert`:
+  `insert_one_into_n100` 2.61 ms vs `rebuild_n101` 6.14 ms (~2.4× at
+  n=100; gap grows linearly since insert is O(hashes) and rebuild is
+  O(catalog)).
 
 ## [0.4.1] - 2026-08-28
 
