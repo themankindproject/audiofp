@@ -130,19 +130,94 @@ pub(crate) struct StreamCore<F> {
     pub(crate) neighborhood: usize,
     pub(crate) log_floor_power: f32,
     pub(crate) zone: Zone,
+    /// Free-list of per-anchor target buffers. `finalize_bucket` pops (or
+    /// allocates on first use); `emit_anchor` implementations return the
+    /// consumed anchor's buffer here. This closes the last steady-state
+    /// allocation in the streaming pipeline: without it every anchor pays
+    /// one `Vec::new()` + growth. Pool size is naturally bounded (one entry
+    /// per anchor that ever lived concurrently — the pending-anchor
+    /// high-water mark); capacities are bounded by construction
+    /// (`insert_top_target` caps at `fan_out`, Panako at `2·fan_out`).
+    pub(crate) targets_pool: Vec<Vec<Peak>>,
+    /// Free-list of per-bucket peak buffers. `push_peak` pops (or allocates
+    /// on first use) when a new second-bucket starts; `finalize_bucket`
+    /// returns the consumed buffer after extracting its peaks. Same
+    /// steady-state rationale as [`targets_pool`](Self::targets_pool), but
+    /// demand-grown (no prefill): bucket concurrency is tiny (≤ a handful
+    /// alive at once — one per unfinalized second), so warmup stabilizes it
+    /// immediately, unlike the bursty anchor path.
+    pub(crate) bucket_pool: Vec<Vec<Peak>>,
+    /// Test-only pool diagnostics: pops served from the pool vs fresh
+    /// allocations (steady-state zero-alloc means ~all hits after warmup).
+    #[cfg(test)]
+    pub(crate) pool_hits: u64,
+    /// Test-only pool diagnostics (see [`pool_hits`](Self::pool_hits)).
+    #[cfg(test)]
+    pub(crate) pool_misses: u64,
 }
 
 /// Push `peak` into the per-second bucket map, creating the bucket entry
 /// if absent. Shared by the steady-state peak scan and the flush drain
 /// so the bucket-insertion order stays identical on both paths.
-fn push_peak(bucket_pending: &mut Vec<(u32, Vec<Peak>)>, bucket: u32, peak: Peak) {
+///
+/// New buckets pop their peak buffer from `bucket_pool` (or allocate on
+/// first use) instead of `vec![peak]` — the steady-state zero-alloc half
+/// of the bucket lifecycle (`finalize_bucket` returns the buffer after
+/// extracting its peaks).
+fn push_peak(
+    bucket_pending: &mut Vec<(u32, Vec<Peak>)>,
+    bucket_pool: &mut Vec<Vec<Peak>>,
+    bucket: u32,
+    peak: Peak,
+) {
     match bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
         Ok(idx) => bucket_pending[idx].1.push(peak),
-        Err(idx) => bucket_pending.insert(idx, (bucket, vec![peak])),
+        Err(idx) => {
+            let mut peaks = bucket_pool.pop().unwrap_or_default();
+            peaks.push(peak);
+            bucket_pending.insert(idx, (bucket, peaks));
+        }
     }
 }
 
+/// Maximum retained entries for [`StreamCore::targets_pool`](StreamCore::targets_pool).
+///
+/// Flush emits every pending anchor while creating few new ones, so the
+/// pool would balloon to the whole backlog on every stream end and reallocate
+/// its own backing Vec whenever a flush exceeds the previous high-water.
+/// Capping keeps pool memory bounded (~`MAX × 300 B` worst case) and pool
+/// pushes allocation-free in steady state; excess buffers are simply dropped
+/// (their memory is freed — the rare flush-time case they cover is not hot).
+pub(crate) const TARGETS_POOL_MAX: usize = 256;
+
+/// Maximum retained entries for the bucket free-list (see
+/// [`TARGETS_POOL_MAX`]). Concurrent unfinalized buckets fit in a handful;
+/// anything beyond that is flush-time excess.
+pub(crate) const BUCKET_POOL_MAX: usize = 32;
+
+/// Prefill size for [`StreamCore::targets_pool`](StreamCore::targets_pool).
+///
+/// Rationale: in steady state most pooled buffers are checked out inside
+/// live pending anchors, so the free count oscillates near zero; bucket
+/// finalization creates anchors in bursts (one bucket's peaks at once) that
+/// would outrun a demand-grown pool and allocate fresh buffers every burst.
+/// Pre-seeding covers ~2× the observed concurrent-anchor high-water mark
+/// (~36 on representative audio) with slack, so bursts pop pre-reserved
+/// buffers instead of allocating. Pathological peak density far beyond
+/// warmup input can still outgrow the pool — the same caveat as every other
+/// amortised buffer in the pipeline (`emitted`, `pending_anchors`, carry).
+pub(crate) const TARGETS_POOL_PREFILL: usize = 64;
+
 impl<F> StreamCore<F> {
+    /// - `pool_buf_cap`: capacity reserved per pre-seeded target buffer —
+    ///   must equal the pop-time `reserve` in `finalize_bucket`
+    ///   (`2·fan_out + 2`, covering both algorithms' transient overshoot)
+    ///   so pre-seeded AND recycled buffers never regrow.
+    /// - `pool_prefill`: number of target buffers to pre-seed (see
+    ///   [`TARGETS_POOL_PREFILL`]).
+    // 8 construction scalars (all used, no meaningful subgrouping that
+    // wouldn't just move the arity into a config struct for 3 call sites).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         n_fft: usize,
         hop: usize,
@@ -150,6 +225,8 @@ impl<F> StreamCore<F> {
         neighborhood: usize,
         log_floor_power: f32,
         zone: Zone,
+        pool_buf_cap: usize,
+        pool_prefill: usize,
     ) -> Self {
         let stft = ShortTimeFFT::new(StftConfig {
             n_fft,
@@ -177,6 +254,14 @@ impl<F> StreamCore<F> {
             pending_anchors: alloc::collections::VecDeque::new(),
             to_finalize: Vec::new(),
             emitted: Vec::new(),
+            targets_pool: (0..pool_prefill)
+                .map(|_| Vec::with_capacity(pool_buf_cap))
+                .collect(),
+            bucket_pool: Vec::new(),
+            #[cfg(test)]
+            pool_hits: 0,
+            #[cfg(test)]
+            pool_misses: 0,
             n_fft,
             hop,
             frames_per_sec: sample_rate as f32 / hop as f32,
@@ -266,7 +351,14 @@ impl<F> StreamCore<F> {
                         _pad: 0,
                         mag: v,
                     };
-                    push_peak(&mut self.bucket_pending, bucket, peak);
+                    // Disjoint field borrows (`bucket_pending` vs
+                    // `bucket_pool`) — no conflict.
+                    push_peak(
+                        &mut self.bucket_pending,
+                        &mut self.bucket_pool,
+                        bucket,
+                        peak,
+                    );
                 }
             }
         }
@@ -304,7 +396,10 @@ impl<F> StreamCore<F> {
         let target_zone_t = cfg.target_zone_t;
         let target_zone_f = cfg.target_zone_f;
 
-        for peak in peaks {
+        // `drain` (not by-value consume) so the buffer survives for the
+        // bucket pool below. `Peak` is `Copy`, so yielded items behave
+        // identically to the old `for peak in peaks`.
+        for peak in peaks.drain(..) {
             // Add as TARGET to older anchors whose zone covers it.
             for anchor in self.pending_anchors.iter_mut() {
                 let dt = peak.t_frame as i32 - anchor.peak.t_frame as i32;
@@ -325,18 +420,58 @@ impl<F> StreamCore<F> {
                 }
                 add_target(&mut anchor.targets, peak, dt, df, cfg);
             }
-            // Register this peak as a new ANCHOR.
+            // Register this peak as a new ANCHOR, reusing a pooled target
+            // buffer when one is available (steady-state zero-alloc).
             // If a hard cap is configured, evict oldest anchors first
-            // so memory stays bounded under adversarial / dense input.
+            // so memory stays bounded under adversarial / dense input —
+            // evicted buffers go back to the pool (no allocation even
+            // under pressure).
             if let Some(limit) = cfg.max_pending_anchors {
                 while self.pending_anchors.len() >= limit {
-                    self.pending_anchors.pop_front();
+                    if let Some(evicted) = self.pending_anchors.pop_front() {
+                        // Capped (see TARGETS_POOL_MAX): excess is dropped.
+                        if self.targets_pool.len() < TARGETS_POOL_MAX {
+                            self.targets_pool.push(evicted.targets);
+                        }
+                    }
                 }
             }
-            self.pending_anchors.push_back(PendingAnchor {
-                peak,
-                targets: Vec::new(),
-            });
+            #[cfg(test)]
+            let pool_len_before = self.targets_pool.len();
+            let mut targets = self.targets_pool.pop().unwrap_or_default();
+            // Pooled buffers arrive with the previous anchor's targets still
+            // in them — `clear` keeps the capacity and drops the stale
+            // contents (reusing them would corrupt hashes AND can underflow
+            // `dt` arithmetic downstream).
+            targets.clear();
+            // Guarantee growth-free accumulation: `insert_top_target`
+            // (Wang) does `Vec::insert`, which reallocs when `len == cap`
+            // even though logical length never exceeds `fan_out` (the
+            // transient insert needs one spare slot); Panako's `add_target`
+            // pushes up to `2·fan_out + 1` transiently. Reserving
+            // `2·fan_out + 2` covers both with negligible waste, and
+            // `reserve` is a no-op for buffers that already converged.
+            targets.reserve(2 * cfg.fan_out + 2);
+            #[cfg(test)]
+            {
+                // The pop hit iff the pool was non-empty (a hit allocates
+                // nothing; a miss allocates one fresh buffer below... i.e.
+                // the `unwrap_or_default` itself).
+                if pool_len_before > 0 {
+                    self.pool_hits += 1;
+                } else {
+                    self.pool_misses += 1;
+                }
+            }
+            self.pending_anchors
+                .push_back(PendingAnchor { peak, targets });
+        }
+        // Return the drained peaks buffer to the bucket pool (empty, capacity
+        // retained) — the steady-state zero-alloc half of the bucket
+        // lifecycle (`push_peak` pops from this pool for new buckets).
+        // Capped (see BUCKET_POOL_MAX): excess is dropped.
+        if self.bucket_pool.len() < BUCKET_POOL_MAX {
+            self.bucket_pool.push(peaks);
         }
         self.last_finalized_bucket = bucket as i32;
     }
@@ -379,10 +514,15 @@ impl<F> StreamCore<F> {
     /// Pop anchors whose target zone is fully observed, build hashes from
     /// their accumulated targets via `emit_anchor`, and push into
     /// `self.emitted`.
+    ///
+    /// `emit_anchor` returns the consumed anchor's target buffer, which is
+    /// recycled into [`targets_pool`](Self::targets_pool) — the steady-state
+    /// zero-allocation half of the anchor lifecycle (`finalize_bucket`
+    /// pops from the pool when creating anchors).
     pub(crate) fn emit_finalized_anchors(
         &mut self,
         cfg: PeakCfg,
-        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         // Pop-and-push pattern: take the front anchor, decide whether its
         // target zone is fully observed, and if not put it back. This avoids
@@ -407,7 +547,13 @@ impl<F> StreamCore<F> {
                 self.pending_anchors.push_front(anchor);
                 break;
             }
-            emit_anchor(anchor, cfg, &mut emitted);
+            let freed = emit_anchor(anchor, cfg, &mut emitted);
+            // Recycle the consumed anchor's target buffer. `mut` access to
+            // the pool while `emitted` is taken is disjoint — no borrow
+            // conflict. Capped (see TARGETS_POOL_MAX): excess is dropped.
+            if self.targets_pool.len() < TARGETS_POOL_MAX {
+                self.targets_pool.push(freed);
+            }
         }
         self.emitted = emitted;
     }
@@ -420,7 +566,7 @@ impl<F> StreamCore<F> {
         samples: &[f32],
         cfg: PeakCfg,
         mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
         pcm::extend_sanitized(&mut self.sample_carry, samples);
@@ -466,7 +612,7 @@ impl<F> StreamCore<F> {
         &mut self,
         cfg: PeakCfg,
         mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>),
+        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let n_bins = self.spec_n_bins;
         let spec = &self.spec;
@@ -474,6 +620,7 @@ impl<F> StreamCore<F> {
         let spec_cap = 2 * self.neighborhood + 1;
         let spec_first_frame = self.spec_first_frame;
         let bucket_pending = &mut self.bucket_pending;
+        let bucket_pool = &mut self.bucket_pool;
         let last_pd = &mut self.last_pd_frame;
         let min_mag = cfg.min_anchor_mag_db;
         let frames_per_sec = self.frames_per_sec;
@@ -492,7 +639,7 @@ impl<F> StreamCore<F> {
                             _pad: 0,
                             mag: v,
                         };
-                        push_peak(bucket_pending, bucket, peak);
+                        push_peak(bucket_pending, bucket_pool, bucket, peak);
                     }
                 }
                 *last_pd = ripe_abs as i32;
@@ -502,21 +649,34 @@ impl<F> StreamCore<F> {
         self.to_finalize
             .extend(self.bucket_pending.iter().map(|e| e.0));
         let n = self.to_finalize.len();
-        for i in 0..n {
-            let bucket = self.to_finalize[i];
-            self.finalize_bucket(cfg, bucket, &mut add_target);
-        }
-        self.to_finalize.clear();
-
+        // Finalize + emit INTERLEAVED per bucket (not finalize-all then
+        // emit-all): each bucket's anchors are emitted — returning their
+        // target buffers to the pool — before the next bucket allocates new
+        // ones, so the flush reuses the same pooled working set as steady
+        // pushes instead of bursting fresh allocations. Output-identical to
+        // emit-all-at-end: `pending_anchors` is FIFO, per-bucket finalize
+        // appends newer anchors at the back, and each emit-all drains in
+        // order — the global emission sequence is unchanged. (Also bounds
+        // `pending_anchors` length to one bucket's burst rather than the
+        // whole remainder, avoiding a flush-time VecDeque doubling.)
+        //
         // Flush drains *all* pending anchors unconditionally — the zone
         // check is a liveness optimization for steady-state `push`, but at
         // end-of-stream every anchor's full lookahead has been observed, so
         // the remaining ones must emit (and the queue must empty).
         let mut emitted = core::mem::take(&mut self.emitted);
-        let mut emit_anchor = emit_anchor;
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            emit_anchor(anchor, cfg, &mut emitted);
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
+            self.finalize_bucket(cfg, bucket, &mut add_target);
+            while let Some(anchor) = self.pending_anchors.pop_front() {
+                let freed = emit_anchor(anchor, cfg, &mut emitted);
+                // Capped (see TARGETS_POOL_MAX): excess is dropped.
+                if self.targets_pool.len() < TARGETS_POOL_MAX {
+                    self.targets_pool.push(freed);
+                }
+            }
         }
+        self.to_finalize.clear();
         self.emitted = emitted;
     }
 }
@@ -527,7 +687,7 @@ mod tests {
 
     #[test]
     fn spec_ring_overwrites_oldest_row_at_capacity() {
-        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive);
+        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive, 8, 0);
         assert_eq!(core.spec_capacity(), 5);
         let n_bins = core.spec_n_bins;
         core.frame_scratch = alloc::vec![0.0f32; n_bins];
@@ -553,7 +713,7 @@ mod tests {
 
     #[test]
     fn spec_ring_reset_clears_tail() {
-        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive);
+        let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive, 8, 0);
         core.frame_scratch = alloc::vec![1.0f32; core.spec_n_bins];
         for _ in 0..12 {
             core.append_frame_scratch_row();
