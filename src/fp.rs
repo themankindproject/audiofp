@@ -15,7 +15,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{Result, SampleRate, TimestampMs};
+use crate::{AfpError, Result, SampleRate, TimestampMs};
 
 /// Offline (whole-buffer) fingerprinter.
 ///
@@ -219,6 +219,28 @@ pub trait StreamingFingerprinter {
         }
         Ok(n)
     }
+
+    /// Like [`push`](Self::push), but fail fast on non-finite input instead
+    /// of sanitizing it to `0.0`.
+    ///
+    /// Streaming `push` replaces NaN/±Inf with `0.0` (infallible realtime
+    /// path), while offline `extract` rejects the same input with
+    /// [`AfpError::NonFiniteSample`]. This defaulted method closes that gap
+    /// for callers who want offline-grade validation on a stream: it
+    /// pre-scans with the same check offline uses and returns
+    /// `NonFiniteSample { index }` (index relative to `samples`, identical
+    /// to what offline `extract` reports for the same buffer) before
+    /// delegating to [`push`](Self::push).
+    ///
+    /// The pre-scan is one branchy pass that predicts perfectly on clean
+    /// audio; the hot path (`push` itself) is untouched. Existing and
+    /// future impls get it free — no override needed.
+    fn push_strict(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
+        if let Some(index) = samples.iter().position(|s| !s.is_finite()) {
+            return Err(AfpError::NonFiniteSample { index });
+        }
+        self.push(samples)
+    }
 }
 
 /// Marker contract for streaming fingerprinters whose `push_with` /
@@ -420,6 +442,37 @@ mod tests {
 
         assert_eq!(n, pending.len());
         assert_eq!(collected, pending, "flush_with must mirror flush");
+    }
+
+    #[test]
+    fn push_strict_rejects_non_finite_with_offline_index() {
+        // Same contract as offline `extract` (see
+        // `classical::wang::tests::extract_rejects_nan_pcm`): first
+        // non-finite index, not sanitized silence.
+        let mut samples = vec![0.0_f32; 10];
+        samples[7] = f32::NAN;
+
+        let mut fp = CountByThree::new();
+        let err = fp.push_strict(&samples).unwrap_err();
+        assert!(
+            matches!(err, crate::AfpError::NonFiniteSample { index: 7 }),
+            "push_strict must report the first non-finite index, got {err:?}"
+        );
+
+        // Clean input delegates to push unchanged.
+        let mut fp = CountByThree::new();
+        let clean = vec![0.0_f32; 9];
+        let via_strict = fp.push_strict(&clean).unwrap();
+        let mut fp = CountByThree::new();
+        let via_push = fp.push(&clean).unwrap();
+        assert_eq!(
+            via_strict, via_push,
+            "push_strict must equal push on clean input"
+        );
+
+        // Empty input is a no-op, not an error.
+        let mut fp = CountByThree::new();
+        assert!(fp.push_strict(&[]).unwrap().is_empty());
     }
 
     #[cfg(feature = "rayon")]

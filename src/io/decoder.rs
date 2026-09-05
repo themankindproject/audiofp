@@ -183,34 +183,7 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
     limits: DecodeLimits,
 ) -> Result<(Vec<f32>, u32)> {
     let path = path.as_ref();
-    // Pre-check: don't even open files that are clearly too large.
-    // Note: this is best-effort against TOCTOU (file can grow after the
-    // stat); `max_samples` is the hard bound on decoded PCM.
-    if limits.max_bytes > 0 {
-        let meta = std::fs::metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
-        let len = meta.len();
-        if len > limits.max_bytes {
-            return Err(AfpError::InputTooLarge {
-                limit: usize::try_from(limits.max_bytes).unwrap_or(usize::MAX),
-                provided: usize::try_from(len).unwrap_or(usize::MAX),
-            });
-        }
-    }
-    let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    // `Instant::now` is the correct choice here: the decode timeout
-    // measures wall-clock time from the caller's perspective. This is not
-    // a testability concern — tests exercise the timeout via
-    // `Duration::from_nanos(0)` which fires on the first packet regardless
-    // of when the Instant was captured.
-    #[allow(clippy::disallowed_methods)]
-    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
+    let (mss, hint, deadline) = open_source(path, &limits)?;
 
     decode_inner(
         mss,
@@ -293,6 +266,84 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     }
 }
 
+/// Observability counters for one decode pass. Returned as part of
+/// [`DecodeReport`]; see [`decode_to_mono_report`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeStats {
+    /// Audio-track packets inspected (other-track packets in multi-track
+    /// files are excluded — they are not part of this stream).
+    pub packets_total: u64,
+    /// Packets skipped without failing the decode: recoverable per-packet
+    /// decode failures (`integrity_mode: false`, the default) plus
+    /// malformed 0-channel packets. A large count relative to
+    /// `packets_total` means the fingerprint was built from partial audio
+    /// and may fail to match for that reason — not because the recording
+    /// differs. Route on this number (enroll / enroll+flag / quarantine)
+    /// instead of guessing.
+    pub packets_skipped: u64,
+    /// Container re-syncs (`ResetRequired` from the reader or one decoder
+    /// reset+retry). Occasional resets are normal on damaged files; a large
+    /// count corroborates `packets_skipped`.
+    pub resets: u64,
+}
+
+/// Decoded audio plus the observability counters for the pass that
+/// produced it. See [`decode_to_mono_report`].
+#[derive(Clone, Debug)]
+pub struct DecodeReport {
+    /// Mono `f32` PCM, same as [`decode_to_mono`] returns.
+    pub samples: Vec<f32>,
+    /// Native sample rate of the decoded stream.
+    pub sample_rate: u32,
+    /// Packet/corruption counters for this decode pass.
+    pub stats: DecodeStats,
+}
+
+/// Opened decode source: media stream + format hint + wall-clock deadline.
+/// Factored out of `open_source`'s signature so clippy's `type_complexity`
+/// lint stays quiet.
+type OpenedSource = (
+    MediaSourceStream<'static>,
+    Hint,
+    Option<(std::time::Instant, std::time::Duration)>,
+);
+
+/// Open `path` for Symphonia decoding: byte-cap pre-check, media source,
+/// format hint, and wall-clock deadline. Shared by [`decode_to_mono_limited`]
+/// and [`decode_to_mono_report`] so the two entry points cannot drift.
+fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
+    // Pre-check: don't even open files that are clearly too large.
+    // Note: this is best-effort against TOCTOU (file can grow after the
+    // stat); `max_samples` is the hard bound on decoded PCM.
+    if limits.max_bytes > 0 {
+        let meta = std::fs::metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+        let len = meta.len();
+        if len > limits.max_bytes {
+            return Err(AfpError::InputTooLarge {
+                limit: usize::try_from(limits.max_bytes).unwrap_or(usize::MAX),
+                provided: usize::try_from(len).unwrap_or(usize::MAX),
+            });
+        }
+    }
+    let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    // `Instant::now` is the correct choice here: the decode timeout
+    // measures wall-clock time from the caller's perspective. This is not
+    // a testability concern — tests exercise the timeout via
+    // `Duration::from_nanos(0)` which fires on the first packet regardless
+    // of when the Instant was captured.
+    #[allow(clippy::disallowed_methods)]
+    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
+
+    Ok((mss, hint, deadline))
+}
+
 fn decode_inner(
     mss: MediaSourceStream,
     hint: &Hint,
@@ -300,6 +351,61 @@ fn decode_inner(
     integrity_mode: bool,
     deadline: Option<(std::time::Instant, std::time::Duration)>,
 ) -> Result<(Vec<f32>, u32)> {
+    decode_inner_report(mss, hint, max_samples, integrity_mode, deadline)
+        .map(|(samples, sr, _)| (samples, sr))
+}
+
+/// Decode with full observability: same output as
+/// [`decode_to_mono_limited`], plus per-packet corruption counters.
+///
+/// Accept/reject behaviour is IDENTICAL to [`decode_to_mono_limited`] —
+/// this only reports what the lenient path already did silently. In
+/// particular, with `integrity_mode: false` (the default) corrupt packets
+/// are still skipped, not fatal; the difference is that
+/// [`DecodeStats::packets_skipped`] now tells you how many.
+///
+/// # Example
+///
+/// ```no_run
+/// use audiofp::io::{DecodeLimits, decode_to_mono_report};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let report = decode_to_mono_report("song.mp3", DecodeLimits::default())?;
+/// if report.stats.packets_skipped > 0 {
+///     eprintln!(
+///         "decoded with {} skipped packets — enroll with caution",
+///         report.stats.packets_skipped
+///     );
+/// }
+/// # Ok(()) }
+/// ```
+pub fn decode_to_mono_report<P: AsRef<Path>>(
+    path: P,
+    limits: DecodeLimits,
+) -> Result<DecodeReport> {
+    let path = path.as_ref();
+    let (mss, hint, deadline) = open_source(path, &limits)?;
+    let (samples, sample_rate, stats) = decode_inner_report(
+        mss,
+        &hint,
+        limits.max_samples,
+        limits.integrity_mode,
+        deadline,
+    )?;
+    Ok(DecodeReport {
+        samples,
+        sample_rate,
+        stats,
+    })
+}
+
+fn decode_inner_report(
+    mss: MediaSourceStream,
+    hint: &Hint,
+    max_samples: Option<usize>,
+    integrity_mode: bool,
+    deadline: Option<(std::time::Instant, std::time::Duration)>,
+) -> Result<(Vec<f32>, u32, DecodeStats)> {
     let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
         .probe(
             hint,
@@ -363,6 +469,7 @@ fn decode_inner(
 
     let mut samples: Vec<f32> = Vec::new();
     let mut convert_buf: Option<AudioBuffer<f32>> = None;
+    let mut stats = DecodeStats::default();
 
     loop {
         let packet = match format.next_packet() {
@@ -373,7 +480,10 @@ fn decode_inner(
             }
             // ResetRequired means the reader re-synced (e.g. after a seek
             // or a corrupt container header); retry the next packet.
-            Err(SymphoniaError::ResetRequired) => continue,
+            Err(SymphoniaError::ResetRequired) => {
+                stats.resets += 1;
+                continue;
+            }
             Err(e) => {
                 return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
                     format!("next_packet: {e}"),
@@ -381,10 +491,12 @@ fn decode_inner(
             }
         };
         // Skip packets from tracks other than the selected default audio
-        // track (multi-track files).
+        // track (multi-track files). Not counted: they are not part of
+        // this stream, skipped or otherwise.
         if packet.track_id != track_id {
             continue;
         }
+        stats.packets_total += 1;
 
         // Wall-clock timeout check: bail if the configured timeout has
         // elapsed. Checked per-packet (~1 ns overhead from Instant::elapsed).
@@ -415,6 +527,7 @@ fn decode_inner(
             // failure is fatal.
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
+                stats.resets += 1;
                 match decoder.decode(&packet) {
                     Ok(d) => d,
                     Err(e) => {
@@ -430,6 +543,7 @@ fn decode_inner(
                         format!("decode integrity: {e}"),
                     ))));
                 }
+                stats.packets_skipped += 1;
                 continue;
             }
             Err(SymphoniaError::DecodeError(e)) => {
@@ -438,6 +552,7 @@ fn decode_inner(
                         format!("decode integrity: {e}"),
                     ))));
                 }
+                stats.packets_skipped += 1;
                 continue;
             }
             Err(e) => {
@@ -491,6 +606,7 @@ fn decode_inner(
         // Defensive: skip packets that report 0 channels (malformed /
         // corrupt). Avoids division by zero and `.plane(0).unwrap()` panic.
         if n_chans == 0 {
+            stats.packets_skipped += 1;
             continue;
         }
 
@@ -512,7 +628,7 @@ fn decode_inner(
         }
     }
 
-    Ok((samples, sample_rate))
+    Ok((samples, sample_rate, stats))
 }
 
 #[cfg(test)]
@@ -1028,5 +1144,85 @@ mod tests {
             "resampled len = {}",
             samples.len()
         );
+    }
+
+    // -- DecodeReport observability --
+
+    #[test]
+    fn report_matches_limited_on_healthy_file() {
+        // On a healthy file the report path must agree byte-for-byte with
+        // the plain path, with zero skips and a sane packet count.
+        let path = write_test_wav(1, 8_000, 8_000);
+        let (plain_samples, plain_sr) =
+            decode_to_mono_limited(&path, DecodeLimits::default()).unwrap();
+        let report = decode_to_mono_report(&path, DecodeLimits::default()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(report.samples, plain_samples, "report must not change PCM");
+        assert_eq!(report.sample_rate, plain_sr);
+        assert!(
+            report.stats.packets_total > 0,
+            "healthy file must inspect packets"
+        );
+        assert_eq!(
+            report.stats.packets_skipped, 0,
+            "healthy file must skip nothing"
+        );
+    }
+
+    /// Copy `tests/assets/freak.mp3` to a temp file and damage a window in
+    /// the middle of the audio data. MP3 frames past a ID3 header resync
+    /// at the next frame sync, so mid-file damage skips frames without
+    /// killing the decode. Only used by the `std-mp3`-gated test below.
+    #[cfg(feature = "std-mp3")]
+    fn write_corrupt_mp3() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "audiofp-decoder-corrupt-mp3-{}-{}.mp3",
+            std::process::id(),
+            n,
+        ));
+        let bytes = std::fs::read("tests/assets/freak.mp3").unwrap();
+        let mut damaged = bytes.clone();
+        // Middle of the file: past ID3/tags, inside audio frames. Fill
+        // with pseudo-random garbage (xorshift — deterministic): invalid
+        // Huffman data and broken frame syncs make Symphonia report
+        // per-packet DecodeErrors, which the lenient path skips; the
+        // decoder resyncs at the next valid frame afterwards.
+        let mid = bytes.len() / 2;
+        let end = core::cmp::min(mid + 4096, bytes.len());
+        let mut x: u32 = 0x1234_5678;
+        for b in damaged[mid..end].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = (x >> 11) as u8;
+        }
+        std::fs::write(&path, &damaged).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(feature = "std-mp3")]
+    fn report_counts_skipped_packets_on_damaged_mp3() {
+        let path = write_corrupt_mp3();
+        let report = decode_to_mono_report(&path, DecodeLimits::default()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            report.stats.packets_total > 0,
+            "damaged file must still inspect packets"
+        );
+        assert!(
+            report.stats.packets_skipped > 0,
+            "mid-file MP3 damage must skip frames: {:?}",
+            report.stats
+        );
+        assert!(
+            report.stats.packets_skipped < report.stats.packets_total,
+            "damage must be partial, not total: {:?}",
+            report.stats
+        );
+        assert!(!report.samples.is_empty(), "partial audio must remain");
     }
 }

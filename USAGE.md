@@ -1414,7 +1414,11 @@ fn main() {
 - Classical streams never error on finite input. Non-finite samples (NaN /
   ±Inf) are **sanitised to 0.0** on `push` (streaming must not crash an
   audio callback); offline `extract` rejects them with `NonFiniteSample`
-  instead.
+  instead. Callers who want offline-grade validation on a stream use
+  **`push_strict`**: same fail-fast contract as `extract` — pre-scans and
+  returns `NonFiniteSample { index }` (identical index) instead of zeroing.
+  Defaulted trait method, free for every impl; realtime callbacks keep
+  using infallible `push`.
 - A single `push` larger than `max_push_samples` is **truncated** — excess
   samples are dropped, no error. `Some(0)` is sanitised to `Some(1)` at
   construction.
@@ -1670,6 +1674,61 @@ enabled together.
 | Mid-stream spec change, reset fails         | `AfpError::Io(IoError)`    |
 | File exceeds `max_bytes` / `max_samples`    | `AfpError::InputTooLarge`  |
 | Wall-clock `timeout` exceeded               | `AfpError::Timeout`        |
+
+### `decode_to_mono_report` — corruption counts
+
+Lenient decode discards information: a half-corrupt MP3 that dropped 40% of
+its frames fingerprints "successfully" into a partial hash set that then
+fails to match — indistinguishable from a genuine non-match. The report
+variant returns the same audio with the skip counts attached, so ingest can
+policy-route instead of guessing:
+
+```rust,ignore
+// Reference definition (src/io/decoder.rs).
+pub struct DecodeStats {
+    pub packets_total: u64,    // audio-track packets inspected
+    pub packets_skipped: u64,  // recoverable failures skipped + 0-channel packets
+    pub resets: u64,           // container re-syncs (ResetRequired)
+}
+
+pub struct DecodeReport {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub stats: DecodeStats,
+}
+
+pub fn decode_to_mono_report<P: AsRef<Path>>(
+    path: P, limits: DecodeLimits,
+) -> Result<DecodeReport>;
+```
+
+```rust
+use audiofp::io::{decode_to_mono_report, DecodeLimits};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let report = decode_to_mono_report("user_upload.mp3", DecodeLimits::default())?;
+    let skip_ratio = report.stats.packets_skipped as f64
+        / report.stats.packets_total.max(1) as f64;
+    if skip_ratio == 0.0 {
+        println!("clean: enroll");
+    } else if skip_ratio < 0.05 {
+        println!("minor damage ({} skipped): enroll + flag", report.stats.packets_skipped);
+    } else {
+        println!("quarantine for re-upload: {:?}", report.stats);
+    }
+    Ok(())
+}
+```
+
+Notes:
+
+- Accept/reject behaviour is **identical** to `decode_to_mono_limited` —
+  same bytes out for the same file. The report only observes what the
+  lenient path already did silently.
+- `packets_total` counts audio-track packets only; other-track packets in
+  multi-track files are excluded.
+- `integrity_mode = true` (strict) is still the fail-fast option; the report
+  is the middle policy between blind leniency and aborting the file.
 
 ---
 
