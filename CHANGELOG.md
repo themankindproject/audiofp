@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classical fingerprint as the #117 v1 blob (byte-identical — no new
   format), enabling parallel extraction → serial index ingest. See the
   `cache_workflow` example.
+- **Mutable catalog indexes** (#133) — `WangIndex` / `HaitsmaIndex` /
+  `PanakoIndex` gain additive `insert` / `remove` / `live_count` /
+  `estimated_bytes`. `insert` is O(hashes) amortised (single map lookup per
+  posting, touched-list-only stop-hash pruning, pre-reserved capacity, reused
+  scratch); `remove` is physical (in-place `retain` per list, Haitsma frame
+  vector freed) so `query` needs no liveness guard and its throughput is
+  unchanged. `build(all)` ≡ `build(prefix)` + `insert(rest)` on query outputs
+  (tested per index); vacated ids are reused LIFO. No API, hash, or score
+  changes — `build` / `query` / `len` untouched.
 
 ## [0.4.1] - 2026-08-28
 
