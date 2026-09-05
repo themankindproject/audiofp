@@ -520,6 +520,11 @@ fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
 pub struct StreamingPanako {
     cfg: PanakoConfig,
     core: stream::StreamCore<PanakoHash>,
+    /// Pooled triplet-selection heap across anchors (`emit_anchor` clears
+    /// per anchor, capacity retained) — steady-state zero-alloc.
+    emit_heap: alloc::collections::BinaryHeap<MinByScoreOwned>,
+    /// Pooled top-K scratch across anchors (cleared per anchor).
+    emit_scratch: Vec<(Peak, Peak, f32)>,
 }
 
 impl Default for StreamingPanako {
@@ -539,7 +544,7 @@ impl StreamingPanako {
     pub fn new(mut cfg: PanakoConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
         Self {
-            cfg,
+            cfg: cfg.clone(),
             core: stream::StreamCore::new(
                 PANAKO_N_FFT,
                 PANAKO_HOP,
@@ -547,7 +552,14 @@ impl StreamingPanako {
                 PANAKO_PEAK_NEIGHBOURHOOD,
                 PANAKO_LOG_FLOOR_POWER,
                 stream::Zone::Strict,
+                // Pool buffers pre-reserved at the pop-time size
+                // (`2·fan_out + 2`, see `StreamCore::new`) so they never
+                // regrow — not even on first use.
+                2 * cfg.fan_out as usize + 2,
+                stream::TARGETS_POOL_PREFILL,
             ),
+            emit_heap: alloc::collections::BinaryHeap::new(),
+            emit_scratch: Vec::new(),
         }
     }
 
@@ -606,18 +618,22 @@ impl StreamingPanako {
 
     /// Emit Panako triplet hashes for a finalised anchor: sort targets by
     /// `(t_frame, f_bin)` and keep the top-K `(b, c)` pairs by
-    /// `b.mag + c.mag`.
+    /// `b.mag + c.mag`. `heap` / `scratch` are caller-pooled buffers kept
+    /// across anchors (cleared per call, capacity retained) — allocating
+    /// them per anchor would violate the steady-state zero-alloc contract.
+    /// Returns the consumed target buffer for the core free-list.
     fn emit_anchor(
         mut anchor: stream::PendingAnchor,
         cfg: stream::PeakCfg,
         out: &mut Vec<(TimestampMs, PanakoHash)>,
-    ) {
+        heap: &mut alloc::collections::BinaryHeap<MinByScoreOwned>,
+        scratch: &mut Vec<(Peak, Peak, f32)>,
+    ) -> Vec<Peak> {
         let fan_out = cfg.fan_out;
         anchor
             .targets
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
-        let mut heap: alloc::collections::BinaryHeap<MinByScoreOwned> =
-            alloc::collections::BinaryHeap::with_capacity(fan_out + 1);
+        heap.clear();
         for (j, b) in anchor.targets.iter().enumerate() {
             for c in &anchor.targets[j + 1..] {
                 let score = b.mag + c.mag;
@@ -627,15 +643,15 @@ impl StreamingPanako {
                 }
             }
         }
-        let mut scratch: Vec<(Peak, Peak, f32)> =
-            heap.drain().map(|w| (w.b, w.c, w.score)).collect();
+        scratch.clear();
+        scratch.extend(heap.drain().map(|w| (w.b, w.c, w.score)));
         scratch.sort_unstable_by(|x, y| {
             y.2.partial_cmp(&x.2)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then_with(|| (x.0.t_frame, x.0.f_bin).cmp(&(y.0.t_frame, y.0.f_bin)))
                 .then_with(|| (x.1.t_frame, x.1.f_bin).cmp(&(y.1.t_frame, y.1.f_bin)))
         });
-        for (b, c, _) in &scratch {
+        for (b, c, _) in &*scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
             let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
             out.push((
@@ -648,6 +664,7 @@ impl StreamingPanako {
                 },
             ));
         }
+        anchor.targets
     }
 }
 
@@ -659,23 +676,29 @@ impl StreamingFingerprinter for StreamingPanako {
     }
 
     fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        self.core.emitted.clear();
+        // Disjoint field borrows: `core` (receiver) vs `emit_heap` /
+        // `emit_scratch` (captured by the closure) — no conflict.
         let cfg = self.peak_cfg();
-        self.core
-            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
-        Ok(core::mem::take(&mut self.core.emitted))
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_push_samples(samples, cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
+        Ok(core::mem::take(&mut core.emitted))
     }
 
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.core.emitted.clear();
         let cfg = self.peak_cfg();
-        self.core
-            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_push_samples(samples, cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
         let mut n = 0usize;
-        for (t, frame) in self.core.emitted.drain(..) {
+        for (t, frame) in core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -683,23 +706,27 @@ impl StreamingFingerprinter for StreamingPanako {
     }
 
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        self.core.emitted.clear();
         let cfg = self.peak_cfg();
-        self.core
-            .process_flush(cfg, Self::add_target, Self::emit_anchor);
-        Ok(core::mem::take(&mut self.core.emitted))
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_flush(cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
+        Ok(core::mem::take(&mut core.emitted))
     }
 
     fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.core.emitted.clear();
         let cfg = self.peak_cfg();
-        self.core
-            .process_flush(cfg, Self::add_target, Self::emit_anchor);
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_flush(cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
         let mut n = 0usize;
-        for (t, frame) in self.core.emitted.drain(..) {
+        for (t, frame) in core.emitted.drain(..) {
             callback(t, &frame);
             n += 1;
         }
@@ -710,6 +737,10 @@ impl StreamingFingerprinter for StreamingPanako {
         (self.lookahead_frames() * PANAKO_HOP as u32 * 1000) / PANAKO_SR
     }
 }
+
+// `push_with` / `flush_with` drain the pre-allocated `emitted` buffer —
+// allocation-free after warmup (pinned by counting-allocator tests).
+impl crate::ZeroAllocStreaming for StreamingPanako {}
 
 #[cfg(test)]
 mod tests {
@@ -1261,8 +1292,10 @@ mod tests {
         s.core.last_finalized_bucket = panako_bucket_of(195);
 
         s.core.emitted.clear();
-        s.core
-            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        s.core.emit_finalized_anchors(s.peak_cfg(), |a, c, o| {
+            let (heap, scratch) = (&mut s.emit_heap, &mut s.emit_scratch);
+            StreamingPanako::emit_anchor(a, c, o, heap, scratch)
+        });
         assert_eq!(s.core.emitted.len(), 3);
         assert!(s.core.pending_anchors.is_empty());
     }
@@ -1282,8 +1315,10 @@ mod tests {
         s.core.last_finalized_bucket = 1;
 
         s.core.emitted.clear();
-        s.core
-            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        s.core.emit_finalized_anchors(s.peak_cfg(), |a, c, o| {
+            let (heap, scratch) = (&mut s.emit_heap, &mut s.emit_scratch);
+            StreamingPanako::emit_anchor(a, c, o, heap, scratch)
+        });
         assert_eq!(s.core.emitted.len(), 1);
         assert_eq!(s.core.pending_anchors.len(), 1);
         assert_eq!(s.core.pending_anchors.front().unwrap().peak.t_frame, 100);
@@ -1300,12 +1335,16 @@ mod tests {
         s.core.last_finalized_bucket = panako_bucket_of(95);
 
         s.core.emitted.clear();
-        s.core
-            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        s.core.emit_finalized_anchors(s.peak_cfg(), |a, c, o| {
+            let (heap, scratch) = (&mut s.emit_heap, &mut s.emit_scratch);
+            StreamingPanako::emit_anchor(a, c, o, heap, scratch)
+        });
         let first_len = s.core.emitted.len();
         s.core.emitted.clear();
-        s.core
-            .emit_finalized_anchors(s.peak_cfg(), StreamingPanako::emit_anchor);
+        s.core.emit_finalized_anchors(s.peak_cfg(), |a, c, o| {
+            let (heap, scratch) = (&mut s.emit_heap, &mut s.emit_scratch);
+            StreamingPanako::emit_anchor(a, c, o, heap, scratch)
+        });
         let second_len = s.core.emitted.len();
         assert_eq!(first_len, 1);
         assert_eq!(second_len, 0);

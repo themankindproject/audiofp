@@ -185,7 +185,7 @@ mod types;
 #[cfg(feature = "std")]
 pub use error::IoError;
 pub use error::{AfpError, Result};
-pub use fp::{Fingerprinter, StreamingFingerprinter};
+pub use fp::{Fingerprinter, StreamingFingerprinter, ZeroAllocStreaming};
 pub use serial::FingerprintEnvelope;
 pub use types::{SampleRate, TimestampMs};
 

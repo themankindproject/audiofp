@@ -221,6 +221,53 @@ pub trait StreamingFingerprinter {
     }
 }
 
+/// Marker contract for streaming fingerprinters whose `push_with` /
+/// `flush_with` perform **no allocation after warmup**.
+///
+/// The base [`StreamingFingerprinter`] trait cannot promise this: its
+/// `push_with` / `flush_with` defaults allocate exactly like `push` /
+/// `flush` (they call them and iterate). This marker separates the impls
+/// that overrode both methods with true zero-allocation paths — draining a
+/// pre-allocated buffer through the callback — from impls that inherited
+/// the allocating defaults.
+///
+/// Contract for implementors (in-crate and third-party):
+/// - Construction may allocate (scratch buffers, spectrogram rings).
+/// - The first pushes may grow buffers (`Vec` amortised growth); warm up
+///   with representative chunk sizes first.
+/// - After warmup, steady-state `push_with` / `flush_with` must not grow,
+///   reallocate, or otherwise allocate. `push` / `flush` are exempt (they
+///   return an owned `Vec` by contract).
+///
+/// Generic realtime code (audio callbacks, cpal/JACK shims, mic loops)
+/// should bound on this trait instead of [`StreamingFingerprinter`]:
+///
+/// ```ignore
+/// use audiofp::{StreamingFingerprinter, ZeroAllocStreaming};
+///
+/// fn mic_loop<S: ZeroAllocStreaming>(s: &mut S, chunks: &[Vec<f32>]) {
+///     for c in chunks {
+///         // Guaranteed allocation-free after warmup — safe on the audio
+///         // thread. A plain `StreamingFingerprinter` bound cannot promise
+///         // this (the defaults allocate per call).
+///         s.push_with(c, |_, _| {}).unwrap();
+///     }
+/// }
+/// ```
+///
+/// In-crate impls: [`StreamingWang`](crate::StreamingWang),
+/// [`StreamingPanako`](crate::StreamingPanako), and
+/// [`StreamingHaitsma`](crate::StreamingHaitsma) (all drain a pre-allocated
+/// `emitted` buffer; pinned by allocation-counting tests).
+/// [`neural::StreamingNeuralEmbedder`](crate::neural::StreamingNeuralEmbedder)
+/// (feature `neural`) deliberately does **not** implement this trait: its
+/// `Frame = Vec<f32>` allocates one embedding vector per emit through the
+/// `StreamingFingerprinter` interface. Its inherent
+/// [`try_push_with`](crate::neural::StreamingNeuralEmbedder::try_push_with)
+/// is the zero-allocation path (borrows internal scratch); use that
+/// directly for realtime neural streaming.
+pub trait ZeroAllocStreaming: StreamingFingerprinter {}
+
 /// Fingerprint a batch of audio buffers in parallel using rayon.
 ///
 /// Each item is `(tag, samples, rate)` where `tag` is an opaque label

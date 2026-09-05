@@ -41,6 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classical fingerprint as the #117 v1 blob (byte-identical — no new
   format), enabling parallel extraction → serial index ingest. See the
   `cache_workflow` example.
+- **`ZeroAllocStreaming` marker trait + true steady-state zero-alloc
+  streaming** (#134) — new `audiofp::ZeroAllocStreaming` bound (also in the
+  prelude) separates the streaming impls whose `push_with` / `flush_with`
+  allocate nothing after warmup (`StreamingWang`, `StreamingPanako`,
+  `StreamingHaitsma`) from impls inheriting the allocating defaults.
+  Generic realtime code (audio callbacks, mic loops) can now require the
+  bound instead of auditing docs. To MAKE the contract true (not just
+  assert it), the streaming pipeline was fixed where the counting-allocator
+  tests proved it allocated per anchor/bucket: pooled per-anchor target
+  buffers (pre-seeded, capped free-list), pooled per-bucket peak buffers,
+  pooled Panako triplet heap/scratch, and flush finalize+emit interleaved
+  per bucket (output-identical, FIFO order preserved). `neural`'s streamer
+  deliberately opts out (`Frame = Vec<f32>` allocates by interface design;
+  its inherent `try_push_with` remains the zero-alloc path). Pinned by
+  `tests/zero_alloc.rs` (thread-local counting allocator: 120-push warmup
+  incl. a full-backlog flush, then 40 pushes + flush assert ZERO allocs)
+  plus a structural pool-coverage unit test. No API, hash, or score
+  changes — additive trait + impls only; `StreamingFingerprinter` and its
+  defaults untouched.
 - **Mutable catalog indexes** (#133) — `WangIndex` / `HaitsmaIndex` /
   `PanakoIndex` gain additive `insert` / `insert_many` / `remove` /
   `remove_many` / `live_count` / `estimated_bytes`. `insert` is O(hashes)

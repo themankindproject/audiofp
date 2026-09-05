@@ -25,6 +25,6 @@ pub use crate::classical::{
     WangFingerprint, WangHash,
 };
 pub use crate::error::{AfpError, Result};
-pub use crate::fp::{Fingerprinter, StreamingFingerprinter};
+pub use crate::fp::{Fingerprinter, StreamingFingerprinter, ZeroAllocStreaming};
 pub use crate::serial::FingerprintEnvelope;
 pub use crate::types::{SampleRate, TimestampMs};
