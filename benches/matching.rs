@@ -155,11 +155,34 @@ fn bench_wang_index(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_wang_index_insert(c: &mut Criterion) {
+    // Incremental enroll: insert one 3 s fingerprint into a warm n=100
+    // index. Compare against full rebuild of n=101 to show the scaling
+    // (insert is O(hashes), rebuild is O(catalog)).
+    let refs: Vec<WangFingerprint> = (0..100u32).map(|i| wang_fp(10 + i, 3)).collect();
+    let new_fp = wang_fp(999, 3);
+
+    let mut g = c.benchmark_group("matching/wang_index_insert");
+    g.bench_function("insert_one_into_n100", |b| {
+        b.iter_batched(
+            || WangIndex::build(&refs, 100),
+            |mut index| black_box(index.insert(black_box(&new_fp), 100)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    let refs101: Vec<WangFingerprint> = (0..101u32).map(|i| wang_fp(10 + i, 3)).collect();
+    g.bench_function("rebuild_n101", |b| {
+        b.iter(|| black_box(WangIndex::build(black_box(&refs101), 100)));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_wang_one,
     bench_haitsma_one,
     bench_panako_one,
-    bench_wang_index
+    bench_wang_index,
+    bench_wang_index_insert
 );
 criterion_main!(benches);
