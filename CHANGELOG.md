@@ -49,7 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector freed) so `query` needs no liveness guard and its throughput is
   unchanged. `build(all)` ≡ `build(prefix)` + `insert(rest)` on query outputs
   (tested per index); vacated ids are reused LIFO. No API, hash, or score
-  changes — `build` / `query` / `len` untouched.
+  changes — `build` / `query` / `len` untouched. Criterion
+  `matching/wang_index_insert` (release, same box): `insert_one_into_n100`
+  2.61 ms vs `rebuild_n101` 6.14 ms (~2.4× at n=100; gap grows linearly
+  since insert is O(hashes) and rebuild is O(catalog)).
 
 ## [0.4.1] - 2026-08-28
 
