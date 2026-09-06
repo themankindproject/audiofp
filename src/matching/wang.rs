@@ -146,6 +146,19 @@ impl Matcher for WangMatcher {
 }
 
 impl WangMatcher {
+    /// Estimated P(same recording | Wang evidence) for a `match_one` /
+    /// `match_one_prebuilt` result: logistic map of the contrib-ratio
+    /// score, versioned `wang-v1` (see `matching::calibration`).
+    ///
+    /// Raw fields are untouched — this maps them onto the shared
+    /// cross-matcher probability scale so thresholds transfer and
+    /// matchers compose (cascades, ensembles). `MatchResult::NONE`
+    /// maps to ≈0.01, not exactly 0.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
+        super::calibration::calibrated_wang(r)
+    }
+
     /// Match `query` against a reference whose index was built once
     /// (`WangRefIndex::build`), skipping the per-call O(R log R) index
     /// rebuild (audit C1).

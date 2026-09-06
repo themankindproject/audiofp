@@ -143,6 +143,61 @@ fails them (pinned by `*_defaults_separate_all_pairs` in the same file).
 Score margins are ≥ 0.35 in all three matchers, so the defaults are not
 tuned to the corpus edge — they sit a wide margin from the first FP/FN.
 
+### Calibrated confidence (issue #136)
+
+Raw scores live in incompatible units per algorithm (landmark contrib
+ratio, `1 − BER`, cosine) and prominence has a different formula per
+matcher, so thresholds do not transfer and matchers cannot be fused
+without user-invented normalization. `calibrated_score` (one inherent
+method per matcher plus query-side helpers on `WangIndex` /
+`HaitsmaIndex` / `PanakoIndex`, all in `src/matching/calibration.rs`)
+maps each algorithm's score through a closed-form two-parameter logistic
+onto one shared probability scale. Raw fields, configs, thresholds, and
+`is_match` semantics are untouched.
+
+Design note — why closed-form, not fitted: the corpus separates perfectly
+with wide margins (n=12 positives, n=55 negatives), so fitting logistic
+coefficients would be statistically meaningless (perfect separation gives
+degenerate infinite weights). Each map instead anchors `mid` at the
+measured score-gap midpoint with slope `k` taking the gap edges to
+≈0.01/0.99. Two auditable numbers per algorithm, versioned with the
+algorithm name (`WANG_V1_*`); a future `wang-v2` must not silently reuse
+`v1` calibration.
+
+Measured on the same catalog (`audiofp` v0.4.1, maps in this tree):
+
+| Matcher | Map | FPR @ 0.5 / 0.9 / 0.99 | TPR @ 0.5 / 0.9 / 0.99 |
+|---------|-----|------------------------|------------------------|
+| Wang (`mid` 0.20, `k` 22) | σ(22·(score − 0.20)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
+| Haitsma (`mid` 0.73, `k` 29) | σ(29·(score − 0.73)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
+| Panako (`mid` 0.24, `k` 19) | σ(19·(score − 0.24)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
+| Neural | σ(20·(score − min_cosine)) | — (no corpus coverage) | — (no corpus coverage) |
+
+The ≥11/12 at the 0.99 cutoff is exact arithmetic, not a measurement
+gap: the weakest positive maps to ≈0.989 (gap edge by construction), a
+hair under 0.99 — every other positive maps above it.
+
+Caveats, stated plainly: the corpus is small (12 positives), so these
+tables confirm separation, not a fitted ROC — any threshold between the
+gap edges achieves the same perfect split. The neural map is provisional
+(no embedding corpus; cosine scales vary by model) with a deliberately
+conservative slope; its midpoint anchors at each deployment's own
+`min_cosine` so the decision boundary always maps to exactly 0.5.
+
+Recalibration recipe (custom catalogs — skewed genres, dense remixes):
+
+1. Re-run the accept-all procedure: `cargo test --test
+   threshold_calibration --features all-codecs -- --ignored --nocapture`
+   on your catalog (swap in your files for the `CATALOG` table).
+2. Read off the score gap: `neg_max` (highest negative score) and
+   `pos_min` (lowest positive score).
+3. Set `mid = (neg_max + pos_min) / 2` and `k = 2·ln(99) / (pos_min −
+   neg_max)` (≈9.19 / gap width) — this maps the gap edges to 0.01/0.99
+   exactly as the shipped constants do.
+4. If the classes overlap (no clean gap), the closed form does not apply —
+   fit a real logistic regression on your pair scores instead; the two
+   coefficients slot into the same call sites.
+
 ### Helper Script
 
 A convenience script is provided at [`scripts/codec_robustness.sh`](scripts/codec_robustness.sh):
