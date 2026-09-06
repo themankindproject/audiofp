@@ -68,6 +68,21 @@ pub struct NeuralMatcher {
     cfg: NeuralMatchConfig,
 }
 
+impl NeuralMatcher {
+    /// Estimated P(same recording | neural evidence): logistic map of the
+    /// cosine score anchored at this matcher's own `min_cosine` (the
+    /// decision boundary maps to exactly 0.5).
+    ///
+    /// Provisional: cosine scales vary by embedding model and there is no
+    /// corpus coverage for neural — the slope is deliberately conservative
+    /// and deployments should refit per model (see `matching::calibration`
+    /// and the `ROBUSTNESS.md` recipe).
+    #[must_use]
+    pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
+        super::calibration::calibrated_neural(r, self.cfg.min_cosine)
+    }
+}
+
 impl Matcher for NeuralMatcher {
     type Fingerprint = NeuralFingerprint;
     type Config = NeuralMatchConfig;

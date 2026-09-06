@@ -41,6 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classical fingerprint as the #117 v1 blob (byte-identical — no new
   format), enabling parallel extraction → serial index ingest. See the
   `cache_workflow` example.
+- **Calibrated confidence scores** (#136) — new `calibrated_score` on all
+  four matchers plus query-side helpers on `WangIndex` / `HaitsmaIndex` /
+  `PanakoIndex` (`src/matching/calibration.rs`): closed-form
+  two-parameter logistics mapping each algorithm's raw score onto one
+  shared probability scale, versioned per algorithm (`WANG_V1_*`).
+  Closed-form, not fitted, because the corpus separates perfectly
+  (fitting would be degenerate) — midpoints at the measured score-gap
+  midpoints, slopes taking gap edges to ≈0.01/0.99. ROC/FPR table
+  (FPR 0/55 at 0.5/0.9/0.99 for all classical matchers; TPR 12/12, 12/12,
+  ≥11/12) plus a two-number refit recipe in `ROBUSTNESS.md`. Neural map
+  anchors at each deployment's `min_cosine` (provisional, conservative
+  slope, no corpus coverage — documented). Raw fields, configs,
+  thresholds, `is_match` untouched — additive only.
 - **Observable decode + strict streaming push** (#135) — new
   `audiofp::io::decode_to_mono_report` returns `DecodeReport { samples,
   sample_rate, stats }` where `DecodeStats` counts audio-track

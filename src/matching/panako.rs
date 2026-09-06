@@ -194,6 +194,17 @@ impl Matcher for PanakoMatcher {
 }
 
 impl PanakoMatcher {
+    /// Estimated P(same recording | Panako evidence) for a `match_one` /
+    /// `match_one_prebuilt` result: logistic map of the RANSAC-inlier-ratio
+    /// score, versioned `panako-v1` (see `matching::calibration`).
+    ///
+    /// Raw fields are untouched — this maps them onto the shared
+    /// cross-matcher probability scale. `MatchResult::NONE` maps to ≈0.01.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
+        super::calibration::calibrated_panako(r)
+    }
+
     /// Match `query` against a reference whose index was built once
     /// ([`PanakoRefIndex::build`]), skipping the per-call O(R) HashMap
     /// construction.

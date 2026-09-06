@@ -543,6 +543,19 @@ impl WangIndex {
         self.live_count
     }
 
+    /// Estimated P(same recording | evidence) for a [`WangIndex::query`]
+    /// result: same `wang-v1` map as [`WangMatcher::calibrated_score`](super::WangMatcher::calibrated_score).
+    ///
+    /// The index computes prominence on a sparse per-reference tally while
+    /// the matcher uses a dense consolidated histogram, so the two paths
+    /// can differ marginally on `is_match` near the boundary (documented
+    /// at `query`) — the calibrated value of an index-only result carries
+    /// that selection bias. Raw fields untouched.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &super::MatchResult) -> f32 {
+        super::calibration::calibrated_wang(r)
+    }
+
     /// Measured heap footprint in bytes: posting lists (capacity × 8 bytes
     /// per `(u32, u32)` posting) + map slots (capacity × key size + slot
     /// overhead) + `fps` / `live` / `vacant` / `touched` storage.
@@ -1040,6 +1053,19 @@ impl HaitsmaIndex {
         self.live_count
     }
 
+    /// Estimated P(same recording | evidence) for a
+    /// [`HaitsmaIndex::query`] result: same `haitsma-v1` map as
+    /// [`HaitsmaMatcher::calibrated_score`](super::HaitsmaMatcher::calibrated_score).
+    ///
+    /// Both paths report `score = 1 − BER`; their prominence formulas
+    /// differ (`0.5/BER` here vs `median_BER/(ber+ε)` in the matcher) —
+    /// see `calibrated_haitsma` for the bounded-error discussion. Raw
+    /// fields untouched.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &super::MatchResult) -> f32 {
+        super::calibration::calibrated_haitsma(r)
+    }
+
     /// Measured heap footprint in bytes: LUT posting lists (capacity × 8
     /// bytes per `(u32, u32)` posting) + map slots + per-reference frame
     /// vectors (capacity × 4 bytes — the dominant term) + `fps` / `live` /
@@ -1465,6 +1491,14 @@ impl PanakoIndex {
     #[must_use]
     pub fn live_count(&self) -> usize {
         self.live_count
+    }
+
+    /// Estimated P(same recording | evidence) for a [`PanakoIndex::query`]
+    /// result: same `panako-v1` map as [`PanakoMatcher::calibrated_score`](super::PanakoMatcher::calibrated_score).
+    /// Raw fields untouched.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &super::MatchResult) -> f32 {
+        super::calibration::calibrated_panako(r)
     }
 
     /// Measured heap footprint in bytes: posting lists (capacity × 16 bytes

@@ -42,6 +42,12 @@ use core::cmp::Ordering;
 mod wang;
 pub use wang::{WangMatchConfig, WangMatcher, WangRefIndex};
 
+mod calibration;
+pub use calibration::{
+    HAITSMA_V1_MID, HAITSMA_V1_SLOPE, NEURAL_SLOPE, PANAKO_V1_MID, PANAKO_V1_SLOPE, WANG_V1_MID,
+    WANG_V1_SLOPE, calibrated_haitsma, calibrated_neural, calibrated_panako, calibrated_wang,
+};
+
 mod panako;
 pub use panako::{PanakoMatchConfig, PanakoMatcher, PanakoRefIndex};
 

@@ -249,6 +249,21 @@ pub struct HaitsmaMatcher {
     cfg: HaitsmaMatchConfig,
 }
 
+impl HaitsmaMatcher {
+    /// Estimated P(same recording | Haitsma evidence): logistic map of the
+    /// `1 − BER` score, versioned `haitsma-v1` (see
+    /// `matching::calibration`).
+    ///
+    /// Shared with the `HaitsmaIndex::query` path — both report
+    /// `score = 1 − BER`. Their prominence formulas differ (documented in
+    /// `calibrated_haitsma`), so treat near-boundary index results as
+    /// carrying that path's selection bias.
+    #[must_use]
+    pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
+        super::calibration::calibrated_haitsma(r)
+    }
+}
+
 impl Matcher for HaitsmaMatcher {
     type Fingerprint = HaitsmaFingerprint;
     type Config = HaitsmaMatchConfig;

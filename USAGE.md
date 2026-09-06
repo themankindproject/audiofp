@@ -1052,6 +1052,18 @@ fn main() {
     });
     assert!(tuned.match_one(&a, &b).is_match);
     assert!(!tuned.match_one(&a, &other).is_match);
+
+    // Raw scores live in per-algorithm units — a Wang 0.4 and a Haitsma
+    // 0.72 are not comparable, and hand-rolling normalization per fusion
+    // site drifts. `calibrated_score` maps any matcher's result onto one
+    // shared probability scale (versioned two-parameter logistics anchored
+    // at the corpus gaps; ROC/FPR table and refit recipe in
+    // ROBUSTNESS.md "Calibrated confidence"):
+    let matcher = WangMatcher::new(WangMatchConfig::default());
+    let p_same = matcher.calibrated_score(&tuned.match_one(&a, &b));
+    let p_other = matcher.calibrated_score(&tuned.match_one(&a, &other));
+    assert!(p_same > p_other);
+    println!("calibrated P(same): {p_same:.3} vs {p_other:.3}");
 }
 ```
 
