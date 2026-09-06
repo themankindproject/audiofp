@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-06
+
 ### Changed
 
 - **Vectorized k=15 sliding-max fast path in the peak picker** — the
