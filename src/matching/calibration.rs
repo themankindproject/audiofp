@@ -173,4 +173,47 @@ mod tests {
         // Custom config recenters: boundary is always 0.5.
         assert!((calibrated_neural(&scored(0.70), 0.70) - 0.5).abs() < 1e-6);
     }
+
+    #[test]
+    fn inherent_methods_delegate_to_free_functions() {
+        use crate::matching::{
+            HaitsmaIndex, HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoIndex,
+            PanakoMatchConfig, PanakoMatcher, WangIndex, WangMatchConfig, WangMatcher,
+        };
+
+        let r = scored(0.5);
+        let wang = WangMatcher::new(WangMatchConfig::default());
+        assert_eq!(wang.calibrated_score(&r), calibrated_wang(&r));
+        let panako = PanakoMatcher::new(PanakoMatchConfig::default());
+        assert_eq!(panako.calibrated_score(&r), calibrated_panako(&r));
+        let haitsma = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
+        assert_eq!(haitsma.calibrated_score(&r), calibrated_haitsma(&r));
+
+        assert_eq!(
+            WangIndex::build(&[], 100).calibrated_score(&r),
+            calibrated_wang(&r)
+        );
+        assert_eq!(
+            HaitsmaIndex::build(&[], 100).calibrated_score(&r),
+            calibrated_haitsma(&r)
+        );
+        assert_eq!(
+            PanakoIndex::build(&[], 100).calibrated_score(&r),
+            calibrated_panako(&r)
+        );
+    }
+
+    #[cfg(feature = "neural")]
+    #[test]
+    fn neural_method_anchors_at_own_min_cosine() {
+        use crate::matching::{Matcher, NeuralMatchConfig, NeuralMatcher};
+
+        let cfg = NeuralMatchConfig::default();
+        let matcher = NeuralMatcher::new(cfg.clone());
+        let at_boundary = MatchResult {
+            score: cfg.min_cosine,
+            ..MatchResult::NONE
+        };
+        assert!((matcher.calibrated_score(&at_boundary) - 0.5).abs() < 1e-6);
+    }
 }
