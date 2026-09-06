@@ -169,6 +169,31 @@ fn main() {
 }
 ```
 
+On a realtime audio thread, bound on `ZeroAllocStreaming` instead and
+use the callback variants — after warmup they allocate nothing:
+
+```rust
+use audiofp::{StreamingFingerprinter, ZeroAllocStreaming};
+use audiofp::classical::StreamingWang;
+
+fn mic_loop<S: ZeroAllocStreaming>(s: &mut S, chunks: &[Vec<f32>]) {
+    for c in chunks {
+        // Guaranteed allocation-free after warmup — safe on the audio thread.
+        s.push_with(c, |_t, _hash| {}).unwrap();
+    }
+    s.flush_with(|_t, _hash| {}).unwrap();
+}
+
+fn main() {
+    mic_loop(&mut StreamingWang::default(), &[vec![0.0_f32; 8_000]]);
+}
+```
+
+`StreamingWang`, `StreamingPanako`, and `StreamingHaitsma` all carry the
+bound (pinned by a counting-allocator test: zero allocs across 40 pushes
+plus flush after warmup). The neural streamer opts out (`Frame = Vec<f32>`
+allocates by design) — its inherent `try_push_with` is the zero-alloc path.
+
 ## Documentation
 
 For complete API reference and usage examples, see [USAGE.md](USAGE.md).

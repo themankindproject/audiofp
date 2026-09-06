@@ -17,6 +17,10 @@ exclude      = [
     ".github/",
     ".claude/",
     ".agents/",
+    ".hermes/",
+
+    # Stray scratch (untracked dev probe, not part of the crate).
+    "bakeoff/tests/",
 
     # Test audio corpus (~8 MB) and golden snapshots.
     "tests/assets/",
