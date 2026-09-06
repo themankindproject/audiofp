@@ -37,7 +37,9 @@ use audiofp::{Fingerprinter, SampleRate};
 // ─── Catalog of real audio files ─────────────────────────────────────
 
 /// Each entry: (logical track id, file path).
-/// Tracks 0-3: multi-codec originals. Tracks 4-10: Musopen classical (CC0).
+/// Tracks 0-1, 11-12: multi-codec originals (positives). Tracks 2-3:
+/// project-generated clips. Tracks 4-10, 13-16: Musopen classical (CC0,
+/// negatives-only singletons).
 const CATALOG: &[(usize, &str)] = &[
     // Track 0: Galway in multiple codecs
     (0, "tests/assets/galway.wav"),
@@ -67,9 +69,30 @@ const CATALOG: &[(usize, &str)] = &[
     (9, "tests/assets/catalog/dvorak_american_mvt1.ogg"),
     // Track 10: Grieg - Peer Gynt, Morning (CC0, Musopen)
     (10, "tests/assets/catalog/grieg_morning.ogg"),
+    // Track 11: AcidJazz in multiple codecs (CC-BY 3.0, Kevin MacLeod)
+    (11, "tests/assets/acidjazz.wav"),
+    (11, "tests/assets/acidjazz.mp3"),
+    (11, "tests/assets/acidjazz.flac"),
+    (11, "tests/assets/acidjazz.ogg"),
+    // Track 12: Digya in multiple codecs (CC-BY 3.0, Kevin MacLeod)
+    (12, "tests/assets/digya.wav"),
+    (12, "tests/assets/digya.mp3"),
+    (12, "tests/assets/digya.flac"),
+    (12, "tests/assets/digya.ogg"),
+    // Track 13: Haydn - String Quartet Op.64 No.4, Finale (CC0, Musopen)
+    (13, "tests/assets/catalog/haydn_lark_finale.ogg"),
+    // Track 14: Mozart - Marriage of Figaro Overture (CC0, Musopen)
+    (14, "tests/assets/catalog/mozart_figaro_over.ogg"),
+    // Track 15: Schubert - Piano Sonata D.958, Menuetto (CC0, Musopen)
+    (15, "tests/assets/catalog/schubert_menuetto.ogg"),
+    // Track 16: Mendelssohn - Italian Symphony, Saltarello (CC0, Musopen)
+    (16, "tests/assets/catalog/mendelssohn_saltarello.ogg"),
 ];
 
-const NUM_TRACKS: usize = 11;
+const NUM_TRACKS: usize = 17;
+
+/// Tracks with multiple codec variants: every pair must match.
+const MULTI_VARIANT_TRACKS: [usize; 4] = [0, 1, 11, 12];
 
 fn load_wang_catalog() -> Vec<(usize, WangFingerprint)> {
     let mut wang = Wang::default();
@@ -123,29 +146,18 @@ fn wang_same_song_cross_codec_matches() {
     let catalog = load_wang_catalog();
     let matcher = WangMatcher::new(WangMatchConfig::default());
 
-    // Each Galway variant must match every other Galway variant.
-    let galway: Vec<_> = catalog.iter().filter(|(t, _)| *t == 0).collect();
-    for i in 0..galway.len() {
-        for j in (i + 1)..galway.len() {
-            let res = matcher.match_one(&galway[i].1, &galway[j].1);
-            assert!(
-                res.is_match,
-                "Wang: Galway codec pair ({i},{j}) must match: score={:.3}, prom={:.1}",
-                res.score, res.prominence,
-            );
-        }
-    }
-
-    // Each Freak variant must match every other Freak variant.
-    let freak: Vec<_> = catalog.iter().filter(|(t, _)| *t == 1).collect();
-    for i in 0..freak.len() {
-        for j in (i + 1)..freak.len() {
-            let res = matcher.match_one(&freak[i].1, &freak[j].1);
-            assert!(
-                res.is_match,
-                "Wang: Freak codec pair ({i},{j}) must match: score={:.3}, prom={:.1}",
-                res.score, res.prominence,
-            );
+    // Each multi-codec variant must match every other variant of its track.
+    for track in MULTI_VARIANT_TRACKS {
+        let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                let res = matcher.match_one(&variants[i].1, &variants[j].1);
+                assert!(
+                    res.is_match,
+                    "Wang: track {track} codec pair ({i},{j}) must match: score={:.3}, prom={:.1}",
+                    res.score, res.prominence,
+                );
+            }
         }
     }
 }
@@ -214,27 +226,17 @@ fn haitsma_same_song_cross_codec_matches() {
     let catalog = load_haitsma_catalog();
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
 
-    let galway: Vec<_> = catalog.iter().filter(|(t, _)| *t == 0).collect();
-    for i in 0..galway.len() {
-        for j in (i + 1)..galway.len() {
-            let res = matcher.match_one(&galway[i].1, &galway[j].1);
-            assert!(
-                res.is_match,
-                "Haitsma: Galway codec pair ({i},{j}) must match: score={:.3}",
-                res.score,
-            );
-        }
-    }
-
-    let freak: Vec<_> = catalog.iter().filter(|(t, _)| *t == 1).collect();
-    for i in 0..freak.len() {
-        for j in (i + 1)..freak.len() {
-            let res = matcher.match_one(&freak[i].1, &freak[j].1);
-            assert!(
-                res.is_match,
-                "Haitsma: Freak codec pair ({i},{j}) must match: score={:.3}",
-                res.score,
-            );
+    for track in MULTI_VARIANT_TRACKS {
+        let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                let res = matcher.match_one(&variants[i].1, &variants[j].1);
+                assert!(
+                    res.is_match,
+                    "Haitsma: track {track} codec pair ({i},{j}) must match: score={:.3}",
+                    res.score,
+                );
+            }
         }
     }
 }
@@ -300,27 +302,17 @@ fn panako_same_song_cross_codec_matches() {
     let catalog = load_panako_catalog();
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
 
-    let galway: Vec<_> = catalog.iter().filter(|(t, _)| *t == 0).collect();
-    for i in 0..galway.len() {
-        for j in (i + 1)..galway.len() {
-            let res = matcher.match_one(&galway[i].1, &galway[j].1);
-            assert!(
-                res.is_match,
-                "Panako: Galway codec pair ({i},{j}) must match: score={:.3}, scale={:.2}",
-                res.score, res.time_scale,
-            );
-        }
-    }
-
-    let freak: Vec<_> = catalog.iter().filter(|(t, _)| *t == 1).collect();
-    for i in 0..freak.len() {
-        for j in (i + 1)..freak.len() {
-            let res = matcher.match_one(&freak[i].1, &freak[j].1);
-            assert!(
-                res.is_match,
-                "Panako: Freak codec pair ({i},{j}) must match: score={:.3}, scale={:.2}",
-                res.score, res.time_scale,
-            );
+    for track in MULTI_VARIANT_TRACKS {
+        let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                let res = matcher.match_one(&variants[i].1, &variants[j].1);
+                assert!(
+                    res.is_match,
+                    "Panako: track {track} codec pair ({i},{j}) must match: score={:.3}, scale={:.2}",
+                    res.score, res.time_scale,
+                );
+            }
         }
     }
 }
