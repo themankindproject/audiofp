@@ -19,6 +19,7 @@
   - [StreamingFingerprinter trait](#streamingfingerprinter-trait)
   - [Shared value types](#shared-value-types)
 - [Algorithm Reference](#algorithm-reference)
+  - [Resource bounds (all classical configs)](#resource-bounds-all-classical-configs)
   - [Shared front-end](#shared-front-end)
   - [Wang (landmark pairs)](#wang-landmark-pairs)
   - [Panako (triplet hashes)](#panako-triplet-hashes)
@@ -33,6 +34,7 @@
   - [Tuning match thresholds](#tuning-match-thresholds)
 - [NeuralMatcher](#neuralmatcher)
 - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
+  - [Mutable catalogs](#mutable-catalogs-insert--remove--live_count--estimated_bytes)
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
 - [Streaming Fingerprinters](#streaming-fingerprinters)
 - [Fingerprint Serialization](#fingerprint-serialization)
@@ -281,6 +283,11 @@ mix algorithm versions in one catalog:
 (`UnsupportedSampleRate`), the `min_samples` check (`AudioTooShort`), then the
 algorithm itself. Cheap checks run before the O(n) finiteness scan.
 
+Long files: `extract_with_progress(samples, rate, callback)` (on each
+classical fingerprinter) reports `0.0 → 1.0` through the STFT phase
+(~70% of the work) — wire it to a progress bar instead of blocking
+silently.
+
 ### `StreamingFingerprinter` trait
 
 Incremental, low-latency extraction:
@@ -383,6 +390,19 @@ This section documents each fingerprinter at implement-it-by-hand depth. The
 constants below are the exact values used by the in-tree extractors; a
 faithful reimplementation following these steps produces byte-identical
 hashes.
+
+#### Resource bounds (all classical configs)
+
+Every classical config carries opt-out resource caps so untrusted input
+can't OOM the process. `new(cfg)` panics on degenerate configs;
+`try_new(cfg)` returns `AfpError::Config` instead:
+
+| Cap | Default | Meaning |
+| --- | ------- | ------- |
+| `max_input_samples` | 30 min at native rate (14.4M Wang/Panako, 9M Haitsma) | `extract` rejects longer inputs with `InputTooLarge` |
+| `max_hashes` (Wang/Panako only) | 500 000 | extraction stops extending the hash set past this |
+| `max_push_samples` | `None` | single `push` larger than this is truncated (excess dropped, no error) |
+| `max_pending_anchors` (Wang/Panako streaming) | `None` | anchor backlog cap; oldest-first eviction, `Some(10_000)` recommended for untrusted streams |
 
 ### Shared front-end
 
@@ -1067,6 +1087,17 @@ fn main() {
 }
 ```
 
+The same map is available three ways: the inherent method on each
+matcher (`WangMatcher` / `PanakoMatcher` / `HaitsmaMatcher` /
+`NeuralMatcher::calibrated_score`), the query-side helpers on
+`WangIndex` / `HaitsmaIndex` / `PanakoIndex` (same map as the
+corresponding matcher), and the free functions
+(`audiofp::matching::calibrated_wang`, `calibrated_panako`,
+`calibrated_haitsma`, `calibrated_neural`) plus the versioned
+constants (`WANG_V1_MID`, `WANG_V1_SLOPE`, …) for fusion code that
+doesn't hold a matcher instance. The neural method anchors at its own
+`min_cosine`, so the decision boundary always maps to exactly 0.5.
+
 Which knob to move follows the margin shape: positives scoring low
 means the evidence is weak (raise `min_votes` cautiously, or lengthen
 queries); negatives scoring high means collisions (raise
@@ -1209,6 +1240,72 @@ Guarantees worth knowing:
   Raise `max_postings_per_hash` or shard for larger catalogs.
 - Indexes are transient accelerators: never serialised, no file handles,
   dropped with their owning scope.
+
+#### Mutable catalogs: insert / remove / live_count / estimated_bytes
+
+All three index types are mutable — no rebuild needed when the catalog
+changes. `build` is just bulk-load; afterwards:
+
+```rust
+use audiofp::classical::{WangFingerprint, WangHash};
+use audiofp::matching::{WangIndex, WangMatchConfig};
+
+fn fp(hash_base: u32) -> WangFingerprint {
+    WangFingerprint {
+        hashes: (0..40)
+            .map(|i| WangHash { hash: hash_base + i, t_anchor: 1000 + i * 10 })
+            .collect(),
+        frames_per_sec: 62.5,
+    }
+}
+
+fn main() {
+    let mut index = WangIndex::build(&[fp(500)], /* max_postings_per_hash */ 100);
+    assert_eq!(index.live_count(), 1);
+
+    // Append: returns a stable ref_id (0-based, never reused while live).
+    let id = index.insert(&fp(9_500), 100);
+    assert_eq!(index.live_count(), 2);
+
+    // Bulk ingest (the parallel-extract → serial-ingest workflow): one
+    // table-growth pass instead of one per fingerprint.
+    let ids = index.insert_many(&[fp(20_500), fp(30_500)], 100);
+    assert_eq!(ids, vec![2, 3]);
+
+    // Erase: physical deletion (postings removed, not flagged), so query
+    // throughput is bit-identical before and after removes.
+    assert!(index.remove(id));
+    assert_eq!(index.live_count(), 3);
+    // Batch erase in a single map pass — prefer over looped `remove`.
+    assert_eq!(index.remove_many(&ids), 2);
+    assert_eq!(index.live_count(), 1);
+
+    // Capacity planning (documented approximation, not billing):
+    // posting lists + map slots + fps/live/vacant storage.
+    let _bytes: usize = index.estimated_bytes();
+
+    let hit = index.query(&fp(500), &WangMatchConfig::default());
+    let _ = hit; // Some((0, result)) once thresholds are met
+}
+```
+
+Semantics worth knowing:
+
+- **Stable ids.** `insert` returns a `ref_id` that never shifts while
+  live, so ids stored in query results stay valid across concurrent
+  reads. `remove` tombstones the id; a later `insert` reuses vacated
+  slots (LIFO for single `remove`; smallest-first after
+  `remove_many`).
+- **`remove` returns `false`** on out-of-range or already-vacant ids
+  (no-op); `remove_many` returns the count actually erased, skipping
+  the rest.
+- **`len()` is the unique-hash-key count** (historical meaning) — use
+  `live_count()` for the catalog track count.
+- `estimated_bytes()` is `O(map size)` — call rarely (capacity
+  planning, shard-split decisions), not per query.
+- Same stop-hash policy as `build` on every path: hashes appearing in
+  more than `max_postings_per_hash` references are dropped, so a
+  pathological insert can't blow up one posting list.
 
 ### Parallel 1:N matching (rayon)
 
@@ -2485,6 +2582,11 @@ fn main() {
    Enable it only when the build host and the run host are the same
    microarchitecture.
 
+10. **Batch index mutations.** `insert_many` reserves table capacity once
+    for the whole batch; `remove_many` compacts each posting list once.
+    A loop of single `insert`/`remove` pays table growth / full-map scans
+    per call — fine for ones and twos, wasteful for ingests and purges.
+
 ---
 
 ## Feature Flags
@@ -2595,6 +2697,7 @@ Runnable starters under `examples/`:
 | `compare_algorithms` | `std-mp3,std-flac,std-ogg,std-wav,std-mp4` | `cargo run --example compare_algorithms --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac` |
 | `stream_buffer`    | none | `cargo run --example stream_buffer` |
 | `dsp_starter`      | none | `cargo run --example dsp_starter` |
+| `cache_workflow`   | `rayon` | `cargo run --example cache_workflow --features rayon -- /tmp/afp-cache` |
 | `neural_embed`     | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
 | `watermark_detect` | `watermark,std-wav` | `cargo run --example watermark_detect --features watermark,std-wav -- model.onnx [audio.wav]` |
 
