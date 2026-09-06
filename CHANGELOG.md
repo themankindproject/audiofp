@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Expanded real-audio corpus (17 tracks, 29 files)** — two new
+  multi-codec positives (jazz-funk `acidjazz`, afrobeat `digya`, CC-BY
+  3.0 Kevin MacLeod, wav/mp3/flac/ogg each), four new classical
+  negatives (Haydn/Mozart/Schubert/Mendelssohn, CC0 Musopen), and
+  deterministic adversarial degradations (`*_fast2` +2% speed,
+  `*_pitch1` +1 semitone, `*_noisy15` 15 dB SNR). New
+  `tests/degradation.rs` gates 15 dB-noise matching and pins
+  speed/pitch rejection as informational; `matching_real_audio`,
+  `threshold_calibration`, and stress snapshots cover the new tracks
+  (24 positives / 136 negatives, separation intact). Calibration maps
+  unchanged — Panako's weakest positive moved to an acidjazz ogg pair
+  (0.394 → ≈0.949), reported honestly in `ROBUSTNESS.md`.
 - **Chromaprint bakeoff** (#88) — `bakeoff/` harness measures overlap,
   1:N identification, and latency vs chromaprint 1.6 on the robustness
   corpus; results published in `BENCHMARKS.md`.
@@ -49,8 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Closed-form, not fitted, because the corpus separates perfectly
   (fitting would be degenerate) — midpoints at the measured score-gap
   midpoints, slopes taking gap edges to ≈0.01/0.99. ROC/FPR table
-  (FPR 0/55 at 0.5/0.9/0.99 for all classical matchers; TPR 12/12, 12/12,
-  ≥11/12) plus a two-number refit recipe in `ROBUSTNESS.md`. Neural map
+  (FPR 0/136 at 0.5/0.9/0.99 for all classical matchers; TPR 24/24, 24/24,
+  23/24 Wang/Haitsma, 22/24 Panako on the 17-track corpus) plus a
+  two-number refit recipe in `ROBUSTNESS.md`. Neural map
   anchors at each deployment's `min_cosine` (provisional, conservative
   slope, no corpus coverage — documented). Raw fields, configs,
   thresholds, `is_match` untouched — additive only.

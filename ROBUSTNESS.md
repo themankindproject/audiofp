@@ -121,7 +121,7 @@ cargo test --all-features -- --nocapture 2>&1 | grep -E "(Jaccard|bit-sim|overla
 ### Threshold Calibration
 
 Issue #104 — matcher threshold defaults are calibrated against the full
-real-audio catalog (11 tracks, 17 files, same-track cross-codec pairs vs
+real-audio catalog (17 tracks, 29 files, same-track cross-codec pairs vs
 cross-track pairs). The sweep lives in
 [`tests/threshold_calibration.rs`](tests/threshold_calibration.rs):
 
@@ -130,13 +130,13 @@ cross-track pairs). The sweep lives in
 cargo test --test threshold_calibration --features all-codecs -- --ignored --nocapture
 ```
 
-Measured on the catalog (`audiofp` v0.4.0):
+Measured on the catalog (`audiofp` v0.4.1, 17-track corpus):
 
-| Matcher | Positives (n=12) score | Positives prom | Negatives (n=55) score | Negatives prom |
+| Matcher | Positives (n=24) score | Positives prom | Negatives (n=136) score | Negatives prom |
 |---------|------------------------|----------------|------------------------|----------------|
-| Wang | 0.405 – 1.00 | ≥ 380.9 | 0.000 – 0.001 | ≤ 2.9 |
-| Haitsma | 0.888 – 1.00 | ≥ 4.5 | 0.000 – 0.531 | ≤ 1.1 |
-| Panako | 0.480 – 1.00 | ≥ 6.9 | 0.000 – 0.003 | ≤ 1.0 |
+| Wang | 0.405 – 1.00 | ≥ 263.5 | 0.000 – 0.001 | ≤ 3.8 |
+| Haitsma | 0.888 – 1.00 | ≥ 4.5 | 0.000 – 0.573 | ≤ 1.2 |
+| Panako | 0.394 – 1.00 | ≥ 6.9 | 0.000 – 0.003 | ≤ 1.0 |
 
 Every positive pair clears the shipped defaults and every negative pair
 fails them (pinned by `*_defaults_separate_all_pairs` in the same file).
@@ -156,7 +156,7 @@ onto one shared probability scale. Raw fields, configs, thresholds, and
 `is_match` semantics are untouched.
 
 Design note — why closed-form, not fitted: the corpus separates perfectly
-with wide margins (n=12 positives, n=55 negatives), so fitting logistic
+with wide margins (n=24 positives, n=136 negatives), so fitting logistic
 coefficients would be statistically meaningless (perfect separation gives
 degenerate infinite weights). Each map instead anchors `mid` at the
 measured score-gap midpoint with slope `k` taking the gap edges to
@@ -168,16 +168,22 @@ Measured on the same catalog (`audiofp` v0.4.1, maps in this tree):
 
 | Matcher | Map | FPR @ 0.5 / 0.9 / 0.99 | TPR @ 0.5 / 0.9 / 0.99 |
 |---------|-----|------------------------|------------------------|
-| Wang (`mid` 0.20, `k` 22) | σ(22·(score − 0.20)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
-| Haitsma (`mid` 0.73, `k` 29) | σ(29·(score − 0.73)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
-| Panako (`mid` 0.24, `k` 19) | σ(19·(score − 0.24)) | 0/55 at all three | 12/12, 12/12, ≥11/12 |
+| Wang (`mid` 0.20, `k` 22) | σ(22·(score − 0.20)) | 0/136 at all three | 24/24, 24/24, 23/24 |
+| Haitsma (`mid` 0.73, `k` 29) | σ(29·(score − 0.73)) | 0/136 at all three | 24/24, 24/24, 23/24 |
+| Panako (`mid` 0.24, `k` 19) | σ(19·(score − 0.24)) | 0/136 at all three | 24/24, 24/24, 22/24 |
 | Neural | σ(20·(score − min_cosine)) | — (no corpus coverage) | — (no corpus coverage) |
 
-The ≥11/12 at the 0.99 cutoff is exact arithmetic, not a measurement
-gap: the weakest positive maps to ≈0.989 (gap edge by construction), a
-hair under 0.99 — every other positive maps above it.
+The sub-24/24 cells at the 0.99 cutoff are exact arithmetic, not a
+measurement gap: the weakest positives sit just under 0.99 by
+construction — Wang 0.405 → ≈0.989, Haitsma 0.888 → ≈0.990, Panako's new
+0.394 edge (an acidjazz ogg pair from the corpus expansion; the map was
+fit when the edge was 0.480) → ≈0.949. Every other positive maps above
+its row's cutoff. The maps are unchanged: all 24 positives still score
+≥ 0.94 and all 136 negatives ≤ 0.011, so separation is intact — the
+corpus grew under fixed constants, and the table reports that honestly
+rather than refitting a week after release.
 
-Caveats, stated plainly: the corpus is small (12 positives), so these
+Caveats, stated plainly: the corpus is small (24 positives), so these
 tables confirm separation, not a fitted ROC — any threshold between the
 gap edges achieves the same perfect split. The neural map is provisional
 (no embedding corpus; cosine scales vary by model) with a deliberately

@@ -53,9 +53,24 @@ const CATALOG: &[(usize, &str)] = &[
     (8, "tests/assets/catalog/beethoven_eroica_mvt1.ogg"),
     (9, "tests/assets/catalog/dvorak_american_mvt1.ogg"),
     (10, "tests/assets/catalog/grieg_morning.ogg"),
+    (11, "tests/assets/acidjazz.wav"),
+    (11, "tests/assets/acidjazz.mp3"),
+    (11, "tests/assets/acidjazz.flac"),
+    (11, "tests/assets/acidjazz.ogg"),
+    (12, "tests/assets/digya.wav"),
+    (12, "tests/assets/digya.mp3"),
+    (12, "tests/assets/digya.flac"),
+    (12, "tests/assets/digya.ogg"),
+    (13, "tests/assets/catalog/haydn_lark_finale.ogg"),
+    (14, "tests/assets/catalog/mozart_figaro_over.ogg"),
+    (15, "tests/assets/catalog/schubert_menuetto.ogg"),
+    (16, "tests/assets/catalog/mendelssohn_saltarello.ogg"),
 ];
 
-const NUM_TRACKS: usize = 11;
+const NUM_TRACKS: usize = 17;
+
+/// Tracks with multiple codec variants: every pair is a positive.
+const MULTI_VARIANT_TRACKS: [usize; 4] = [0, 1, 11, 12];
 
 /// (score, prominence) per pair; positives (same-track) and negatives
 /// (cross-track) separately.
@@ -118,7 +133,7 @@ fn wang_pair_scores() -> PairScores {
     });
 
     let mut positives = Vec::new();
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
@@ -152,7 +167,7 @@ fn haitsma_pair_scores() -> PairScores {
     });
 
     let mut positives = Vec::new();
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
@@ -187,7 +202,7 @@ fn panako_pair_scores() -> PairScores {
     });
 
     let mut positives = Vec::new();
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
@@ -255,7 +270,7 @@ fn wang_defaults_separate_all_pairs() {
     let catalog = load_wang_catalog();
     let matcher = WangMatcher::new(WangMatchConfig::default());
 
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
@@ -285,7 +300,7 @@ fn haitsma_defaults_separate_all_pairs() {
     let catalog = load_haitsma_catalog();
     let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
 
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
@@ -315,7 +330,7 @@ fn panako_defaults_separate_all_pairs() {
     let catalog = load_panako_catalog();
     let matcher = PanakoMatcher::new(PanakoMatchConfig::default());
 
-    for track in [0usize, 1] {
+    for track in MULTI_VARIANT_TRACKS {
         let variants: Vec<_> = catalog.iter().filter(|(t, _)| *t == track).collect();
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {

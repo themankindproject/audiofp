@@ -405,6 +405,99 @@ mod real_audio_snapshots {
         assert_count_in_range("haitsma/freak.flac", fp.frames.len(), 1000, 1600);
     }
 
+    // ─── New corpus: jazz-funk + afrobeat multi-codec tracks ──────────
+    // Measured 2026-09-06 (16 s clips @ default config).
+
+    #[test]
+    fn wang_acidjazz_wav_hash_count_stable() {
+        let samples = decode_to_mono_at(asset("acidjazz.wav"), 8_000).unwrap();
+        let mut w = Wang::default();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
+        assert_count_in_range("wang/acidjazz.wav", fp.hashes.len(), 1500, 3000);
+    }
+
+    #[test]
+    fn wang_digya_wav_hash_count_stable() {
+        let samples = decode_to_mono_at(asset("digya.wav"), 8_000).unwrap();
+        let mut w = Wang::default();
+        let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
+        assert_count_in_range("wang/digya.wav", fp.hashes.len(), 2500, 4000);
+    }
+
+    #[test]
+    fn panako_acidjazz_wav_hash_count_stable() {
+        let samples = decode_to_mono_at(asset("acidjazz.wav"), 8_000).unwrap();
+        let mut p = Panako::default();
+        let fp = p.extract(&samples, SampleRate::HZ_8000).unwrap();
+        assert_count_in_range("panako/acidjazz.wav", fp.hashes.len(), 1500, 3000);
+    }
+
+    #[test]
+    fn panako_digya_wav_hash_count_stable() {
+        let samples = decode_to_mono_at(asset("digya.wav"), 8_000).unwrap();
+        let mut p = Panako::default();
+        let fp = p.extract(&samples, SampleRate::HZ_8000).unwrap();
+        assert_count_in_range("panako/digya.wav", fp.hashes.len(), 1500, 3000);
+    }
+
+    #[test]
+    fn haitsma_acidjazz_frame_count_stable() {
+        let samples = decode_to_mono_at(asset("acidjazz.wav"), 5_000).unwrap();
+        let mut h = Haitsma::default();
+        let fp = h.extract(&samples, SampleRate::HZ_5000).unwrap();
+        // ~16s × 78.125 fps ≈ 1250 frames; allow ±20%
+        assert_count_in_range("haitsma/acidjazz.wav", fp.frames.len(), 1000, 1600);
+    }
+
+    // ─── New corpus: classical singletons (30 s excerpts) ─────────────
+    // Measured 2026-09-06 @ default config; ranges carry ±25% headroom.
+
+    #[test]
+    fn wang_classical_new_hash_counts_stable() {
+        let mut w = Wang::default();
+        for (name, min, max) in [
+            ("catalog/haydn_lark_finale.ogg", 3500, 6000),
+            ("catalog/mozart_figaro_over.ogg", 4000, 6500),
+            ("catalog/schubert_menuetto.ogg", 2800, 4800),
+            ("catalog/mendelssohn_saltarello.ogg", 3000, 5000),
+        ] {
+            let samples = decode_to_mono_at(asset(name), 8_000).unwrap();
+            let fp = w.extract(&samples, SampleRate::HZ_8000).unwrap();
+            assert_count_in_range(&format!("wang/{name}"), fp.hashes.len(), min, max);
+        }
+    }
+
+    #[test]
+    fn panako_classical_new_hash_counts_stable() {
+        let mut p = Panako::default();
+        for (name, min, max) in [
+            ("catalog/haydn_lark_finale.ogg", 3000, 5000),
+            ("catalog/mozart_figaro_over.ogg", 3000, 5000),
+            ("catalog/schubert_menuetto.ogg", 2600, 4400),
+            ("catalog/mendelssohn_saltarello.ogg", 2700, 4600),
+        ] {
+            let samples = decode_to_mono_at(asset(name), 8_000).unwrap();
+            let fp = p.extract(&samples, SampleRate::HZ_8000).unwrap();
+            assert_count_in_range(&format!("panako/{name}"), fp.hashes.len(), min, max);
+        }
+    }
+
+    #[test]
+    fn haitsma_classical_new_frame_counts_stable() {
+        let mut h = Haitsma::default();
+        for name in [
+            "catalog/haydn_lark_finale.ogg",
+            "catalog/mozart_figaro_over.ogg",
+            "catalog/schubert_menuetto.ogg",
+            "catalog/mendelssohn_saltarello.ogg",
+        ] {
+            let samples = decode_to_mono_at(asset(name), 5_000).unwrap();
+            let fp = h.extract(&samples, SampleRate::HZ_5000).unwrap();
+            // ~30s × 78.125 fps ≈ 2340 frames; allow ±20%
+            assert_count_in_range(&format!("haitsma/{name}"), fp.frames.len(), 1850, 2800);
+        }
+    }
+
     // ─── Cross-format consistency ────────────────────────────────────
 
     #[test]
