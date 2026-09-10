@@ -128,9 +128,9 @@ pub(crate) fn mul_into(src: &[f32], win: &[f32], dst: &mut [f32]) {
 /// Core power-to-dB conversion: `buf[i] = factor * max(buf[i], floor).log2()`
 /// in place, 8-wide with a scalar tail.
 ///
-/// Produces bit-identical results to the scalar path because
-/// `wide::f32x8::log2()` implements the same IEEE-754 log2 computation
-/// as the scalar `f32::log2()`.
+/// May differ from the scalar path by 1 ULP: `wide::f32x8::log2()` is a
+/// polynomial approximation, not the same routine as `f32::log2()`. See
+/// [`power_to_db_wide`](crate::dsp::power_to_db_wide).
 #[inline]
 pub(crate) fn db_into(buf: &mut [f32], floor: f32, factor: f32) {
     let n = buf.len();

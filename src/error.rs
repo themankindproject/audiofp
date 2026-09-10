@@ -129,9 +129,14 @@ pub enum AfpError {
     /// When the `std` feature is enabled, this carries a structured
     /// [`IoError`] with path, kind, and source. Without `std`, it
     /// carries only a string description.
+    ///
+    /// `#[error(transparent)]` forwards both `Display` and
+    /// [`source()`](std::error::Error::source), so the underlying
+    /// `std::io::Error` stays reachable through an error chain
+    /// (`anyhow`/`eyre` introspection included).
     #[cfg(feature = "std")]
-    #[error("{0}")]
-    Io(IoError),
+    #[error(transparent)]
+    Io(#[from] IoError),
 
     /// An I/O failure (no_std fallback — string only).
     #[cfg(not(feature = "std"))]
@@ -216,7 +221,9 @@ pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
     if e.kind() == std::io::ErrorKind::NotFound {
         AfpError::ModelNotFound(path.to_string())
     } else {
-        AfpError::ModelLoad(alloc::format!("open: {e}"))
+        // Keep the path: a permission/IO failure without it is
+        // undiagnosable in a multi-model deployment.
+        AfpError::ModelLoad(alloc::format!("open {path}: {e}"))
     }
 }
 

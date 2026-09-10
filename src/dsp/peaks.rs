@@ -76,7 +76,12 @@ impl Default for PeakPickerConfig {
         Self {
             neighborhood_t: 7,
             neighborhood_f: 7,
-            min_magnitude_db: 1e-3,
+            // A dB floor, matching `WangConfig`/`PanakoConfig`'s
+            // `min_anchor_mag_db`. It must not be a small *linear* value:
+            // for the dB spectrograms the in-tree extractors feed `pick`,
+            // any positive threshold sits above the entire signal and
+            // silently returns zero peaks.
+            min_magnitude_db: -50.0,
             min_magnitude_linear: None,
             target_per_sec: 30,
         }
@@ -215,15 +220,27 @@ impl PeakPicker {
         // Upper bound on candidate peaks (fps × target/s), doubled as
         // headroom, floored at 64 so the reserve is non-trivial even when
         // the per-second cap is disabled.
-        let upper = (frames_per_sec.ceil() as usize * target_per_sec)
-            .max(1)
-            .saturating_mul(2)
-            .max(64);
+        //
+        // `frames_per_sec` is caller-supplied, so guard the arithmetic:
+        // `ceil() as usize` saturates for huge/non-finite values and the
+        // multiply then overflows (debug panic) or reserves gigabytes
+        // (release abort). Bounding the frame term by `n_frames` is safe —
+        // it is only a capacity hint, and no candidate can exceed it.
+        let upper = if frames_per_sec.is_finite() && frames_per_sec > 0.0 {
+            let frames_per_sec = (frames_per_sec.ceil() as usize).min(n_frames);
+            frames_per_sec
+                .saturating_mul(target_per_sec)
+                .saturating_mul(2)
+                .max(64)
+        } else {
+            64
+        };
         self.candidates.clear();
-        // Reuse the pooled buffer if capacity already covers the
-        // typical case; otherwise this is a single realloc (same as
-        // before).  After the call the buffer retains its capacity
-        // for the next `pick`.
+        // `self.candidates` is moved out of `self` by the `mem::take` at the
+        // end of this method (the caller owns the returned peaks), so its
+        // capacity is NOT retained across `pick` calls — this reserve runs
+        // once per call. That is amortised over the whole spectrogram, so
+        // per-call allocation is not on the hot path.
         if self.candidates.capacity() < upper {
             self.candidates.reserve(upper - self.candidates.capacity());
         }
@@ -414,7 +431,12 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
     // Forward pass: as we add input[j], settle output[j - k] when j >= k.
     for j in 0..n {
         while let Some(&back) = dq.back() {
-            if input[back] <= input[j] {
+            // Evict the back while the new value is at least as large
+            // under `f32::max` semantics — identical to `<=` for finite
+            // inputs, but a NaN never wins (plain `<=` is false for every
+            // NaN comparison, which let a NaN reach the front and be
+            // returned, diverging from `max31_vec`).
+            if f32::max(input[back], input[j]) == input[j] {
                 dq.pop_back();
             } else {
                 break;
@@ -461,8 +483,8 @@ fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque
 /// Same contract: `output[i] = max(input[max(0, i-15) ..= min(n-1, i+15)])`.
 /// The interior runs 8-wide via pairwise `f32x8::max` (31 taps: 31 vector
 /// loads + 30 vector max ops per 8 outputs), branch-free; the ≤15-cell
-/// edges run scalar. Bit-exact vs the Lemire deque — pure pairwise
-/// `f32::max`, so tie/NaN semantics match the deque's `<=` eviction.
+/// edges run scalar. Bit-exact vs the Lemire deque for finite inputs —
+/// both use `f32::max`, so a NaN never wins in either path.
 #[inline]
 fn max31_vec(input: &[f32], output: &mut [f32]) {
     use crate::dsp::simd::{load8, store8};
@@ -535,13 +557,6 @@ pub struct IncrementalPeakDetector {
     kt: usize,
     kf: usize,
     n_bins: usize,
-    window_cap: usize,
-    // Ring of horizontally-maxed rows (flat, row-major).
-    horiz_ring: Vec<f32>,
-    ring_len: usize,
-    ring_write: usize,
-    // Absolute row index of the most recently pushed row.
-    abs_pushed: u32,
     // Number of rows pushed so far (saturates at u32::MAX in practice).
     n_pushed: u32,
     // Absolute index of the last row whose 2-D max was emitted, via
@@ -571,11 +586,6 @@ impl IncrementalPeakDetector {
             kt,
             kf,
             n_bins,
-            window_cap,
-            horiz_ring: alloc::vec![0.0_f32; window_cap * n_bins],
-            ring_len: 0,
-            ring_write: 0,
-            abs_pushed: 0,
             n_pushed: 0,
             last_emitted: -1,
             vert_deques,
@@ -601,17 +611,12 @@ impl IncrementalPeakDetector {
         debug_assert_eq!(out_max.len(), self.n_bins);
 
         let abs = self.n_pushed;
-        self.abs_pushed = abs;
         self.n_pushed += 1;
 
-        // 1. Horizontal rolling-max of the new row → store in ring.
+        // 1. Horizontal rolling-max of the new row into reusable scratch.
+        //    The vertical deques below consume it directly and store the
+        //    values themselves, so no ring copy is needed.
         rolling_max_1d(row, self.kf, &mut self.horiz_scratch, &mut self.dq);
-        let dst_start = self.ring_write * self.n_bins;
-        self.horiz_ring[dst_start..dst_start + self.n_bins].copy_from_slice(&self.horiz_scratch);
-        self.ring_write = (self.ring_write + 1) % self.window_cap;
-        if self.ring_len < self.window_cap {
-            self.ring_len += 1;
-        }
 
         // 2. Update vertical deques with the new horizontal-maxed values.
         for col in 0..self.n_bins {
@@ -726,9 +731,6 @@ impl IncrementalPeakDetector {
     /// row.
     #[allow(dead_code)]
     pub fn reset(&mut self) {
-        self.ring_len = 0;
-        self.ring_write = 0;
-        self.abs_pushed = 0;
         self.n_pushed = 0;
         self.last_emitted = -1;
         for dq in &mut self.vert_deques {
@@ -818,6 +820,32 @@ mod tests {
             let mut got = vec![0.0; n];
             super::max31_vec(&input, &mut got);
             assert_eq!(got, naive_max_1d(&input, 15), "random n={n}");
+        }
+    }
+
+    #[test]
+    fn nan_never_wins_in_either_rolling_max_path() {
+        // The k==15 vectorized path uses `f32::max` (NaN never wins); the
+        // deque path must agree. Plain `<=` eviction let a NaN reach the
+        // deque front and be returned.
+        let mut input = vec![1.0_f32; 64];
+        input[32] = f32::NAN;
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        let mut fast = vec![0.0; input.len()];
+        super::max31_vec(&input, &mut fast);
+        let mut deque = vec![0.0; input.len()];
+        rolling_max_1d(&input, 14, &mut deque, &mut dq);
+
+        // k=15 fast path: no NaN anywhere in the output.
+        assert!(fast.iter().all(|v| !v.is_nan()), "max31 produced NaN");
+        // The generic deque path must also never surface the NaN, and the
+        // finite neighbours it does surface must match the naive max.
+        assert!(deque.iter().all(|v| !v.is_nan()), "deque path surfaced NaN");
+        for (i, &v) in deque.iter().enumerate() {
+            let naive = naive_max_1d(&input, 14)[i];
+            if !naive.is_nan() {
+                assert_eq!(v, naive, "deque mismatch at {i}");
+            }
         }
     }
 

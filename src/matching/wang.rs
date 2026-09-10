@@ -153,7 +153,7 @@ impl WangMatcher {
     /// Raw fields are untouched — this maps them onto the shared
     /// cross-matcher probability scale so thresholds transfer and
     /// matchers compose (cascades, ensembles). `MatchResult::NONE`
-    /// maps to ≈0.01, not exactly 0.
+    /// maps to ≈0.012 (a small value, not exactly 0).
     #[must_use]
     pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
         super::calibration::calibrated_wang(r)

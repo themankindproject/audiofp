@@ -99,26 +99,44 @@ pub struct WatermarkResult {
     pub localization: Vec<f32>,
 }
 
+/// Number of concretised input-length plans kept alive simultaneously.
+///
+/// # Memory tradeoff
+///
+/// Concretising does `self.model.clone()`, and tract's clone is a **deep**
+/// copy (see the same note in `neural::embedder`), so each cached plan owns
+/// its own copy of the model weights. This cap therefore multiplies the
+/// detector's resident model memory by up to `MAX_CACHED_PLANS`. Four is a
+/// deliberate compromise: it covers the common "a few fixed clip lengths"
+/// workload, which is exactly the case that used to thrash a single slot,
+/// without letting a caller with many distinct lengths grow memory without
+/// bound. Raising it trades memory for rebuild latency; lowering it to 1
+/// restores the old behaviour exactly.
+const MAX_CACHED_PLANS: usize = 4;
+
 /// AudioSeal-style watermark detector.
 ///
 /// The loaded ONNX model is held in `InferenceModel` form with no fixed
-/// input shape. The first [`detect`] call concretises the input length
-/// and caches a typed model; subsequent calls of the **same input
-/// length** reuse that typed plan. If the input length changes, the
-/// detector transparently rebuilds the typed plan for the new length —
-/// no cryptic Tract shape error reaches the caller. For best
-/// performance, prefer batching at a fixed length.
+/// input shape, and plans are cached per input length (up to four, least
+/// recently used evicted first). A repeated input length reuses its plan; a
+/// new length is concretised on demand — no cryptic Tract shape error
+/// reaches the caller. For best performance, batch at a fixed length.
+///
+/// Each cached plan holds its own deep copy of the model weights, so
+/// resident memory scales with the number of distinct input lengths in
+/// flight (bounded by the cache size).
 ///
 /// [`detect`]: WatermarkDetector::detect
 pub struct WatermarkDetector {
     cfg: WatermarkConfig,
     model: InferenceModel,
-    /// Cached runnable plan paired with the input length it was built
-    /// for. On a length mismatch the cache is rebuilt; equal-length
-    /// repeat calls reuse the existing plan without cloning.
+    /// Concretised plans paired with the input length each was built for,
+    /// in **LRU order: least-recently-used first, most-recently-used last**.
+    /// A hit is moved to the back; a miss is pushed and, at
+    /// [`MAX_CACHED_PLANS`], evicts the front.
     ///
     /// [`detect`]: WatermarkDetector::detect
-    cached: Option<(usize, Runnable)>,
+    plans: Vec<(usize, Runnable)>,
 }
 
 impl WatermarkDetector {
@@ -169,7 +187,7 @@ impl WatermarkDetector {
         Ok(Self {
             cfg,
             model,
-            cached: None,
+            plans: Vec::new(),
         })
     }
 
@@ -213,34 +231,44 @@ impl WatermarkDetector {
         let input_tensor = Tensor::from_shape(&[1, 1, n], samples)
             .map_err(|e| AfpError::Inference(format!("input shape: {e}")))?;
 
-        let needs_rebuild = match &self.cached {
-            Some((cached_n, _)) => *cached_n != n,
-            None => true,
-        };
-
-        if needs_rebuild {
-            let typed = self
-                .model
-                .clone()
-                .with_input_fact(
-                    0,
-                    InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
-                )
-                .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
-                .into_typed()
-                .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
-            let runnable = typed
-                .into_optimized()
-                .map_err(|e| AfpError::Inference(format!("optimize: {e}")))?
-                .into_runnable()
-                .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
-            self.cached = Some((n, runnable));
+        // LRU plan lookup: a hit is served from cache and promoted to the
+        // back; a miss concretises a new plan and evicts the LRU entry at
+        // the cap. A single slot (the previous behaviour) thrashed whenever
+        // two lengths alternated, rebuilding the ~1.3 ms tract plan on every
+        // call (audit §4.2 #11).
+        match self.plans.iter().position(|(len, _)| *len == n) {
+            Some(i) => {
+                let hit = self.plans.remove(i);
+                self.plans.push(hit);
+            }
+            None => {
+                let typed = self
+                    .model
+                    .clone()
+                    .with_input_fact(
+                        0,
+                        InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 1, n)),
+                    )
+                    .map_err(|e| AfpError::Inference(format!("input fact: {e}")))?
+                    .into_typed()
+                    .map_err(|e| AfpError::Inference(format!("type: {e}")))?;
+                let runnable = typed
+                    .into_optimized()
+                    .map_err(|e| AfpError::Inference(format!("optimize: {e}")))?
+                    .into_runnable()
+                    .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
+                if self.plans.len() >= MAX_CACHED_PLANS {
+                    // Front == least recently used.
+                    self.plans.remove(0);
+                }
+                self.plans.push((n, runnable));
+            }
         }
 
         let runnable = &self
-            .cached
-            .as_ref()
-            .expect("cached runnable set in block above")
+            .plans
+            .last()
+            .expect("a plan was served or inserted above")
             .1;
 
         let outputs = runnable
@@ -386,5 +414,98 @@ mod tests {
         assert_eq!(cfg.message_bits, 16);
         assert_eq!(cfg.threshold, 0.5);
         assert_eq!(cfg.sample_rate, 16_000);
+    }
+
+    /// The positive path: load a real ONNX file, build the plan, run, and
+    /// decode both outputs.
+    ///
+    /// This closes the §4.3 #13 gap — every pre-existing test above asserts a
+    /// construction or validation *error*, so `detect()`'s body (plan
+    /// building, the ≥2-output check, the confidence mean, the LSB-first
+    /// message decode) had no coverage at all. The fixture is an identity
+    /// model, so every expected value below is exact rather than a range.
+    #[test]
+    fn detect_runs_identity_model_and_decodes_both_outputs() {
+        let path = crate::watermark::test_fixture::write_identity_onnx("positive");
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load identity onnx");
+
+        // Identity → output 0 == input, so confidence is the input's mean and
+        // output 1 == input, so bit i of the message is `sample[i] >= 0.0`.
+        let samples: Vec<f32> = vec![0.8; 4096];
+        let rate = SampleRate::new(16_000).expect("rate");
+        let r = detector.detect(&samples, rate).expect("detect");
+
+        assert!(r.detected, "mean 0.8 is above the 0.5 default threshold");
+        assert!(
+            (r.confidence - 0.8).abs() < 1e-4,
+            "confidence should be the input mean, got {}",
+            r.confidence
+        );
+        assert_eq!(r.localization.len(), samples.len());
+        // All logits are +0.8 ≥ 0 → every bit set.
+        assert_eq!(r.message, 0xFFFF, "all-positive logits set all 16 bits");
+
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    /// A negative-input run must decode a zero message and not detect.
+    #[test]
+    fn detect_negative_input_decodes_zero_message() {
+        let path = crate::watermark::test_fixture::write_identity_onnx("negative");
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load identity onnx");
+
+        let samples: Vec<f32> = vec![-0.9; 4096];
+        let rate = SampleRate::new(16_000).expect("rate");
+        let r = detector.detect(&samples, rate).expect("detect");
+
+        assert!(!r.detected, "mean -0.9 is below the 0.5 default threshold");
+        assert_eq!(r.message, 0, "all-negative logits clear every bit");
+
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    /// §4.2 #11 — the plan cache must serve repeated lengths and survive
+    /// interleaving.
+    ///
+    /// The cache is single-slot, so alternating lengths rebuild the tract plan
+    /// every call. Whatever the eviction policy, the *results* must not depend
+    /// on how many distinct lengths were seen first, and same-length repeats
+    /// must not degrade. Correctness here is what makes the LRU change safe.
+    #[test]
+    fn detect_is_correct_across_interleaved_input_lengths() {
+        let path = crate::watermark::test_fixture::write_identity_onnx("lengths");
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load identity onnx");
+        let rate = SampleRate::new(16_000).expect("rate");
+
+        // Three distinct lengths, interleaved twice. Every pass over a given
+        // length must agree with the first pass, whether the plan came from
+        // the cache or a rebuild.
+        let lengths = [2048usize, 4096, 1024];
+        let mut first: Vec<(f32, u32, usize)> = Vec::new();
+        for round in 0..2 {
+            for &n in &lengths {
+                let samples: Vec<f32> = vec![0.75; n];
+                let r = detector.detect(&samples, rate).expect("detect");
+                if round == 0 {
+                    first.push((r.confidence, r.message, r.localization.len()));
+                } else {
+                    let (conf, msg, loc) = first[lengths.iter().position(|&x| x == n).unwrap()];
+                    assert!(
+                        (r.confidence - conf).abs() < 1e-6,
+                        "confidence drifted for n={n} after interleaving"
+                    );
+                    assert_eq!(r.message, msg, "message drifted for n={n}");
+                    assert_eq!(r.localization.len(), loc, "localization drifted for n={n}");
+                }
+            }
+        }
+
+        crate::watermark::test_fixture::cleanup(&path);
     }
 }

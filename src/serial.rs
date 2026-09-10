@@ -13,9 +13,12 @@
 //! [hash_count: u32 LE] [fps: f32 LE] [hashes: Pod bytes]
 //! ```
 //!
-//! The hash payload is the raw `bytemuck::cast_slice` representation of
-//! each algorithm's Pod hash type, meaning zero-copy reads on
-//! little-endian hosts.
+//! The hash payload is the raw native-endian `bytemuck::cast_slice`
+//! representation of each algorithm's Pod hash type. The header fields
+//! are explicitly little-endian; the payload is **not** byte-swapped, so
+//! a blob written on a different-endian host parses with a valid header
+//! and silently swapped hashes. The format is therefore effectively
+//! little-endian-only in practice (all supported targets are LE).
 //!
 //! [`to_bytes`]: crate::classical::WangFingerprint::to_bytes
 //! [`from_bytes`]: crate::classical::WangFingerprint::from_bytes
@@ -187,9 +190,8 @@ fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)>
 /// Read a byte slice into a `Vec<T>` where `T: Pod`.
 ///
 /// This handles potentially-unaligned input by allocating a properly
-/// aligned `Vec<T>` and copying the raw bytes into it exactly once (no
-/// intermediate zero-fill). `src` must be an exact multiple of
-/// `size_of::<T>()`.
+/// aligned `Vec<T>` and copying the raw bytes into it. `src` must be an
+/// exact multiple of `size_of::<T>()`.
 fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     let elem_size = core::mem::size_of::<T>();
     if elem_size == 0 || src.is_empty() {

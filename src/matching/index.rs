@@ -24,7 +24,7 @@ use crate::matching::{MatchResult, Matcher};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::matching::maps::{HashMap, hashmap_new};
+use crate::matching::maps::{HashMap, hashmap_new, hashmap_with_capacity};
 
 /// Soft cap on votes recorded per reference in [`WangIndex::query`].
 ///
@@ -33,21 +33,39 @@ use crate::matching::maps::{HashMap, hashmap_new};
 /// `Vec`s under hash flooding (audit 67-6).
 const MAX_VOTES_PER_REF: usize = 10_000_000;
 
+/// Hard cap on the **total** votes a single [`WangIndex::query`] may
+/// accumulate across all references.
+///
+/// `MAX_VOTES_PER_REF` bounds each reference independently, so total query
+/// memory was `O(refs_hit × MAX_VOTES_PER_REF)` — a hostile catalog that
+/// touches many references could still allocate far past any sane budget
+/// (audit §4.1 #6). This is the real per-query bound: one flat-list entry is
+/// `size_of::<(u32, i64, u32)>()` = 16 bytes, so the worst case is bounded at
+/// 160 MB, and the `Vec` capacity is clamped to this value so it cannot
+/// pre-allocate past it either. A legitimate query — a few thousand hashes,
+/// each hitting stop-hash-pruned postings — lands orders of magnitude below
+/// it. Kept equal to `MAX_VOTES_PER_REF` so the per-reference and per-query
+/// budgets stay the same order of magnitude.
+const MAX_VOTES_PER_QUERY: usize = 10_000_000;
+
 /// Find the single best-matching reference.
 ///
 /// Returns `Some((index, result))` if any reference clears its
 /// decision threshold, or `None` if no reference matched.
 ///
-/// Scans references once and keeps the best `is_match` result (by
-/// [`match_result_compare_desc`](crate::matching::match_result_compare_desc)).
-/// Stops early when a perfect score (`score >= 1.0`) is found. For the
+/// Scans every reference and keeps the highest-ranked `is_match` result
+/// (by [`match_result_compare_desc`](crate::matching::match_result_compare_desc)
+/// — score desc, then prominence desc; a tie keeps the incumbent, i.e.
+/// the lowest reference id, because the scan is ascending). There is
+/// **no** early exit on a perfect score: a later reference can also score
+/// `1.0` with a higher prominence, so terminating early would return a
+/// different answer than [`match_ranked`] / [`par_match_best`]. For the
 /// full ranking of every reference use [`match_ranked`]; for large
 /// catalogs prefer the index types.
 ///
 /// # Performance
 ///
-/// `O(N × match_one_cost)` sequential scan with early-exit on perfect
-/// score. Each reference is scored independently.
+/// `O(N × match_one_cost)` — every reference is scored independently.
 #[must_use]
 pub fn match_best<M: Matcher>(
     matcher: &M,
@@ -67,10 +85,6 @@ pub fn match_best<M: Matcher>(
             }
         };
         if better {
-            // Perfect hit: no later reference can outrank score 1.0.
-            if result.score >= 1.0 {
-                return Some((i, result));
-            }
             best = Some((i, result));
         }
     }
@@ -109,9 +123,9 @@ pub fn match_ranked<M: Matcher>(
 /// deterministically: higher score, then higher prominence, then the
 /// lowest reference id — identical to the sequential scan (which keeps
 /// the first-encountered winner on ties, i.e. the lowest id, since it
-/// iterates ascending). There is no perfect-score early exit, so very
-/// large catalogs with an early 1.0 hit may run slightly longer than
-/// the sequential version.
+/// iterates ascending). Like the sequential scan, this evaluates every
+/// reference (no perfect-score early exit), so the two are
+/// element-for-element equivalent.
 ///
 /// # Panics
 ///
@@ -233,10 +247,18 @@ fn assign_ref_id(fps_len: usize, vacant: &mut Vec<u32>) -> (usize, u32) {
     }
 }
 
-/// Track a candidate result into `best`, early-aborting when it hits a
-/// perfect score. Shared by all three index `query` paths.
+/// Track a candidate result into `best`, keeping the higher-ranked one.
+///
+/// Ranking is [`match_result_compare_desc`](crate::matching::match_result_compare_desc)
+/// — score desc, then prominence desc — so a perfect score does **not**
+/// terminate the scan: a later reference can share `score == 1.0` with a
+/// higher prominence and must win. Callers therefore always evaluate every
+/// candidate, which is what makes `match_best`, `match_ranked`, and
+/// `par_match_best` agree.
+///
+/// [`match_result_compare_desc`]: crate::matching::match_result_compare_desc
 #[inline]
-fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: MatchResult) -> bool {
+fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: MatchResult) {
     let better = match best {
         None => true,
         Some((_, b)) => {
@@ -245,10 +267,7 @@ fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: Ma
     };
     if better {
         *best = Some((ref_id, result));
-        // Early-abort: a perfect score cannot be beaten.
-        return result.score >= 1.0;
     }
-    false
 }
 
 /// An in-memory inverted index over several Wang fingerprints.
@@ -278,6 +297,12 @@ pub struct WangIndex {
     map: HashMap<u32, alloc::vec::Vec<(u32, u32)>>,
     /// Frame rates are stored per-reference for offset conversion.
     fps: alloc::vec::Vec<f32>,
+    /// Largest `t_anchor` per reference, stored so `query` can reproduce
+    /// [`WangMatcher`](super::WangMatcher)'s dense offset-histogram span
+    /// (`[-q_max, +r_max]`) when computing prominence. Without it the index
+    /// would normalise over the observed vote span only and disagree with
+    /// the 1:1 matcher on `is_match`.
+    r_max: alloc::vec::Vec<u32>,
     /// Liveness bit parallel to `fps`: `false` after [`WangIndex::remove`].
     /// Bookkeeping for [`WangIndex::live_count`] and slot reuse (removal is
     /// physical, so query needs no guard).
@@ -314,6 +339,10 @@ impl WangIndex {
             refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
         );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
+        let r_max: Vec<u32> = refs
+            .iter()
+            .map(|r| r.hashes.iter().map(|h| h.t_anchor).max().unwrap_or(0))
+            .collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for h in &fp.hashes {
@@ -330,6 +359,7 @@ impl WangIndex {
         Self {
             map,
             fps,
+            r_max,
             live,
             vacant: Vec::new(),
             live_count,
@@ -409,13 +439,16 @@ impl WangIndex {
                 self.map.remove(&key);
             }
         }
+        let t_max = fp.hashes.iter().map(|h| h.t_anchor).max().unwrap_or(0);
         if ref_id < self.fps.len() {
-            // Vacated-slot reuse: fps/live already have entries.
+            // Vacated-slot reuse: fps/live/r_max already have entries.
             self.fps[ref_id] = fp.frames_per_sec;
+            self.r_max[ref_id] = t_max;
             self.live[ref_id] = true;
         } else {
             debug_assert_eq!(ref_id, self.fps.len());
             self.fps.push(fp.frames_per_sec);
+            self.r_max.push(t_max);
             self.live.push(true);
         }
         self.live_count += 1;
@@ -459,6 +492,7 @@ impl WangIndex {
         }
         self.live[ref_id] = false;
         self.fps[ref_id] = f32::NAN;
+        self.r_max[ref_id] = 0;
         self.vacant.push(rid);
         self.live_count -= 1;
         true
@@ -500,6 +534,7 @@ impl WangIndex {
             let id = rid as usize;
             self.live[id] = false;
             self.fps[id] = f32::NAN;
+            self.r_max[id] = 0;
         }
         // Ascending push order → smallest id popped first by `insert`.
         for &rid in dead.iter().rev() {
@@ -566,13 +601,17 @@ impl WangIndex {
     /// rounding); use for alerting and sharding, not billing.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let mut bytes = self.map.len() * size_of::<u32>();
-        bytes += map_slot_count(&self.map)
+        // `map_slot_count` is `map.capacity()` on `std`, and every slot
+        // already accounts for one key plus one value, so a separate
+        // `map.len() * size_of::<K>()` term would count each live key
+        // twice (audit §4.2 #10).
+        let mut bytes = map_slot_count(&self.map)
             * (size_of::<u32>() + size_of::<Vec<(u32, u32)>>() + map_overhead_per_slot());
         for list in self.map.values() {
             bytes += list.capacity() * size_of::<(u32, u32)>();
         }
         bytes += self.fps.capacity() * size_of::<f32>();
+        bytes += self.r_max.capacity() * size_of::<u32>();
         bytes += self.live.capacity() * size_of::<bool>();
         bytes += self.vacant.capacity() * size_of::<u32>();
         bytes += self.touched.capacity() * size_of::<u32>();
@@ -604,36 +643,87 @@ impl WangIndex {
             return None;
         }
 
-        // Per-reference votes: ref_id → list of (offset δ, query-hash index).
-        // Capped at MAX_VOTES_PER_REF so hash flooding cannot OOM (audit 67-6).
-        let mut per_ref: HashMap<u32, Vec<(i64, u32)>> =
-            super::maps::hashmap_with_capacity(self.fps.len().min(256));
-        for (qi, h) in query.hashes.iter().enumerate() {
+        // Votes as one flat `(ref_id, offset δ, query-hash index)` list,
+        // stably sorted by `ref_id`, instead of a `HashMap<u32, Vec<_>>`.
+        //
+        // The map allocated one `Vec` per candidate reference (≈ one
+        // allocation per reference in the catalog per query — the dominant
+        // remaining per-query allocation, audit §4.2 #8), plus its own table.
+        // A flat list is one allocation, is contiguous for the scoring pass,
+        // and needs no hashing. The sort is **stable**, so votes for a given
+        // reference keep their original query-hash insertion order; the
+        // per-reference truncation below therefore selects exactly the same
+        // first-`MAX_VOTES_PER_REF` votes the old push-based cap did, keeping
+        // flooded-input results identical.
+        //
+        // Pre-size to the common case (each query hash hits a small handful
+        // of postings) so the list does not pay repeated doubling
+        // reallocations. An underestimate simply grows as usual.
+        let mut flat: Vec<(u32, i64, u32)> = Vec::with_capacity(
+            query
+                .hashes
+                .len()
+                .saturating_mul(2)
+                .min(MAX_VOTES_PER_QUERY),
+        );
+        'outer: for (qi, h) in query.hashes.iter().enumerate() {
             let q_t = h.t_anchor as i64;
-            let hh = h.hash;
-            if let Some(list) = self.map.get(&hh) {
+            if let Some(list) = self.map.get(&h.hash) {
                 for &(ref_id, tr) in list {
-                    let d = tr as i64 - q_t;
-                    let entry = per_ref.entry(ref_id).or_default();
-                    if entry.len() < MAX_VOTES_PER_REF {
-                        entry.push((d, qi as u32));
+                    if flat.len() >= MAX_VOTES_PER_QUERY {
+                        break 'outer;
                     }
+                    flat.push((ref_id, tr as i64 - q_t, qi as u32));
                 }
             }
         }
+        flat.sort_by_key(|&(r, _, _)| r);
 
         let tol = cfg.offset_tolerance_frames as i64;
         let q_len = query.hashes.len().max(1) as f32;
         let mut best: Option<(usize, MatchResult)> = None;
 
-        // Deterministic candidate order: iterate references by ascending
-        // id, not in HashMap order, so exact (score, prominence) ties and
-        // the perfect-score early-exit always resolve to the lowest
-        // reference id regardless of hasher state (audit 67-1 follow-up).
-        let mut per_ref_list: Vec<(&u32, &Vec<(i64, u32)>)> = per_ref.iter().collect();
-        per_ref_list.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        // Loop-invariant: the query's largest anchor frame. The prominence
+        // below reproduces `WangMatcher`'s dense `[-q_max, +r_max]` span, so
+        // this depends only on the query — it used to be recomputed inside
+        // the per-candidate loop (an O(Q) scan per candidate).
+        let q_max = query.hashes.iter().map(|h| h.t_anchor).max().unwrap_or(0);
 
-        for (&ref_id, votes) in per_ref_list {
+        // Reusable scratch for the per-candidate scoring steps. Each of
+        // these was previously allocated fresh for *every* candidate
+        // reference, so a query surfacing `C` candidates paid `C` rounds of
+        // allocator traffic (audit §4.2 #8). `clear()` retains capacity, so
+        // after the first few candidates these stop allocating entirely.
+        let mut bins: HashMap<i64, u32> = hashmap_with_capacity(256);
+        let mut bin_vec: Vec<(i64, u32)> = Vec::new();
+        let mut consolidated: Vec<u32> = Vec::new();
+        let mut contrib_indices: Vec<u32> = Vec::new();
+
+        // Deterministic candidate order: walk the flat list in ascending
+        // `ref_id` order (guaranteed by the sort above), not in HashMap
+        // order, so exact (score, prominence) ties and the perfect-score
+        // early-exit always resolve to the lowest reference id regardless of
+        // hasher state (audit 67-1 follow-up).
+        let mut group_start = 0usize;
+        while group_start < flat.len() {
+            let ref_id = flat[group_start].0;
+            let mut group_end = group_start + 1;
+            while group_end < flat.len() && flat[group_end].0 == ref_id {
+                group_end += 1;
+            }
+            let group = &flat[group_start..group_end];
+            // Same first-N truncation the old per-reference push applied.
+            let votes = &group[..group.len().min(MAX_VOTES_PER_REF)];
+            group_start = group_end;
+            // `matching/mod.rs` documents that a frame-rate mismatch returns
+            // `MatchResult::NONE` in all builds. The index stores per-reference
+            // rates, so enforce the same rule per candidate — otherwise the
+            // `offset.ms` below is converted with the reference rate while the
+            // query claims a different one.
+            let fps = self.fps.get(ref_id as usize).copied().unwrap_or(62.5);
+            if !crate::matching::frames_per_sec_compatible(query.frames_per_sec, fps) {
+                continue;
+            }
             // Quick pre-filter: if the total raw vote count for this
             // reference is below min_votes, the consolidated peak can
             // never reach the threshold either (consolidation can only
@@ -647,11 +737,12 @@ impl WangIndex {
             // all downstream steps (peak search, prominence, plateau
             // selection) are independent of HashMap iteration order
             // (audit 67-1).
-            let mut bins: HashMap<i64, u32> = hashmap_new();
-            for &(d, _) in votes {
+            bins.clear();
+            for &(_, d, _) in votes {
                 *bins.entry(d).or_insert(0) += 1;
             }
-            let mut bin_vec: Vec<(i64, u32)> = bins.iter().map(|(&d, &c)| (d, c)).collect();
+            bin_vec.clear();
+            bin_vec.extend(bins.iter().map(|(&d, &c)| (d, c)));
             bin_vec.sort_unstable_by_key(|&(d, _)| d);
 
             // Consolidated peak with a parallel consolidated-values
@@ -664,14 +755,22 @@ impl WangIndex {
             // offset, we maintain a window [lo, hi) where all offsets are
             // within ±tol of the current centre. The running sum is updated
             // incrementally as the centre advances.
-            let mut consolidated: Vec<u32> = vec![0u32; bin_vec.len()];
+            consolidated.clear();
+            consolidated.resize(bin_vec.len(), 0);
             let mut peak_votes = 0u32;
             let mut peak_linear_idx = 0usize;
+            // Sum of every consolidated value, accumulated in the same pass
+            // that fills `consolidated` — `sum_rest` below is then
+            // `total - peak_votes`, which removes a separate O(B) pass and
+            // avoids indexing `consolidated[peak_linear_idx]` (which was a
+            // panic edge on an empty `bin_vec` when `min_votes == 0`).
+            let mut total: u64 = 0;
 
             if tol == 0 {
                 // Fast path: no neighbourhood, each bin stands alone.
                 for (i, &(_, c)) in bin_vec.iter().enumerate() {
                     consolidated[i] = c;
+                    total += c as u64;
                     if c > peak_votes {
                         peak_votes = c;
                         peak_linear_idx = i;
@@ -696,6 +795,7 @@ impl WangIndex {
                         lo += 1;
                     }
                     consolidated[i] = window_sum;
+                    total += window_sum as u64;
                     if window_sum > peak_votes {
                         peak_votes = window_sum;
                         peak_linear_idx = i;
@@ -706,43 +806,51 @@ impl WangIndex {
             // Plateau-centre tie-break: if multiple offsets share the
             // same consolidated peak, pick the median offset of the
             // plateau so the result is deterministic (audit 67-1).
+            //
+            // Selection without materialising the plateau: count the
+            // matches, then walk to index `count / 2`. Same median as
+            // collecting the offsets and indexing `len / 2`, but no
+            // allocation per candidate.
             let peak_off = {
-                let plateau: Vec<i64> = bin_vec
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, _)| consolidated[i] == peak_votes)
-                    .map(|(_, &(d, _))| d)
-                    .collect();
-                let mid = plateau.len() / 2;
-                plateau
-                    .get(mid)
-                    .copied()
-                    .unwrap_or_else(|| bin_vec.get(peak_linear_idx).map(|&(d, _)| d).unwrap_or(0))
+                let fallback = || bin_vec.get(peak_linear_idx).map(|&(d, _)| d).unwrap_or(0);
+                let count = consolidated.iter().filter(|&&v| v == peak_votes).count();
+                if count == 0 {
+                    fallback()
+                } else {
+                    let mid = count / 2;
+                    let mut seen = 0usize;
+                    let mut chosen = None;
+                    for (i, &v) in consolidated.iter().enumerate() {
+                        if v == peak_votes {
+                            if seen == mid {
+                                chosen = bin_vec.get(i).map(|&(d, _)| d);
+                                break;
+                            }
+                            seen += 1;
+                        }
+                    }
+                    chosen.unwrap_or_else(fallback)
+                }
             };
 
             if peak_votes < cfg.min_votes {
                 continue;
             }
 
-            // Prominence with dense-range parity with `WangMatcher`.
+            // Prominence with true dense-range parity with `WangMatcher`.
             //
-            // The matcher computes prominence over its dense histogram
-            // (zeros included) — mean background is diluted by the empty
-            // bins. This sparse path only materialises occupied bins, so
-            // dividing by (occupied − 1) would systematically *understate*
-            // prominence versus the 1:1 matcher at the same
-            // `min_prominence`. Normalise by the vote-offset span width
-            // instead: same mean-of-rest semantics over the same window
-            // the dense histogram would cover.
-            let d_min = votes.iter().map(|&(d, _)| d).min().unwrap_or(0);
-            let d_max = votes.iter().map(|&(d, _)| d).max().unwrap_or(0);
-            let dense_bins = (d_max - d_min + 1).max(1) as f32;
-            let sum_rest: u64 = consolidated
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| i != peak_linear_idx)
-                .map(|(_, &v)| v as u64)
-                .sum();
+            // `WangMatcher` builds a dense histogram over the full offset
+            // range `[-q_max, +r_max]` (zeros included), so its mean
+            // background divides by that whole width. This path only
+            // materialises occupied bins, so using the observed vote span
+            // would divide by a much smaller number and *understate* (or, for
+            // a single occupied bin, overstate) prominence — enough to flip
+            // `is_match` against the 1:1 matcher. Reproduce the matcher's
+            // span exactly from the query max and the stored per-reference
+            // `r_max`.
+            let r_max = self.r_max.get(ref_id as usize).copied().unwrap_or(0);
+            let dense_bins = (q_max as u64 + r_max as u64 + 1) as f32;
+            let sum_rest: u64 = total - peak_votes as u64;
             let mean_rest = sum_rest as f32 / (dense_bins - 1.0).max(1.0);
             let prominence = peak_votes as f32 / (mean_rest + 1.0);
             if prominence < cfg.min_prominence {
@@ -750,11 +858,13 @@ impl WangIndex {
             }
 
             // Contrib count: distinct query-hash indices near peak.
-            let mut contrib_indices: Vec<u32> = votes
-                .iter()
-                .filter(|(d, _)| (*d - peak_off).abs() <= tol)
-                .map(|(_, qi)| *qi)
-                .collect();
+            contrib_indices.clear();
+            contrib_indices.extend(
+                votes
+                    .iter()
+                    .filter(|(_, d, _)| (*d - peak_off).abs() <= tol)
+                    .map(|&(_, _, qi)| qi),
+            );
             contrib_indices.sort_unstable();
             contrib_indices.dedup();
             let score = clamp_score(contrib_indices.len() as f32 / q_len);
@@ -762,9 +872,8 @@ impl WangIndex {
                 continue;
             }
 
-            // fps is always populated by `build`; the 62.5 fallback is
-            // defensive only and masks nothing in practice.
-            let fps = self.fps.get(ref_id as usize).copied().unwrap_or(62.5);
+            // fps was fetched and compatibility-checked above; the 62.5
+            // fallback is defensive only.
             let result = MatchResult {
                 is_match: true,
                 score,
@@ -774,24 +883,40 @@ impl WangIndex {
                 time_scale: 1.0,
             };
 
-            if track_best(&mut best, ref_id as usize, result) {
-                return best;
-            }
+            track_best(&mut best, ref_id as usize, result);
         }
 
         best
     }
 
-    /// Return the number of unique hashes in the index.
+    /// Return the number of unique hash keys in the index.
+    ///
+    /// This is **key-space**, not catalog size: keys whose posting lists
+    /// were emptied by [`WangIndex::remove`] are retained, so `len` does
+    /// not shrink on removal. Use [`WangIndex::live_count`] for the
+    /// number of references.
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Return `true` if the index has no entries.
+    /// Return `true` if the index holds **no hash keys at all**.
+    ///
+    /// Because removal is physical but leaves empty keys behind, this
+    /// stays `false` after every reference has been removed. To test
+    /// whether the catalog is empty, use [`WangIndex::is_empty_catalog`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Return `true` if the catalog holds no live references.
+    ///
+    /// This is the "no tracks enrolled" test; unlike
+    /// [`WangIndex::is_empty`] it tracks removals.
+    #[must_use]
+    pub fn is_empty_catalog(&self) -> bool {
+        self.live_count == 0
     }
 }
 
@@ -1074,8 +1199,9 @@ impl HaitsmaIndex {
     /// rounding); for alerting and sharding, not billing.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let mut bytes = self.lut.len() * size_of::<u32>();
-        bytes += map_slot_count(&self.lut)
+        // No separate `lut.len() * size_of::<u32>()` key term: the slot
+        // count below already includes one key per slot (audit §4.2 #10).
+        let mut bytes = map_slot_count(&self.lut)
             * (size_of::<u32>() + size_of::<Vec<(u32, u32)>>() + map_overhead_per_slot());
         for list in self.lut.values() {
             bytes += list.capacity() * size_of::<(u32, u32)>();
@@ -1171,6 +1297,15 @@ impl HaitsmaIndex {
         let mut best: Option<(usize, MatchResult)> = None;
 
         for (ref_id, deltas) in cand_refs {
+            // The matcher contract (matching/mod.rs) requires both
+            // fingerprints to share a frame rate; a mismatch returns
+            // `MatchResult::NONE`. The index holds per-reference rates, so
+            // enforce it per candidate rather than converting offsets with
+            // the wrong rate.
+            let ref_fps = self.fps[*ref_id as usize];
+            if !crate::matching::frames_per_sec_compatible(query.frames_per_sec, ref_fps) {
+                continue;
+            }
             let r_len = self.frames[*ref_id as usize].len();
             // Best-BER tracking with a rate-normalized early-abort bound
             // (same rationale as `HaitsmaMatcher`): a short-overlap
@@ -1226,7 +1361,6 @@ impl HaitsmaIndex {
 
             let offset =
                 crate::matching::TimeOffset::from_frames(delta, self.fps[*ref_id as usize]);
-
             let result = MatchResult {
                 is_match,
                 score,
@@ -1240,24 +1374,37 @@ impl HaitsmaIndex {
                 continue;
             }
 
-            if track_best(&mut best, *ref_id as usize, result) {
-                return best;
-            }
+            track_best(&mut best, *ref_id as usize, result);
         }
 
         best
     }
 
-    /// Return the number of unique sub-fingerprints in the index.
+    /// Return the number of unique sub-fingerprints (LUT keys) in the
+    /// index.
+    ///
+    /// Key-space, not catalog size — keys emptied by
+    /// [`HaitsmaIndex::remove`] are retained. Use
+    /// [`HaitsmaIndex::live_count`] for the reference count.
     #[must_use]
     pub fn len(&self) -> usize {
         self.lut.len()
     }
 
-    /// Return `true` if the index has no entries.
+    /// Return `true` if the index holds **no LUT keys at all**.
+    ///
+    /// Stays `false` after every reference has been removed (removal
+    /// leaves empty keys behind); use
+    /// [`HaitsmaIndex::is_empty_catalog`] for the liveness test.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lut.is_empty()
+    }
+
+    /// Return `true` if the catalog holds no live references.
+    #[must_use]
+    pub fn is_empty_catalog(&self) -> bool {
+        self.live_count == 0
     }
 }
 
@@ -1508,8 +1655,9 @@ impl PanakoIndex {
     /// rounding); for alerting and sharding, not billing.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let mut bytes = self.map.len() * size_of::<u32>();
-        bytes += map_slot_count(&self.map)
+        // No separate `map.len() * size_of::<u32>()` key term: the slot
+        // count below already includes one key per slot (audit §4.2 #10).
+        let mut bytes = map_slot_count(&self.map)
             * (size_of::<u32>() + size_of::<Vec<(u32, u32, u32, u32)>>() + map_overhead_per_slot());
         for list in self.map.values() {
             bytes += list.capacity() * size_of::<(u32, u32, u32, u32)>();
@@ -1562,9 +1710,17 @@ impl PanakoIndex {
             let q_tc = h.t_c;
             if let Some(list) = self.map.get(&hh) {
                 for &(ref_id, tr_a, _tr_b, tr_c) in list {
-                    let q_span = (q_tc - q_ta).max(1) as f64;
-                    let r_span = (tr_c - tr_a) as f64;
-                    let s = r_span / q_span;
+                    // Total arithmetic: `PanakoHash` fields are `pub` + `Pod`,
+                    // so a malformed triplet (`t_c <= t_anchor`) can arrive
+                    // from caller construction or `from_bytes`. Saturating
+                    // subtraction avoids the debug panic / release wrap-around;
+                    // degenerate spans carry no scale information, so skip.
+                    let q_span = q_tc.saturating_sub(q_ta);
+                    let r_span = tr_c.saturating_sub(tr_a);
+                    if q_span == 0 || r_span == 0 {
+                        continue;
+                    }
+                    let s = r_span as f64 / q_span as f64;
 
                     if s < scale_min - eps_scale || s > scale_max + eps_scale {
                         continue;
@@ -1596,6 +1752,13 @@ impl PanakoIndex {
         cand_refs.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
         for (&ref_id, bins) in cand_refs {
+            // Frame-rate mismatch → `MatchResult::NONE`, matching every
+            // matcher's contract (`matching/mod.rs`). Without this the
+            // index would return a match the 1:1 matcher rejects.
+            let ref_fps = self.fps[ref_id as usize];
+            if !crate::matching::frames_per_sec_compatible(query.frames_per_sec, ref_fps) {
+                continue;
+            }
             // Quick pre-filter: sum of all bin votes for this reference.
             // If total is below min_votes, the consolidated peak cannot
             // reach the threshold — skip expensive consolidation.
@@ -1634,6 +1797,11 @@ impl PanakoIndex {
                     if s_bin.saturating_sub(ns) > 1 {
                         break;
                     }
+                    // Same-scale rows are offset-ascending; once one falls
+                    // below the window, all earlier ones do too.
+                    if ns == s_bin && no < off_key - tol_i64 {
+                        break;
+                    }
                     if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
                         neigh += v;
                     }
@@ -1643,6 +1811,9 @@ impl PanakoIndex {
                 // Scan forward from i.
                 for &((ns, no), v) in &bin_vec[(i + 1)..] {
                     if ns.saturating_sub(s_bin) > 1 {
+                        break;
+                    }
+                    if ns == s_bin && no > off_key + tol_i64 {
                         break;
                     }
                     if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
@@ -1690,8 +1861,8 @@ impl PanakoIndex {
                 1.0
             };
 
-            // fps is always populated by `build`; the 62.5 fallback is
-            // defensive only and masks nothing in practice.
+            // fps always populated by `build`/`insert` (compatibility was
+            // checked above); the 62.5 fallback is defensive only.
             let fps = self.fps.get(ref_id as usize).copied().unwrap_or(62.5);
             let result = MatchResult {
                 is_match: true,
@@ -1702,24 +1873,40 @@ impl PanakoIndex {
                 time_scale,
             };
 
-            if track_best(&mut best, ref_id as usize, result) {
-                return best;
-            }
+            track_best(&mut best, ref_id as usize, result);
         }
 
         best
     }
 
-    /// Return the number of unique hashes in the index.
+    /// Return the number of unique hash keys in the index.
+    ///
+    /// This is **key-space**, not catalog size: keys whose posting lists
+    /// were emptied by [`PanakoIndex::remove`] are retained, so `len` does
+    /// not shrink on removal. Use [`PanakoIndex::live_count`] for the
+    /// number of references.
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Return `true` if the index has no entries.
+    /// Return `true` if the index holds **no hash keys at all**.
+    ///
+    /// Because removal is physical but leaves empty keys behind, this
+    /// stays `false` after every reference has been removed. To test
+    /// whether the catalog is empty, use [`PanakoIndex::is_empty_catalog`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Return `true` if the catalog holds no live references.
+    ///
+    /// This is the "no tracks enrolled" test; unlike
+    /// [`PanakoIndex::is_empty`] it tracks removals.
+    #[must_use]
+    pub fn is_empty_catalog(&self) -> bool {
+        self.live_count == 0
     }
 }
 
@@ -2796,5 +2983,205 @@ mod tests {
             "score {} should reflect the low-BER alignment",
             res.score
         );
+    }
+
+    // ── Vote capping under flooded input ──
+    //
+    // `query` gathers votes into one flat list and caps them two ways:
+    // `MAX_VOTES_PER_QUERY` overall and `MAX_VOTES_PER_REF` per reference
+    // (audit 67-6, §4.1 #6). Both exist so a hostile catalog cannot make a
+    // single query allocate without bound. The caps must not change which
+    // reference wins, and results must stay deterministic.
+
+    /// A query whose hashes all collide with every reference must still
+    /// return a deterministic winner and not panic.
+    ///
+    /// Every reference is built from the same hash list, so the vote list is
+    /// maximally dense (one vote per reference per query hash) and every
+    /// candidate ties on raw votes. The tie-break must land on the lowest
+    /// reference id, exactly as it does without flooding.
+    #[test]
+    fn wang_index_query_is_deterministic_under_hash_flooding() {
+        use crate::classical::WangHash;
+
+        // 64 references that all share the same 256 hashes → every candidate
+        // accumulates 256 votes, a total of 16_384 votes in the flat list.
+        let shared: Vec<WangHash> = (0..256_u32)
+            .map(|i| WangHash {
+                hash: i,
+                t_anchor: i * 4,
+            })
+            .collect();
+        let fp = WangFingerprint {
+            hashes: shared.clone(),
+            frames_per_sec: 62.5,
+        };
+        let refs: Vec<WangFingerprint> = (0..64).map(|_| fp.clone()).collect();
+        let index = WangIndex::build(&refs, 1_000_000);
+
+        let cfg = WangMatchConfig::default();
+        let first = index.query(&fp, &cfg);
+        assert!(
+            first.is_some(),
+            "a self-match among identical refs must match"
+        );
+        let (ref_id, res) = first.expect("checked Some");
+        assert_eq!(
+            ref_id, 0,
+            "all refs tie, so the lowest id must win (got {ref_id})"
+        );
+        assert!(res.is_match);
+
+        // Repeated queries must agree exactly (no hasher-order dependence).
+        for run in 0..8 {
+            let again = index.query(&fp, &cfg).expect("repeat query matches");
+            assert_eq!(again.0, ref_id, "ref_id changed on run {run}");
+            assert_eq!(
+                again.1.score, res.score,
+                "score changed on run {run} under flooding"
+            );
+            assert_eq!(again.1.offset.frames, res.offset.frames);
+        }
+    }
+
+    // ── Frame-rate contract on the index paths ──
+    //
+    // `matching::mod` documents that a mismatched `frames_per_sec`
+    // returns `MatchResult::NONE` in all builds. The matchers enforce it;
+    // the indexes must too, or they return a match the 1:1 path rejects
+    // (and convert `offset.ms` with the wrong rate).
+
+    #[test]
+    fn index_query_rejects_frame_rate_mismatch() {
+        use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, PanakoHash, WangHash};
+
+        // Wang
+        let wang = WangFingerprint {
+            hashes: (0..8_u32)
+                .map(|i| WangHash {
+                    hash: i,
+                    t_anchor: 10 + i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let wang_q = WangFingerprint {
+            hashes: wang.hashes.clone(),
+            frames_per_sec: 31.25,
+        };
+        let widx = WangIndex::build(core::slice::from_ref(&wang), 100);
+        assert!(
+            widx.query(&wang_q, &WangMatchConfig::default()).is_none(),
+            "WangIndex must reject an fps mismatch"
+        );
+
+        // Haitsma
+        let haitsma = HaitsmaFingerprint {
+            frames: (0..200_u32)
+                .map(|i| i.wrapping_mul(2_654_435_761))
+                .collect(),
+            frames_per_sec: 78.125,
+        };
+        let haitsma_q = HaitsmaFingerprint {
+            frames: haitsma.frames.clone(),
+            frames_per_sec: 39.0625,
+        };
+        let hidx = HaitsmaIndex::build(&[haitsma], 1_000);
+        assert!(
+            hidx.query(&haitsma_q, &HaitsmaMatchConfig::default())
+                .is_none(),
+            "HaitsmaIndex must reject an fps mismatch"
+        );
+
+        // Panako
+        let panako = PanakoFingerprint {
+            hashes: (0..10_u32)
+                .map(|i| PanakoHash {
+                    hash: 500 + i,
+                    t_anchor: 100 + i * 10,
+                    t_b: 105 + i * 10,
+                    t_c: 110 + i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let panako_q = PanakoFingerprint {
+            hashes: panako.hashes.clone(),
+            frames_per_sec: 31.25,
+        };
+        let pidx = PanakoIndex::build(&[panako], 100);
+        assert!(
+            pidx.query(&panako_q, &PanakoMatchConfig::default())
+                .is_none(),
+            "PanakoIndex must reject an fps mismatch"
+        );
+    }
+
+    /// `match_best`, `match_ranked`, and (with `rayon`) `par_match_best`
+    /// must agree on a score-1.0 tie broken by prominence. The old
+    /// perfect-score early exit in `match_best` returned the first 1.0 hit
+    /// while `par_match_best` returned the higher-prominence one.
+    #[test]
+    fn match_best_agrees_with_ranked_on_perfect_score_ties() {
+        use crate::classical::WangHash;
+
+        let query = WangFingerprint {
+            hashes: (0..8_u32)
+                .map(|i| WangHash {
+                    hash: i,
+                    t_anchor: i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        // ref0: exact copy plus 99 scattered decoys (lower prominence).
+        let mut ref0_hashes: alloc::vec::Vec<WangHash> = query.hashes.clone();
+        for i in 0..99_u32 {
+            ref0_hashes.push(WangHash {
+                hash: 1_000 + i,
+                t_anchor: 5_000 + i * 37,
+            });
+        }
+        let ref0 = WangFingerprint {
+            hashes: ref0_hashes,
+            frames_per_sec: 62.5,
+        };
+        // ref1: exact copy only (higher prominence).
+        let ref1 = WangFingerprint {
+            hashes: query.hashes.clone(),
+            frames_per_sec: 62.5,
+        };
+
+        let matcher = WangMatcher::new(WangMatchConfig::default());
+        let ranked = match_ranked(&matcher, &query, &[ref0.clone(), ref1.clone()]);
+        let best = match_best(&matcher, &query, &[ref0, ref1]).expect("a reference matches");
+        assert_eq!(
+            best.0, ranked[0].0,
+            "match_best must return the same winner as match_ranked"
+        );
+        assert_eq!(best.1, ranked[0].1);
+    }
+
+    /// `is_empty()` is key-space; `is_empty_catalog()` tracks removals.
+    #[test]
+    fn is_empty_catalog_tracks_removals() {
+        use crate::classical::WangHash;
+
+        let fp = WangFingerprint {
+            hashes: (0..8_u32)
+                .map(|i| WangHash {
+                    hash: i,
+                    t_anchor: i * 10,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        };
+        let mut idx = WangIndex::build(&[fp], 100);
+        assert!(!idx.is_empty_catalog());
+        assert!(idx.remove(0));
+        assert_eq!(idx.live_count(), 0);
+        assert!(idx.is_empty_catalog());
+        // Removal leaves empty keys behind, so `is_empty` stays false.
+        assert!(!idx.is_empty());
     }
 }

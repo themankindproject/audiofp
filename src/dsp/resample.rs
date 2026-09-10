@@ -71,9 +71,20 @@ pub struct SincQuality {
     /// `2 * half_taps` input samples around each output position.
     /// Typical: 16 (low-latency), 32 (good), 64 (excellent).
     pub half_taps: usize,
-    /// Kaiser β parameter. Larger values trade transition-band sharpness
-    /// for stopband attenuation. Typical: 8.6 (≈ -80 dB stopband), 12.0
-    /// (≈ -120 dB).
+    /// Kaiser β parameter: larger values trade a wider transition band
+    /// for deeper stopband attenuation. The achievable stopband depth is
+    /// set by β *and* by `half_taps`; the β = 8.6 default is the usual
+    /// ≈ -80 dB design only when the kernel is long enough.
+    ///
+    /// **Downsampling caveat.** `half_taps` is measured in *input*
+    /// samples, independent of the conversion ratio, so the transition
+    /// band of the anti-alias filter is roughly `from_sr / (2·half_taps)`
+    /// Hz wide — not a fixed fraction of the output Nyquist. At the
+    /// defaults (β = 8.6, half_taps = 32) a 48 kHz → 16 kHz conversion
+    /// attenuates content just above the 8 kHz output Nyquist by only
+    /// ≈ -23 dB (a 9 kHz tone), not -80 dB. Scale `half_taps` with the
+    /// decimation ratio (`half_taps · from_sr / to_sr`) when stopband
+    /// rejection matters.
     pub kaiser_beta: f32,
     /// Number of polyphase steps for the precomputed kernel table.
     /// Each step stores `2 * half_taps + 1` kernel coefficients for a
@@ -96,8 +107,14 @@ impl Default for SincQuality {
 /// Each output sample is computed by convolving the input with a sinc
 /// kernel multiplied by a Kaiser window. The cutoff is automatically set
 /// to `min(from_sr, to_sr) / 2` (in the input's sample-rate frame), which
-/// suppresses aliasing on downsamples and limits image content on
-/// upsamples.
+/// limits image content on upsamples and provides anti-alias filtering on
+/// downsamples.
+///
+/// The filter's transition band scales with `SincQuality::half_taps` in
+/// *input* samples, so at the default quality the attenuation just above
+/// the output Nyquist is modest (≈ -23 dB for a 3:1 downsample). Raise
+/// `half_taps` proportionally to the decimation ratio for stronger
+/// rejection — see [`SincQuality::kaiser_beta`] for the full caveat.
 ///
 /// # Example
 ///
@@ -171,6 +188,27 @@ impl SincResampler {
             return Err(crate::AfpError::Config(
                 "polyphase_steps must be > 0".into(),
             ));
+        }
+        // `modified_bessel_i0` is a 30-term f32 series: a non-finite or
+        // large beta overflows it to `inf`, and `inf * 0.0` then poisons
+        // every kernel tap with NaN. The default is 8.6; anything at/above
+        // ~200 already overflows, so bound well below that.
+        if !quality.kaiser_beta.is_finite() || quality.kaiser_beta.abs() > 50.0 {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "kaiser_beta must be finite and within ±50 (got {})",
+                quality.kaiser_beta,
+            )));
+        }
+        // `2 * half + 1` and `steps * taps` are unchecked; a huge
+        // half_taps would panic inside this fallible constructor.
+        // (`polyphase_steps` is a `u16`, so it cannot overflow the table
+        // size on its own.)
+        const MAX_HALF_TAPS: usize = 1 << 16;
+        if quality.half_taps > MAX_HALF_TAPS {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "half_taps ({}) must be <= {MAX_HALF_TAPS}",
+                quality.half_taps,
+            )));
         }
 
         let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;

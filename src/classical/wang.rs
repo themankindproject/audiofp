@@ -47,7 +47,7 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 ///
 /// The type is `#[repr(C)]` and implements [`bytemuck::Pod`], so it can be
 /// safely cast to/from `&[u8]` for zero-copy persistence (mmap, flat files)
-/// or transmitted across a C FFI boundary. Layout is two little-endian
+/// or transmitted across a C FFI boundary. Layout is two native-endian
 /// `u32` fields: `hash` followed by `t_anchor` (8 bytes total, no padding).
 ///
 /// # Hash bit layout (MSB → LSB)

@@ -115,8 +115,8 @@ impl MelFilterBank {
     ///
     /// # Panics
     ///
-    /// Panics if `n_mels == 0`, `n_fft < 2`, `n_fft` is not even, or
-    /// `fmin >= fmax`.
+    /// Panics if `n_mels == 0`, `n_fft < 2`, `n_fft` is not even, `sr == 0`,
+    /// or `fmin >= fmax`.
     ///
     /// `fmin = 0` is accepted — both the Slaney and HTK mel scales
     /// handle 0 Hz without hitting `log(0)` (Slaney's linear branch
@@ -145,6 +145,7 @@ impl MelFilterBank {
     ///
     /// - `n_mels == 0`
     /// - `n_fft < 2` or odd
+    /// - `sr == 0` (bin frequencies would be `0`, making every band degenerate)
     /// - `fmin < 0`
     /// - `fmin >= fmax`
     pub fn try_new(
@@ -163,6 +164,12 @@ impl MelFilterBank {
                 "n_fft must be even and >= 2".into(),
             ));
         }
+        if sr == 0 {
+            // `bin_hz` would be 0, so `left / bin_hz` is +inf/NaN and the
+            // bin-range arithmetic below overflowed (debug panic) or wrapped
+            // every band to an empty all-zero filter (release).
+            return Err(crate::AfpError::Config("sr must be > 0".into()));
+        }
         if fmin < 0.0 || fmin.is_nan() {
             return Err(crate::AfpError::Config("fmin must be >= 0".into()));
         }
@@ -170,6 +177,9 @@ impl MelFilterBank {
             return Err(crate::AfpError::Config(
                 "fmin must be strictly less than fmax".into(),
             ));
+        }
+        if !fmax.is_finite() {
+            return Err(crate::AfpError::Config("fmax must be finite".into()));
         }
 
         let n_bins = n_fft / 2 + 1;
@@ -211,12 +221,14 @@ impl MelFilterBank {
             // last_bin: largest b such that b * bin_hz < right
             //   → b < right / bin_hz → b = ceil(right / bin_hz) - 1
             //   (clamped to n_bins - 1)
-            let first_bin = ((left / bin_hz).floor() as usize + 1).min(n_bins);
+            let first_bin = ((left / bin_hz).floor() as usize)
+                .saturating_add(1)
+                .min(n_bins);
             let last_bin_raw = (right / bin_hz).ceil() as usize;
             let last_bin = if last_bin_raw == 0 {
                 0
             } else {
-                (last_bin_raw - 1).min(n_bins - 1)
+                last_bin_raw.saturating_sub(1).min(n_bins - 1)
             };
 
             if first_bin <= last_bin && first_bin < n_bins {
@@ -400,6 +412,22 @@ mod tests {
         let fb = MelFilterBank::new(64, 1024, 16_000, 0.0, 8_000.0, MelScale::Htk);
         assert_eq!(fb.n_bins(), 513);
         assert_eq!(fb.matrix().len(), 64 * 513);
+    }
+
+    #[test]
+    fn zero_sample_rate_is_a_config_error_not_a_panic_or_silent_ok() {
+        // `sr == 0` makes `bin_hz == 0`: the old code divided by it, then
+        // overflowed on `+ 1` in debug or wrapped every band to an empty
+        // all-zero filter (returning `Ok`) in release.
+        for scale in [MelScale::Htk, MelScale::Slaney] {
+            let res = MelFilterBank::try_new(8, 512, 0, 0.0, 8_000.0, scale);
+            assert!(
+                matches!(res, Err(crate::AfpError::Config(ref m)) if m.contains("sr")),
+                "sr=0 must be a Config error for {scale:?}"
+            );
+        }
+        // Non-finite fmax is likewise rejected rather than saturating.
+        assert!(MelFilterBank::try_new(8, 512, 8000, 0.0, f32::INFINITY, MelScale::Htk).is_err());
     }
 
     #[test]

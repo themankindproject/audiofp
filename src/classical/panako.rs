@@ -75,7 +75,7 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 ///
 /// The type is `#[repr(C)]` and implements [`bytemuck::Pod`], enabling
 /// zero-copy persistence (mmap, flat files) and C FFI. Layout is four
-/// little-endian `u32` fields (16 bytes total, no padding).
+/// native-endian `u32` fields (16 bytes total, no padding).
 ///
 /// # Frame index invariants
 ///
@@ -107,9 +107,10 @@ pub struct PanakoHash {
 ///
 /// # Typical output size
 ///
-/// At default config (`fan_out = 5`, `peaks_per_sec = 30`), expect
-/// roughly **250 hashes per second** of rich audio, or ~4 KB/s
-/// (`250 × 16 bytes`). Silence produces zero hashes.
+/// At default config (`fan_out = 5`, `peaks_per_sec = 30`) the hard cap
+/// is **150 hashes per second** (`30 anchors/s × 5 triplets`), i.e.
+/// ≤ 2.4 KB/s (`150 × 16 bytes`); dense audio approaches that ceiling
+/// while typical music lands lower. Silence produces zero hashes.
 #[derive(Clone, Debug)]
 pub struct PanakoFingerprint {
     /// Hashes sorted by `(t_anchor, t_b, t_c, hash)`.
@@ -645,12 +646,15 @@ impl StreamingPanako {
         }
         scratch.clear();
         scratch.extend(heap.drain().map(|w| (w.b, w.c, w.score)));
-        scratch.sort_unstable_by(|x, y| {
-            y.2.partial_cmp(&x.2)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| (x.0.t_frame, x.0.f_bin).cmp(&(y.0.t_frame, y.0.f_bin)))
-                .then_with(|| (x.1.t_frame, x.1.f_bin).cmp(&(y.1.t_frame, y.1.f_bin)))
-        });
+        // Select the top `fan_out` triplets by score (the heap above
+        // already capped the set), then re-sort the selected triplets in
+        // place by `(t_b, t_c)` so the streamed sequence is ordered by
+        // `(t_anchor, t_b, t_c)` — the `PanakoFingerprint` ordering
+        // invariant the offline `extract` establishes. `(t_b, t_c)` is a
+        // unique key per anchor (b and c are distinct peaks), so no hash
+        // tiebreak is needed. The emitted set is unchanged, so
+        // streaming↔offline multiset parity holds.
+        scratch.sort_unstable_by_key(|x| (x.0.t_frame, x.0.f_bin, x.1.t_frame, x.1.f_bin));
         for (b, c, _) in &*scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
             let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;

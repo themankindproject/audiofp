@@ -45,8 +45,9 @@
 //! `haitsma-v1` hash layout in [`Haitsma::name`] is part of the crate's
 //! versioned contract, and changing it would invalidate every
 //! persisted `haitsma-v1` fingerprint. Callers porting an existing
-//! Haitsma database must XOR or byte-reverse each 32-bit frame before
-//! comparison.
+//! Haitsma database must convert each 32-bit frame with
+//! `u32::reverse_bits()` (band 0 lands in bit 0); neither XOR with
+//! `0xFFFF_FFFF` nor `swap_bytes` produces the paper's natural order.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -60,10 +61,13 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
 ///
 /// Each `u32` in `frames` represents one STFT frame as 32 sign-difference
-/// bits: bit `k` (0 = LSB, 31 = MSB) is `1` when the energy in band `k`
-/// exceeds the energy in band `k+1` at that frame, relative to the
-/// previous frame. Two fingerprints are compared by computing the
-/// **Bit Error Rate** (Hamming distance / 32) at the best alignment.
+/// bits. Band `b` is stored in bit `31 - b` (the "MSB-zero" layout — band
+/// 0 in the most significant bit, band 31 in the least; see the module
+/// docs on the deliberate divergence from the paper). Bit `31 - b` is `1`
+/// when the energy in band `b` exceeds the energy in band `b+1` at that
+/// frame, relative to the previous frame. Two fingerprints are compared
+/// by computing the **Bit Error Rate** (Hamming distance / 32) at the
+/// best alignment.
 ///
 /// # Ordering invariant
 ///
@@ -76,7 +80,7 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 /// (`78.125 × 4 bytes`). A 30 s clip yields ~2 344 frames (~9 KB).
 #[derive(Clone, Debug)]
 pub struct HaitsmaFingerprint {
-    /// One `u32` per STFT frame from `n=1` onwards. Bit `k` encodes
+    /// One `u32` per STFT frame from `n=1` onwards. Bit `31 - k` encodes
     /// the sign of `E[k](n) − E[k+1](n) − (E[k](n−1) − E[k+1](n−1))`.
     pub frames: Vec<u32>,
     /// Frame rate of the underlying STFT — always 78.125 for `haitsma-v1`
@@ -205,6 +209,7 @@ impl Haitsma {
         });
 
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+        ensure_all_bands_have_bins(&bin_to_band)?;
         let band_ranges = build_band_ranges(&bin_to_band);
 
         Ok(Self {
@@ -452,6 +457,34 @@ fn build_bin_to_band(cfg: &HaitsmaConfig, n_bins: usize) -> Vec<u8> {
     out
 }
 
+/// Reject a `fmin..fmax` range so narrow that some band receives no FFT bin.
+///
+/// A band with no bins contributes `0.0` energy forever, so the whole
+/// sub-fingerprint degenerates to a constant (often all-zero) value and
+/// two unrelated recordings compare with BER 0 — a universal false
+/// positive. The default range covers every band; the in-file
+/// `band_lookup_table_covers_in_band_frequencies` test pins that for the
+/// default only, so `try_new` must enforce it for caller-supplied configs.
+fn ensure_all_bands_have_bins(bin_to_band: &[u8]) -> crate::Result<()> {
+    let mut hit = [false; HAITSMA_N_BANDS];
+    for &b in bin_to_band {
+        if b != NO_BAND {
+            hit[b as usize] = true;
+        }
+    }
+    for (band, &covered) in hit.iter().enumerate() {
+        if !covered {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "fmin/fmax range is too narrow: band {band} of {HAITSMA_N_BANDS} \
+                 receives no FFT bin; widen the range so every band spans at \
+                 least one {:.1} Hz bin",
+                HAITSMA_SR as f32 / HAITSMA_N_FFT as f32,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Streaming Haitsma–Kalker fingerprinter.
 ///
 /// Trivially incremental: each output bit-frame depends only on the
@@ -531,6 +564,7 @@ impl StreamingHaitsma {
             center: false,
         });
         let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+        ensure_all_bands_have_bins(&bin_to_band)?;
         let band_ranges = build_band_ranges(&bin_to_band);
         let n_bins = stft.n_bins();
         Ok(Self {
@@ -878,6 +912,44 @@ mod tests {
             matches!(err, crate::AfpError::Config(ref msg) if msg.contains("fmax must exceed fmin")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn narrow_band_range_rejected_instead_of_constant_zero_fingerprint() {
+        // A range so narrow that a band receives no FFT bin degenerates the
+        // whole sub-fingerprint to a constant (all-zero) value: two
+        // unrelated recordings then compare with BER 0 and `HaitsmaMatcher`
+        // reports score 1.0. `try_new` must reject the config instead.
+        let degenerate = HaitsmaConfig {
+            fmin: 1000.0,
+            fmax: 1000.5,
+            max_input_samples: None,
+            max_push_samples: None,
+        };
+        let err = match Haitsma::try_new(degenerate.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("degenerate band range must be rejected"),
+        };
+        assert!(
+            matches!(err, crate::AfpError::Config(ref msg) if msg.contains("no FFT bin")),
+            "unexpected error: {err:?}"
+        );
+        // The streaming twin validates identically.
+        assert!(StreamingHaitsma::try_new(degenerate).is_err());
+        // A narrower-but-viable range still constructs (300..400 spans at
+        // least one bin in every band), and the default is always valid.
+        for fmax in [400.0_f32, 2_000.0] {
+            assert!(
+                Haitsma::try_new(HaitsmaConfig {
+                    fmin: 300.0,
+                    fmax,
+                    max_input_samples: None,
+                    max_push_samples: None,
+                })
+                .is_ok(),
+                "300..{fmax} must remain a valid config"
+            );
+        }
     }
 
     #[test]

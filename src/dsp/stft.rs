@@ -48,7 +48,9 @@ impl StftConfig {
     pub fn new(n_fft: usize) -> Self {
         Self {
             n_fft,
-            hop: n_fft / 4,
+            // `n_fft / 4` is zero for n_fft ∈ {1, 2, 3}; clamp to 1 so the
+            // helper never builds a config that `try_new` would reject.
+            hop: (n_fft / 4).max(1),
             window: WindowKind::Hann,
             center: true,
         }

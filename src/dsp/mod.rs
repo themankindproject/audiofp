@@ -27,8 +27,8 @@ pub mod windows;
 /// Conversion factor: `10·log10(x) = DB_LOG2_FACTOR·log2(x)`.
 ///
 /// Used by the Wang and Panako front-ends to compute dB magnitude from
-/// power spectra without a `log10` call (`log2` is faster on x86 via a
-/// single hardware instruction).
+/// power spectra without a `log10` call (`log2` is cheaper to evaluate
+/// than `log10` on the supported targets).
 pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
 
 /// Convert a power spectrum slice to dB in-place using SIMD via `wide`.
@@ -41,9 +41,14 @@ pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
 /// ```
 ///
 /// Uses `wide::f32x8` to process 8 elements at a time with vectorized
-/// `max` and `log2`. Produces bit-identical results to the scalar path
-/// because `wide::f32x8::log2()` implements the same IEEE-754 log2
-/// computation as the scalar `f32::log2()`.
+/// `max` and `log2`.
+///
+/// **Not bit-identical to the scalar loop.** `wide::f32x8::log2()` is a
+/// polynomial approximation that can differ from `f32::log2()` by 1 ULP
+/// on some inputs, so the 8-wide body and the scalar tail of the same row
+/// can disagree in the last bit. The difference is far below any
+/// fingerprinting threshold, but do not rely on exact equality against a
+/// scalar reference.
 #[inline]
 pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
     simd::db_into(buf, floor, DB_LOG2_FACTOR);
