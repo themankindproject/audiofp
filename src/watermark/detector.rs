@@ -117,10 +117,14 @@ const MAX_CACHED_PLANS: usize = 4;
 /// AudioSeal-style watermark detector.
 ///
 /// The loaded ONNX model is held in `InferenceModel` form with no fixed
-/// input shape, and plans are cached per input length (see
-/// [`MAX_CACHED_PLANS`]). A repeated input length reuses its plan; a new
-/// length is concretised on demand — no cryptic Tract shape error reaches
-/// the caller. For best performance, batch at a fixed length.
+/// input shape, and plans are cached per input length (up to four, least
+/// recently used evicted first). A repeated input length reuses its plan; a
+/// new length is concretised on demand — no cryptic Tract shape error
+/// reaches the caller. For best performance, batch at a fixed length.
+///
+/// Each cached plan holds its own deep copy of the model weights, so
+/// resident memory scales with the number of distinct input lengths in
+/// flight (bounded by the cache size).
 ///
 /// [`detect`]: WatermarkDetector::detect
 pub struct WatermarkDetector {
