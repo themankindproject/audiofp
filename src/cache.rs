@@ -37,6 +37,15 @@ use std::path::{Path, PathBuf};
 use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, WangFingerprint};
 use crate::{AfpError, Result};
 
+/// Default cap on the size of a `.afp` file that will be read.
+///
+/// The v1 blob is ~8 bytes per Wang/Panako hash and 4 bytes per Haitsma
+/// frame, so 256 MiB is far beyond any realistic fingerprint (tens of
+/// millions of hashes). The cap exists because [`load_from_cache`] and
+/// [`load_all_cached`] accept caller-supplied paths — without it a
+/// corrupt or adversarial file (including a symlink to `/dev/zero`) makes
+/// `fs::read` allocate until the process is killed.
+pub const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Fingerprint file extension (without the leading dot).
 pub const AFP_EXT: &str = "afp";
 
@@ -146,6 +155,33 @@ impl CacheableFingerprint for HaitsmaFingerprint {
     }
 }
 
+/// Read a regular `.afp` file with a size cap and no symlink following.
+///
+/// Shared by [`load_from_cache`] and [`load_all_cached`]. Rejecting
+/// non-regular files (symlinks, FIFOs, devices) matters because both
+/// entry points take caller-supplied paths: a `*.afp` symlink to
+/// `/dev/zero` would otherwise make `fs::read` allocate until the
+/// process dies.
+fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    if !meta.file_type().is_file() {
+        return Err(AfpError::io_with_path(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file (symlink, FIFO, or device)",
+            ),
+        ));
+    }
+    if meta.len() > MAX_CACHE_FILE_BYTES {
+        return Err(AfpError::InputTooLarge {
+            limit: MAX_CACHE_FILE_BYTES as usize,
+            provided: meta.len() as usize,
+        });
+    }
+    fs::read(path).map_err(|e| AfpError::io_with_path(path, e))
+}
+
 /// Write a fingerprint to a `.afp` cache file (the v1 blob).
 ///
 /// Parent directories are **not** created (caller's job) — matching the
@@ -160,20 +196,29 @@ pub fn cache_to_file<T: CacheableFingerprint>(fp: &T, path: &Path) -> Result<()>
 
 /// Load a fingerprint from a `.afp` cache file.
 ///
+/// The file must be a regular file no larger than
+/// [`MAX_CACHE_FILE_BYTES`]; symlinks are rejected rather than followed.
+///
 /// # Errors
 ///
-/// - `AfpError::Io` if the file cannot be read.
+/// - `AfpError::Io` if the file cannot be read or is not a regular file.
+/// - `AfpError::InputTooLarge` if the file exceeds [`MAX_CACHE_FILE_BYTES`].
 /// - `AfpError::Deserialize` if the contents are not a valid v1 blob for `T`.
 pub fn load_from_cache<T: CacheableFingerprint>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    let bytes = read_cache_file(path)?;
     T::from_cache_bytes(&bytes)
 }
 
 /// Load every `*.afp` file in a directory (non-recursive).
 ///
-/// Files with other extensions (and subdirectories) are ignored. Entries
+/// Only **regular files** whose extension is `.afp` are read —
+/// subdirectories, symlinks, FIFOs, and other devices are skipped, so a
+/// dangling or `/dev/*` symlink cannot abort or hang the scan. Entries
 /// are sorted by path for deterministic ingest order. An empty directory
 /// yields `Ok(vec![])`.
+///
+/// Files larger than [`MAX_CACHE_FILE_BYTES`] are rejected
+/// ([`AfpError::InputTooLarge`]).
 ///
 /// **Fails on the first invalid `.afp` file** (error carries the path via
 /// [`AfpError::Io`] or a `Deserialize` message naming it) — bulk ingest
@@ -189,13 +234,19 @@ pub fn load_all_cached(dir: &Path) -> Result<Vec<(PathBuf, CachedFingerprint)>> 
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| AfpError::io_with_path(dir.to_path_buf(), e))?;
-        let path = entry.path();
-        if path.is_dir() {
+        // `file_type()` comes from the directory entry itself (no extra
+        // `stat`, no symlink following). Symlinks are skipped: following
+        // them can escape the directory or block forever on a FIFO.
+        let file_type = entry
+            .file_type()
+            .map_err(|e| AfpError::io_with_path(entry.path(), e))?;
+        if !file_type.is_file() {
             continue;
         }
+        let path = entry.path();
         let is_afp = path
             .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("afp"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(AFP_EXT));
         if is_afp {
             paths.push(path);
         }
@@ -203,7 +254,7 @@ pub fn load_all_cached(dir: &Path) -> Result<Vec<(PathBuf, CachedFingerprint)>> 
     paths.sort();
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes = fs::read(&path).map_err(|e| AfpError::io_with_path(&path, e))?;
+        let bytes = read_cache_file(&path)?;
         // `from_blob` yields `Deserialize` on every failure path today
         // (header + payload validation); name the offending file. The
         // `other` arm is defensive — it cannot fire while `from_blob`
@@ -341,6 +392,44 @@ mod tests {
         let dir = TempDir::new("empty");
         let loaded = load_all_cached(&dir.0).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_afp_files_are_skipped_not_followed() {
+        // A `*.afp` symlink could point at /dev/zero (unbounded read) or
+        // dangle (would abort the whole scan). Both must be skipped.
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("symlink");
+        cache_to_file(&fp, &dir.0.join("real.afp")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.0.join("zero.afp")).unwrap();
+        std::os::unix::fs::symlink(dir.0.join("nope"), dir.0.join("dead.afp")).unwrap();
+
+        let loaded = load_all_cached(&dir.0).expect("symlinks must not abort the scan");
+        let names: Vec<&str> = loaded
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["real.afp"], "only regular files are loaded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_from_cache_rejects_a_symlink_pointing_at_a_device() {
+        let dir = TempDir::new("symlink_device");
+        let link = dir.0.join("zero.afp");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        let err = load_from_cache::<WangFingerprint>(&link).unwrap_err();
+        assert!(
+            matches!(err, AfpError::Io(_)),
+            "device symlink must be an Io error, got {err:?}"
+        );
     }
 
     #[test]

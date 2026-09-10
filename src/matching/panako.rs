@@ -199,7 +199,7 @@ impl PanakoMatcher {
     /// score, versioned `panako-v1` (see `matching::calibration`).
     ///
     /// Raw fields are untouched — this maps them onto the shared
-    /// cross-matcher probability scale. `MatchResult::NONE` maps to ≈0.01.
+    /// cross-matcher probability scale. `MatchResult::NONE` maps to ≈0.010.
     #[must_use]
     pub fn calibrated_score(&self, r: &MatchResult) -> f32 {
         super::calibration::calibrated_panako(r)
@@ -257,9 +257,20 @@ impl PanakoMatcher {
             let q_tc = h.t_c;
             if let Some(list) = index.get(&hash) {
                 for &(tr_a, _tr_b, tr_c) in list {
-                    let q_span = (q_tc - q_ta).max(1) as f64;
-                    let r_span = (tr_c - tr_a) as f64;
-                    let s = r_span / q_span;
+                    // `PanakoHash` documents `t_anchor < t_b < t_c`, but the
+                    // fields are `pub` and the type is `Pod`, so a malformed
+                    // triplet is constructible in safe Rust and reachable
+                    // verbatim from `from_bytes` (mmap / flat-file path).
+                    // Saturating arithmetic keeps this total: debug builds
+                    // previously panicked on `t_c < t_anchor`, release builds
+                    // wrapped to a garbage scale. Degenerate spans carry no
+                    // alignment information, so skip them.
+                    let q_span = q_tc.saturating_sub(q_ta);
+                    let r_span = tr_c.saturating_sub(tr_a);
+                    if q_span == 0 || r_span == 0 {
+                        continue;
+                    }
+                    let s = r_span as f64 / q_span as f64;
 
                     if s < scale_min - eps_scale || s > scale_max + eps_scale {
                         continue;
@@ -279,7 +290,11 @@ impl PanakoMatcher {
                     let off_key = b.round() as i64;
 
                     *acc.entry((s_bin, off_key)).or_insert(0) += 1;
-                    pairs.push((q_ta as f64, tr_a as f64));
+                    // Only the refinement pass reads `pairs`; skip the push
+                    // (and the per-pair growth) when refinement is disabled.
+                    if cfg.ransac_refine {
+                        pairs.push((q_ta as f64, tr_a as f64));
+                    }
                 }
             }
         }
@@ -330,6 +345,13 @@ impl PanakoMatcher {
                 if s_bin.saturating_sub(ns) > 1 {
                     break;
                 }
+                // Within the same scale row the offsets are ascending, so
+                // once one falls below the window every earlier one does too
+                // — this bounds the scan to the neighbourhood instead of the
+                // whole same-scale run (O(B2) → O(B·W)).
+                if ns == s_bin && no < off_key - tol_i64 {
+                    break;
+                }
                 if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
                     neigh_votes += v;
                 }
@@ -339,6 +361,11 @@ impl PanakoMatcher {
             // Scan forward from i.
             for &((ns, no), v) in &acc_vec[(i + 1)..] {
                 if ns.saturating_sub(s_bin) > 1 {
+                    break;
+                }
+                // Same-scale rows are offset-ascending: past the window the
+                // rest of the row cannot contribute.
+                if ns == s_bin && no > off_key + tol_i64 {
                     break;
                 }
                 if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
@@ -378,7 +405,13 @@ impl PanakoMatcher {
         // input), fall back to the coarse Hough result.
         let (final_scale, final_offset, votes) = if cfg.ransac_refine {
             let (s, b, n) = ransac_refine(&pairs, coarse_s as f32, coarse_b, tol_i64, cfg);
-            if n > 0 {
+            // Refinement fits a SINGLE line, so a consolidated coarse peak
+            // spread over ±1 scale bins can yield fewer inliers than the
+            // neighbourhood count. Falling back only on `n == 0` used to turn
+            // an accepted match into `NONE` (the smaller `n` was then
+            // compared against `min_votes`). Fall back whenever refinement
+            // does not itself clear the vote floor.
+            if n >= cfg.min_votes {
                 (s, b, n)
             } else {
                 (coarse_s as f32, coarse_b, peak_votes)
@@ -543,6 +576,7 @@ impl XorShift64 {
 mod tests {
     use super::*;
     use crate::classical::PanakoHash;
+    use crate::matching::PanakoIndex;
 
     /// Build a synthetic Panako fingerprint.
     fn make_fp(triples: &[(u32, u32, u32)], hash_offset: u32) -> PanakoFingerprint {
@@ -1141,5 +1175,44 @@ mod tests {
             matcher.match_one_prebuilt(&query, &index),
             MatchResult::NONE
         );
+    }
+
+    #[test]
+    fn malformed_triplet_spans_do_not_panic_or_wrap() {
+        // `PanakoHash` fields are `pub` and `Pod`, so `t_c <= t_anchor` is
+        // constructible in safe Rust (and reachable from `from_bytes`).
+        // Before the `saturating_sub` fix this panicked in debug
+        // (`attempt to subtract with overflow`) and silently wrapped to a
+        // garbage scale in release.
+        let malformed = PanakoFingerprint {
+            hashes: alloc::vec![
+                crate::classical::PanakoHash {
+                    hash: 7,
+                    t_anchor: 100,
+                    t_b: 90, // violates t_anchor < t_b
+                    t_c: 10, // violates t_b < t_c
+                },
+                crate::classical::PanakoHash {
+                    hash: 7,
+                    t_anchor: u32::MAX,
+                    t_b: 0,
+                    t_c: 0,
+                },
+            ],
+            frames_per_sec: 62.5,
+        };
+        let cfg = PanakoMatchConfig::default();
+        let matcher = PanakoMatcher::new(cfg.clone());
+        // Must not panic; degenerate spans carry no alignment evidence.
+        let _ = matcher.match_one(&malformed, &malformed);
+        // The reference-side arithmetic must also be total.
+        let _ = matcher.match_one(&malformed, &malformed);
+        // Same for the 1:N index path.
+        let index = PanakoIndex::build(core::slice::from_ref(&malformed), 100);
+        let _ = index.query(&malformed, &cfg);
+        // And the prebuilt path.
+        if let Some(ri) = PanakoRefIndex::build(&malformed, &cfg) {
+            let _ = matcher.match_one_prebuilt(&malformed, &ri);
+        }
     }
 }

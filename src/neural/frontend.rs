@@ -88,7 +88,10 @@ impl LogMelFrontend {
         window: &[f32],
         mut callback: F,
     ) {
-        debug_assert_eq!(
+        // A hard assert, not a `debug_assert`: the doc promises a panic on
+        // a wrong-length window, and in release a mismatch would otherwise
+        // silently slice past the intended frame layout.
+        assert_eq!(
             window.len(),
             self.window_samples,
             "for_each_frame requires exactly window_samples"

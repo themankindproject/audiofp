@@ -28,8 +28,13 @@
 //! - Raw fields are untouched: [`MatchResult`], configs, thresholds, and
 //!   `is_match` semantics are frozen. A caller that never invokes these
 //!   maps observes zero change.
-//! - `MatchResult::NONE` (score 0) maps to ≈0.01, not exactly 0 — an
-//!   honest epsilon, documented at each call site.
+//! - The maps are *not* clamped and are not a shared floor: a
+//!   [`MatchResult::NONE`] (score 0) maps to a small value whose magnitude
+//!   depends on the algorithm's midpoint and slope — ≈0.012 for Wang,
+//!   ≈0.010 for Panako, but ≈6e-10 for Haitsma and ≈1e-7 for neural.
+//!   Treat the output as a probability, not as a signal that a match
+//!   exists; `is_match` remains the decision. A non-finite `score` (or
+//!   `min_cosine`) propagates as `NaN`.
 //! - The neural map is provisional (no corpus coverage, model-dependent):
 //!   it anchors at the matcher's own `min_cosine` with a conservative
 //!   slope, and its docs say to refit per deployment.

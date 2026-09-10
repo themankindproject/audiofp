@@ -101,6 +101,7 @@ dependencies = [
  "num-complex",
  "num-traits",
  "proptest",
+ "prost",
  "rayon",
  "realfft",
  "symphonia",

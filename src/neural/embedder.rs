@@ -95,7 +95,15 @@ pub struct NeuralEmbedderConfig {
     /// runtime across multiple windows. The streaming path always uses
     /// single-window inference regardless of this setting.
     ///
-    /// Must be ≥ 1.
+    /// **Model requirement:** with `batch_size > 1` the model's first
+    /// input must accept a dynamic (or matching) batch axis — the
+    /// embedder builds a `[batch_size, n_mels, n_frames]` plan. A model
+    /// with a fixed `[1, n_mels, n_frames]` input rejects that plan and
+    /// [`NeuralEmbedder::new`] returns [`AfpError::Inference`]; leave
+    /// `batch_size` at 1 for such models. (The batch size is a plan-level
+    /// constant, so it also becomes the model's batch dimension.)
+    ///
+    /// Must be in `1..=4096`.
     pub batch_size: usize,
 }
 
@@ -445,6 +453,17 @@ impl NeuralEmbedder {
         }
         if cfg.batch_size == 0 {
             return Err(AfpError::Config("batch_size must be >= 1".to_string()));
+        }
+        // `extract` does `Vec::with_capacity(batch_size)` *before* touching
+        // the audio, so an unbounded `batch_size` is a reachable
+        // `capacity overflow` panic (e.g. `usize::MAX / 2`) or a multi-GiB
+        // allocation. Bound it, like the front-end cell cap below.
+        const MAX_BATCH_SIZE: usize = 4096;
+        if cfg.batch_size > MAX_BATCH_SIZE {
+            return Err(AfpError::Config(format!(
+                "batch_size {} exceeds the maximum of {MAX_BATCH_SIZE}",
+                cfg.batch_size,
+            )));
         }
 
         let window_samples = (cfg.window_secs * cfg.sample_rate as f32).round() as usize;

@@ -230,11 +230,12 @@ pub fn clamp_score(s: f32) -> f32 {
     s.clamp(0.0, 1.0)
 }
 
-/// Compute prominence: `peak / (mean_of_rest + ε)`.
+/// Compute prominence: `peak / (mean_of_rest + 1.0)`.
 ///
 /// `values` is the raw histogram (or Hough accumulator) slice. `peak_idx`
-/// is the index of the peak bin. Returns `peak as f32 / mean(rest)` or a
-/// large sentinel when there is no background.
+/// is the index of the peak bin. The `+ 1.0` keeps the result finite when
+/// the background is all zeros (a lone peak then reports its own vote
+/// count).
 ///
 /// # Panics
 ///

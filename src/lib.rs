@@ -86,7 +86,7 @@
 //!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |         | Symphonia itself (no codecs; combine with a `std-*` feature). Also enables the `cache` module (`.afp` fingerprint files).     |
+//! | `std`        |         | Symphonia itself (no codecs). Also enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature for [`io`]. |
 //! | `std-wav`    |         | WAV + raw PCM decoding → [`io`].                                  |
 //! | `std-mp3`    |         | MP3 decoding → [`io`].                                            |
 //! | `std-flac`   |         | FLAC decoding → [`io`].                                           |
@@ -111,37 +111,18 @@
 // feature gate needed. The `docsrs` cfg is set by docs.rs and by our
 // `package.metadata.docs.rs` rustdoc-args.
 
-// The `std` feature is a bare dependency on Symphonia; codec support is
-// opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, …) or the
-// `all-codecs` feature (every codec at once). Enable one of them to get
-// `audiofp::io`. Features that merely imply `std` (`neural`, `watermark`,
-// `rayon`, `mimalloc`) are unaffected.
-#[cfg(all(
-    feature = "std",
-    not(any(
-        feature = "std-mp3",
-        feature = "std-aac",
-        feature = "std-flac",
-        feature = "std-ogg",
-        feature = "std-wav",
-        feature = "std-mp4",
-        feature = "std-aiff",
-        feature = "std-mkv",
-        feature = "std-adpcm",
-        feature = "std-alac",
-        feature = "all-codecs",
-        feature = "neural",
-        feature = "watermark",
-        feature = "rayon",
-        feature = "mimalloc"
-    ))
-))]
-compile_error!(
-    "the `std` feature enables no codecs by itself; enable at least one \
-     per-codec feature (e.g. `std-wav`, `std-mp3`, `std-flac`, `std-ogg`, \
-     `std-aac`, `std-mp4`, or the extended `std-aiff` / `std-mkv` / \
-     `std-adpcm` / `std-alac`), or `all-codecs` for every codec, to use `audiofp::io`"
-);
+// The `std` feature is a bare dependency on Symphonia. Codec support is
+// opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, ...) or the
+// `all-codecs` feature, which is what gates `audiofp::io`. `std` on its
+// own is nonetheless a **valid** configuration: it enables `cache`
+// (plain `std::fs`, no Symphonia) and `IoError`, and simply leaves `io`
+// absent. Features that imply `std` (`neural`, `watermark`, `rayon`,
+// `mimalloc`) behave the same way.
+//
+// (`std` used to be a hard `compile_error!`. That broke feature
+// unification: a downstream graph that enabled `audiofp/std` through a
+// sibling dependency could not build at all, and it made the codec-free
+// `cache` module unreachable.)
 
 extern crate alloc;
 

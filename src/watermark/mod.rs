@@ -42,4 +42,7 @@
 
 pub mod detector;
 
+#[cfg(test)]
+mod test_fixture;
+
 pub use detector::{WatermarkConfig, WatermarkDetector, WatermarkResult};

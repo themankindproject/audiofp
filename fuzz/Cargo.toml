@@ -77,6 +77,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "matching_malformed"
+path = "fuzz_targets/matching_malformed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "serial_roundtrip"
 path = "fuzz_targets/serial_roundtrip.rs"
 test = false

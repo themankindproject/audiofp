@@ -15,6 +15,29 @@ use crate::dsp::resample::SincResampler;
 use crate::error::IoError;
 use crate::{AfpError, Result};
 
+/// Maximum channel count `audiofp` will decode.
+///
+/// The decoder downmixes to mono, so more than a handful of channels is
+/// already pathological for fingerprinting — and the per-packet
+/// conversion buffer is `frames × channels` `f32`s, so an unbounded
+/// channel count is a memory amplification vector (Matroska
+/// `Channels::Discrete(u16)` and AIFF can both carry counts up to
+/// 65535). 64 comfortably covers 7.1, ambisonics, and stem files.
+const MAX_DECODE_CHANNELS: usize = 64;
+
+/// Default ceiling on the mono buffer produced by an upsampling
+/// [`decode_to_mono_at_limited`] call when the caller set no
+/// `max_samples`.
+///
+/// `max_samples` bounds the buffer at the *native* rate; a resample to a
+/// higher `target_sr` can legally multiply it. The source rate is
+/// container-declared (a crafted file may claim 1 Hz) and the resampler
+/// is a bulk call outside the cooperative timeout, so without a hard
+/// default the byte-only [`DecodeLimits::bytes`] configuration would
+/// provide no protection at all. 10 minutes at 48 kHz is far beyond any
+/// fingerprinting window.
+const DEFAULT_MAX_RESAMPLED_SAMPLES: usize = 48_000 * 60 * 10;
+
 /// Resource limits for untrusted-upload decoding.
 ///
 /// Use **both** caps in production: `max_bytes` rejects oversized files
@@ -201,6 +224,17 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
 /// (32-tap Kaiser, β = 8.6). Equivalent to calling [`decode_to_mono`]
 /// then [`SincResampler::process`] yourself, but in one step.
 ///
+/// # Security
+///
+/// This function applies **no resource limits** (it delegates to
+/// [`decode_to_mono`]). Prefer [`decode_to_mono_at_limited`] for
+/// untrusted uploads.
+///
+/// Upsampling can expand the buffer by `target_sr / source_sr`, and the
+/// source rate is container-declared — so the `_limited` variant bounds
+/// the *projected* post-resample length even when the caller sets no
+/// `max_samples` (see [`DecodeLimits`]).
+///
 /// # Errors
 ///
 /// Surfaces every error [`decode_to_mono`] can return; resampling itself
@@ -233,32 +267,29 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     if sr == target_sr {
         Ok(samples)
     } else {
-        // `DecodeLimits::max_samples` is documented to bound the
-        // *returned* buffer. It is enforced at the native rate during
-        // decode, so an upsample can legally grow the output by the
-        // resample ratio. Project the post-resample length and enforce
-        // the limit *before* allocating the upsampled buffer: a hostile
-        // container can claim a native rate far below `target_sr`
-        // (e.g. 1 Hz → 48 kHz is a 48,000× blow-up), and resampling
-        // first would allocate the giant buffer before any check runs.
-        // (`sr` is guaranteed non-zero by `decode_inner`.)
-        if let Some(limit) = limits.max_samples {
-            let projected = (samples.len() as u64 * target_sr as u64).div_ceil(sr as u64);
-            if projected > limit as u64 {
-                return Err(AfpError::InputTooLarge {
-                    limit,
-                    provided: usize::try_from(projected).unwrap_or(usize::MAX),
-                });
-            }
+        // Upsampling can grow the buffer by `target_sr / sr`. `sr` comes
+        // from the container and has no lower bound beyond 1, while
+        // `SincResampler::process` is a bulk call that the cooperative
+        // `timeout` cannot interrupt — so a tiny hostile file declaring
+        // 1 Hz can demand gigabytes and minutes of CPU. Bound the
+        // projection *before* resampling regardless of whether the caller
+        // set `max_samples`: when they did, that is the cap; when they did
+        // not, use a hard default so `DecodeLimits::bytes(..)` (byte-only)
+        // is not a false sense of security.
+        let projected = (samples.len() as u64 * target_sr as u64).div_ceil(sr as u64);
+        let cap = limits.max_samples.unwrap_or(DEFAULT_MAX_RESAMPLED_SAMPLES);
+        if projected > cap as u64 {
+            return Err(AfpError::InputTooLarge {
+                limit: cap,
+                provided: usize::try_from(projected).unwrap_or(usize::MAX),
+            });
         }
         let out = SincResampler::new(sr, target_sr).process(&samples);
         // Defensive re-check: projection and actual length must agree;
-        // fail rather than silently returning more than the caller allowed.
-        if let Some(limit) = limits.max_samples
-            && out.len() > limit
-        {
+        // fail rather than silently returning more than allowed.
+        if out.len() > cap {
             return Err(AfpError::InputTooLarge {
-                limit,
+                limit: cap,
                 provided: out.len(),
             });
         }
@@ -284,6 +315,13 @@ pub struct DecodeStats {
     /// Container re-syncs (`ResetRequired` from the reader or one decoder
     /// reset+retry). Occasional resets are normal on damaged files; a large
     /// count corroborates `packets_skipped`.
+    ///
+    /// **Chained Ogg is not followed.** A chained stream (concatenated
+    /// physical Ogg streams) makes the reader return `ResetRequired` and
+    /// switches `track_id`; `audiofp` decodes only the first logical
+    /// stream, so the returned audio is silently shorter than the file.
+    /// This counter is the only signal — `packets_skipped` stays 0. Split
+    /// chained files before decoding if the full duration matters.
     pub resets: u64,
 }
 
@@ -470,8 +508,39 @@ fn decode_inner_report(
     let mut samples: Vec<f32> = Vec::new();
     let mut convert_buf: Option<AudioBuffer<f32>> = None;
     let mut stats = DecodeStats::default();
+    // The rate the decoded PCM is ACTUALLY at, taken from the decoder's
+    // output spec on the first successfully decoded packet. The container
+    // header can disagree with the codec (e.g. a patched MP4 `mp4a`
+    // sample-entry rate vs the esds/AudioSpecificConfig rate), and
+    // `SincResampler` must be driven by the real rate — otherwise the
+    // returned buffer is mislabelled and `decode_to_mono_at` can take the
+    // `sr == target_sr` pass-through on a false premise.
+    let mut decoded_rate: Option<u32> = None;
 
     loop {
+        // Wall-clock deadline: checked at the TOP of the loop so it also
+        // covers iterations that `continue` early (non-audio packets,
+        // `ResetRequired` resyncs). A multi-track file flooded with video
+        // packets, or an Ogg whose pages all report `ResetRequired`, would
+        // otherwise spin without the timeout ever firing.
+        //
+        // This is a *cooperative* deadline — it is only observed between
+        // packets, so time spent inside a single `probe()`,
+        // `next_packet()`, or `decode()` call (and the resample step in
+        // `decode_to_mono_at_limited`) is not interruptible. A pathological
+        // stream that hangs inside one of those calls can still exceed the
+        // timeout; callers needing a hard wall-clock guarantee should run
+        // the decode on a watchdog thread.
+        if let Some((start, limit)) = deadline {
+            let elapsed = start.elapsed();
+            if elapsed > limit {
+                return Err(AfpError::Timeout {
+                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        }
+
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
@@ -497,26 +566,6 @@ fn decode_inner_report(
             continue;
         }
         stats.packets_total += 1;
-
-        // Wall-clock timeout check: bail if the configured timeout has
-        // elapsed. Checked per-packet (~1 ns overhead from Instant::elapsed).
-        //
-        // Note: this is a *cooperative* deadline — it is only observed
-        // between packets, so time spent inside a single `probe()`,
-        // `next_packet()`, or `decode()` call (and the resample step in
-        // `decode_to_mono_at_limited`) is not interruptible. A pathological
-        // stream that hangs inside one of those calls can still exceed the
-        // timeout; callers needing a hard wall-clock guarantee should run
-        // the decode on a watchdog thread.
-        if let Some((start, limit)) = deadline {
-            let elapsed = start.elapsed();
-            if elapsed > limit {
-                return Err(AfpError::Timeout {
-                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                    limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
-                });
-            }
-        }
 
         let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
@@ -562,16 +611,43 @@ fn decode_inner_report(
             }
         };
 
+        // Inspect the decoded channel layout BEFORE allocating the f32
+        // conversion buffer. `AudioBuffer::new(spec, capacity)` allocates
+        // `capacity * channels` samples and (inside Symphonia) divides by
+        // the channel count, so a packet reporting 0 channels would panic
+        // and one reporting an absurd count would blow the memory budget by
+        // that factor. The old code did both checks only after the
+        // allocation.
+        let n_chans = decoded.spec().channels().count();
+        if n_chans == 0 {
+            // Malformed / corrupt packet. Skip it (matching the lenient
+            // default); `decode_to_mono_report` counts it as skipped.
+            stats.packets_skipped += 1;
+            continue;
+        }
+        if n_chans > MAX_DECODE_CHANNELS {
+            return Err(AfpError::UnsupportedChannels(n_chans as u16));
+        }
+
         // Bound decoded PCM growth *before* allocating the conversion
         // buffer: a malformed packet can report a huge frame count, and
         // allocating `AudioBuffer::new(spec, frames)` first would blow the
-        // memory budget regardless of `max_samples`.
+        // memory budget regardless of `max_samples`. Use `checked_mul` on
+        // the transient (frames × channels) so an adversarial frame count
+        // cannot overflow the bound.
         if let Some(limit) = max_samples {
             let next = samples.len().saturating_add(decoded.frames());
             if next > limit {
                 return Err(AfpError::InputTooLarge {
                     limit,
                     provided: next,
+                });
+            }
+            let transient = decoded.frames().saturating_mul(n_chans);
+            if transient > limit {
+                return Err(AfpError::InputTooLarge {
+                    limit: limit / n_chans.max(1),
+                    provided: decoded.frames(),
                 });
             }
         }
@@ -601,13 +677,17 @@ fn decode_inner_report(
         decoded.copy_to::<f32, _>(buf);
 
         let n_frames = buf.frames();
-        let n_chans = buf.spec().channels().count();
 
-        // Defensive: skip packets that report 0 channels (malformed /
-        // corrupt). Avoids division by zero and `.plane(0).unwrap()` panic.
-        if n_chans == 0 {
-            stats.packets_skipped += 1;
-            continue;
+        // Record the decoder's real output rate (once). A mid-stream rate
+        // change is a codec reset we do not model; adopt the first value
+        // and let the spec-change branch above handle the buffer.
+        if decoded_rate.is_none() {
+            let actual = decoded.spec().rate();
+            if actual == 0 {
+                stats.packets_skipped += 1;
+                continue;
+            }
+            decoded_rate = Some(actual);
         }
 
         if n_chans == 1 {
@@ -628,6 +708,12 @@ fn decode_inner_report(
         }
     }
 
+    // Prefer the decoder's actual output rate over the container-declared
+    // one. They normally agree; when they do not (a mislabelled MP4/AAC
+    // sample entry, a patched header) the container value would mislabel
+    // the PCM and produce a duration and fingerprint pitch/speed error.
+    // The real rate is what the samples are at, so it is authoritative.
+    let sample_rate = decoded_rate.unwrap_or(sample_rate);
     Ok((samples, sample_rate, stats))
 }
 
@@ -1144,6 +1230,33 @@ mod tests {
             "resampled len = {}",
             samples.len()
         );
+    }
+
+    /// A byte-only cap (`max_samples = None`) must still bound the
+    /// post-resample buffer: the source rate is container-declared, so an
+    /// upsample can otherwise expand a tiny file without limit.
+    #[test]
+    fn resample_amplification_bounded_without_max_samples() {
+        // 1 Hz declared rate, 1000 samples → 48 kHz projects 48_000_000
+        // samples, over the 28.8M hard default cap — and this is the
+        // `max_samples = None` path, so nothing else bounds it.
+        let path = write_test_wav(1, 1, 1_000);
+        let limits = DecodeLimits::bytes(10_000); // byte-only: max_samples None
+        let result = decode_to_mono_at_limited(&path, 48_000, limits);
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(AfpError::InputTooLarge { provided, .. }) => {
+                assert!(
+                    provided > super::DEFAULT_MAX_RESAMPLED_SAMPLES,
+                    "projected {provided} should exceed the default cap"
+                );
+            }
+            // The WAV writer may refuse a 1 Hz header on some platforms;
+            // an Io/Config error is equally acceptable — the contract
+            // under test is "never returns an unbounded buffer".
+            Err(AfpError::Io(_)) | Err(AfpError::Config(_)) => {}
+            other => panic!("expected a bounded rejection, got {other:?}"),
+        }
     }
 
     // -- DecodeReport observability --

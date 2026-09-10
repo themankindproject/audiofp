@@ -126,11 +126,14 @@ impl StreamingNeuralEmbedder {
     /// buffer and is overwritten on the next emit — copy out before
     /// the next iteration if you need to keep it.
     ///
-    /// Performs **zero allocations per embedding**: the embedding scratch
-    /// is allocated once at construction (with capacity =
+    /// Performs **no audiofp-owned allocations per embedding**: the
+    /// embedding scratch is allocated once at construction (capacity =
     /// `embedding_dim`) and reused across every emit in every push. The
-    /// sample carry grows only when a push larger than one analysis
-    /// window arrives (amortised growth, `O(1)` per sample).
+    /// ONNX runtime itself still allocates per call (tract's `run` and
+    /// the per-window input tensor), so this is not a whole-path
+    /// zero-allocation guarantee. The sample carry grows only when a push
+    /// larger than one analysis window arrives (amortised `O(1)` per
+    /// sample).
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -263,8 +266,15 @@ impl StreamingFingerprinter for StreamingNeuralEmbedder {
 
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         // Non-centred framing means partial windows can't produce
-        // embeddings — drop them.
+        // embeddings — drop them, but keep the timeline continuous: the
+        // dropped samples were still fed to the stream, so advance
+        // `samples_consumed` past them. Otherwise a documented-valid
+        // `push` after this `flush` reports a `t_start` that rewinds to
+        // the start of the dropped tail.
+        let dropped = self.sample_carry.len().saturating_sub(self.carry_read);
+        self.samples_consumed = self.samples_consumed.saturating_add(dropped as u64);
         self.sample_carry.clear();
+        self.carry_read = 0;
         Ok(Vec::new())
     }
 
