@@ -302,24 +302,25 @@ impl Matcher for HaitsmaMatcher {
             // Deduplicated body across the three probe modes: verify
             // each candidate offset by BER with a rate-normalized
             // early-abort bound.
-            let consider = |q_pos: usize, positions: &Vec<usize>, best: &mut BestAlignment| {
-                for &r_pos in positions {
-                    let delta = r_pos as i64 - q_pos as i64;
-                    best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-                }
-            };
+            // A repeated exact frame hit can identify the same alignment
+            // hundreds of times. Remember deltas for this entire query;
+            // consideration still occurs in first-seen order for stable ties.
+            let mut seen_deltas = alloc::collections::BTreeSet::new();
 
             for (q_pos, &q_frame) in q_frames.iter().enumerate() {
+                let mut consider = |positions: &Vec<usize>| {
+                    for &r_pos in positions {
+                        let delta = r_pos as i64 - q_pos as i64;
+                        if !seen_deltas.insert(delta) {
+                            continue;
+                        }
+                        best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
+                    }
+                };
                 match self.cfg.probe_bit_flips {
-                    0 => probe_exact(q_frame, &lut, &mut |positions| {
-                        consider(q_pos, positions, &mut best)
-                    }),
-                    1 => probe_1flip(q_frame, &lut, &mut |positions| {
-                        consider(q_pos, positions, &mut best)
-                    }),
-                    _ => probe_2flip(q_frame, &lut, &mut |positions| {
-                        consider(q_pos, positions, &mut best)
-                    }),
+                    0 => probe_exact(q_frame, &lut, &mut consider),
+                    1 => probe_1flip(q_frame, &lut, &mut consider),
+                    _ => probe_2flip(q_frame, &lut, &mut consider),
                 }
                 if best.ber == 0.0 {
                     break;

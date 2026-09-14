@@ -321,58 +321,16 @@ impl PanakoMatcher {
         // the offset dimension within each scale-bin neighbourhood.
         acc_vec.sort_unstable_by_key(|&((s, o), _)| (s, o));
 
+        let rows = super::consolidate::panako_scale_rows(&acc_vec);
+        let prefix = super::consolidate::panako_vote_prefix(&acc_vec);
         let mut consolidated: Vec<u32> = vec![0u32; acc_vec.len()];
         let mut peak_votes = 0u32;
         let mut peak_linear_idx = 0usize;
 
-        for (i, &((s_bin, off_key), _)) in acc_vec.iter().enumerate() {
-            let mut neigh_votes = 0u32;
-            // Since acc_vec is sorted by (s_bin, off_key), bins with
-            // ds <= 1 are clustered. Scan forward/backward from i to
-            // find neighbours within the scale ± 1 and offset ± tol
-            // window. This is O(W) per element where W is the
-            // neighbourhood size (typically small), giving O(B·W) total
-            // instead of O(B²).
-            //
-            // Scan backward from i.
-            let mut j = i;
-            loop {
-                if j == 0 {
-                    break;
-                }
-                j -= 1;
-                let ((ns, no), v) = acc_vec[j];
-                if s_bin.saturating_sub(ns) > 1 {
-                    break;
-                }
-                // Within the same scale row the offsets are ascending, so
-                // once one falls below the window every earlier one does too
-                // — this bounds the scan to the neighbourhood instead of the
-                // whole same-scale run (O(B2) → O(B·W)).
-                if ns == s_bin && no < off_key - tol_i64 {
-                    break;
-                }
-                if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
-                    neigh_votes += v;
-                }
-            }
-            // Centre element.
-            neigh_votes += acc_vec[i].1;
-            // Scan forward from i.
-            for &((ns, no), v) in &acc_vec[(i + 1)..] {
-                if ns.saturating_sub(s_bin) > 1 {
-                    break;
-                }
-                // Same-scale rows are offset-ascending: past the window the
-                // rest of the row cannot contribute.
-                if ns == s_bin && no > off_key + tol_i64 {
-                    break;
-                }
-                if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
-                    neigh_votes += v;
-                }
-            }
-            consolidated[i] = neigh_votes;
+        for (i, slot) in consolidated.iter_mut().enumerate() {
+            let neigh_votes =
+                super::consolidate::panako_neighborhood_sum(&acc_vec, &rows, &prefix, i, tol_i64);
+            *slot = neigh_votes;
             if neigh_votes > peak_votes {
                 peak_votes = neigh_votes;
                 peak_linear_idx = i;

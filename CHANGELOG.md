@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Correct Wang connected-peak selection and sparse jitter voting, Panako
+  neighboring-scale consolidation, and mutable stop-hash suppression. Preserve
+  hash bytes and public layouts; incorrect match decisions can change. Reuse
+  query scratch across candidates and deduplicate Haitsma alignment checks.
+
 ### Fixed
 
 Deep-audit pass across every subsystem. No hash bytes, scores, or

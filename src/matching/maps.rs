@@ -75,18 +75,30 @@ impl SortedPostings {
     ///
     /// Drops entries where the hash appears in more than `max_postings`
     /// positions (stop-hash removal). Returns `None` if nothing remains.
+    #[cfg(test)]
     pub(crate) fn build(pairs: &[(u32, u32)], max_postings: u32) -> Option<Self> {
         if pairs.is_empty() {
             return None;
         }
+        Self::build_sorted(pairs.to_vec(), max_postings)
+    }
 
-        let n = pairs.len();
+    /// Build from [`WangHash`] anchors without an intermediate projection
+    /// buffer in the caller (audit perf #6).
+    pub(crate) fn build_from_wang(
+        hashes: &[crate::classical::WangHash],
+        max_postings: u32,
+    ) -> Option<Self> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<(u32, u32)> = Vec::with_capacity(hashes.len());
+        sorted.extend(hashes.iter().map(|h| (h.hash, h.t_anchor)));
+        Self::build_sorted(sorted, max_postings)
+    }
 
-        // Copy to a single working buffer and sort in place by
-        // (hash, t_anchor). Sorting the pairs directly — instead of an
-        // index permutation over split key/val arrays — uses one O(n)
-        // allocation instead of five and keeps the gather contiguous.
-        let mut sorted = pairs.to_vec();
+    fn build_sorted(mut sorted: Vec<(u32, u32)>, max_postings: u32) -> Option<Self> {
+        let n = sorted.len();
         sorted.sort_unstable_by_key(|&(hash, t_anchor)| (hash, t_anchor));
 
         // Build hash → range index, filtering stop-hashes in one pass.
