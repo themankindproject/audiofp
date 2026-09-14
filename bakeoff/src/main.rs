@@ -156,8 +156,8 @@ fn median(v: &[f64]) -> f64 {
 ///
 /// Setup (resampler construction, one untimed resample+extract) stays outside
 /// the timed loop. Each timed repetition measures resample and extract
-/// separately; `kernel_ms` is their sum so comparisons include the resample
-/// work the methodology claims.
+/// separately; `kernel_ms` covers both stages. Reported values are independent
+/// medians, so the reported kernel median need not equal the sum of stage medians.
 fn extract_timed<F: Fingerprinter + Default>(
     samples: &[f32],
     native: u32,
@@ -182,19 +182,15 @@ fn extract_timed<F: Fingerprinter + Default>(
     let mut extract_times = Vec::with_capacity(REPETITIONS);
     let mut kernel_times = Vec::with_capacity(REPETITIONS);
     for _ in 0..REPETITIONS {
-        let t_kernel = Instant::now();
         let t_resample = Instant::now();
         let input = resample_input(samples);
-        let resample_ms = t_resample.elapsed().as_secs_f64() * 1e3;
-
         let t_extract = Instant::now();
         fp = f.extract(&input, rate).expect("extract");
-        let extract_ms = t_extract.elapsed().as_secs_f64() * 1e3;
-        let kernel_ms = t_kernel.elapsed().as_secs_f64() * 1e3;
-
-        resample_times.push(resample_ms);
-        extract_times.push(extract_ms);
-        kernel_times.push(kernel_ms);
+        let finished = Instant::now();
+        let timing = timing_between(t_resample, t_extract, finished);
+        resample_times.push(timing.resample_ms);
+        extract_times.push(timing.extract_ms);
+        kernel_times.push(timing.kernel_ms);
     }
 
     let timing = KernelTiming {
@@ -203,6 +199,14 @@ fn extract_timed<F: Fingerprinter + Default>(
         kernel_ms: median(&kernel_times),
     };
     (fp, timing)
+}
+
+fn timing_between(start: Instant, resampled: Instant, finished: Instant) -> KernelTiming {
+    KernelTiming {
+        resample_ms: resampled.duration_since(start).as_secs_f64() * 1e3,
+        extract_ms: finished.duration_since(resampled).as_secs_f64() * 1e3,
+        kernel_ms: finished.duration_since(start).as_secs_f64() * 1e3,
+    }
 }
 
 /// Extract every fingerprint + staged kernel timing for one decoded file.
@@ -1107,8 +1111,8 @@ mod tests {
     #[test]
     fn extract_timed_kernel_includes_resample_work() {
         // Native 44.1 kHz buffer resampled down to 8 kHz: resample_ms must be
-        // non-zero and kernel_ms must be >= resample_ms + extract_ms (within fp
-        // noise — they are measured sequentially so kernel ≈ sum).
+        // non-zero. Independent stage medians need not add to the total median,
+        // but neither stage median can exceed the total median.
         let samples: Vec<f32> = (0..88_200).map(|i| (i as f32 * 0.001).sin()).collect();
         let (_, timing) = extract_timed::<Wang>(&samples, 44_100, 8_000);
         assert!(
@@ -1116,8 +1120,21 @@ mod tests {
             "expected resample stage to be timed, got {timing:?}"
         );
         assert!(
-            timing.kernel_ms + 1e-6 >= timing.resample_ms + timing.extract_ms,
-            "kernel must cover resample+extract, got {timing:?}"
+            timing.kernel_ms >= timing.resample_ms.max(timing.extract_ms),
+            "kernel must cover each stage, got {timing:?}"
         );
+    }
+
+    #[test]
+    fn staged_timing_uses_complete_boundaries() {
+        let start = Instant::now();
+        let timing = timing_between(
+            start,
+            start + std::time::Duration::from_millis(7),
+            start + std::time::Duration::from_millis(18),
+        );
+        assert_eq!(timing.resample_ms, 7.0);
+        assert_eq!(timing.extract_ms, 11.0);
+        assert_eq!(timing.kernel_ms, 18.0);
     }
 }
