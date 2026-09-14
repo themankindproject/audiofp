@@ -343,6 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn effective_rate_matches_quantized_sample_hop() {
+        let mut cfg = small_cfg();
+        cfg.hop_secs = 0.10003;
+        let rate = cfg.sample_rate;
+        let mut stream = passthrough_streaming(cfg.clone()).unwrap();
+        let hop = stream.hop_samples();
+        assert_eq!(stream.effective_frames_per_sec(), rate as f32 / hop as f32);
+        assert_ne!(stream.effective_frames_per_sec(), 1.0 / cfg.hop_secs);
+        let audio = synth_audio(1, stream.window_samples() + 2 * hop, rate);
+        let output = stream.push(&audio).unwrap();
+        assert_eq!(output.len(), 3);
+        for (i, (timestamp, _)) in output.iter().enumerate() {
+            assert_eq!(timestamp.0, (i * hop * 1000 / rate as usize) as u64);
+        }
+    }
+
+    #[test]
     fn empty_push_emits_nothing_and_does_not_buffer() {
         let mut s = fixture();
         let out = s.push(&[]).unwrap();
