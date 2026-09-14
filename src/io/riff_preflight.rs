@@ -216,4 +216,76 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         File::open(&path).unwrap()
     }
+
+    #[test]
+    fn ignores_short_files_and_non_wave_containers() {
+        let mut short = tempfile_from_bytes(b"RIFF\x08\x00\x00\x00WAVE");
+        assert!(preflight_wav_from_file(&mut short, Path::new("short.wav")).is_ok());
+
+        let mut avi = tempfile_from_bytes(b"RIFF\x1c\x00\x00\x00AVI ");
+        assert!(preflight_wav_from_file(&mut avi, Path::new("clip.avi")).is_ok());
+
+        let mut flac = tempfile_from_bytes(b"fLaC\x00\x00\x00\x22");
+        assert!(preflight_wav_from_file(&mut flac, Path::new("x.flac")).is_ok());
+    }
+
+    #[test]
+    fn rifx_big_endian_valid_header_passes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFX");
+        bytes.extend_from_slice(&38u32.to_be_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // mono
+        bytes.extend_from_slice(&8_000u32.to_be_bytes());
+        bytes.extend_from_slice(&8_000u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&8u16.to_be_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&[0x80, 0x00]);
+
+        let mut file = tempfile_from_bytes(&bytes);
+        assert!(preflight_wav_from_file(&mut file, Path::new("be.wav")).is_ok());
+    }
+
+    #[test]
+    fn preflight_attaches_path_to_malformed_fmt_errors() {
+        let bytes: [u8; 44] = [
+            b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ',
+            16, 0, 0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, b'd', b'a',
+            b't', b'a', 0, 0, 0, 0,
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "audiofp-riff-path-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let err = preflight_wav_from_file(&mut file, &path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(path.file_name().unwrap().to_str().unwrap()),
+            "malformed fmt must include the source path, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_block_alignment_overflow_before_channel_cap() {
+        let mut fmt = [0_u8; 16];
+        fmt[0..2].copy_from_slice(&1u16.to_le_bytes());
+        fmt[2..4].copy_from_slice(&64u16.to_le_bytes());
+        fmt[14..16].copy_from_slice(&65_528u16.to_le_bytes());
+        let err = validate_fmt_fields(&fmt, true).unwrap_err();
+        assert!(
+            err.to_string().contains("block alignment overflow"),
+            "expected alignment overflow, got {err}"
+        );
+    }
 }

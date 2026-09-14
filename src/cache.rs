@@ -290,7 +290,11 @@ fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<
             provided: usize::try_from(meta.len()).unwrap_or(usize::MAX),
         });
     }
-    let mut limited = file.take(cap.saturating_add(1));
+    read_limited(path, file, cap)
+}
+
+fn read_limited(path: &Path, reader: impl Read, cap: u64) -> Result<Vec<u8>> {
+    let mut limited = reader.take(cap.saturating_add(1));
     let mut bytes = Vec::new();
     limited
         .read_to_end(&mut bytes)
@@ -364,12 +368,16 @@ impl Drop for AtomicTempGuard {
 ///
 /// `AfpError::Io` with the path attached on any filesystem failure.
 pub fn cache_to_file_atomic<T: CacheableFingerprint>(fp: &T, path: &Path) -> Result<()> {
+    let base = ATOMIC_TEMP_COUNTER.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+    cache_to_file_atomic_at(fp, path, base)
+}
+
+fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u64) -> Result<()> {
     let bytes = fp.to_cache_bytes();
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let base = ATOMIC_TEMP_COUNTER.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
     let stem = path
         .file_name()
         .map(|s| s.to_string_lossy())
@@ -604,15 +612,8 @@ impl Iterator for CacheDirIter {
             Ok(b) => b,
             Err(e) => return Some(Err(e)),
         };
-        if let Some(max_total) = self.limits.max_total_bytes {
-            let next = self.bytes_loaded.saturating_add(bytes.len() as u64);
-            if next > max_total {
-                return Some(Err(AfpError::InputTooLarge {
-                    limit: max_total as usize,
-                    provided: next as usize,
-                }));
-            }
-        }
+        // The actual read above is capped to the remaining total budget,
+        // even if the file grows after metadata is inspected.
         let fp = match CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
             AfpError::Deserialize(msg) => {
                 AfpError::Deserialize(format!("{}: {msg}", path.display()))
@@ -1145,13 +1146,13 @@ mod tests {
         let dir = TempDir::new("atomic_collision");
         let target = dir.0.join("keep.afp");
         let stem = target.file_name().unwrap().to_string_lossy();
-        let base = ATOMIC_TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let base = 0;
         let colliding = dir
             .0
             .join(format!(".{}.afp.tmp.{}_{}", stem, std::process::id(), base,));
         std::fs::write(&colliding, b"unrelated stale temp").unwrap();
 
-        cache_to_file_atomic(&fp, &target).unwrap();
+        cache_to_file_atomic_at(&fp, &target, base).unwrap();
         assert_eq!(
             std::fs::read(&colliding).unwrap(),
             b"unrelated stale temp",
@@ -1190,5 +1191,218 @@ mod tests {
         assert_eq!(h_env.sample_rate, 5_000);
         assert_eq!(h_env.hash_count, 3);
         assert_eq!(h_env.frames_per_sec, 78.125);
+    }
+
+    #[test]
+    fn wang_envelope_from_cached_fingerprint() {
+        let wang = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x42,
+                t_anchor: 3,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let env = CachedFingerprint::Wang(wang).envelope();
+        assert_eq!(env.algorithm, "wang-v1");
+        assert_eq!(env.sample_rate, 8_000);
+        assert_eq!(env.hash_count, 1);
+        assert_eq!(env.frames_per_sec, 62.5);
+    }
+
+    #[test]
+    fn actual_read_rejects_growth_without_trusting_metadata() {
+        let path = Path::new("growing.afp");
+        let mut source = std::io::Cursor::new(vec![7; 64]);
+        let result = read_limited(path, &mut source, 8);
+        assert!(matches!(
+            result,
+            Err(AfpError::InputTooLarge {
+                limit: 8,
+                provided: 9
+            })
+        ));
+        assert_eq!(source.position(), 9, "read only one byte beyond budget");
+        let exact = read_limited(path, std::io::Cursor::new(vec![7; 8]), 8).unwrap();
+        assert_eq!(exact, vec![7; 8]);
+    }
+
+    #[test]
+    fn iterator_handles_files_removed_after_enumeration() {
+        for budget in [None, Some(1000)] {
+            let dir = TempDir::new("removed_after_list");
+            let path = dir.0.join("gone.afp");
+            std::fs::write(&path, b"placeholder").unwrap();
+            let mut iter = iter_cached(
+                &dir.0,
+                CacheLoadLimits {
+                    max_files: None,
+                    max_total_bytes: budget,
+                },
+            )
+            .unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(matches!(iter.next(), Some(Err(AfpError::Io(_)))));
+            assert!(iter.next().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_reader_rejects_directories_and_devices() {
+        let dir = TempDir::new("non_regular_handle");
+        for path in [dir.0.as_path(), Path::new("/dev/null")] {
+            let mut file = File::open(path).unwrap();
+            let result = read_handle_with_limit(path, &mut file, 32);
+            assert!(matches!(result, Err(AfpError::Io(_))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn handle_reader_rejects_a_symlink_handle_without_following() {
+        use rustix::fs::{Mode, OFlags};
+        let dir = TempDir::new("symlink_handle");
+        let path = dir.0.join("link.afp");
+        std::os::unix::fs::symlink("missing.afp", &path).unwrap();
+        let fd = rustix::fs::open(&path, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty()).unwrap();
+        let mut file = File::from(fd);
+        let result = read_handle_with_limit(&path, &mut file, 32);
+        assert!(matches!(result, Err(AfpError::Io(ref err))
+            if err.source.to_string().contains("symlink")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_from_cache_rejects_file_over_max_bytes() {
+        let dir = TempDir::new("oversized");
+        let path = dir.0.join("huge.afp");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            use std::io::Write;
+            f.write_all(b"AUDIOFP\0").unwrap();
+            f.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
+        }
+        let err = load_from_cache::<WangFingerprint>(&path).unwrap_err();
+        match err {
+            AfpError::InputTooLarge { limit, provided } => {
+                assert_eq!(limit, MAX_CACHE_FILE_BYTES as usize);
+                assert_eq!(provided, MAX_CACHE_FILE_BYTES as usize + 1);
+            }
+            other => panic!("expected InputTooLarge for oversized cache file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atomic_rename_to_directory_fails_and_drops_temp() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x99,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("atomic_rename_fail");
+        let target = dir.0.join("blocked.afp");
+        std::fs::create_dir(&target).unwrap();
+        let err = cache_to_file_atomic(&fp, &target).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked.afp"),
+            "rename failure must name the destination: {err}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".afp.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed atomic write must remove its temp file, found {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_temp_name_exhaustion_returns_error() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x77,
+                t_anchor: 1,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("temp_exhaust");
+        let target = dir.0.join("out.afp");
+        let stem = target.file_name().unwrap().to_string_lossy();
+        let attempt_base = 0_u64;
+        for attempt in 0..8u64 {
+            let colliding = dir.0.join(format!(
+                ".{}.afp.tmp.{}_{}",
+                stem,
+                std::process::id(),
+                attempt_base.wrapping_add(attempt),
+            ));
+            std::fs::write(&colliding, b"occupied").unwrap();
+        }
+        let err = cache_to_file_atomic_at(&fp, &target, attempt_base).unwrap_err();
+        assert!(
+            err.to_string().contains("unique temporary cache file"),
+            "expected temp allocation failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn iter_byte_budget_rejects_second_file_from_metadata() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("byte_meta");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&fp, &dir.0.join("b.afp")).unwrap();
+        let one = fp.to_cache_bytes().len() as u64;
+        let limits = CacheLoadLimits {
+            max_files: None,
+            max_total_bytes: Some(one + one / 2),
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        assert!(iter.next().unwrap().is_ok(), "first file must fit");
+        match iter.next() {
+            Some(Err(AfpError::InputTooLarge { limit, provided })) => {
+                assert_eq!(limit, (one + one / 2) as usize);
+                assert_eq!(provided, (one + one) as usize);
+            }
+            other => panic!("expected metadata byte-budget rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iter_byte_budget_zero_remaining_after_first_file() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("byte_zero_remain");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&fp, &dir.0.join("b.afp")).unwrap();
+        let one = fp.to_cache_bytes().len() as u64;
+        let limits = CacheLoadLimits {
+            max_files: None,
+            max_total_bytes: Some(one),
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        assert!(iter.next().unwrap().is_ok());
+        match iter.next() {
+            Some(Err(AfpError::InputTooLarge { limit, provided })) => {
+                assert_eq!(limit, one as usize);
+                assert_eq!(provided, one as usize + 1);
+            }
+            other => panic!("expected zero-remaining byte budget error, got {other:?}"),
+        }
     }
 }

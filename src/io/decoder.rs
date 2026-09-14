@@ -437,6 +437,28 @@ fn downmix_planes_to_mono<S: Sample + IntoSample<f32>>(
     }
 }
 
+fn append_decoded_mono(decoded: GenericAudioBufferRef<'_>, samples: &mut Vec<f32>) {
+    let n_chans = decoded.spec().channels().count();
+    let n_frames = decoded.frames();
+    macro_rules! downmix {
+        ($buffer:expr) => {
+            downmix_planes_to_mono($buffer, n_chans, n_frames, samples)
+        };
+    }
+    match decoded {
+        GenericAudioBufferRef::U8(buf) => downmix!(buf),
+        GenericAudioBufferRef::U16(buf) => downmix!(buf),
+        GenericAudioBufferRef::U24(buf) => downmix!(buf),
+        GenericAudioBufferRef::U32(buf) => downmix!(buf),
+        GenericAudioBufferRef::S8(buf) => downmix!(buf),
+        GenericAudioBufferRef::S16(buf) => downmix!(buf),
+        GenericAudioBufferRef::S24(buf) => downmix!(buf),
+        GenericAudioBufferRef::S32(buf) => downmix!(buf),
+        GenericAudioBufferRef::F32(buf) => downmix!(buf),
+        GenericAudioBufferRef::F64(buf) => downmix!(buf),
+    }
+}
+
 fn decode_inner(
     mss: MediaSourceStream,
     hint: &Hint,
@@ -700,8 +722,6 @@ fn decode_inner_report(
             }
         }
 
-        let n_frames = decoded.frames();
-
         // Record the decoder's real output rate (once). A mid-stream rate
         // change is a codec reset we do not model; adopt the first value
         // and let the spec-change branch above handle the buffer.
@@ -716,23 +736,7 @@ fn decode_inner_report(
 
         // Convert individual samples with Symphonia's own conversion trait.
         // No duplicated capacity-sized or channel-multiplied f32 buffer.
-        macro_rules! downmix {
-            ($buffer:expr) => {
-                downmix_planes_to_mono($buffer, n_chans, n_frames, &mut samples)
-            };
-        }
-        match decoded {
-            GenericAudioBufferRef::U8(buf) => downmix!(buf),
-            GenericAudioBufferRef::U16(buf) => downmix!(buf),
-            GenericAudioBufferRef::U24(buf) => downmix!(buf),
-            GenericAudioBufferRef::U32(buf) => downmix!(buf),
-            GenericAudioBufferRef::S8(buf) => downmix!(buf),
-            GenericAudioBufferRef::S16(buf) => downmix!(buf),
-            GenericAudioBufferRef::S24(buf) => downmix!(buf),
-            GenericAudioBufferRef::S32(buf) => downmix!(buf),
-            GenericAudioBufferRef::F32(buf) => downmix!(buf),
-            GenericAudioBufferRef::F64(buf) => downmix!(buf),
-        }
+        append_decoded_mono(decoded, &mut samples);
     }
 
     if integrity_mode {
@@ -765,6 +769,38 @@ fn decode_inner_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_decoded_sample_format_preserves_mono_values_and_frame_count() {
+        use symphonia::core::audio::sample::{i24, u24};
+        use symphonia::core::audio::{AudioSpec, Channels};
+        macro_rules! check {
+            ($type:ty, $variant:ident, $value:expr) => {{
+                let value: $type = $value;
+                let expected: f32 = value.into_sample();
+                for channels in [1, 2] {
+                    let spec = AudioSpec::new(8000, Channels::Discrete(channels));
+                    let mut buffer = AudioBuffer::<$type>::new(spec, 1024);
+                    buffer.resize(3, &vec![value; channels as usize]);
+                    let mut actual = vec![0.125];
+                    append_decoded_mono(GenericAudioBufferRef::$variant(&buffer), &mut actual);
+                    assert_eq!(actual.len(), 4, "capacity must not become decoded length");
+                    assert_eq!(actual[0], 0.125, "append must preserve prior packets");
+                    assert_eq!(&actual[1..], &[expected; 3]);
+                }
+            }};
+        }
+        check!(u8, U8, 192);
+        check!(u16, U16, 49152);
+        check!(u24, U24, u24(12582912));
+        check!(u32, U32, 3221225472);
+        check!(i8, S8, -64);
+        check!(i16, S16, -16384);
+        check!(i24, S24, i24(-4194304));
+        check!(i32, S32, -1073741824);
+        check!(f32, F32, 0.375);
+        check!(f64, F64, -0.375);
+    }
 
     #[cfg(feature = "std-wav")]
     mod wav_tests {
@@ -1458,6 +1494,113 @@ mod tests {
             writer.write_sample(f32::MAX).unwrap();
             writer.finalize().unwrap();
             path
+        }
+
+        fn write_test_wav_bits(
+            channels: u16,
+            sr: u32,
+            len: usize,
+            bits: u16,
+        ) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-bits-{}-{}-{}-{}-{}.wav",
+                std::process::id(),
+                channels,
+                sr,
+                bits,
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: sr,
+                bits_per_sample: bits,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            let max = (1_i64 << (bits - 1)) - 1;
+            for i in 0..len {
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32);
+                let sample = (s * max as f32 * 0.5) as i32;
+                for _c in 0..channels {
+                    writer.write_sample(sample).unwrap();
+                }
+            }
+            writer.finalize().unwrap();
+            path
+        }
+
+        fn write_physically_truncated_wav() -> std::path::PathBuf {
+            let path = write_test_wav(1, 8_000, 2_048);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.truncate(128);
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        }
+
+        #[test]
+        fn decode_to_mono_at_rejects_zero_target_rate() {
+            let path = write_test_wav(1, 8_000, 64);
+            let err = decode_to_mono_at_limited(&path, 0, DecodeLimits::default()).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::Config(msg) => {
+                    assert!(msg.contains("target sample rate"), "got {msg}");
+                }
+                other => panic!("expected Config error for target_sr=0, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn eight_bit_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 8_000, 256, 8);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 256);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn twenty_four_bit_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 16_000, 128, 24);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 16_000);
+            assert_eq!(samples.len(), 128);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn thirty_two_bit_int_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 8_000, 64, 32);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 64);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn strict_mode_rejects_physically_truncated_stream() {
+            let path = write_physically_truncated_wav();
+            let limits = DecodeLimits::default().strict();
+            let err = decode_to_mono_limited(&path, limits).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::Io(e) => {
+                    let msg = e.source.to_string();
+                    assert!(
+                        e.source.kind() == std::io::ErrorKind::UnexpectedEof
+                            || msg.contains("truncated")
+                            || msg.contains("unexpected end"),
+                        "got {e}"
+                    );
+                }
+                other => panic!("expected truncated-stream Io error, got {other:?}"),
+            }
         }
 
         fn write_overflow_channel_wav_header() -> std::path::PathBuf {
