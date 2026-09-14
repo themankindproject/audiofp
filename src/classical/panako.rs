@@ -1543,6 +1543,36 @@ mod tests {
         assert_eq!(via_cb, via_flush);
     }
 
+    #[test]
+    fn complete_callback_matches_offline_across_chunk_sizes() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut expected = Panako::default()
+            .extract(&samples, SampleRate::HZ_8000)
+            .unwrap()
+            .hashes;
+        assert!(!expected.is_empty());
+        expected.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+        for chunk in [1, 127, 1_024, samples.len()] {
+            let mut stream = StreamingPanako::default();
+            let mut actual = Vec::new();
+            for part in samples.chunks(chunk) {
+                stream.push_with(part, |_, h| actual.push(*h)).unwrap();
+            }
+            let before = actual.len();
+            let emitted = stream.flush_complete_with(|_, h| actual.push(*h)).unwrap();
+            assert!(emitted > 0, "fixture must exercise buffered finalization");
+            assert_eq!(actual.len() - before, emitted);
+            assert_eq!(
+                stream
+                    .flush_complete_with(|_, _| panic!("duplicate flush"))
+                    .unwrap(),
+                0
+            );
+            actual.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+            assert_eq!(actual, expected, "chunk={chunk}");
+        }
+    }
+
     // ── OOM protection: max_input_samples enforcement ──
 
     #[test]

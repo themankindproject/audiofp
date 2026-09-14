@@ -735,4 +735,16 @@ mod tests {
             assert!(s.abs() <= 0.55, "gain beyond Gibbs envelope: {s}");
         }
     }
+
+    #[test]
+    fn excessive_kernel_table_is_rejected_before_allocation() {
+        let quality = SincQuality {
+            half_taps: 1 << 16,
+            polyphase_steps: u16::MAX,
+            ..SincQuality::default()
+        };
+        let result = SincResampler::try_with_quality(8_000, 16_000, quality);
+        assert!(matches!(result, Err(crate::AfpError::Config(ref message))
+            if message.contains("polyphase kernel table") && message.contains("exceeds")));
+    }
 }
