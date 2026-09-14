@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Correct bakeoff resampling/timing boundaries and no-match reporting; protect
+  Chromaprint resources with RAII, compare equal-work watermark calls, and
+  run the separate bakeoff tests in CI. Published latency tables remain historical.
+
 ### Fixed
 
 Deep-audit pass across every subsystem. No hash bytes, scores, or

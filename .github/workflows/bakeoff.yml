@@ -23,15 +23,26 @@ jobs:
       - name: install libchromaprint
         run: sudo apt-get update && sudo apt-get install -y libchromaprint-dev
       - name: run invariants
+        id: invariants
         working-directory: bakeoff
-        run: cargo run --release -- --check
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo run --release -- --check 2>&1 | tee ../bakeoff-check.log
+          exit ${PIPESTATUS[0]}
       - name: regenerate report
+        if: always()
         working-directory: bakeoff
         run: cargo run --release --quiet -- --report > ../BENCHMARKS-DRIFT.txt
       - name: upload report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bakeoff-report
           path: |
             BENCHMARKS-DRIFT.txt
+            bakeoff-check.log
             bakeoff/Cargo.lock
+      - name: fail job if invariants failed
+        if: steps.invariants.outcome == 'failure'
+        run: exit 1
