@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add opt-in `flush_complete` / `flush_complete_with` for Wang and Panako to
+  restore offline parity at fractional clip lengths; legacy flush is unchanged.
+  Reduce Haitsma extraction memory and compact peak candidates in place without
+  changing offline hash bytes. Harden DSP sizing, add effective neural-rate
+  extraction and validated detection-score APIs, and correct allocation claims.
+
 ### Fixed
 
 Deep-audit pass across every subsystem. No hash bytes, scores, or

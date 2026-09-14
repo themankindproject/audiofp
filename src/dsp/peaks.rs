@@ -226,12 +226,16 @@ impl PeakPicker {
         // multiply then overflows (debug panic) or reserves gigabytes
         // (release abort). Bounding the frame term by `n_frames` is safe —
         // it is only a capacity hint, and no candidate can exceed it.
+        // Capacity hint only — bound by actual spectrogram cell count so
+        // absurd `target_per_sec` / `frames_per_sec` cannot reserve gigabytes.
+        let cell_count = n_frames.saturating_mul(n_bins);
         let upper = if frames_per_sec.is_finite() && frames_per_sec > 0.0 {
             let frames_per_sec = (frames_per_sec.ceil() as usize).min(n_frames);
             frames_per_sec
                 .saturating_mul(target_per_sec)
                 .saturating_mul(2)
                 .max(64)
+                .min(cell_count.max(64))
         } else {
             64
         };
@@ -295,21 +299,26 @@ fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize)
             .then_with(|| (a.t_frame, a.f_bin).cmp(&(b.t_frame, b.f_bin)))
     });
 
-    let mut kept = Vec::with_capacity(peaks.len());
+    // In-place compaction after the bucket sort — same kept set, one buffer.
+    let mut write = 0usize;
     let mut current_bucket = u32::MAX;
     let mut count = 0usize;
-    for p in peaks {
-        let bucket = (p.t_frame as f32 / frames_per_sec) as u32;
+    for read in 0..peaks.len() {
+        let bucket = (peaks[read].t_frame as f32 / frames_per_sec) as u32;
         if bucket != current_bucket {
             current_bucket = bucket;
             count = 0;
         }
         if count < target {
-            kept.push(p);
+            if write != read {
+                peaks[write] = peaks[read];
+            }
+            write += 1;
             count += 1;
         }
     }
-    kept
+    peaks.truncate(write);
+    peaks
 }
 
 /// 2-D rolling max with caller-provided scratch buffers (no allocation).
@@ -624,7 +633,8 @@ impl IncrementalPeakDetector {
             let dq = &mut self.vert_deques[col];
             // Maintain decreasing monotonicity.
             while let Some(&(_, back_val)) = dq.back() {
-                if back_val <= val {
+                // Match horizontal `f32::max` semantics: NaN never wins.
+                if f32::max(back_val, val) == val {
                     dq.pop_back();
                 } else {
                     break;
@@ -835,18 +845,20 @@ mod tests {
         super::max31_vec(&input, &mut fast);
         let mut deque = vec![0.0; input.len()];
         rolling_max_1d(&input, 14, &mut deque, &mut dq);
+        let naive = naive_max_1d(&input, 14);
 
-        // k=15 fast path: no NaN anywhere in the output.
-        assert!(fast.iter().all(|v| !v.is_nan()), "max31 produced NaN");
-        // The generic deque path must also never surface the NaN, and the
-        // finite neighbours it does surface must match the naive max.
-        assert!(deque.iter().all(|v| !v.is_nan()), "deque path surfaced NaN");
-        for (i, &v) in deque.iter().enumerate() {
-            let naive = naive_max_1d(&input, 14)[i];
-            if !naive.is_nan() {
-                assert_eq!(v, naive, "deque mismatch at {i}");
+        // Pin exact outputs on both axes — NaN at index 32 must not win.
+        for (i, ((&f, &d), &n)) in fast.iter().zip(deque.iter()).zip(naive.iter()).enumerate() {
+            assert!(!f.is_nan(), "max31 produced NaN at {i}");
+            assert!(!d.is_nan(), "deque path surfaced NaN at {i}");
+            assert_eq!(f, d, "fast vs deque mismatch at {i}");
+            if !n.is_nan() {
+                assert_eq!(d, n, "deque vs naive mismatch at {i}");
             }
         }
+        assert_eq!(fast[31], 1.0);
+        assert_eq!(fast[32], 1.0);
+        assert_eq!(fast[33], 1.0);
     }
 
     #[test]
@@ -1250,6 +1262,72 @@ mod tests {
         );
         let want: Vec<u32> = (0..total as u32).collect();
         assert_eq!(sorted, want, "full session must cover rows 0..{total} once");
+    }
+
+    #[test]
+    fn vertical_nan_never_surfaces_in_incremental_path() {
+        let kt = 1;
+        let kf = 0;
+        let mut det = IncrementalPeakDetector::new(kt, kf, 4);
+        let mut out = vec![0.0_f32; 4];
+        let rows = [
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![f32::NAN, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0],
+        ];
+        for row in rows {
+            let _ = det.push_row(&row, &mut out);
+        }
+        let mut flushed: Vec<[f32; 4]> = Vec::new();
+        det.flush(&mut out, |_, max_row| {
+            let pinned = [max_row[0], max_row[1], max_row[2], max_row[3]];
+            assert!(pinned.iter().all(|v| !v.is_nan()));
+            flushed.push(pinned);
+        });
+        assert_eq!(flushed.len(), 1);
+        // Row 2's vertical max: NaN in row 1 never wins over the zeros.
+        assert_eq!(flushed[0], [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn vertical_all_nan_row_yields_zeros() {
+        let kt = 1;
+        let kf = 0;
+        let mut det = IncrementalPeakDetector::new(kt, kf, 3);
+        let mut out = vec![0.0_f32; 3];
+        let rows = [
+            vec![2.0, 2.0, 2.0],
+            vec![f32::NAN, f32::NAN, f32::NAN],
+            vec![1.0, 1.0, 1.0],
+        ];
+        for row in rows {
+            let _ = det.push_row(&row, &mut out);
+        }
+        let mut flushed: Vec<[f32; 3]> = Vec::new();
+        det.flush(&mut out, |_, max_row| {
+            flushed.push([max_row[0], max_row[1], max_row[2]]);
+        });
+        assert_eq!(flushed.len(), 1);
+        // All-NaN row 1 never wins; row 2's vertical max is row 2 itself.
+        assert_eq!(flushed[0], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn peak_picker_huge_target_per_sec_does_not_panic_on_one_cell() {
+        let spec = vec![1.0_f32];
+        let mut picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: 0,
+            neighborhood_f: 0,
+            min_magnitude_db: f32::NEG_INFINITY,
+            min_magnitude_linear: None,
+            target_per_sec: usize::MAX,
+        });
+        // Finite fps=1 with a one-cell spectrogram: old code reserved
+        // `usize::MAX` candidates; the cell-count cap must keep this O(1).
+        let peaks = picker.pick(&spec, 1, 1, 1.0);
+        assert_eq!(peaks.len(), 1);
+        assert_eq!(peaks[0].t_frame, 0);
+        assert_eq!(peaks[0].f_bin, 0);
     }
 
     #[test]

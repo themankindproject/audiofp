@@ -113,7 +113,56 @@ pub fn write_identity_onnx(stem: &str) -> PathBuf {
     path
 }
 
-/// Remove a fixture written by [`write_identity_onnx`].
+/// Write an ONNX model whose detection output is a length-`n` constant tensor
+/// (`det_value` at every position) and whose message output aliases the input.
+pub fn write_constant_detection_onnx(stem: &str, n: usize, det_value: f32) -> PathBuf {
+    let det_bytes = det_value.to_le_bytes().repeat(n);
+    let graph = pb::GraphProto {
+        initializer: vec![pb::TensorProto {
+            name: "det_const".to_string(),
+            data_type: 1,
+            dims: vec![1, 1, n as i64],
+            raw_data: det_bytes,
+            ..Default::default()
+        }],
+        node: vec![
+            pb::NodeProto {
+                input: vec!["det_const".to_string()],
+                output: vec!["det".to_string()],
+                name: "det_identity".to_string(),
+                op_type: "Identity".to_string(),
+                ..Default::default()
+            },
+            identity_node("msg_node", "msg"),
+        ],
+        name: "constant_det_wm".to_string(),
+        input: vec![value_info("x", vec![Some(1), Some(1), None])],
+        output: vec![
+            value_info("det", vec![Some(1), Some(1), Some(n as i64)]),
+            value_info("msg", vec![Some(1), Some(1), None]),
+        ],
+        ..Default::default()
+    };
+
+    let model = pb::ModelProto {
+        ir_version: 8,
+        opset_import: vec![pb::OperatorSetIdProto {
+            domain: String::new(),
+            version: 13,
+        }],
+        producer_name: "audiofp-test-fixture".to_string(),
+        graph: Some(graph),
+        ..Default::default()
+    };
+
+    let path = unique_path(stem);
+    let bytes = prost::Message::encode_to_vec(&model);
+    std::fs::write(&path, bytes).expect("write onnx fixture");
+    path
+}
+
+/// Remove a fixture written by [`write_identity_onnx`] or
+/// [`write_constant_detection_onnx`].
 pub fn cleanup(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
 }

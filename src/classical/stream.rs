@@ -14,8 +14,9 @@
 //!
 //! This module owns the shared skeleton once, so the two extractors
 //! become thin wrappers that configure the knobs and supply their emit
-//! closure. Output parity is pinned by the existing
-//! `streaming_offline_*` tests in each file.
+//! closure. Offline parity for whole-second clips is pinned by the
+//! `streaming_offline_*` tests; fractional-second remainders may need
+//! `flush_complete` (audit F01).
 //!
 //! # Continuous-stream frame limit
 //!
@@ -653,10 +654,12 @@ impl<F> StreamCore<F> {
         // emit-all): each bucket's anchors are emitted — returning their
         // target buffers to the pool — before the next bucket allocates new
         // ones, so the flush reuses the same pooled working set as steady
-        // pushes instead of bursting fresh allocations. Output-identical to
-        // emit-all-at-end: `pending_anchors` is FIFO, per-bucket finalize
-        // appends newer anchors at the back, and each emit-all drains in
-        // order — the global emission sequence is unchanged. (Also bounds
+        // pushes instead of bursting fresh allocations. Interleaved
+        // finalize+emit preserves the legacy emission order relative to
+        // finalize-all-then-emit-all within this path: `pending_anchors`
+        // is FIFO, per-bucket finalize appends newer anchors at the back,
+        // and each emit-all drains in order. (This is **not** offline
+        // parity — see `process_flush_complete`.) Also bounds
         // `pending_anchors` length to one bucket's burst rather than the
         // whole remainder, avoiding a flush-time VecDeque doubling.)
         //
@@ -674,6 +677,71 @@ impl<F> StreamCore<F> {
                 if self.targets_pool.len() < TARGETS_POOL_MAX {
                     self.targets_pool.push(freed);
                 }
+            }
+        }
+        self.to_finalize.clear();
+        self.emitted = emitted;
+    }
+
+    /// Corrected end-of-stream finalisation: finalize every remaining bucket
+    /// first so later peaks can become targets for earlier anchors, then
+    /// emit anchors whose target zones are fully observed, then drain any
+    /// tail anchors at EOF. Matches offline [`Wang::extract`] /
+    /// [`Panako::extract`] hash multisets; the legacy [`process_flush`] path
+    /// is retained for byte-compatible streaming output.
+    pub(crate) fn process_flush_complete(
+        &mut self,
+        cfg: PeakCfg,
+        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        let n_bins = self.spec_n_bins;
+        let spec = &self.spec;
+        let spec_tail = self.spec_tail;
+        let spec_cap = 2 * self.neighborhood + 1;
+        let spec_first_frame = self.spec_first_frame;
+        let bucket_pending = &mut self.bucket_pending;
+        let bucket_pool = &mut self.bucket_pool;
+        let last_pd = &mut self.last_pd_frame;
+        let min_mag = cfg.min_anchor_mag_db;
+        let frames_per_sec = self.frames_per_sec;
+
+        self.peak_det
+            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
+                let row_idx = (ripe_abs - spec_first_frame) as usize;
+                let bucket = (ripe_abs as f32 / frames_per_sec) as u32;
+                for (bin, &row_max) in max_row.iter().enumerate() {
+                    let idx = (spec_tail + row_idx) % spec_cap * n_bins + bin;
+                    let v = spec[idx];
+                    if v > min_mag && v >= row_max {
+                        let peak = Peak {
+                            t_frame: ripe_abs,
+                            f_bin: bin as u16,
+                            _pad: 0,
+                            mag: v,
+                        };
+                        push_peak(bucket_pending, bucket_pool, bucket, peak);
+                    }
+                }
+                *last_pd = ripe_abs as i32;
+            });
+
+        self.to_finalize.clear();
+        self.to_finalize
+            .extend(self.bucket_pending.iter().map(|e| e.0));
+        let n = self.to_finalize.len();
+        for i in 0..n {
+            let bucket = self.to_finalize[i];
+            self.finalize_bucket(cfg, bucket, &mut add_target);
+        }
+
+        self.emit_finalized_anchors(cfg, &mut emit_anchor);
+
+        let mut emitted = core::mem::take(&mut self.emitted);
+        while let Some(anchor) = self.pending_anchors.pop_front() {
+            let freed = emit_anchor(anchor, cfg, &mut emitted);
+            if self.targets_pool.len() < TARGETS_POOL_MAX {
+                self.targets_pool.push(freed);
             }
         }
         self.to_finalize.clear();

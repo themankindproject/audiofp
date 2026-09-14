@@ -109,6 +109,12 @@ impl StreamingNeuralEmbedder {
         self.core.hop_samples
     }
 
+    /// Effective embedding rate: `sample_rate / hop_samples`.
+    #[must_use]
+    pub fn effective_frames_per_sec(&self) -> f32 {
+        self.core.cfg.sample_rate as f32 / self.core.hop_samples as f32
+    }
+
     /// Same contract as [`StreamingFingerprinter::push`] but propagates
     /// inference errors instead of panicking. Prefer this entry point
     /// when you need to surface model failures.
@@ -126,14 +132,13 @@ impl StreamingNeuralEmbedder {
     /// buffer and is overwritten on the next emit — copy out before
     /// the next iteration if you need to keep it.
     ///
-    /// Performs **no audiofp-owned allocations per embedding**: the
-    /// embedding scratch is allocated once at construction (capacity =
-    /// `embedding_dim`) and reused across every emit in every push. The
-    /// ONNX runtime itself still allocates per call (tract's `run` and
-    /// the per-window input tensor), so this is not a whole-path
-    /// zero-allocation guarantee. The sample carry grows only when a push
-    /// larger than one analysis window arrives (amortised `O(1)` per
-    /// sample).
+    /// Performs **no audiofp-owned allocations per embedding** for the
+    /// callback scratch vector (allocated once at construction). The ONNX
+    /// runtime still allocates per inference call (input tensor and tract
+    /// `run` internals), so this is **not** a whole-path zero-allocation
+    /// guarantee — see [`ZeroAllocStreaming`] in `fp.rs`. The sample carry
+    /// grows only when a push larger than one analysis window arrives
+    /// (amortised `O(1)` per sample).
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been

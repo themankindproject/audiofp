@@ -267,18 +267,9 @@ impl Wang {
         progress(0.80);
         progress(0.90);
 
-        let mut hashes = build_hashes(&peaks, &self.cfg);
+        let mut hashes = build_hashes(&peaks, &self.cfg)?;
         // Stable, deterministic ordering for round-trip and golden tests.
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
-
-        if let Some(limit) = self.cfg.max_hashes
-            && hashes.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: hashes.len(),
-            });
-        }
 
         progress(1.0);
 
@@ -316,11 +307,17 @@ impl Fingerprinter for Wang {
 }
 
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit landmark hashes.
-fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
-    let mut hashes = Vec::with_capacity(peaks.len() * cfg.fan_out as usize);
+fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Result<Vec<WangHash>> {
+    let capacity = peaks
+        .len()
+        .saturating_mul(cfg.fan_out as usize)
+        .min(cfg.max_hashes.unwrap_or(usize::MAX));
+    let mut hashes = Vec::with_capacity(capacity);
     let target_zone_t = cfg.target_zone_t as u32;
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
+    let max_hashes = cfg.max_hashes;
+    let mut total_emits = 0usize;
 
     // Pooled target list reused across anchors. Maintained sorted by
     // (mag desc, position asc) via linear-insert. For fan_out ≤ 16 the
@@ -354,6 +351,10 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
 
         let f_a_q = quantise_freq(anchor.f_bin);
         for target in &targets {
+            total_emits += 1;
+            if max_hashes.is_some_and(|limit| total_emits > limit) {
+                continue;
+            }
             let f_b_q = quantise_freq(target.f_bin);
             // Δt is encoded in 14 bits (max 16383). target_zone_t can never
             // realistically saturate this with default config, but clamp
@@ -367,7 +368,15 @@ fn build_hashes(peaks: &[Peak], cfg: &WangConfig) -> Vec<WangHash> {
             });
         }
     }
-    hashes
+    if let Some(limit) = max_hashes
+        && total_emits > limit
+    {
+        return Err(AfpError::InputTooLarge {
+            limit,
+            provided: total_emits,
+        });
+    }
+    Ok(hashes)
 }
 
 /// Linear-insert `target` into a top-K list of peaks kept sorted by
@@ -413,9 +422,12 @@ fn quantise_freq(bin: u16) -> u32 {
 /// target zone is fully observed. Per-push CPU cost is proportional to
 /// the number of new frames (not the total stream length).
 ///
-/// The output hash multiset matches what [`Wang::extract`] would produce
-/// for the same total input — verified by the `streaming_offline_*`
-/// tests, including the 1-sample-per-push pathological case.
+/// For whole-second (and many other) clip lengths, the legacy
+/// [`StreamingFingerprinter::flush`] hash multiset matches
+/// [`Wang::extract`] — verified by the `streaming_offline_*` tests.
+/// At certain fractional-second remainders (audit F01) legacy `flush`
+/// may emit fewer hashes; use [`flush_complete`](Self::flush_complete)
+/// when you need offline parity.
 ///
 /// The pipeline itself is shared with
 /// [`StreamingPanako`](crate::classical::StreamingPanako) via the
@@ -542,6 +554,44 @@ impl StreamingWang {
             ));
         }
         anchor.targets
+    }
+
+    /// Corrected end-of-stream finalisation matching offline
+    /// [`Wang::extract`].
+    ///
+    /// The default [`StreamingFingerprinter::flush`] is **legacy**: it may
+    /// emit fewer hashes than offline extraction at certain clip lengths
+    /// (notably fractional-second remainders such as 18 000 samples at 8 kHz)
+    /// because anchors are drained before later target buckets are finalised.
+    /// Call this opt-in API when you need offline parity; keep using `flush`
+    /// only when byte-identical legacy streaming output is required.
+    ///
+    /// Idempotent with respect to anchor emission: a second call with no
+    /// intervening `push` returns nothing. Safe after `push` following an
+    /// earlier `flush_complete` (pending anchors/targets are empty).
+    pub fn flush_complete(&mut self) -> Result<alloc::vec::Vec<(TimestampMs, WangHash)>> {
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush_complete(cfg, Self::add_target, Self::emit_anchor);
+        Ok(core::mem::take(&mut self.core.emitted))
+    }
+
+    /// Callback variant of [`flush_complete`](Self::flush_complete).
+    pub fn flush_complete_with<F>(&mut self, mut callback: F) -> Result<usize>
+    where
+        F: FnMut(TimestampMs, &WangHash),
+    {
+        self.core.emitted.clear();
+        let cfg = self.peak_cfg();
+        self.core
+            .process_flush_complete(cfg, Self::add_target, Self::emit_anchor);
+        let mut n = 0usize;
+        for (t, frame) in self.core.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        Ok(n)
     }
 }
 
@@ -755,7 +805,7 @@ mod tests {
             },
         ];
         let cfg = WangConfig::default();
-        let hashes = build_hashes(&peaks, &cfg);
+        let hashes = build_hashes(&peaks, &cfg).unwrap();
         assert_eq!(hashes.len(), 1);
         let h = hashes[0].hash;
         // Decode
@@ -793,7 +843,7 @@ mod tests {
             target_zone_f: u16::MAX,
             ..WangConfig::default()
         };
-        let hashes = build_hashes(&peaks, &cfg);
+        let hashes = build_hashes(&peaks, &cfg).unwrap();
         assert_eq!(hashes.len(), 1);
         // Δt field must saturate at 16383 — NOT wrap around to 20000 % 16384 = 3616.
         let dt = hashes[0].hash & 0x3FFF;
@@ -1107,7 +1157,7 @@ mod tests {
         sorted.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
 
         let cfg = WangConfig::default();
-        let hashes = build_hashes(&sorted, &cfg);
+        let hashes = build_hashes(&sorted, &cfg).unwrap();
         // Anchor at (0,100) should pair with (5,110) only; anchor at (0,200)
         // can pair with (5,110) (|Δf|=90 — wait that's > 64), or (5,300)
         // (|Δf|=100 > 64). Neither fits → no hash from anchor (0,200).
@@ -1605,5 +1655,184 @@ mod tests {
         };
         let s = StreamingWang::new(cfg);
         assert_eq!(s.config().max_push_samples, Some(1));
+    }
+
+    // F01: legacy flush loses hashes at fractional clip lengths; corrected
+    // flush_complete restores offline parity (18_000 samples @ 8 kHz).
+    #[test]
+    fn legacy_flush_fewer_hashes_than_offline_at_18000_samples() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut offline = Wang::default();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+        let mut streaming = StreamingWang::default();
+        let mut legacy: Vec<WangHash> = streaming
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        legacy.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
+
+        assert!(
+            legacy.len() < off.hashes.len(),
+            "legacy flush should reproduce audit loss: offline={} legacy={}",
+            off.hashes.len(),
+            legacy.len(),
+        );
+    }
+
+    #[test]
+    fn flush_complete_matches_offline_at_18000_samples() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut offline = Wang::default();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+        let mut streaming = StreamingWang::default();
+        let mut online: Vec<WangHash> = streaming
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        online.extend(
+            streaming
+                .flush_complete()
+                .unwrap()
+                .into_iter()
+                .map(|(_, h)| h),
+        );
+
+        let mut a = off.hashes;
+        let mut b = online;
+        a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn flush_complete_with_matches_flush_complete_vec() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut via_vec = StreamingWang::default();
+        let _ = via_vec.push(&samples).unwrap();
+        let vec_out = via_vec.flush_complete().unwrap();
+
+        let mut via_cb = StreamingWang::default();
+        let _ = via_cb.push(&samples).unwrap();
+        let mut cb_out = Vec::new();
+        via_cb
+            .flush_complete_with(|t, h| cb_out.push((t, *h)))
+            .unwrap();
+
+        assert_eq!(vec_out.len(), cb_out.len());
+        for ((t1, h1), (t2, h2)) in vec_out.iter().zip(cb_out.iter()) {
+            assert_eq!(t1.0, t2.0);
+            assert_eq!(h1, h2);
+        }
+    }
+
+    #[test]
+    fn flush_complete_is_idempotent_after_empty_second_call() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut s = StreamingWang::default();
+        let _ = s.push(&samples).unwrap();
+        let first = s.flush_complete().unwrap();
+        assert!(!first.is_empty());
+        assert!(s.flush_complete().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flush_complete_matches_offline_across_fractional_lengths() {
+        for len in [16_001_usize, 18_000, 22_500] {
+            let samples = synthetic_audio(0xF01 ^ len as u32, len);
+            let mut offline = Wang::default();
+            let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+            let mut streaming = StreamingWang::default();
+            let mut online: Vec<WangHash> = streaming
+                .push(&samples)
+                .unwrap()
+                .into_iter()
+                .map(|(_, h)| h)
+                .collect();
+            online.extend(
+                streaming
+                    .flush_complete()
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, h)| h),
+            );
+
+            let mut a = off.hashes;
+            let mut b = online;
+            a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+            b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+            assert_eq!(a, b, "flush_complete mismatch at len={len}");
+        }
+    }
+
+    #[test]
+    fn legacy_flush_still_matches_offline_at_whole_second_lengths() {
+        let samples = synthetic_audio(0xF02, 8_000 * 4);
+        let mut offline = Wang::default();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+        let mut streaming = StreamingWang::default();
+        let mut legacy: Vec<WangHash> = streaming
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        legacy.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
+
+        let mut a = off.hashes;
+        let mut b = legacy;
+        a.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        b.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn flush_complete_push_after_flush_does_not_duplicate() {
+        let a = synthetic_audio(0x0AF3, 8_000 * 3);
+        let b = synthetic_audio(0x0AF4, 8_000 * 2);
+        let mut s = StreamingWang::default();
+        let _ = s.push(&a).unwrap();
+        let _ = s.flush_complete().unwrap();
+
+        let mut after: Vec<(TimestampMs, WangHash)> = s.push(&b).unwrap();
+        after.extend(s.flush_complete().unwrap());
+        assert!(!after.is_empty());
+        let first_new_frame = 1 + (a.len().saturating_sub(WANG_N_FFT)) / WANG_HOP;
+        for (t, h) in &after {
+            assert!(
+                h.t_anchor as usize >= first_new_frame,
+                "hash anchored before continuation: frame {} (first new {first_new_frame}), t={} ms",
+                h.t_anchor,
+                t.0,
+            );
+        }
+    }
+
+    #[test]
+    fn flush_complete_reuses_targets_pool_after_warmup() {
+        let mut s = StreamingWang::default();
+        let audio = synthetic_audio(0xABCE, 8_000 * 20);
+        for c in audio.chunks(1024) {
+            let _ = s.push_with(c, |_, _| {});
+        }
+        let (hits0, misses0) = (s.core.pool_hits, s.core.pool_misses);
+        assert!(hits0 > 0, "warmup must exercise the pool");
+        let _ = s.flush_complete().unwrap();
+        for c in audio.chunks(1024) {
+            let _ = s.push_with(c, |_, _| {});
+        }
+        let (hits1, misses1) = (s.core.pool_hits, s.core.pool_misses);
+        assert_eq!(
+            misses1, misses0,
+            "steady-state anchors must reuse pooled buffers after flush_complete",
+        );
+        assert!(hits1 > hits0);
     }
 }

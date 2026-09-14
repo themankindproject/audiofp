@@ -151,7 +151,12 @@ pub struct NeuralFingerprint {
     /// Length of each embedding vector. Determined by the model at
     /// construction time.
     pub embedding_dim: usize,
-    /// `1.0 / hop_secs` — convenience for downstream consumers.
+    /// `1.0 / hop_secs` — nominal rate from the configured hop in seconds.
+    ///
+    /// When `hop_secs * sample_rate` is not an integer number of samples,
+    /// the actual embedding spacing follows [`NeuralEmbedder::hop_samples`]
+    /// and [`NeuralEmbedder::effective_frames_per_sec`], which may differ
+    /// slightly from this field.
     pub frames_per_sec: f32,
 }
 
@@ -284,13 +289,24 @@ impl EmbedderCore {
     ) -> Result<()> {
         let batch = windows.len();
         assert!(batch > 0, "embed_batch_into requires at least one window");
+        let n_mels = self.frontend.n_mels();
+        let n_frames = self.n_frames;
+        const MAX_FRONTEND_CELLS: usize = 1 << 28;
+        let batch_cells = batch
+            .checked_mul(n_mels)
+            .and_then(|c| c.checked_mul(n_frames))
+            .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
+        if batch_cells.is_none() {
+            return Err(AfpError::Config(format!(
+                "batch front-end too large: {batch} × {n_mels} mels × {n_frames} frames \
+                 exceeds {MAX_FRONTEND_CELLS} cells",
+            )));
+        }
         let batch_runnable = self
             .batch_runnable
             .as_ref()
             .expect("embed_batch_into requires batch_runnable");
 
-        let n_mels = self.frontend.n_mels();
-        let n_frames = self.n_frames;
         let embedding_dim = self.embedding_dim;
         let window_stride = n_mels * n_frames; // elements per batch item
 
@@ -507,6 +523,19 @@ impl NeuralEmbedder {
                 cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
             )));
         }
+        if cfg.batch_size > 1 {
+            let batch_cells = cfg
+                .batch_size
+                .checked_mul(cfg.n_mels)
+                .and_then(|c| c.checked_mul(n_frames))
+                .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
+            if batch_cells.is_none() {
+                return Err(AfpError::Config(format!(
+                    "batch front-end too large: {} × {} mels × {} frames exceeds {} cells",
+                    cfg.batch_size, cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
+                )));
+            }
+        }
 
         // --- Model loading -------------------------------------------
         if cfg.model_path.is_empty() {
@@ -639,6 +668,31 @@ impl NeuralEmbedder {
     #[must_use]
     pub fn hop_samples(&self) -> usize {
         self.core.hop_samples
+    }
+
+    /// Effective embedding rate from the quantised hop in samples:
+    /// `sample_rate / hop_samples`.
+    ///
+    /// Prefer this over [`NeuralFingerprint::frames_per_sec`] (which is
+    /// `1.0 / hop_secs`) when converting embedding indices to wall-clock
+    /// time — rounding `hop_secs * sample_rate` to samples can skew the
+    /// nominal rate (audit F16).
+    #[must_use]
+    pub fn effective_frames_per_sec(&self) -> f32 {
+        self.core.cfg.sample_rate as f32 / self.core.hop_samples as f32
+    }
+
+    /// Extract embeddings with frame-rate metadata derived from the actual
+    /// quantised sample hop. Embedding vectors and timestamps are unchanged.
+    /// The trait's `extract` retains its historical nominal-rate metadata.
+    pub fn extract_with_effective_rate(
+        &mut self,
+        samples: &[f32],
+        rate: SampleRate,
+    ) -> Result<NeuralFingerprint> {
+        let mut fingerprint = self.extract(samples, rate)?;
+        fingerprint.frames_per_sec = self.effective_frames_per_sec();
+        Ok(fingerprint)
     }
 }
 
@@ -1094,6 +1148,66 @@ mod tests {
             }
             Err(e) => panic!("expected Config, got {e:?}"),
             Ok(_) => panic!("expected Config error for n_fft=1<<24, got Ok"),
+        }
+    }
+
+    #[test]
+    fn effective_frames_per_sec_uses_quantised_hop() {
+        use crate::neural::test_support::passthrough_embedder;
+
+        let cfg = NeuralEmbedderConfig {
+            model_path: "test-fixture".into(),
+            sample_rate: 1_000,
+            n_fft: 2,
+            hop: 1,
+            n_mels: 1,
+            fmin: 0.0,
+            fmax: 500.0,
+            mel_scale: MelScale::Slaney,
+            window_kind: WindowKind::Hann,
+            window_secs: 0.002, // 2 samples ≥ n_fft
+            hop_secs: 0.00149,  // rounds to hop_samples=1
+            l2_normalize: true,
+            max_input_samples: None,
+            max_push_samples: None,
+            batch_size: 1,
+        };
+        let mut fp = passthrough_embedder(cfg).expect("embedder");
+        assert_eq!(fp.hop_samples(), 1);
+        assert_eq!(fp.window_samples(), 2);
+        assert_eq!(fp.embedding_dim(), 1);
+        let nominal = 1.0 / 0.00149;
+        let effective = fp.effective_frames_per_sec();
+        let samples = vec![0.25; 10];
+        let rate = SampleRate::new(1000).unwrap();
+        let legacy = fp.extract(&samples, rate).unwrap();
+        let corrected = fp.extract_with_effective_rate(&samples, rate).unwrap();
+        assert_eq!(corrected.frames_per_sec, effective);
+        assert_eq!(legacy.frames_per_sec, nominal);
+        for (a, b) in legacy.embeddings.iter().zip(&corrected.embeddings) {
+            assert_eq!(a.vector, b.vector);
+            assert_eq!(a.t_start, b.t_start);
+        }
+        assert!((effective - 1000.0).abs() < 1e-3, "effective={effective}");
+        assert!(
+            (nominal - effective).abs() > 1.0,
+            "nominal {nominal} should differ from effective {effective}",
+        );
+    }
+
+    #[test]
+    fn absurd_batch_frontend_cells_is_rejected_as_config() {
+        let mut cfg = small_cfg();
+        cfg.batch_size = 4096;
+        cfg.n_mels = 8192;
+        cfg.window_secs = 0.08; // n_frames = 9 → 4096×8192×9 cells exceeds cap
+        cfg.hop_secs = 0.08;
+        match NeuralEmbedder::new(cfg) {
+            Err(AfpError::Config(msg)) => {
+                assert!(msg.contains("batch front-end"), "unexpected message: {msg}",);
+            }
+            Err(e) => panic!("expected Config, got {e:?}"),
+            Ok(_) => panic!("expected Config error for oversized batch plan, got Ok"),
         }
     }
 }
