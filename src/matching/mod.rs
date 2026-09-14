@@ -13,7 +13,7 @@
 //! | [`WangMatcher`] | [`WangFingerprint`](crate::classical::WangFingerprint) | Offset-histogram voter (Shazam-style) |
 //! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | 2-D Hough + optional RANSAC (tempo-invariant) |
 //! | [`HaitsmaMatcher`] | [`HaitsmaFingerprint`](crate::classical::HaitsmaFingerprint) | BER sliding + sub-fingerprint LUT |
-//! | [`NeuralMatcher`] | [`NeuralFingerprint`](crate::neural::NeuralFingerprint) | Cosine similarity (requires the `neural` feature) |
+//! | [`NeuralMatcher`](https://docs.rs/audiofp/latest/audiofp/matching/struct.NeuralMatcher.html) | [`NeuralFingerprint`](https://docs.rs/audiofp/latest/audiofp/neural/struct.NeuralFingerprint.html) | Cosine similarity (requires the `neural` feature) |
 //!
 //! # Quick example
 //!

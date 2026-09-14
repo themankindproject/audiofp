@@ -33,10 +33,12 @@ impl Rng {
         self.0
     }
 
+    /// Uniform sample in `[0, 1)`.
     fn f32(&mut self) -> f32 {
-        (self.next() as i64 as f32) / (i64::MAX as f32)
+        (self.next() >> 11) as f32 / ((1u64 << 53) as f32)
     }
 
+    /// Uniform sample in `[-1, 1)`.
     fn f32_bipolar(&mut self) -> f32 {
         self.f32() * 2.0 - 1.0
     }
@@ -418,4 +420,29 @@ fn resonator(x: f32, state: &mut [f32; 2], r: f32, theta: f32) -> f32 {
     state[1] = state[0];
     state[0] = y;
     y * (1.0 - r * r) // normalize gain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Rng;
+
+    #[test]
+    fn rng_samples_stay_in_declared_ranges() {
+        let mut rng = Rng(0xDEAD_BEEF);
+        let mut sum = 0.0f64;
+        for _ in 0..10_000 {
+            let u = rng.f32();
+            assert!((0.0..1.0).contains(&u), "unit sample out of range: {u}");
+            let b = rng.f32_bipolar();
+            assert!((-1.0..1.0).contains(&b), "bipolar sample out of range: {b}");
+            sum += b as f64;
+        }
+        // Old signed-cast mapping biased low; a fair bipolar stream should
+        // centre near zero (not a golden — just a sanity bound).
+        assert!(
+            sum.abs() < 2_000.0,
+            "bipolar stream looks DC-biased: mean={}",
+            sum / 10_000.0
+        );
+    }
 }

@@ -8,6 +8,9 @@ use audiofp::io::{DecodeLimits, decode_to_mono, decode_to_mono_at, decode_to_mon
 use audiofp::{AfpError, Fingerprinter, SampleRate};
 use std::collections::HashSet;
 
+mod common;
+use common::temp::TempPath;
+
 // ═══════════════════════════════════════════════════════════════════
 // Phase C: Segment/offset matching, gain invariance, determinism
 // ═══════════════════════════════════════════════════════════════════
@@ -254,20 +257,17 @@ fn short_audio_returns_audio_too_short() {
 
 #[test]
 fn empty_file_returns_io_error() {
-    let path = std::env::temp_dir().join("audiofp_empty_test.wav");
-    std::fs::write(&path, b"").unwrap();
-    let result = decode_to_mono(&path);
-    std::fs::remove_file(&path).ok();
+    let scratch = TempPath::new("empty_wav", false);
+    std::fs::write(scratch.path(), b"").unwrap();
+    let result = decode_to_mono(scratch.path());
     assert!(result.is_err());
 }
 
 #[test]
 fn corrupt_header_returns_io_error() {
-    let path = std::env::temp_dir().join("audiofp_corrupt_test.wav");
-    // Write 200 bytes of garbage
-    std::fs::write(&path, vec![0u8; 200]).unwrap();
-    let result = decode_to_mono(&path);
-    std::fs::remove_file(&path).ok();
+    let scratch = TempPath::new("corrupt_wav", false);
+    std::fs::write(scratch.path(), vec![0u8; 200]).unwrap();
+    let result = decode_to_mono(scratch.path());
     assert!(result.is_err());
 }
 
@@ -318,14 +318,14 @@ fn odd_sample_rates_resample_correctly() {
 #[test]
 fn multichannel_wav_decodes_to_mono() {
     // Create a stereo WAV in memory and verify it decodes
-    let path = std::env::temp_dir().join("audiofp_stereo_test.wav");
+    let scratch = TempPath::new("stereo_wav", false);
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: 16_000,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+    let mut writer = hound::WavWriter::create(scratch.path(), spec).unwrap();
     for i in 0..16_000 {
         let s = (i as f32 * 0.01).sin() * 16000.0;
         writer.write_sample(s as i16).unwrap(); // Left
@@ -333,8 +333,7 @@ fn multichannel_wav_decodes_to_mono() {
     }
     writer.finalize().unwrap();
 
-    let (samples, sr) = decode_to_mono(&path).unwrap();
-    std::fs::remove_file(&path).ok();
+    let (samples, sr) = decode_to_mono(scratch.path()).unwrap();
     assert_eq!(sr, 16_000);
     assert_eq!(samples.len(), 16_000);
 }
@@ -342,14 +341,14 @@ fn multichannel_wav_decodes_to_mono() {
 #[test]
 fn six_channel_wav_decodes_to_mono() {
     // 5.1 surround
-    let path = std::env::temp_dir().join("audiofp_51_test.wav");
+    let scratch = TempPath::new("surround_wav", false);
     let spec = hound::WavSpec {
         channels: 6,
         sample_rate: 48_000,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+    let mut writer = hound::WavWriter::create(scratch.path(), spec).unwrap();
     for i in 0..48_000 {
         let s = (i as f32 * 0.005).sin() * 10000.0;
         for _ in 0..6 {
@@ -358,8 +357,7 @@ fn six_channel_wav_decodes_to_mono() {
     }
     writer.finalize().unwrap();
 
-    let (samples, sr) = decode_to_mono(&path).unwrap();
-    std::fs::remove_file(&path).ok();
+    let (samples, sr) = decode_to_mono(scratch.path()).unwrap();
     assert_eq!(sr, 48_000);
     assert_eq!(samples.len(), 48_000);
 }

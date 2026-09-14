@@ -230,8 +230,9 @@ fn real_audio_streaming_equivalence() {
 
     let chunk_sizes = [128, 512, 1024, 256, 2048, 128];
     let mut cursor = 0;
+    let mut chunk_idx = 0usize;
     while cursor < samples_8k.len() {
-        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
+        let chunk_len = chunk_sizes[chunk_idx % chunk_sizes.len()].min(samples_8k.len() - cursor);
         let end = cursor + chunk_len;
         online_wang.extend(
             wang_stream
@@ -241,6 +242,7 @@ fn real_audio_streaming_equivalence() {
                 .map(|(_, h)| h),
         );
         cursor = end;
+        chunk_idx += 1;
     }
     online_wang.extend(wang_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
@@ -260,8 +262,9 @@ fn real_audio_streaming_equivalence() {
     let mut panako_stream = StreamingPanako::default();
     let mut online_panako = Vec::new();
     let mut cursor = 0;
+    chunk_idx = 0;
     while cursor < samples_8k.len() {
-        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_8k.len() - cursor);
+        let chunk_len = chunk_sizes[chunk_idx % chunk_sizes.len()].min(samples_8k.len() - cursor);
         let end = cursor + chunk_len;
         online_panako.extend(
             panako_stream
@@ -271,6 +274,7 @@ fn real_audio_streaming_equivalence() {
                 .map(|(_, h)| h),
         );
         cursor = end;
+        chunk_idx += 1;
     }
     online_panako.extend(panako_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
@@ -291,8 +295,9 @@ fn real_audio_streaming_equivalence() {
     let mut haitsma_stream = StreamingHaitsma::default();
     let mut online_haitsma = Vec::new();
     let mut cursor = 0;
+    chunk_idx = 0;
     while cursor < samples_5k.len() {
-        let chunk_len = chunk_sizes[cursor % chunk_sizes.len()].min(samples_5k.len() - cursor);
+        let chunk_len = chunk_sizes[chunk_idx % chunk_sizes.len()].min(samples_5k.len() - cursor);
         let end = cursor + chunk_len;
         online_haitsma.extend(
             haitsma_stream
@@ -302,10 +307,48 @@ fn real_audio_streaming_equivalence() {
                 .map(|(_, h)| h),
         );
         cursor = end;
+        chunk_idx += 1;
     }
     online_haitsma.extend(haitsma_stream.flush().unwrap().into_iter().map(|(_, h)| h));
 
     assert_eq!(off_haitsma, online_haitsma);
+}
+
+#[test]
+fn real_audio_streaming_timestamps_are_monotonic() {
+    use audiofp::TimestampMs;
+
+    let path = "tests/assets/speech.ogg";
+    let samples = decode_to_mono_at(path, 8_000).expect("failed to decode at 8kHz");
+    let chunk_sizes = [128, 512, 1024, 256, 2048, 128];
+
+    let mut stream = StreamingWang::default();
+    let mut last = TimestampMs(0);
+    let mut cursor = 0usize;
+    let mut chunk_idx = 0usize;
+    while cursor < samples.len() {
+        let chunk_len = chunk_sizes[chunk_idx % chunk_sizes.len()].min(samples.len() - cursor);
+        let end = cursor + chunk_len;
+        for (ts, _) in stream.push(&samples[cursor..end]).unwrap() {
+            assert!(
+                ts.0 >= last.0,
+                "Wang streaming timestamp went backwards: {} -> {}",
+                last.0,
+                ts.0
+            );
+            last = ts;
+        }
+        cursor = end;
+        chunk_idx += 1;
+    }
+    for (ts, _) in stream.flush().unwrap() {
+        assert!(ts.0 >= last.0, "flush timestamp went backwards");
+        last = ts;
+    }
+    assert!(
+        last.0 > 0,
+        "fixture should emit at least one timestamped hash"
+    );
 }
 
 #[test]

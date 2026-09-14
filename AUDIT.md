@@ -1,5 +1,18 @@
 # audiofp — Deep Audit Report
 
+> **Superseded for remediation tracking (2026-03).** The authoritative,
+> reproduction-backed audit for commit `1a055a5` / `origin/main` @ `dfd42cc`
+> is the read-only report at `audiofp-audit-1a055a5/AUDIT-1a055a5.md`
+> (findings F01–F25 with evidence). This file retains the earlier in-tree
+> pass for historical context; several “fixed” claims below were incomplete
+> or stale when re-verified. **Remaining unknowns / open work (sibling
+> worktrees):** F01 streaming flush hash loss, F02–F05 matching/index
+> correctness, F06–F12 I/O/cache hardening, F13–F17 DSP/neural metadata,
+> MP3-only ungated WAV unit tests, and full benchmark timer boundaries
+> (F23). This worktree addresses **F18–F22, F25** and doc/CI gates; fuzz
+> targets call `flush_complete` (build blocked until the streaming PR stacks).
+> Per-file status: `afp-remediation/logs/verification-followup-final.md`.
+
 **Scope:** the whole `audiofp` v0.4.2 crate (`src/`, 24 files / ~28.7 kLOC),
 plus `tests/`, `fuzz/`, `benches/`, `examples/`, CI, and the long-form docs.
 **Method:** full read of every source file; five parallel deep audits

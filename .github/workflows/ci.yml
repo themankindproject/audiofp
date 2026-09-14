@@ -61,7 +61,7 @@ jobs:
   # Linux rather than on the 3-OS matrix (Windows runners don't expose
   # a reliable `python3`).
   usage-snippets:
-    name: USAGE.md snippet check
+    name: doc snippet check (USAGE/README/SECURITY)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +69,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: compile + run rust snippets
         run: python3 scripts/check_usage_snippets.py
+      - name: checker regression tests
+        run: |
+          python3 scripts/test_check_usage_snippets.py
+          python3 scripts/test_shell_scripts.py
+          python3 scripts/test_fuzz_smoke_all11.py
+
+  allocation-tests:
+    name: allocation regressions (std, no mimalloc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: zero-alloc streaming + index allocation tests
+        run: cargo test --features std --test zero_alloc --test index_alloc
+
+  doc-minimal:
+    name: rustdoc (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc --no-default-features
+        run: cargo doc --no-deps --no-default-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  doc-std:
+    name: rustdoc (bare std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc --features std
+        run: cargo doc --no-deps --features std
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   golden:
     name: golden hash drift
@@ -193,9 +232,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
-      - name: fuzz smoke test (all 11 targets, 30s each)
-        run: |
-          for target in streaming_wang_equiv streaming_panako_equiv streaming_haitsma_equiv wang_hash_roundtrip panako_hash_roundtrip haitsma_hash_roundtrip sinc_resampler decode_bytes decode_resample serial_roundtrip matching_malformed; do
-            echo "=== Fuzzing $target ==="
-            cargo +nightly fuzz run --sanitizer=none "$target" -- -max_total_time=30 -runs=1000
-          done
+      - name: fuzz smoke test (all 11 targets, bounded runs)
+        run: bash scripts/fuzz_smoke_all11.sh

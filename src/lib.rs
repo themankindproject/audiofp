@@ -7,9 +7,11 @@
 //!
 //! The crate is **`no_std + alloc`** in API shape when the `std`
 //! feature is disabled, but the current FFT dependency chain still
-//! keeps the no_std path host-only today. The file decoder ([`io`]) and
-//! watermark detector ([`watermark`]) live behind feature flags and
-//! require `std`.
+//! keeps the no_std path host-only today. The file decoder
+//! ([`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html), behind
+//! `std-*` codec features) and watermark detector
+//! ([`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html),
+//! feature `watermark`) live behind feature flags and require `std`.
 //!
 //! # Quick tour
 //!
@@ -48,8 +50,8 @@
 //! on invalid configs; each has a `try_new` counterpart returning
 //! `Result`.
 //!
-//! [`neural::StreamingNeuralEmbedder::push`]: crate::neural::StreamingNeuralEmbedder::push
-//! [`neural::StreamingNeuralEmbedder::try_push`]: crate::neural::StreamingNeuralEmbedder::try_push
+//! [`neural::StreamingNeuralEmbedder::push`]: https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.push
+//! [`neural::StreamingNeuralEmbedder::try_push`]: https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.try_push
 //! [`ShortTimeFFT::new`]: crate::dsp::stft::ShortTimeFFT::new
 //!
 //! # Example
@@ -86,21 +88,21 @@
 //!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |         | Symphonia itself (no codecs). Also enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature for [`io`]. |
-//! | `std-wav`    |         | WAV + raw PCM decoding → [`io`].                                  |
-//! | `std-mp3`    |         | MP3 decoding → [`io`].                                            |
-//! | `std-flac`   |         | FLAC decoding → [`io`].                                           |
-//! | `std-ogg`    |         | Ogg-Vorbis decoding → [`io`].                                     |
-//! | `std-aac`    |         | AAC decoding → [`io`].                                            |
-//! | `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF decoding → [`io`].                          |
-//! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`]. |
-//! | `all-codecs` |         | Every format/codec above at once → [`io`] (the pre-0.4.0 `std`). |
+//! | `std`        |         | Symphonia itself (no codecs). Also enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature for [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
+//! | `std-wav`    |         | WAV + raw PCM decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                  |
+//! | `std-mp3`    |         | MP3 decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                            |
+//! | `std-flac`   |         | FLAC decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                           |
+//! | `std-ogg`    |         | Ogg-Vorbis decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                     |
+//! | `std-aac`    |         | AAC decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                            |
+//! | `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                          |
+//! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
+//! | `all-codecs` |         | Every format/codec above at once → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html) (the pre-0.4.0 `std`). |
 //! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] (implies `std`). |
-//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`] (implies `std`). |
-//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`]); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
+//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html) (implies `std`). |
+//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`](https://docs.rs/audiofp/latest/audiofp/neural/index.html)); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator (implies `std`). |
 //!
-//! [`fingerprint_batch_parallel`]: crate::fingerprint_batch_parallel
+//! [`fingerprint_batch_parallel`]: https://docs.rs/audiofp/latest/audiofp/fn.fingerprint_batch_parallel.html
 //!
 //! See [`USAGE.md`](https://github.com/themankindproject/audiofp/blob/main/USAGE.md)
 //! for the complete API guide.

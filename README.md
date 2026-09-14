@@ -34,16 +34,16 @@ Perfect for:
 
 - **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
 - **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC) / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` accelerators for 1:N identification. No persistence or DB adapters.
-- **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` (verified by the test suite at every chunk size).
+- **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` when you finalise with `flush_complete` (legacy `flush` is retained for byte-identical older streams).
 - **Bit-Exact Determinism** - Same input always produces the same hashes; verified down to 1-sample-per-push streaming chunks
 - **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization
 - **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
 - **High-Quality Resampling** - Built-in windowed-sinc Kaiser resampler with auto anti-aliasing cutoff
 - **Watermark Detection** - AudioSeal-compatible ONNX wrapper (Tract backend); typed model is cached per input length and rebuilt automatically when the length changes
-- **Neural Embedder** - Generic ONNX log-mel embedder with offline + streaming modes; build-once-runnable, zero-alloc `try_push_with` callback (scratch is allocated at construction, reused on every push)
+- **Neural Embedder** - Generic ONNX log-mel embedder with offline + streaming modes; `try_push_with` reuses a caller-sized embedding scratch buffer (Tract may still allocate per inference window — see `neural::StreamingNeuralEmbedder` docs)
 - **DSP Primitives Reusable** - Public `dsp::stft`, `dsp::mel`, `dsp::peaks`, `dsp::resample`, `dsp::windows`
-- **Allocation-Free Hot Path** - Streaming `push` reuses pre-allocated scratch after warmup
-- **`no_std + alloc` Capable** - DSP and classical fingerprinters compile without std (host-only today; bare-metal in roadmap)
+- **Low-Allocation Hot Path** - Classical streaming `push` reuses pre-allocated scratch after warmup (`ZeroAllocStreaming`; neural/watermark ONNX paths may still allocate per inference window)
+- **`no_std + alloc` API Shape** - DSP and classical fingerprinters compile without `std` on the host today (FFT dependency chain is not bare-metal ready yet)
 - **Feature-Gated Heavy Deps** - Symphonia and Tract both opt-in via Cargo features
 - **Optional `mimalloc`** - Single-flag opt-in to install `mimalloc` as the global allocator
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{} hashes at {:.1} fps", fp.hashes.len(), fp.frames_per_sec);
     for h in fp.hashes.iter().take(5) {
-        println!("  t_anchor={.0} hash={:08x}", h.t_anchor, h.hash);
+        println!("  t_anchor={} hash={:08x}", h.t_anchor, h.hash);
     }
 
     Ok(())

@@ -1,7 +1,7 @@
 //! Enroll an audio file by computing its Wang fingerprint.
 //!
 //! ```bash
-//! cargo run --example enroll_file -- path/to/song.flac
+//! cargo run --example enroll_file --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- path/to/song.flac
 //! ```
 //!
 //! Decodes any Symphonia-supported format, resamples to Wang's 8 kHz, and

@@ -68,14 +68,14 @@ use audiofp::prelude::*;
 fn enroll_trusted(path: &str) -> audiofp::Result<WangFingerprint> {
     let samples = decode_to_mono_at(path, 8_000)?;
     let mut wang = Wang::default();
-    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+    wang.extract(&samples, SampleRate::HZ_8000)
 }
 
 fn enroll_upload(path: &str) -> audiofp::Result<WangFingerprint> {
     let limits = DecodeLimits::both(50 * 1024 * 1024, 30 * 60 * 8_000);
     let samples = decode_to_mono_at_limited(path, 8_000, limits)?;
     let mut wang = Wang::default();
-    wang.extract(AudioBuffer::new(&samples, SampleRate::HZ_8000))
+    wang.extract(&samples, SampleRate::HZ_8000)
 }
 ```
 

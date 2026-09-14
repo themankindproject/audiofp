@@ -59,8 +59,10 @@ const MAX_VOTES_PER_QUERY: usize = 10_000_000;
 /// the lowest reference id, because the scan is ascending). There is
 /// **no** early exit on a perfect score: a later reference can also score
 /// `1.0` with a higher prominence, so terminating early would return a
-/// different answer than [`match_ranked`] / [`par_match_best`]. For the
-/// full ranking of every reference use [`match_ranked`]; for large
+/// different answer than [`match_ranked`] /
+/// [`par_match_best`](https://docs.rs/audiofp/latest/audiofp/matching/fn.par_match_best.html)
+/// (requires `rayon`). For the full ranking of every reference use
+/// [`match_ranked`]; for large
 /// catalogs prefer the index types.
 ///
 /// # Performance

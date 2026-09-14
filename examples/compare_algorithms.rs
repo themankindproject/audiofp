@@ -1,7 +1,7 @@
 //! Run all three classical fingerprinters on the same file, side by side.
 //!
 //! ```bash
-//! cargo run --example compare_algorithms -- path/to/song.flac
+//! cargo run --example compare_algorithms --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- path/to/song.flac
 //! ```
 //!
 //! Prints output size, frame rate, and elapsed time per algorithm so you

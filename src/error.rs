@@ -110,7 +110,7 @@ pub enum AfpError {
     /// untrusted uploads in multi-tenant / FFI environments where a hung
     /// decode would block the calling thread indefinitely.
     ///
-    /// [`DecodeLimits::timeout`]: crate::io::DecodeLimits::timeout
+    /// [`DecodeLimits::timeout`]: https://docs.rs/audiofp/latest/audiofp/io/struct.DecodeLimits.html#method.timeout
     #[cfg(feature = "std")]
     #[error("decode timeout: elapsed {elapsed_ms} ms exceeds limit of {limit_ms} ms")]
     Timeout {

@@ -6,7 +6,7 @@
 //! eliminates the false positives that plague naive hash-set overlap.
 //!
 //! ```bash
-//! cargo run --example match_two_files -- song.flac song_re_encoded.mp3
+//! cargo run --example match_two_files --features std-mp3,std-flac,std-ogg,std-wav,std-mp4 -- song.flac song_re_encoded.mp3
 //! ```
 
 use audiofp::classical::{Wang, WangFingerprint};

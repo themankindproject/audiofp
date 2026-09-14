@@ -38,7 +38,10 @@ fn synth(seed: u32, sr: u32, n_samples: usize) -> Vec<f32> {
 /// Strategy: a random sequence of chunk sizes in `1..=max_chunk` whose
 /// sum is `total_samples`.
 fn chunk_pattern(total_samples: usize, max_chunk: usize) -> impl Strategy<Value = Vec<usize>> {
-    proptest::collection::vec(1usize..=max_chunk, 1..=200).prop_map(move |sizes| {
+    // Bound chunk count so proptest cannot generate thousands of 1-sample
+    // pushes (slow, and not more informative than a modest partition sweep).
+    let max_chunks = total_samples.div_ceil(max_chunk).clamp(1, 64);
+    proptest::collection::vec(1usize..=max_chunk, 1..=max_chunks).prop_map(move |sizes| {
         let mut out = Vec::with_capacity(sizes.len());
         let mut remaining = total_samples;
         for s in sizes {
