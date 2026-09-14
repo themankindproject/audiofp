@@ -318,6 +318,11 @@ pub struct WangIndex {
     /// limit during the current insert (usually empty — the common case
     /// prunes zero keys). Reused across calls; empty outside `insert`.
     touched: alloc::vec::Vec<u32>,
+    /// Stop-hash tombstones: keys pruned for exceeding the posting cap stay
+    /// suppressed for the lifetime of this index (append-only fixed policy).
+    /// Lowering `max_postings_per_hash` on a later insert can add more keys;
+    /// raising it does not resurrect stopped keys (audit F05).
+    stopped: HashMap<u32, ()>,
 }
 
 impl WangIndex {
@@ -352,6 +357,12 @@ impl WangIndex {
             }
         }
 
+        let mut stopped = hashmap_new();
+        for (key, v) in &map {
+            if (v.len() as u32) > max_postings_per_hash {
+                stopped.insert(*key, ());
+            }
+        }
         map.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         let live_count = refs.len();
@@ -364,6 +375,7 @@ impl WangIndex {
             vacant: Vec::new(),
             live_count,
             touched: Vec::new(),
+            stopped,
         }
     }
 
@@ -409,6 +421,9 @@ impl WangIndex {
         self.touched.reserve(fp.hashes.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for h in &fp.hashes {
+            if self.stopped.contains_key(&h.hash) {
+                continue;
+            }
             // Single-lookup insert: `entry` hashes once. Stop-hash
             // bookkeeping rides on the post-push length while the list is
             // already borrowed — no second lookup:
@@ -429,13 +444,12 @@ impl WangIndex {
                 self.touched.push(h.hash);
             }
         }
-        // Prune only over-limit keys (usually none). Duplicate keys re-check
-        // an already-removed key: `get` → None → skip. Untouched lists
-        // provably still satisfy the policy.
-        // `drain` keeps the scratch allocation for the next insert.
+        // Prune only over-limit keys (usually none). Tombstone pruned keys so
+        // a later insert cannot resurrect them with a short posting list.
         for key in self.touched.drain(..) {
             let drop = self.map.get(&key).is_some_and(|v| v.len() > limit);
             if drop {
+                self.stopped.insert(key, ());
                 self.map.remove(&key);
             }
         }
@@ -615,6 +629,7 @@ impl WangIndex {
         bytes += self.live.capacity() * size_of::<bool>();
         bytes += self.vacant.capacity() * size_of::<u32>();
         bytes += self.touched.capacity() * size_of::<u32>();
+        bytes += map_slot_count(&self.stopped) * (size_of::<u32>() + map_overhead_per_slot());
         bytes
     }
 
@@ -673,6 +688,13 @@ impl WangIndex {
                     if flat.len() >= MAX_VOTES_PER_QUERY {
                         break 'outer;
                     }
+                    if flat.len() == flat.capacity() {
+                        let capacity = flat
+                            .capacity()
+                            .saturating_mul(2)
+                            .clamp(4, MAX_VOTES_PER_QUERY);
+                        flat.reserve_exact(capacity - flat.len());
+                    }
                     flat.push((ref_id, tr as i64 - q_t, qi as u32));
                 }
             }
@@ -696,7 +718,6 @@ impl WangIndex {
         // after the first few candidates these stop allocating entirely.
         let mut bins: HashMap<i64, u32> = hashmap_with_capacity(256);
         let mut bin_vec: Vec<(i64, u32)> = Vec::new();
-        let mut consolidated: Vec<u32> = Vec::new();
         let mut contrib_indices: Vec<u32> = Vec::new();
 
         // Deterministic candidate order: walk the flat list in ascending
@@ -745,112 +766,25 @@ impl WangIndex {
             bin_vec.extend(bins.iter().map(|(&d, &c)| (d, c)));
             bin_vec.sort_unstable_by_key(|&(d, _)| d);
 
-            // Consolidated peak with a parallel consolidated-values
-            // vector: peak selection sums ±tol neighbours, so prominence
-            // must be computed on the same consolidated values, not on raw
-            // bin counts. This matches WangMatcher's prefix-sum
-            // consolidation on the dense histogram.
-            //
-            // O(B) sliding-window approach: since bin_vec is sorted by
-            // offset, we maintain a window [lo, hi) where all offsets are
-            // within ±tol of the current centre. The running sum is updated
-            // incrementally as the centre advances.
-            consolidated.clear();
-            consolidated.resize(bin_vec.len(), 0);
-            let mut peak_votes = 0u32;
-            let mut peak_linear_idx = 0usize;
-            // Sum of every consolidated value, accumulated in the same pass
-            // that fills `consolidated` — `sum_rest` below is then
-            // `total - peak_votes`, which removes a separate O(B) pass and
-            // avoids indexing `consolidated[peak_linear_idx]` (which was a
-            // panic edge on an empty `bin_vec` when `min_votes == 0`).
-            let mut total: u64 = 0;
-
-            if tol == 0 {
-                // Fast path: no neighbourhood, each bin stands alone.
-                for (i, &(_, c)) in bin_vec.iter().enumerate() {
-                    consolidated[i] = c;
-                    total += c as u64;
-                    if c > peak_votes {
-                        peak_votes = c;
-                        peak_linear_idx = i;
-                    }
-                }
-            } else {
-                // Sliding window: advance lo/hi pointers as centre moves.
-                let mut lo: usize = 0;
-                let mut hi: usize = 0;
-                let mut window_sum: u32 = 0;
-
-                for i in 0..bin_vec.len() {
-                    let d0 = bin_vec[i].0;
-                    // Expand hi to include all offsets ≤ d0 + tol.
-                    while hi < bin_vec.len() && bin_vec[hi].0 <= d0 + tol {
-                        window_sum += bin_vec[hi].1;
-                        hi += 1;
-                    }
-                    // Shrink lo to exclude offsets < d0 - tol.
-                    while lo < bin_vec.len() && bin_vec[lo].0 < d0 - tol {
-                        window_sum -= bin_vec[lo].1;
-                        lo += 1;
-                    }
-                    consolidated[i] = window_sum;
-                    total += window_sum as u64;
-                    if window_sum > peak_votes {
-                        peak_votes = window_sum;
-                        peak_linear_idx = i;
-                    }
-                }
-            }
-
-            // Plateau-centre tie-break: if multiple offsets share the
-            // same consolidated peak, pick the median offset of the
-            // plateau so the result is deterministic (audit 67-1).
-            //
-            // Selection without materialising the plateau: count the
-            // matches, then walk to index `count / 2`. Same median as
-            // collecting the offsets and indexing `len / 2`, but no
-            // allocation per candidate.
-            let peak_off = {
-                let fallback = || bin_vec.get(peak_linear_idx).map(|&(d, _)| d).unwrap_or(0);
-                let count = consolidated.iter().filter(|&&v| v == peak_votes).count();
-                if count == 0 {
-                    fallback()
-                } else {
-                    let mid = count / 2;
-                    let mut seen = 0usize;
-                    let mut chosen = None;
-                    for (i, &v) in consolidated.iter().enumerate() {
-                        if v == peak_votes {
-                            if seen == mid {
-                                chosen = bin_vec.get(i).map(|&(d, _)| d);
-                                break;
-                            }
-                            seen += 1;
-                        }
-                    }
-                    chosen.unwrap_or_else(fallback)
-                }
-            };
+            // Box-consolidate over every integer centre in the dense span
+            // `[-q_max, +r_max]`, including unoccupied offsets (audit F03).
+            let r_max = self.r_max.get(ref_id as usize).copied().unwrap_or(0);
+            let dmin = -(q_max as i64);
+            let dmax = r_max as i64;
+            let (peak_votes, peak_off, dense_total) =
+                super::consolidate::sparse_wang_box_peak(&bin_vec, tol, dmin, dmax);
 
             if peak_votes < cfg.min_votes {
                 continue;
             }
 
-            // Prominence with true dense-range parity with `WangMatcher`.
-            //
-            // `WangMatcher` builds a dense histogram over the full offset
-            // range `[-q_max, +r_max]` (zeros included), so its mean
-            // background divides by that whole width. This path only
-            // materialises occupied bins, so using the observed vote span
-            // would divide by a much smaller number and *understate* (or, for
-            // a single occupied bin, overstate) prominence — enough to flip
-            // `is_match` against the 1:1 matcher. Reproduce the matcher's
-            // span exactly from the query max and the stored per-reference
-            // `r_max`.
-            let r_max = self.r_max.get(ref_id as usize).copied().unwrap_or(0);
+            // Dense-range prominence within the sparse index's full span:
+            // background mean divides by the full `[-q_max, +r_max]` width,
+            // not just occupied-bin centres. Unlike the dense matcher, the
+            // sparse index need not truncate spans beyond 10M bins. Retaining
+            // those matches preserves the historical long-span index behavior.
             let dense_bins = (q_max as u64 + r_max as u64 + 1) as f32;
-            let sum_rest: u64 = total - peak_votes as u64;
+            let sum_rest: u64 = dense_total - peak_votes as u64;
             let mean_rest = sum_rest as f32 / (dense_bins - 1.0).max(1.0);
             let prominence = peak_votes as f32 / (mean_rest + 1.0);
             if prominence < cfg.min_prominence {
@@ -964,6 +898,8 @@ pub struct HaitsmaIndex {
     live_count: usize,
     /// Reused touched-key scratch for [`HaitsmaIndex::insert`].
     touched: alloc::vec::Vec<u32>,
+    /// Stop-hash tombstones (see [`WangIndex::stopped`]).
+    stopped: HashMap<u32, ()>,
 }
 
 impl HaitsmaIndex {
@@ -1002,6 +938,12 @@ impl HaitsmaIndex {
             }
         }
 
+        let mut stopped = hashmap_new();
+        for (key, v) in &lut {
+            if (v.len() as u32) > max_postings_per_hash {
+                stopped.insert(*key, ());
+            }
+        }
         // Silence/DC frames produce enormous posting lists; prune them so
         // memory and query time stay bounded.
         lut.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
@@ -1016,6 +958,7 @@ impl HaitsmaIndex {
             vacant: Vec::new(),
             live_count,
             touched: Vec::new(),
+            stopped,
         }
     }
 
@@ -1055,6 +998,9 @@ impl HaitsmaIndex {
         self.touched.reserve(fp.frames.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for (pos, &frame) in fp.frames.iter().enumerate() {
+            if self.stopped.contains_key(&frame) {
+                continue;
+            }
             // Same over-limit recording as WangIndex::insert: the prune pass
             // below is empty in the common case.
             let list = self.lut.entry(frame).or_default();
@@ -1067,6 +1013,7 @@ impl HaitsmaIndex {
         for key in self.touched.drain(..) {
             let drop = self.lut.get(&key).is_some_and(|v| v.len() > limit);
             if drop {
+                self.stopped.insert(key, ());
                 self.lut.remove(&key);
             }
         }
@@ -1444,6 +1391,8 @@ pub struct PanakoIndex {
     live_count: usize,
     /// Reused touched-key scratch for [`PanakoIndex::insert`].
     touched: alloc::vec::Vec<u32>,
+    /// Stop-hash tombstones (see [`WangIndex::stopped`]).
+    stopped: HashMap<u32, ()>,
 }
 
 impl PanakoIndex {
@@ -1471,6 +1420,12 @@ impl PanakoIndex {
             }
         }
 
+        let mut stopped = hashmap_new();
+        for (key, v) in &map {
+            if (v.len() as u32) > max_postings_per_hash {
+                stopped.insert(*key, ());
+            }
+        }
         map.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         let live_count = refs.len();
@@ -1482,6 +1437,7 @@ impl PanakoIndex {
             vacant: Vec::new(),
             live_count,
             touched: Vec::new(),
+            stopped,
         }
     }
 
@@ -1518,6 +1474,9 @@ impl PanakoIndex {
         self.touched.reserve(fp.hashes.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for h in &fp.hashes {
+            if self.stopped.contains_key(&h.hash) {
+                continue;
+            }
             // Same over-limit recording as WangIndex::insert: the prune pass
             // below is empty in the common case.
             let list = self.map.entry(h.hash).or_default();
@@ -1530,6 +1489,7 @@ impl PanakoIndex {
         for key in self.touched.drain(..) {
             let drop = self.map.get(&key).is_some_and(|v| v.len() > limit);
             if drop {
+                self.stopped.insert(key, ());
                 self.map.remove(&key);
             }
         }
@@ -1778,53 +1738,24 @@ impl PanakoIndex {
             // prominence is computed on the same neighbourhood-summed
             // values that selected the peak (parity with PanakoMatcher
             // and WangMatcher — audit B5).
+            let rows = super::consolidate::panako_scale_rows(&bin_vec);
+            let prefix = super::consolidate::panako_vote_prefix(&bin_vec);
             let mut consolidated: Vec<u32> = vec![0u32; bin_vec.len()];
             let mut peak_votes = 0u32;
             let mut peak_s_bin: u32 = 0;
             let mut peak_off_key: i64 = 0;
 
             let tol_i64 = tol;
-            for (i, &((s_bin, off_key), _)) in bin_vec.iter().enumerate() {
-                let mut neigh = 0u32;
-                // Scan backward from i.
-                let mut j = i;
-                loop {
-                    if j == 0 {
-                        break;
-                    }
-                    j -= 1;
-                    let ((ns, no), v) = bin_vec[j];
-                    if s_bin.saturating_sub(ns) > 1 {
-                        break;
-                    }
-                    // Same-scale rows are offset-ascending; once one falls
-                    // below the window, all earlier ones do too.
-                    if ns == s_bin && no < off_key - tol_i64 {
-                        break;
-                    }
-                    if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
-                        neigh += v;
-                    }
-                }
-                // Centre element.
-                neigh += bin_vec[i].1;
-                // Scan forward from i.
-                for &((ns, no), v) in &bin_vec[(i + 1)..] {
-                    if ns.saturating_sub(s_bin) > 1 {
-                        break;
-                    }
-                    if ns == s_bin && no > off_key + tol_i64 {
-                        break;
-                    }
-                    if ns.abs_diff(s_bin) <= 1 && (no - off_key).abs() <= tol_i64 {
-                        neigh += v;
-                    }
-                }
+            for i in 0..bin_vec.len() {
+                let neigh = super::consolidate::panako_neighborhood_sum(
+                    &bin_vec, &rows, &prefix, i, tol_i64,
+                );
                 consolidated[i] = neigh;
                 if neigh > peak_votes {
                     peak_votes = neigh;
-                    peak_s_bin = s_bin;
-                    peak_off_key = off_key;
+                    let ((s, o), _) = bin_vec[i];
+                    peak_s_bin = s;
+                    peak_off_key = o;
                 }
             }
 

@@ -64,6 +64,7 @@ pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
 #[cfg(feature = "rayon")]
 pub use index::{par_match_best, par_match_ranked};
 
+mod consolidate;
 mod maps;
 
 /// Signed time offset of the query relative to the reference.
@@ -210,6 +211,22 @@ pub fn score_compare(a: f32, b: f32) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
+/// Total-order score comparison for internal ranking (descending).
+///
+/// Unlike [`score_compare`], non-finite values sort after all finite scores
+/// so `sort_by` / `min_by` cannot panic on custom matcher output (audit F25).
+/// Public [`score_compare`] keeps its documented NaN-equality semantics.
+#[inline]
+#[must_use]
+pub(crate) fn score_compare_desc_rank(a: f32, b: f32) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
+    }
+}
+
 /// Compare two `MatchResult`s in descending order of quality.
 ///
 /// Primary key: score (desc).  Secondary key: prominence (desc).
@@ -217,8 +234,8 @@ pub fn score_compare(a: f32, b: f32) -> Ordering {
 #[inline]
 #[must_use]
 pub fn match_result_compare_desc(a: &MatchResult, b: &MatchResult) -> Ordering {
-    match score_compare(b.score, a.score) {
-        Ordering::Equal => score_compare(b.prominence, a.prominence),
+    match score_compare_desc_rank(a.score, b.score) {
+        Ordering::Equal => score_compare_desc_rank(a.prominence, b.prominence),
         other => other,
     }
 }
@@ -333,6 +350,25 @@ mod tests {
         assert!(
             p < 2.0,
             "expected low prominence for flat histogram, got {p}"
+        );
+    }
+
+    #[test]
+    fn match_result_compare_desc_nan_sorts_last() {
+        let finite = MatchResult {
+            score: 0.5,
+            prominence: 1.0,
+            ..MatchResult::NONE
+        };
+        let nan = MatchResult {
+            score: f32::NAN,
+            prominence: 100.0,
+            ..MatchResult::NONE
+        };
+        assert_eq!(
+            match_result_compare_desc(&finite, &nan),
+            Ordering::Less,
+            "finite must rank above NaN in desc order"
         );
     }
 

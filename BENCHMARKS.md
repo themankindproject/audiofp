@@ -38,9 +38,17 @@ Chromaprint reference fingerprint size (b64 chars): galway.flac 356 · freak.fla
   Panako/Haitsma 1:1-vote max. chromaprint = best-shift-hamming argmin.
   Margin = best − runner-up (audiofp secondary + chromaprint only; the index
   path returns a single winner).
-- **Latency** (M3): median of 3, release (lto=fat), single-threaded both
-  systems. Kernel = fingerprint on already-decoded PCM (resample included);
-  e2e = decode + kernel.
+- **Latency** (M3): median of 3 timed repetitions after one untimed warmup,
+  release (lto=fat), single-threaded both systems. Decode is timed once at
+  ingest. audiofp kernel stages are reported separately: **resample** (or a
+  PCM copy when rates agree), **extract** (fingerprint core on target-rate PCM),
+  and **kernel** (= resample + extract). chromaprint kernel is one timed step
+  (includes its internal resample). e2e = decode + kernel (audiofp e2e averages
+  the three kernels).
+- **Historical note:** the latency table below is from the 2026-08-30 harness
+  run, which excluded audiofp resampling despite claiming it was included.
+  It is not an end-to-end latency comparison. Numbers are unchanged; regenerate with
+  `cd bakeoff && cargo run --release -- --report` to refresh.
 
 ## Results
 

@@ -119,15 +119,26 @@ struct Decoded {
     decode_ms: f64,
 }
 
-/// Fingerprint data + kernel timing (median of `REPETITIONS`) for one file.
+/// Per-stage kernel timing (median of `REPETITIONS` after one warmup).
+#[derive(Debug, Clone, Copy)]
+struct KernelTiming {
+    /// Resample to the target rate, or copy PCM when native == target.
+    resample_ms: f64,
+    /// Core fingerprint extraction on target-rate PCM.
+    extract_ms: f64,
+    /// resample + extract — what a caller pays after decode.
+    kernel_ms: f64,
+}
+
+/// Fingerprint data + staged kernel timing for one file.
 struct Fps {
     wang: WangFingerprint,
     panako: PanakoFingerprint,
     haitsma: HaitsmaFingerprint,
     cp: Vec<u32>,
-    wang_ms: f64,
-    panako_ms: f64,
-    haitsma_ms: f64,
+    wang_timing: KernelTiming,
+    panako_timing: KernelTiming,
+    haitsma_timing: KernelTiming,
     cp_ms: f64,
 }
 
@@ -141,41 +152,67 @@ fn median(v: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
-/// Resample (if needed) then extract, `REPETITIONS` times.
+/// Resample (if needed) then extract, `REPETITIONS` times after one warmup.
 ///
-/// Returns the fingerprint (last run) and the median wall time (ms) of the
-/// resample + extract step. The resampler is built once and reused; the
-/// timing includes the resample because that is part of what a caller
-/// would pay when starting from native-rate PCM.
+/// Setup (resampler construction, one untimed resample+extract) stays outside
+/// the timed loop. Each timed repetition measures resample and extract
+/// separately; `kernel_ms` is their sum so comparisons include the resample
+/// work the methodology claims.
 fn extract_timed<F: Fingerprinter + Default>(
     samples: &[f32],
     native: u32,
     target: u32,
-) -> (F::Output, f64) {
+) -> (F::Output, KernelTiming) {
     let mut f = F::default();
     let rate = SampleRate::new(target).expect("non-zero target rate");
     let resampler = (native != target).then(|| SincResampler::new(native, target));
-    let input: Vec<f32> = match &resampler {
-        Some(r) => r.process(samples),
-        None => samples.to_vec(),
+
+    let resample_input = |raw: &[f32]| -> Vec<f32> {
+        match &resampler {
+            Some(r) => r.process(raw),
+            None => raw.to_vec(),
+        }
     };
-    let mut times = Vec::with_capacity(REPETITIONS);
-    let mut fp = f.extract(&input, rate).expect("extract");
+
+    // Warmup: one full resample + extract (not timed).
+    let warmup = resample_input(samples);
+    let mut fp = f.extract(&warmup, rate).expect("extract warmup");
+
+    let mut resample_times = Vec::with_capacity(REPETITIONS);
+    let mut extract_times = Vec::with_capacity(REPETITIONS);
+    let mut kernel_times = Vec::with_capacity(REPETITIONS);
     for _ in 0..REPETITIONS {
-        let t = Instant::now();
+        let t_kernel = Instant::now();
+        let t_resample = Instant::now();
+        let input = resample_input(samples);
+        let resample_ms = t_resample.elapsed().as_secs_f64() * 1e3;
+
+        let t_extract = Instant::now();
         fp = f.extract(&input, rate).expect("extract");
-        times.push(t.elapsed().as_secs_f64() * 1e3);
+        let extract_ms = t_extract.elapsed().as_secs_f64() * 1e3;
+        let kernel_ms = t_kernel.elapsed().as_secs_f64() * 1e3;
+
+        resample_times.push(resample_ms);
+        extract_times.push(extract_ms);
+        kernel_times.push(kernel_ms);
     }
-    (fp, median(&times))
+
+    let timing = KernelTiming {
+        resample_ms: median(&resample_times),
+        extract_ms: median(&extract_times),
+        kernel_ms: median(&kernel_times),
+    };
+    (fp, timing)
 }
 
-/// Extract every fingerprint + kernel timing for one decoded file.
+/// Extract every fingerprint + staged kernel timing for one decoded file.
 fn extract_all(d: &Decoded) -> Fps {
-    let (wang, wang_ms) = extract_timed::<Wang>(&d.samples, d.sr, 8_000);
-    let (panako, panako_ms) = extract_timed::<Panako>(&d.samples, d.sr, 8_000);
-    let (haitsma, haitsma_ms) = extract_timed::<Haitsma>(&d.samples, d.sr, 5_000);
+    let (wang, wang_timing) = extract_timed::<Wang>(&d.samples, d.sr, 8_000);
+    let (panako, panako_timing) = extract_timed::<Panako>(&d.samples, d.sr, 8_000);
+    let (haitsma, haitsma_timing) = extract_timed::<Haitsma>(&d.samples, d.sr, 5_000);
     let mut cp_times = Vec::with_capacity(REPETITIONS);
-    let mut cp_raw = Vec::new();
+    // Warmup once, then time (chromaprint resamples internally).
+    let mut cp_raw = cp::extract(&d.samples, d.sr);
     for _ in 0..REPETITIONS {
         let t = Instant::now();
         cp_raw = cp::extract(&d.samples, d.sr);
@@ -186,9 +223,9 @@ fn extract_all(d: &Decoded) -> Fps {
         panako,
         haitsma,
         cp: cp_raw,
-        wang_ms,
-        panako_ms,
-        haitsma_ms,
+        wang_timing,
+        panako_timing,
+        haitsma_timing,
         cp_ms: median(&cp_times),
     }
 }
@@ -322,16 +359,39 @@ fn cp_top1(query: &[u32], refs: &[Vec<u32>]) -> (usize, f32, f32) {
     (best_id, best, margin)
 }
 
+/// Top-1 identification slot with score and margin.
+///
+/// `slot == None` means the matcher/index returned no candidate (e.g.
+/// WangIndex below threshold). Never use a sentinel index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MatchSlot {
+    slot: Option<usize>,
+    score: f32,
+    margin: f32,
+}
+
+/// Resolve a catalog slot to a track display name for reporting.
+fn slot_track_name(tracks: &[Track], cat: &Catalog, slot: Option<usize>) -> &'static str {
+    match slot {
+        Some(i) if i < cat.ids.len() => tracks[cat.ids[i]].name,
+        Some(_) => "(out of range)",
+        None => "— (no match)",
+    }
+}
+
+/// Whether a top-1 slot identifies the query's source track.
+fn id_correct(cat: &Catalog, slot: Option<usize>, source_track: usize) -> bool {
+    matches!(slot, Some(i) if i < cat.ids.len() && cat.ids[i] == source_track)
+}
+
 /// One identified query row.
 struct IdRow {
     file: String,
     source_track: usize,
-    /// (catalog slot, score, margin) — margin is 0 for the index path
-    /// (it returns a single winner, not a ranked list).
-    wang: (usize, f32, f32),
-    panako: (usize, f32, f32),
-    haitsma: (usize, f32, f32),
-    cp: (usize, f32, f32),
+    wang: MatchSlot,
+    panako: MatchSlot,
+    haitsma: MatchSlot,
+    cp: MatchSlot,
     wang_query_ms: f64,
     cp_query_ms: f64,
 }
@@ -351,20 +411,45 @@ fn run_identification(tracks: &[Track], fmap: &Fmap, cat: &Catalog) -> Vec<IdRow
             // Wang: index query (primary audiofp path).
             let t = Instant::now();
             let wang = match wang_index.query(&f.wang, &WangMatchConfig::default()) {
-                Some((slot, r)) => (slot, r.score, 0.0),
-                None => (usize::MAX, 0.0, 0.0),
+                Some((slot, r)) => MatchSlot {
+                    slot: Some(slot),
+                    score: r.score,
+                    margin: 0.0,
+                },
+                None => MatchSlot {
+                    slot: None,
+                    score: 0.0,
+                    margin: 0.0,
+                },
             };
             let wang_query_ms = t.elapsed().as_secs_f64() * 1e3;
             // Panako / Haitsma: 1:1-vote max over the 9 refs (secondary).
-            let panako = best_of(&f.panako, &cat.panako, |q, r| {
-                panako_m.match_one(q, r).score
-            });
-            let haitsma = best_of(&f.haitsma, &cat.haitsma, |q, r| {
-                haitsma_m.match_one(q, r).score
-            });
+            let (panako_id, panako_score, panako_margin) =
+                best_of(&f.panako, &cat.panako, |q, r| {
+                    panako_m.match_one(q, r).score
+                });
+            let panako = MatchSlot {
+                slot: Some(panako_id),
+                score: panako_score,
+                margin: panako_margin,
+            };
+            let (haitsma_id, haitsma_score, haitsma_margin) =
+                best_of(&f.haitsma, &cat.haitsma, |q, r| {
+                    haitsma_m.match_one(q, r).score
+                });
+            let haitsma = MatchSlot {
+                slot: Some(haitsma_id),
+                score: haitsma_score,
+                margin: haitsma_margin,
+            };
             // Chromaprint: best-shift-hamming argmin.
             let t = Instant::now();
-            let cp = cp_top1(&f.cp, &cat.cp);
+            let (cp_id, cp_score, cp_margin) = cp_top1(&f.cp, &cat.cp);
+            let cp = MatchSlot {
+                slot: Some(cp_id),
+                score: cp_score,
+                margin: cp_margin,
+            };
             let cp_query_ms = t.elapsed().as_secs_f64() * 1e3;
             rows.push(IdRow {
                 file: file.to_string(),
@@ -488,9 +573,13 @@ const METHODOLOGY: &str = "\
   Panako/Haitsma 1:1-vote max. chromaprint = best-shift-hamming argmin.
   Margin = best − runner-up (audiofp secondary + chromaprint only; the index
   path returns a single winner).
-- **Latency** (M3): median of 3, release (lto=fat), single-threaded both
-  systems. Kernel = fingerprint on already-decoded PCM (resample included);
-  e2e = decode + kernel.
+- **Latency** (M3): median of 3 timed repetitions after one untimed warmup,
+  release (lto=fat), single-threaded both systems. Decode is timed once at
+  ingest. audiofp kernel stages are reported separately: **resample** (when
+  native rate ≠ target), **extract** (fingerprint core on target-rate PCM),
+  and **kernel** (= resample + extract). chromaprint kernel is one timed step
+  (includes its internal resample). e2e = decode + kernel (audiofp e2e averages
+  the three kernels).
 ";
 
 fn hash_ids(w: &WangFingerprint) -> Vec<u32> {
@@ -577,45 +666,47 @@ fn m2_table(tracks: &[Track], cat: &Catalog, rows: &[IdRow]) -> String {
     s.push_str("|---|---|---|---|---|---|---|\n");
     for r in rows {
         let src = tracks[r.source_track].name;
-        let w_ok = cat.ids[r.wang.0] == r.source_track;
-        let p_ok = cat.ids[r.panako.0] == r.source_track;
-        let h_ok = cat.ids[r.haitsma.0] == r.source_track;
-        let c_ok = cat.ids[r.cp.0] == r.source_track;
+        let w_ok = id_correct(cat, r.wang.slot, r.source_track);
+        let p_ok = id_correct(cat, r.panako.slot, r.source_track);
+        let h_ok = id_correct(cat, r.haitsma.slot, r.source_track);
+        let c_ok = id_correct(cat, r.cp.slot, r.source_track);
         s.push_str(&format!(
             "| {} | {} | {} {} | {} {} | {} {} | {} {} | {} |\n",
             r.file,
             src,
-            tracks[cat.ids[r.wang.0]].name,
+            slot_track_name(tracks, cat, r.wang.slot),
             tick(w_ok),
-            tracks[cat.ids[r.panako.0]].name,
+            slot_track_name(tracks, cat, r.panako.slot),
             tick(p_ok),
-            tracks[cat.ids[r.haitsma.0]].name,
+            slot_track_name(tracks, cat, r.haitsma.slot),
             tick(h_ok),
-            tracks[cat.ids[r.cp.0]].name,
+            slot_track_name(tracks, cat, r.cp.slot),
             tick(c_ok),
-            fmt3(r.cp.2),
+            fmt3(r.cp.margin),
         ));
     }
     let wang_correct = rows
         .iter()
-        .filter(|r| cat.ids[r.wang.0] == r.source_track)
+        .filter(|r| id_correct(cat, r.wang.slot, r.source_track))
         .count();
     let panako_correct = rows
         .iter()
-        .filter(|r| cat.ids[r.panako.0] == r.source_track)
+        .filter(|r| id_correct(cat, r.panako.slot, r.source_track))
         .count();
     let haitsma_correct = rows
         .iter()
-        .filter(|r| cat.ids[r.haitsma.0] == r.source_track)
+        .filter(|r| id_correct(cat, r.haitsma.slot, r.source_track))
         .count();
     let cp_correct = rows
         .iter()
-        .filter(|r| cat.ids[r.cp.0] == r.source_track)
+        .filter(|r| id_correct(cat, r.cp.slot, r.source_track))
         .count();
+    let wang_no_match = rows.iter().filter(|r| r.wang.slot.is_none()).count();
     s.push_str(&format!(
-        "\nTop-1 / {}: audiofp Wang {} (primary) · Panako {} · Haitsma {} · chromaprint {}\n",
+        "\nTop-1 / {}: audiofp Wang {} (primary, {} no-match) · Panako {} · Haitsma {} · chromaprint {}\n",
         rows.len(),
         wang_correct,
+        wang_no_match,
         panako_correct,
         haitsma_correct,
         cp_correct,
@@ -626,25 +717,42 @@ fn m2_table(tracks: &[Track], cat: &Catalog, rows: &[IdRow]) -> String {
 /// M3 latency tables.
 fn m3_table(tracks: &[Track], dmap: &Dmap, fmap: &Fmap, rows: &[IdRow]) -> String {
     let mut s = String::new();
-    s.push_str("Per file (median of 3). e2e = decode + kernel (3 audiofp kernels averaged).\n\n");
     s.push_str(
-        "| file | dur(s) | decode(ms) | e2e-audiofp(ms) | e2e-cp(ms) | Wang(ms) | Panako(ms) | Haitsma(ms) | cp(ms) |\n",
+        "Per file (median of 3 after warmup; decode measured once). e2e = decode + kernel. \
+         audiofp stage medians are averaged across its three algorithms and may not add \
+         exactly to the separately measured kernel median. Resample includes a PCM copy \
+         when rates already agree.\n\n",
+    );
+    s.push_str(
+        "| file | dur(s) | decode(ms) | e2e-audiofp(ms) | e2e-cp(ms) | \
+         resample(ms) | extract(ms) | kernel(ms) | cp(ms) |\n",
     );
     s.push_str("|---|---|---|---|---|---|---|---|---|\n");
     for track in tracks {
         for &file in track.variants {
             let d = &dmap[file];
             let f = &fmap[file];
+            let avg_kernel =
+                (f.wang_timing.kernel_ms + f.panako_timing.kernel_ms + f.haitsma_timing.kernel_ms)
+                    / 3.0;
+            let avg_resample = (f.wang_timing.resample_ms
+                + f.panako_timing.resample_ms
+                + f.haitsma_timing.resample_ms)
+                / 3.0;
+            let avg_extract = (f.wang_timing.extract_ms
+                + f.panako_timing.extract_ms
+                + f.haitsma_timing.extract_ms)
+                / 3.0;
             s.push_str(&format!(
                 "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
                 file,
                 d.duration,
                 d.decode_ms,
-                d.decode_ms + (f.wang_ms + f.panako_ms + f.haitsma_ms) / 3.0,
+                d.decode_ms + avg_kernel,
                 d.decode_ms + f.cp_ms,
-                f.wang_ms,
-                f.panako_ms,
-                f.haitsma_ms,
+                avg_resample,
+                avg_extract,
+                avg_kernel,
                 f.cp_ms,
             ));
         }
@@ -724,15 +832,15 @@ fn run_invariants(tracks: &[Track], fmap: &Fmap, rows: &[IdRow], cat: &Catalog) 
         }
     }
 
-    // 3. Identification floors: Wang ≥ 15/18 AND chromaprint ≥ 15/18.
+    // 3. Identification floors: Wang ≥ 15/17 AND chromaprint ≥ 15/17.
     {
         let w = rows
             .iter()
-            .filter(|r| cat.ids[r.wang.0] == r.source_track)
+            .filter(|r| id_correct(cat, r.wang.slot, r.source_track))
             .count();
         let c = rows
             .iter()
-            .filter(|r| cat.ids[r.cp.0] == r.source_track)
+            .filter(|r| id_correct(cat, r.cp.slot, r.source_track))
             .count();
         n += 2;
         if w < 15 {
@@ -749,10 +857,13 @@ fn run_invariants(tracks: &[Track], fmap: &Fmap, rows: &[IdRow], cat: &Catalog) 
         for &file in track.variants {
             let f = &fmap[file];
             n += 1;
-            if f.wang_ms > 500.0 || f.panako_ms > 500.0 || f.haitsma_ms > 500.0 {
+            if f.wang_timing.kernel_ms > 500.0
+                || f.panako_timing.kernel_ms > 500.0
+                || f.haitsma_timing.kernel_ms > 500.0
+            {
                 v.push(format!(
                     "kernel latency {file}: Wang {:.0}/Panako {:.0}/Haitsma {:.0} ms ≥ 500 ms",
-                    f.wang_ms, f.panako_ms, f.haitsma_ms
+                    f.wang_timing.kernel_ms, f.panako_timing.kernel_ms, f.haitsma_timing.kernel_ms
                 ));
             }
         }
@@ -929,5 +1040,84 @@ mod tests {
                 assert!(p.exists(), "missing corpus variant {}", p.display());
             }
         }
+    }
+
+    /// F24: WangIndex `None` must not use a sentinel slot index — `m2_table`
+    /// and invariants must render/count no-match rows without indexing panic.
+    #[test]
+    fn m2_table_renders_wang_no_match_without_panic() {
+        let tracks = corpus();
+        let cat = Catalog {
+            ids: vec![0, 1],
+            wang: Vec::new(),
+            panako: Vec::new(),
+            haitsma: Vec::new(),
+            cp: Vec::new(),
+        };
+        let rows = vec![IdRow {
+            file: "synthetic.query".to_string(),
+            source_track: 0,
+            wang: MatchSlot {
+                slot: None,
+                score: 0.0,
+                margin: 0.0,
+            },
+            panako: MatchSlot {
+                slot: Some(0),
+                score: 1.0,
+                margin: 0.5,
+            },
+            haitsma: MatchSlot {
+                slot: Some(0),
+                score: 1.0,
+                margin: 0.5,
+            },
+            cp: MatchSlot {
+                slot: Some(1),
+                score: 0.1,
+                margin: 0.0,
+            },
+            wang_query_ms: 0.0,
+            cp_query_ms: 0.0,
+        }];
+        let table = m2_table(&tracks, &cat, &rows);
+        assert!(
+            table.contains("no match"),
+            "expected explicit no-match label, got:\n{table}"
+        );
+        assert!(
+            table.contains("1 no-match"),
+            "expected no-match count in summary, got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn id_correct_treats_none_as_incorrect() {
+        let cat = Catalog {
+            ids: vec![0],
+            wang: Vec::new(),
+            panako: Vec::new(),
+            haitsma: Vec::new(),
+            cp: Vec::new(),
+        };
+        assert!(!id_correct(&cat, None, 0));
+        assert!(id_correct(&cat, Some(0), 0));
+    }
+
+    #[test]
+    fn extract_timed_kernel_includes_resample_work() {
+        // Native 44.1 kHz buffer resampled down to 8 kHz: resample_ms must be
+        // non-zero and kernel_ms must be >= resample_ms + extract_ms (within fp
+        // noise — they are measured sequentially so kernel ≈ sum).
+        let samples: Vec<f32> = (0..88_200).map(|i| (i as f32 * 0.001).sin()).collect();
+        let (_, timing) = extract_timed::<Wang>(&samples, 44_100, 8_000);
+        assert!(
+            timing.resample_ms > 0.0,
+            "expected resample stage to be timed, got {timing:?}"
+        );
+        assert!(
+            timing.kernel_ms + 1e-6 >= timing.resample_ms + timing.extract_ms,
+            "kernel must cover resample+extract, got {timing:?}"
+        );
     }
 }
