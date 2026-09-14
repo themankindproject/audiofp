@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-
 - Add opt-in `flush_complete` / `flush_complete_with` for Wang and Panako to
   restore offline parity at fractional clip lengths; legacy flush is unchanged.
   Reduce Haitsma extraction memory and compact peak candidates in place without
@@ -19,12 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Correct public examples and robustness claims; strengthen fixture generators,
   chunk-pattern tests, and temporary-file isolation.
 
+- Bound cache reads on validated file handles; add atomic writes and budgeted
+  directory ingestion. Convert decoded samples directly to mono without a
+  duplicated multichannel buffer, preserve normal PCM rounding, and reject
+  strict truncation and malformed WAV header arithmetic before decoding.
+
+- Correct Wang connected-peak selection and sparse jitter voting, Panako
+  neighboring-scale consolidation, and mutable stop-hash suppression. Preserve
+  hash bytes and public layouts; incorrect match decisions can change. Reuse
+  query scratch across candidates and deduplicate Haitsma alignment checks.
+
+- Correct bakeoff resampling/timing boundaries and no-match reporting; protect
+  Chromaprint resources with RAII, compare equal-work watermark calls, and
+  run the separate bakeoff tests in CI. Published latency tables remain historical.
 
 ### Fixed
 
-Deep-audit pass across every subsystem. No hash bytes, scores, or
-`is_match` semantics change; the fixes below are correctness, safety, and
-honesty repairs.
+Earlier audit fixes below preserve hash bytes. The matching corrections
+listed above intentionally change incorrect scores and match decisions;
+public APIs and wire layouts remain compatible.
 
 - **Reachable panics from the public API on caller-constructed input.**
   `PanakoHash` documents `t_anchor < t_b < t_c` but its fields are `pub`
@@ -142,6 +154,12 @@ honesty repairs.
 
 ### Performance
 
+The measurements below describe the earlier audit implementation, not the
+final corrected matchers or the repaired benchmark harness. Follow-up A/B
+results are attached to PRs #148 and #149: Haitsma noisy matching and cold
+extraction memory improve, while corrected Wang voting has a measured
+latency cost. These changes are not a universal speedup.
+
 - **`WangIndex::query` is 56% faster; per-query allocations are down 96%.**
   `bins`, `bin_vec`, `consolidated`, the plateau `Vec`, and
   `contrib_indices` were allocated fresh for *every* candidate reference,
@@ -189,9 +207,9 @@ honesty repairs.
   | `alternating_two_lengths`, one-slot cache | 97.63 µs |
   | `alternating_two_lengths`, LRU(4) | 26.73 µs |
 
-  So alternating lengths go from **97.63 µs to 26.73 µs (−72.6%)** and stop
-  costing ~2.8× a fixed-length call. (`same_length` is unchanged at
-  ~35–36 µs; the two runs differ by noise.)
+  These historical rows performed unequal work and cannot establish a
+  speedup against `same_length`. PR #146 repairs call counts and workload
+  denominators; use the corrected harness for new comparisons.
 - **Audit §4.2 #9 (`HaitsmaIndex` frame storage) was measured and left
   unchanged.** The audit estimated that replacing `frames: Vec<Vec<u32>>`
   with an `Arc`/offset arena would "roughly halve memory". It does not: the

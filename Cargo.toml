@@ -78,7 +78,7 @@ default = []
 # module (`.afp` fingerprint files) and `IoError`, and just leaves
 # `audiofp::io` absent. It is never a compile error, so enabling `std`
 # through feature unification cannot break a downstream build.
-std = ["dep:symphonia", "dep:ahash"]
+std = ["dep:symphonia", "dep:ahash", "dep:rustix"]
 std-mp3 = ["std", "symphonia/mp3"]
 std-aac = ["std", "symphonia/aac"]
 std-flac = ["std", "symphonia/flac"]
@@ -156,9 +156,12 @@ realfft     = { version = "3.5.0", default-features = false }
 wide        = { version = "1.6.0", default-features = false }
 bytemuck    = { version = "1.25.0", features = ["derive", "extern_crate_alloc"] }
 ahash       = { version = "0.8.11", default-features = false, features = ["compile-time-rng"], optional = true }
-symphonia   = { version = "0.6", default-features = false, optional = true }
+symphonia   = { version = "0.6.1", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }
 tract-onnx  = { version = "0.23", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0.8", default-features = false, features = ["fs"], optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

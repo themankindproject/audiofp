@@ -64,7 +64,7 @@ fn bench_wang_one(c: &mut Criterion) {
 
     // Repeated single-reference matching against fixed audio: the exact
     // 1:1 use case C1 optimises.
-    let queries: Vec<WangFingerprint> = (1..20u32).map(|i| wang_fp(100 + i, 5)).collect();
+    let queries: Vec<WangFingerprint> = (1..21u32).map(|i| wang_fp(100 + i, 5)).collect();
     let mut g = c.benchmark_group("matching/wang_1to1_reuse");
     g.bench_function("20_queries_vs_one_ref", |b| {
         b.iter(|| {
@@ -161,18 +161,78 @@ fn bench_wang_index_insert(c: &mut Criterion) {
     // (insert is O(hashes), rebuild is O(catalog)).
     let refs: Vec<WangFingerprint> = (0..100u32).map(|i| wang_fp(10 + i, 3)).collect();
     let new_fp = wang_fp(999, 3);
+    let refs_plus_new: Vec<WangFingerprint> = {
+        let mut v = refs.clone();
+        v.push(new_fp.clone());
+        v
+    };
 
     let mut g = c.benchmark_group("matching/wang_index_insert");
     g.bench_function("insert_one_into_n100", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || WangIndex::build(&refs, 100),
-            |mut index| black_box(index.insert(black_box(&new_fp), 100)),
+            |index| black_box(index.insert(black_box(&new_fp), 100)),
             criterion::BatchSize::SmallInput,
         );
     });
-    let refs101: Vec<WangFingerprint> = (0..101u32).map(|i| wang_fp(10 + i, 3)).collect();
     g.bench_function("rebuild_n101", |b| {
-        b.iter(|| black_box(WangIndex::build(black_box(&refs101), 100)));
+        b.iter(|| black_box(WangIndex::build(black_box(&refs_plus_new), 100)));
+    });
+    g.finish();
+}
+
+fn bench_haitsma_lut_noisy(c: &mut Criterion) {
+    let samples = synth(42, 5_000, 5);
+    let fp = Haitsma::default()
+        .extract(&samples, SampleRate::HZ_5000)
+        .expect("haitsma extract");
+    let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig {
+        use_lut: true,
+        min_overlap_frames: 64,
+        ..Default::default()
+    });
+
+    let mut g = c.benchmark_group("matching/haitsma_lut_noisy");
+    g.throughput(Throughput::Elements(fp.frames.len() as u64));
+    g.bench_function("self_match_5s_lut", |b| {
+        b.iter(|| black_box(matcher.match_one(black_box(&fp), black_box(&fp))));
+    });
+    g.finish();
+}
+
+fn bench_panako_pathological_row(c: &mut Criterion) {
+    use audiofp::classical::{PanakoFingerprint, PanakoHash};
+    use audiofp::matching::{PanakoMatchConfig, PanakoMatcher};
+
+    let mut q = PanakoFingerprint {
+        hashes: Vec::new(),
+        frames_per_sec: 62.5,
+    };
+    let mut r = q.clone();
+    for i in 0..64usize {
+        q.hashes.push(PanakoHash {
+            hash: i as u32,
+            t_anchor: 100,
+            t_b: 150,
+            t_c: 200,
+        });
+        r.hashes.push(PanakoHash {
+            hash: i as u32,
+            t_anchor: 100 + (i as u32) * 4,
+            t_b: 150 + (i as u32) * 4,
+            t_c: 200 + (i as u32) * 4,
+        });
+    }
+    let matcher = PanakoMatcher::new(PanakoMatchConfig {
+        min_prominence: 0.0,
+        ransac_refine: false,
+        ..Default::default()
+    });
+
+    let mut g = c.benchmark_group("matching/panako_dense_row");
+    g.throughput(Throughput::Elements(q.hashes.len() as u64));
+    g.bench_function("wide_same_scale_row", |b| {
+        b.iter(|| black_box(matcher.match_one(black_box(&q), black_box(&r))));
     });
     g.finish();
 }
@@ -183,6 +243,8 @@ criterion_group!(
     bench_haitsma_one,
     bench_panako_one,
     bench_wang_index,
-    bench_wang_index_insert
+    bench_wang_index_insert,
+    bench_haitsma_lut_noisy,
+    bench_panako_pathological_row
 );
 criterion_main!(benches);

@@ -220,6 +220,52 @@ jobs:
         with:
           arguments: --all-features
 
+  bakeoff:
+    name: bakeoff unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: detect bakeoff-related changes
+        id: changes
+        run: |
+          PATTERN='^(bakeoff/|benches/(watermark_plans|streaming)\.rs|BENCHMARKS\.md|\.github/workflows/(bakeoff|ci)\.yml)'
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$BASE" "$HEAD" | grep -qE "$PATTERN"; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@1.93.0
+        if: steps.changes.outputs.run == 'true'
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
+        with:
+          workspaces: bakeoff
+      - name: install libchromaprint
+        if: steps.changes.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libchromaprint-dev
+      - name: cargo fmt --check
+        if: steps.changes.outputs.run == 'true'
+        working-directory: bakeoff
+        run: cargo fmt -- --check
+      - name: clippy
+        if: steps.changes.outputs.run == 'true'
+        working-directory: bakeoff
+        run: cargo clippy --all-targets -- -D warnings
+      - name: unit tests
+        if: steps.changes.outputs.run == 'true'
+        working-directory: bakeoff
+        run: cargo test
+
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest

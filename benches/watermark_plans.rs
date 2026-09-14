@@ -1,22 +1,24 @@
-//! Watermark plan-cache microbench (audit §4.2 #11).
+//! Watermark plan-cache microbench (audit §4.2 #11 / F23).
 //!
 //! ```bash
 //! cargo bench --bench watermark_plans --features watermark
 //! ```
 //!
-//! Measures `WatermarkDetector::detect` for two access patterns over the
-//! same total call count:
+//! Compares two access patterns with **equal total samples processed per
+//! timed iteration** (6144 = 4096 + 2048):
 //!
-//! * `same_length` — every call uses one length, so the plan is built once.
-//! * `alternating` — calls alternate between two lengths. With the old
-//!   single-slot cache this rebuilt the tract plan (clone + optimise) on
-//!   *every* call; with the LRU it should behave like `same_length`.
+//! * `same_length` — one `detect` on a 6144-sample buffer (one plan).
+//! * `alternating_two_lengths` — `detect(4096)` then `detect(2048)` (two
+//!   plans, LRU exercise) in the same iteration.
 //!
-//! The two groups must land within noise of each other after the fix. The
-//! audit measured 33 ms (same) vs 195 ms (alternating) before it.
+//! Throughput claims must not compare unequal work. Correctness of cache
+//! behaviour (stable results across patterns) is checked in `#[cfg(test)]`
+//! below; plan build/eviction counts are not observable from the public API
+//! without modifying the detector.
 //!
-//! The model is an identity graph built here with prost, so the bench needs
-//! no committed ONNX weights and no download.
+//! The identity ONNX stub exercises plan-cache plumbing only. Absolute timings
+//! and any relative speedup between arms are model-dependent and must not be
+//! treated as production watermark performance.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -25,6 +27,11 @@ use tract_onnx::pb;
 
 use audiofp::SampleRate;
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
+
+/// Samples processed per timed iteration in both bench arms.
+const SAMPLES_PER_ITER: usize = 6144;
+const LEN_A: usize = 4096;
+const LEN_B: usize = 2048;
 
 /// Two f32 input dims plus a symbolic time dim.
 fn f32_tensor(shapes: Vec<Option<i64>>) -> pb::type_proto::Tensor {
@@ -99,36 +106,64 @@ fn detector(path: &std::path::Path) -> WatermarkDetector {
         .expect("load bench onnx")
 }
 
+fn verify_equal_work_and_cache_correctness(path: &std::path::Path) {
+    assert_eq!(
+        LEN_A + LEN_B,
+        SAMPLES_PER_ITER,
+        "bench arms must process equal samples per iteration"
+    );
+    let rate = SampleRate::new(16_000).expect("rate");
+    let uniform: Vec<f32> = vec![0.75; SAMPLES_PER_ITER];
+    let a: Vec<f32> = vec![0.75; LEN_A];
+    let b: Vec<f32> = vec![0.75; LEN_B];
+    let mut det = detector(path);
+    let r_uniform = det.detect(&uniform, rate).expect("uniform detect");
+    let r_a = det.detect(&a, rate).expect("a detect");
+    let r_b = det.detect(&b, rate).expect("b detect");
+    assert!(
+        (r_uniform.confidence - 0.75).abs() < 1e-4,
+        "identity model confidence drift on uniform buffer"
+    );
+    assert!(
+        (r_a.confidence - 0.75).abs() < 1e-4 && (r_b.confidence - 0.75).abs() < 1e-4,
+        "identity model confidence drift on split buffers"
+    );
+    assert_eq!(
+        r_uniform.message, r_a.message,
+        "message must not depend on cache path"
+    );
+}
+
 fn bench_watermark_plans(c: &mut Criterion) {
     let path = write_model();
+    verify_equal_work_and_cache_correctness(&path);
     let rate = SampleRate::new(16_000).expect("rate");
-    let a: Vec<f32> = vec![0.5; 4096];
-    let b: Vec<f32> = vec![0.5; 2048];
+    assert_eq!(LEN_A + LEN_B, SAMPLES_PER_ITER);
+    let uniform: Vec<f32> = vec![0.5; SAMPLES_PER_ITER / 2];
+    let a: Vec<f32> = vec![0.5; LEN_A];
+    let b: Vec<f32> = vec![0.5; LEN_B];
 
     let mut g = c.benchmark_group("watermark/plan_cache");
+    g.throughput(criterion::Throughput::Elements(SAMPLES_PER_ITER as u64));
 
-    // One length throughout: the plan is built once and reused.
+    // Two calls of one length: 3072 + 3072 samples per timed iteration.
     g.bench_function("same_length", |bencher| {
         let mut det = detector(&path);
-        // Warm the plan so the measured loop is pure reuse.
-        det.detect(&a, rate).expect("warmup detect");
+        det.detect(&uniform, rate).expect("warmup detect");
         bencher.iter(|| {
-            black_box(det.detect(black_box(&a), rate).expect("detect"));
+            black_box(det.detect(black_box(&uniform), rate).expect("detect"));
+            black_box(det.detect(black_box(&uniform), rate).expect("detect"));
         });
     });
 
-    // Two lengths alternating. This is the case the LRU fixes: the old
-    // single-slot cache evicted on every switch, so every call paid a
-    // full clone + optimise of the graph.
+    // Two distinct lengths, equal total samples per iteration (4096 + 2048).
     g.bench_function("alternating_two_lengths", |bencher| {
         let mut det = detector(&path);
         det.detect(&a, rate).expect("warmup a");
         det.detect(&b, rate).expect("warmup b");
-        let mut flip = false;
         bencher.iter(|| {
-            flip = !flip;
-            let s = if flip { &a } else { &b };
-            black_box(det.detect(black_box(s), rate).expect("detect"));
+            black_box(det.detect(black_box(&a), rate).expect("detect a"));
+            black_box(det.detect(black_box(&b), rate).expect("detect b"));
         });
     });
 
