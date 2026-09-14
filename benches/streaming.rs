@@ -1,14 +1,17 @@
 //! Streaming-throughput microbenches for the classical fingerprinters.
 //!
-//! Each fingerprinter is benched in two push patterns that expose
-//! different cost centres:
+//! Each fingerprinter is benched in two ingestion patterns:
 //!
-//! - **Small chunks** (256 samples / push): mimics a realtime mic
-//!   capture loop. Per-frame overhead (allocations, drain shifts) is a
-//!   larger fraction of total work.
-//! - **Large chunks** (1 s / push): mimics offline batch ingestion. A
-//!   single push processes many frames; per-frame `drain` becomes
-//!   O(frames²) over a long buffer.
+//! - **Small chunks** (256 samples / push): mimics a realtime mic capture loop.
+//! - **Large chunks** (1 s / push): mimics offline batch ingestion.
+//!
+//! Naming conventions:
+//!
+//! - `push_flush_session`: one full pass (push all chunks + flush) per timed
+//!   iteration. Streamer construction runs in criterion's untimed setup;
+//!   destructor runs between batches (outside the timed routine).
+//! - `push_with_callback_warmed`: after an untimed warmup pass, times a single
+//!   steady-state `push_with` call — no flush, no drop in the timed routine.
 //!
 //! Run with:
 //! ```bash
@@ -43,7 +46,7 @@ fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
     out
 }
 
-fn run_in_chunks<S: StreamingFingerprinter>(s: &mut S, audio: &[f32], chunk: usize) {
+fn push_flush_session<S: StreamingFingerprinter>(s: &mut S, audio: &[f32], chunk: usize) {
     let mut start = 0;
     while start < audio.len() {
         let end = (start + chunk).min(audio.len());
@@ -53,23 +56,47 @@ fn run_in_chunks<S: StreamingFingerprinter>(s: &mut S, audio: &[f32], chunk: usi
     black_box(s.flush().unwrap());
 }
 
+fn warm_callbacks<S: StreamingFingerprinter>(s: &mut S, audio: &[f32]) {
+    for _ in 0..4 {
+        for chunk in audio.chunks(SMALL_CHUNK) {
+            s.push_with(chunk, |_, _| {}).unwrap();
+        }
+    }
+}
+
 fn bench_streaming_wang(c: &mut Criterion) {
     let audio = synth(1, 8_000, SECS);
     let large = audio.len();
+    let chunk_1s = large / SECS;
 
     let mut g = c.benchmark_group("streaming/wang");
     g.throughput(Throughput::Elements(audio.len() as u64));
-    g.bench_function("small_chunk_256", |b| {
-        b.iter_batched(
+
+    g.bench_function("push_flush_session/small_chunk_256", |b| {
+        b.iter_batched_ref(
             StreamingWang::default,
-            |mut s| run_in_chunks(&mut s, &audio, SMALL_CHUNK),
+            |s| push_flush_session(s, &audio, SMALL_CHUNK),
             criterion::BatchSize::SmallInput,
         );
     });
-    g.bench_function("large_chunk_1s", |b| {
-        b.iter_batched(
+    g.bench_function("push_flush_session/large_chunk_1s", |b| {
+        b.iter_batched_ref(
             StreamingWang::default,
-            |mut s| run_in_chunks(&mut s, &audio, large / SECS),
+            |s| push_flush_session(s, &audio, chunk_1s),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    g.throughput(Throughput::Elements(SMALL_CHUNK as u64));
+    g.bench_function("push_with_callback_warmed/small_chunk_256", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut s = StreamingWang::default();
+                warm_callbacks(&mut s, &audio);
+                s
+            },
+            |s| {
+                black_box(s.push_with(&audio[..SMALL_CHUNK], |_, _| {}).unwrap());
+            },
             criterion::BatchSize::SmallInput,
         );
     });
@@ -79,20 +106,36 @@ fn bench_streaming_wang(c: &mut Criterion) {
 fn bench_streaming_panako(c: &mut Criterion) {
     let audio = synth(2, 8_000, SECS);
     let large = audio.len();
+    let chunk_1s = large / SECS;
 
     let mut g = c.benchmark_group("streaming/panako");
     g.throughput(Throughput::Elements(audio.len() as u64));
-    g.bench_function("small_chunk_256", |b| {
-        b.iter_batched(
+
+    g.bench_function("push_flush_session/small_chunk_256", |b| {
+        b.iter_batched_ref(
             StreamingPanako::default,
-            |mut s| run_in_chunks(&mut s, &audio, SMALL_CHUNK),
+            |s| push_flush_session(s, &audio, SMALL_CHUNK),
             criterion::BatchSize::SmallInput,
         );
     });
-    g.bench_function("large_chunk_1s", |b| {
-        b.iter_batched(
+    g.bench_function("push_flush_session/large_chunk_1s", |b| {
+        b.iter_batched_ref(
             StreamingPanako::default,
-            |mut s| run_in_chunks(&mut s, &audio, large / SECS),
+            |s| push_flush_session(s, &audio, chunk_1s),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    g.throughput(Throughput::Elements(SMALL_CHUNK as u64));
+    g.bench_function("push_with_callback_warmed/small_chunk_256", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut s = StreamingPanako::default();
+                warm_callbacks(&mut s, &audio);
+                s
+            },
+            |s| {
+                black_box(s.push_with(&audio[..SMALL_CHUNK], |_, _| {}).unwrap());
+            },
             criterion::BatchSize::SmallInput,
         );
     });
@@ -102,20 +145,36 @@ fn bench_streaming_panako(c: &mut Criterion) {
 fn bench_streaming_haitsma(c: &mut Criterion) {
     let audio = synth(3, 5_000, SECS);
     let large = audio.len();
+    let chunk_1s = large / SECS;
 
     let mut g = c.benchmark_group("streaming/haitsma");
     g.throughput(Throughput::Elements(audio.len() as u64));
-    g.bench_function("small_chunk_256", |b| {
-        b.iter_batched(
+
+    g.bench_function("push_flush_session/small_chunk_256", |b| {
+        b.iter_batched_ref(
             StreamingHaitsma::default,
-            |mut s| run_in_chunks(&mut s, &audio, SMALL_CHUNK),
+            |s| push_flush_session(s, &audio, SMALL_CHUNK),
             criterion::BatchSize::SmallInput,
         );
     });
-    g.bench_function("large_chunk_1s", |b| {
-        b.iter_batched(
+    g.bench_function("push_flush_session/large_chunk_1s", |b| {
+        b.iter_batched_ref(
             StreamingHaitsma::default,
-            |mut s| run_in_chunks(&mut s, &audio, large / SECS),
+            |s| push_flush_session(s, &audio, chunk_1s),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    g.throughput(Throughput::Elements(SMALL_CHUNK as u64));
+    g.bench_function("push_with_callback_warmed/small_chunk_256", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut s = StreamingHaitsma::default();
+                warm_callbacks(&mut s, &audio);
+                s
+            },
+            |s| {
+                black_box(s.push_with(&audio[..SMALL_CHUNK], |_, _| {}).unwrap());
+            },
             criterion::BatchSize::SmallInput,
         );
     });
