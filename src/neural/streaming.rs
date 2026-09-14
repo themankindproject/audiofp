@@ -136,7 +136,7 @@ impl StreamingNeuralEmbedder {
     /// callback scratch vector (allocated once at construction). The ONNX
     /// runtime still allocates per inference call (input tensor and tract
     /// `run` internals), so this is **not** a whole-path zero-allocation
-    /// guarantee — see [`ZeroAllocStreaming`] in `fp.rs`. The sample carry
+    /// guarantee — see [`ZeroAllocStreaming`](crate::ZeroAllocStreaming). The sample carry
     /// grows only when a push larger than one analysis window arrives
     /// (amortised `O(1)` per sample).
     ///

@@ -683,7 +683,7 @@ impl StreamingPanako {
     /// Corrected end-of-stream finalisation matching offline
     /// [`Panako::extract`].
     ///
-    /// See [`StreamingWang::flush_complete`] for the legacy-vs-corrected
+    /// See [`StreamingWang::flush_complete`](super::StreamingWang::flush_complete) for the legacy-vs-corrected
     /// flush contract and when to opt in.
     pub fn flush_complete(&mut self) -> Result<Vec<(TimestampMs, PanakoHash)>> {
         let cfg = self.peak_cfg();
