@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+- Correct Wang connected-peak selection and sparse jitter voting, Panako
+  neighboring-scale consolidation, and mutable stop-hash suppression. Preserve
+  hash bytes and public layouts; incorrect match decisions can change. Reuse
+  query scratch across candidates and deduplicate Haitsma alignment checks.
+
 - Correct bakeoff resampling/timing boundaries and no-match reporting; protect
   Chromaprint resources with RAII, compare equal-work watermark calls, and
   run the separate bakeoff tests in CI. Published latency tables remain historical.
 
+
 ### Fixed
 
-Deep-audit pass across every subsystem. No hash bytes, scores, or
-`is_match` semantics change; the fixes below are correctness, safety, and
-honesty repairs.
+Earlier audit fixes below preserve hash bytes. The matching corrections
+listed above intentionally change incorrect scores and match decisions;
+public APIs and wire layouts remain compatible.
 
 - **Reachable panics from the public API on caller-constructed input.**
   `PanakoHash` documents `t_anchor < t_b < t_c` but its fields are `pub`
