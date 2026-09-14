@@ -58,13 +58,7 @@ unsafe extern "C" {
         algorithm: *mut c_int,
         base64: c_int,
     ) -> c_int;
-    fn chromaprint_decode_fingerprint_header(
-        encoded_fp: *const c_char,
-        encoded_size: c_int,
-        size: *mut c_int,
-        algorithm: *mut c_int,
-        base64: c_int,
-    ) -> c_int;
+
     fn chromaprint_dealloc(ptr: *mut c_void);
 }
 
@@ -245,17 +239,8 @@ pub fn encode_decode_roundtrip(raw: &[u32]) -> bool {
     }
     let enc = b64.as_ptr() as *const c_char;
     let enc_len = b64.len() as c_int;
-    let mut header_size: c_int = 0;
-    let mut header_algo: c_int = 0;
-    if unsafe {
-        chromaprint_decode_fingerprint_header(enc, enc_len, &mut header_size, &mut header_algo, 1)
-    } != 1
-    {
-        return false;
-    }
-    if header_size != raw.len() as c_int {
-        return false;
-    }
+    // Decode only bytes produced by our own encoder. Avoid the newer
+    // decode_fingerprint_header symbol, absent from distro chromaprint 1.5.
     let mut dec: *mut u32 = std::ptr::null_mut();
     let mut dec_size: c_int = 0;
     let mut algo: c_int = 0;
