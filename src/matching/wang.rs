@@ -93,13 +93,14 @@ impl WangRefIndex {
         if reference.hashes.is_empty() {
             return None;
         }
-        let r_hashes: alloc::vec::Vec<(u32, u32)> = reference
+        let postings =
+            SortedPostings::build_from_wang(&reference.hashes, cfg.max_postings_per_hash)?;
+        let r_max = reference
             .hashes
             .iter()
-            .map(|h| (h.hash, h.t_anchor))
-            .collect();
-        let postings = SortedPostings::build(&r_hashes, cfg.max_postings_per_hash)?;
-        let r_max = r_hashes.iter().map(|&(_, t)| t as i64).max().unwrap_or(0);
+            .map(|h| h.t_anchor as i64)
+            .max()
+            .unwrap_or(0);
         Some(Self {
             postings,
             r_max,
@@ -269,15 +270,7 @@ impl WangMatcher {
             return MatchResult::NONE;
         }
 
-        let plateau_start = consolidated
-            .iter()
-            .position(|&v| v == peak_val)
-            .unwrap_or(0);
-        let plateau_end = consolidated
-            .iter()
-            .rposition(|&v| v == peak_val)
-            .unwrap_or(0);
-        let peak_idx = (plateau_start + plateau_end) / 2;
+        let peak_idx = super::consolidate::first_connected_plateau_center(&consolidated, peak_val);
 
         // --- 5. Prominence (on consolidated histogram) ---
         let prominence = compute_prominence(&consolidated, peak_idx);
@@ -501,6 +494,36 @@ mod tests {
         let result = matcher.match_one(&query_fp, &ref_fp);
         // Should fail due to low prominence (spread out, not a sharp spike)
         assert!(!result.is_match);
+    }
+
+    #[test]
+    fn disconnected_equal_peaks_use_first_connected_plateau() {
+        let cfg = WangMatchConfig {
+            offset_tolerance_frames: 0,
+            min_votes: 4,
+            min_score: 0.1,
+            min_prominence: 1.0,
+            ..Default::default()
+        };
+        let matcher = WangMatcher::new(cfg);
+        let q = make_fp(&[10, 20, 30, 40], 0);
+        let mut r = make_fp(&[10, 20, 30, 40], 0);
+        r.hashes.extend(
+            make_fp(&[10, 20, 30, 40], 0)
+                .hashes
+                .into_iter()
+                .map(|h| WangHash {
+                    hash: h.hash,
+                    t_anchor: h.t_anchor + 1000,
+                }),
+        );
+        let result = matcher.match_one(&q, &r);
+        assert!(result.is_match, "must match first connected peak");
+        assert_eq!(
+            result.offset.frames, 0,
+            "first plateau wins over later copy"
+        );
+        assert_eq!(result.votes, 4);
     }
 
     #[test]

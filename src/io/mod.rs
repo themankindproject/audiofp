@@ -38,6 +38,8 @@
 //! [`Fingerprinter`]: crate::Fingerprinter
 //! [`SincResampler`]: crate::dsp::resample::SincResampler
 
+mod riff_preflight;
+
 pub mod decoder;
 
 pub use decoder::{
