@@ -1260,12 +1260,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn handle_reader_rejects_a_symlink_handle_without_following() {
-        use rustix::fs::{Mode, OFlags};
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt;
         let dir = TempDir::new("symlink_handle");
         let path = dir.0.join("link.afp");
         std::os::unix::fs::symlink("missing.afp", &path).unwrap();
-        let fd = rustix::fs::open(&path, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty()).unwrap();
-        let mut file = File::from(fd);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlags::PATH | OFlags::NOFOLLOW).bits() as i32)
+            .open(&path)
+            .unwrap();
         let result = read_handle_with_limit(&path, &mut file, 32);
         assert!(matches!(result, Err(AfpError::Io(ref err))
             if err.source.to_string().contains("symlink")));
