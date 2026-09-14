@@ -1474,7 +1474,7 @@ mod tests {
                 b' ', 16, 0, 0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0,
                 b'd', b'a', b't', b'a', 0, 0, 0, 0,
             ];
-            std::fs::write(&path, &bytes).unwrap();
+            std::fs::write(&path, bytes).unwrap();
             path
         }
     } // wav_tests

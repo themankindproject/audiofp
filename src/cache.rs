@@ -1111,10 +1111,10 @@ mod tests {
             max_files: Some(10),
             max_total_bytes: None,
         };
-        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        let iter = iter_cached(&dir.0, limits).unwrap();
         let mut saw_good = false;
         let mut saw_bad_err = false;
-        while let Some(item) = iter.next() {
+        for item in iter {
             match item {
                 Ok((path, _)) => {
                     assert_eq!(path.file_name().unwrap(), "good.afp");
