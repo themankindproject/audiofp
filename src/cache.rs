@@ -31,11 +31,14 @@
 //! # }
 //! ```
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, WangFingerprint};
 use crate::{AfpError, Result};
+
+static ATOMIC_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Default cap on the size of a `.afp` file that will be read.
 ///
@@ -155,31 +158,162 @@ impl CacheableFingerprint for HaitsmaFingerprint {
     }
 }
 
-/// Read a regular `.afp` file with a size cap and no symlink following.
+/// Optional aggregate limits for directory cache ingestion.
 ///
-/// Shared by [`load_from_cache`] and [`load_all_cached`]. Rejecting
-/// non-regular files (symlinks, FIFOs, devices) matters because both
-/// entry points take caller-supplied paths: a `*.afp` symlink to
-/// `/dev/zero` would otherwise make `fs::read` allocate until the
-/// process dies.
-fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
-    if !meta.file_type().is_file() {
+/// Per-file size is always capped by [`MAX_CACHE_FILE_BYTES`]; these
+/// options bound how many files and how many total payload bytes a bulk
+/// scan may retain in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheLoadLimits {
+    /// Stop after this many `.afp` files. `None` means no file-count cap.
+    pub max_files: Option<usize>,
+    /// Stop after this many bytes of successfully loaded payload. `None`
+    /// means no aggregate byte cap.
+    pub max_total_bytes: Option<u64>,
+}
+
+/// Open a cache file for reading without following symlinks.
+///
+/// On Unix the open uses `O_NOFOLLOW` and `O_NONBLOCK` so a writable
+/// parent directory cannot substitute a FIFO/device between validation
+/// and read. On Windows the open uses `FILE_FLAG_OPEN_REPARSE_POINT` so
+/// final-component reparse points are not followed and are rejected via
+/// file attributes. Parent directories must be trusted on every platform.
+/// Other platforms use a `symlink_metadata`
+/// guard before a bounded read — callers must place cache files in a
+/// **trusted parent directory** they control.
+fn open_cache_file_for_read(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use rustix::fs::OFlags;
+
+        let flags = (OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK).bits();
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(flags as i32)
+            .open(path)
+            .map_err(|e| AfpError::io_with_path(path, e))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x0020_0000): do not follow symlinks.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|e| AfpError::io_with_path(path, e))?;
+        let attrs = file
+            .metadata()
+            .map_err(|e| AfpError::io_with_path(path, e))?
+            .file_attributes();
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file (reparse point)",
+                ),
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let meta = fs::symlink_metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+        if meta.file_type().is_symlink() {
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file (symlink)",
+                ),
+            ));
+        }
+        if !meta.is_file() {
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file (FIFO or device)",
+                ),
+            ));
+        }
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| AfpError::io_with_path(path, e))
+    }
+}
+
+/// Read up to [`MAX_CACHE_FILE_BYTES`] from an already-opened regular file.
+///
+/// Metadata comes from the opened handle (not a separate path stat), and
+/// the read is capped to `MAX + 1` bytes so growth/substitution after
+/// open cannot force an unbounded allocation.
+fn read_bounded_from_handle(path: &Path, file: &mut File) -> Result<Vec<u8>> {
+    read_handle_with_limit(path, file, MAX_CACHE_FILE_BYTES)
+}
+
+fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<u8>> {
+    let meta = file
+        .metadata()
+        .map_err(|e| AfpError::io_with_path(path, e))?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
         return Err(AfpError::io_with_path(
             path,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "not a regular file (symlink, FIFO, or device)",
+                "not a regular file (symlink)",
             ),
         ));
     }
-    if meta.len() > MAX_CACHE_FILE_BYTES {
+    if !file_type.is_file() {
+        return Err(AfpError::io_with_path(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file (FIFO or device)",
+            ),
+        ));
+    }
+    if meta.len() > cap {
         return Err(AfpError::InputTooLarge {
-            limit: MAX_CACHE_FILE_BYTES as usize,
-            provided: meta.len() as usize,
+            limit: usize::try_from(cap).unwrap_or(usize::MAX),
+            provided: usize::try_from(meta.len()).unwrap_or(usize::MAX),
         });
     }
-    fs::read(path).map_err(|e| AfpError::io_with_path(path, e))
+    let mut limited = file.take(cap.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| AfpError::io_with_path(path, e))?;
+    if bytes.len() as u64 > cap {
+        return Err(AfpError::InputTooLarge {
+            limit: usize::try_from(cap).unwrap_or(usize::MAX),
+            provided: bytes.len(),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Read a regular `.afp` file with a size cap and no symlink following.
+///
+/// Shared by [`load_from_cache`], [`load_all_cached`], and
+/// [`iter_cached`]. Rejecting non-regular files (symlinks, FIFOs,
+/// devices) matters because entry points take caller-supplied paths: a
+/// `*.afp` symlink to `/dev/zero` would otherwise make `fs::read`
+/// allocate until the process dies.
+fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = open_cache_file_for_read(path)?;
+    read_bounded_from_handle(path, &mut file)
 }
 
 /// Write a fingerprint to a `.afp` cache file (the v1 blob).
@@ -192,6 +326,112 @@ fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
 /// `AfpError::Io` with the path attached on any filesystem failure.
 pub fn cache_to_file<T: CacheableFingerprint>(fp: &T, path: &Path) -> Result<()> {
     fs::write(path, fp.to_cache_bytes()).map_err(|e| AfpError::io_with_path(path, e))
+}
+
+/// RAII guard: removes the temp file on drop unless disarmed after a
+/// successful rename.
+struct AtomicTempGuard(PathBuf);
+
+impl AtomicTempGuard {
+    fn disarm(&mut self) {
+        self.0 = PathBuf::new();
+    }
+}
+
+impl Drop for AtomicTempGuard {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}
+
+/// Write a fingerprint atomically: create a private temporary sibling,
+/// write the full v1 blob, then rename into place.
+///
+/// On failure the previous file at `path` (if any) is preserved. The
+/// temporary file is removed when possible. Parent directories are **not**
+/// created (caller's job), matching [`cache_to_file`].
+///
+/// Durability: the temp file is `fsync`ed before `rename`. Parent-directory
+/// `fsync` is **not** performed — on Windows (and some network filesystems)
+/// a crash immediately after `rename` can still leave the directory entry
+/// invisible until the volume journal replays. Callers needing strict
+/// crash safety should fsync the parent directory themselves after this
+/// returns `Ok`.
+///
+/// # Errors
+///
+/// `AfpError::Io` with the path attached on any filesystem failure.
+pub fn cache_to_file_atomic<T: CacheableFingerprint>(fp: &T, path: &Path) -> Result<()> {
+    let bytes = fp.to_cache_bytes();
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = ATOMIC_TEMP_COUNTER.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "cache".into());
+
+    let mut temp_path = PathBuf::new();
+    let mut file = None;
+    for attempt in 0..8u64 {
+        let candidate = parent.join(format!(
+            ".{}.afp.tmp.{}_{}",
+            stem,
+            std::process::id(),
+            base.wrapping_add(attempt),
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(f) => {
+                temp_path = candidate;
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(AfpError::io_with_path(&candidate, e)),
+        }
+    }
+    let mut file = file.ok_or_else(|| {
+        AfpError::io_with_path(
+            parent,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique temporary cache file name",
+            ),
+        )
+    })?;
+    let mut guard = AtomicTempGuard(temp_path.clone());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
+    }
+
+    file.write_all(&bytes)
+        .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
+    file.sync_all()
+        .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
+    drop(file);
+
+    match fs::rename(&temp_path, path) {
+        Ok(()) => {
+            guard.disarm();
+            Ok(())
+        }
+        Err(e) => Err(AfpError::io_with_path(path, e)),
+    }
 }
 
 /// Load a fingerprint from a `.afp` cache file.
@@ -230,13 +470,40 @@ pub fn load_from_cache<T: CacheableFingerprint>(path: &Path) -> Result<T> {
 /// `AfpError::Io` if the directory cannot be read or any `.afp` file
 /// fails to load/parse.
 pub fn load_all_cached(dir: &Path) -> Result<Vec<(PathBuf, CachedFingerprint)>> {
+    load_all_cached_limited(dir, CacheLoadLimits::default())
+}
+
+/// Like [`load_all_cached`] with optional aggregate file-count and
+/// total-byte caps.
+///
+/// # Errors
+///
+/// Same as [`load_all_cached`], plus [`AfpError::InputTooLarge`] when an
+/// aggregate limit is exceeded (the error message names the limit).
+pub fn load_all_cached_limited(
+    dir: &Path,
+    limits: CacheLoadLimits,
+) -> Result<Vec<(PathBuf, CachedFingerprint)>> {
+    let mut out = Vec::new();
+    for item in iter_cached(dir, limits)? {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// Iterator over sorted `.afp` files in `dir` with optional aggregate
+/// limits applied as entries are loaded.
+///
+/// # Errors
+///
+/// Returns `Err` when the directory cannot be read. Individual load
+/// failures are returned as `Item = Err(...)`.
+pub fn iter_cached(dir: &Path, limits: CacheLoadLimits) -> Result<CacheDirIter> {
     let entries = fs::read_dir(dir).map_err(|e| AfpError::io_with_path(dir.to_path_buf(), e))?;
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut afp_count = 0usize;
     for entry in entries {
         let entry = entry.map_err(|e| AfpError::io_with_path(dir.to_path_buf(), e))?;
-        // `file_type()` comes from the directory entry itself (no extra
-        // `stat`, no symlink following). Symlinks are skipped: following
-        // them can escape the directory or block forever on a FIFO.
         let file_type = entry
             .file_type()
             .map_err(|e| AfpError::io_with_path(entry.path(), e))?;
@@ -248,27 +515,121 @@ pub fn load_all_cached(dir: &Path) -> Result<Vec<(PathBuf, CachedFingerprint)>> 
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case(AFP_EXT));
         if is_afp {
-            paths.push(path);
+            afp_count += 1;
+            if let Some(max_files) = limits.max_files {
+                if paths.len() < max_files {
+                    paths.push(path);
+                }
+            } else {
+                paths.push(path);
+            }
         }
     }
     paths.sort();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let bytes = read_cache_file(&path)?;
-        // `from_blob` yields `Deserialize` on every failure path today
-        // (header + payload validation); name the offending file. The
-        // `other` arm is defensive — it cannot fire while `from_blob`
-        // only constructs `Deserialize`, but if a future error variant
-        // is added there it must still propagate with its own context.
-        let fp = CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
+    let excess_files = limits
+        .max_files
+        .is_some_and(|max_files| afp_count > max_files);
+    Ok(CacheDirIter {
+        paths,
+        index: 0,
+        limits,
+        bytes_loaded: 0,
+        files_loaded: 0,
+        excess_files,
+        afp_count,
+    })
+}
+
+/// Lazy directory scan for `.afp` fingerprints.
+pub struct CacheDirIter {
+    paths: Vec<PathBuf>,
+    index: usize,
+    limits: CacheLoadLimits,
+    bytes_loaded: u64,
+    files_loaded: usize,
+    excess_files: bool,
+    afp_count: usize,
+}
+
+impl Iterator for CacheDirIter {
+    type Item = Result<(PathBuf, CachedFingerprint)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = match self.paths.get(self.index) {
+            Some(p) => {
+                self.index += 1;
+                p.clone()
+            }
+            None => {
+                if self.excess_files {
+                    self.excess_files = false;
+                    let max_files = self.limits.max_files.unwrap_or(0);
+                    return Some(Err(AfpError::InputTooLarge {
+                        limit: max_files,
+                        provided: self.afp_count,
+                    }));
+                }
+                return None;
+            }
+        };
+        if let Some(max_total) = self.limits.max_total_bytes {
+            let remaining = max_total.saturating_sub(self.bytes_loaded);
+            if remaining == 0 {
+                return Some(Err(AfpError::InputTooLarge {
+                    limit: max_total as usize,
+                    provided: self.bytes_loaded as usize + 1,
+                }));
+            }
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => return Some(Err(AfpError::io_with_path(&path, e))),
+            };
+            if meta.is_file() && meta.len() > remaining {
+                return Some(Err(AfpError::InputTooLarge {
+                    limit: max_total as usize,
+                    provided: (self.bytes_loaded + meta.len()) as usize,
+                }));
+            }
+        }
+        let cap = self
+            .limits
+            .max_total_bytes
+            .map_or(MAX_CACHE_FILE_BYTES, |max| {
+                max.saturating_sub(self.bytes_loaded)
+                    .min(MAX_CACHE_FILE_BYTES)
+            });
+        let bytes = match open_cache_file_for_read(&path)
+            .and_then(|mut file| read_handle_with_limit(&path, &mut file, cap))
+        {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Some(max_total) = self.limits.max_total_bytes {
+            let next = self.bytes_loaded.saturating_add(bytes.len() as u64);
+            if next > max_total {
+                return Some(Err(AfpError::InputTooLarge {
+                    limit: max_total as usize,
+                    provided: next as usize,
+                }));
+            }
+        }
+        let fp = match CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
             AfpError::Deserialize(msg) => {
                 AfpError::Deserialize(format!("{}: {msg}", path.display()))
             }
+            AfpError::InputTooLarge { limit, provided } => AfpError::Deserialize(format!(
+                "{}: payload exceeds limit (limit {limit}, provided {provided})",
+                path.display()
+            )),
             other => other,
-        })?;
-        out.push((path, fp));
+        }) {
+            Ok(fp) => fp,
+            Err(e) => return Some(Err(e)),
+        };
+        self.bytes_loaded += bytes.len() as u64;
+        self.files_loaded += 1;
+        Some(Ok((path, fp)))
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -590,6 +951,214 @@ mod tests {
             }),
             CachedFingerprint::Haitsma(haitsma)
         );
+    }
+
+    #[test]
+    fn cache_to_file_atomic_roundtrip() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0xABCD,
+                t_anchor: 1,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("atomic_ok");
+        let path = dir.0.join("atomic.afp");
+        cache_to_file_atomic(&fp, &path).unwrap();
+        let restored: WangFingerprint = load_from_cache(&path).unwrap();
+        assert_eq!(restored.hashes, fp.hashes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_failure_preserves_existing_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x11,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("atomic_preserve");
+        let path = dir.0.join("keep.afp");
+        cache_to_file(&fp, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut perms = std::fs::metadata(&dir.0).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir.0, perms).unwrap();
+
+        let fp2 = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x22,
+                t_anchor: 1,
+            }],
+            frames_per_sec: 62.5,
+        };
+        assert!(cache_to_file_atomic(&fp2, &path).is_err());
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "failed atomic write must not truncate cache");
+    }
+
+    #[test]
+    fn iter_cached_respects_aggregate_limits() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("iter_limits");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&fp, &dir.0.join("b.afp")).unwrap();
+
+        let limits = CacheLoadLimits {
+            max_files: Some(1),
+            max_total_bytes: None,
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        assert!(iter.next().unwrap().is_ok());
+        match iter.next() {
+            Some(Err(AfpError::InputTooLarge {
+                limit: 1,
+                provided: 2,
+            })) => {}
+            other => panic!("expected InputTooLarge when more .afp files remain, got {other:?}"),
+        }
+
+        let one = load_from_cache::<WangFingerprint>(&dir.0.join("a.afp")).unwrap();
+        let bytes_one = one.to_cache_bytes().len() as u64;
+        let limits = CacheLoadLimits {
+            max_files: None,
+            max_total_bytes: Some(bytes_one),
+        };
+        let err = load_all_cached_limited(&dir.0, limits).unwrap_err();
+        assert!(
+            matches!(err, AfpError::InputTooLarge { .. }),
+            "byte budget exhaustion must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn max_files_zero_on_nonempty_dir_errors() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("max_files_zero");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+
+        let limits = CacheLoadLimits {
+            max_files: Some(0),
+            max_total_bytes: None,
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        match iter.next() {
+            Some(Err(AfpError::InputTooLarge {
+                limit: 0,
+                provided: 1,
+            })) => {}
+            other => panic!("expected InputTooLarge for max_files=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_total_bytes_rejects_before_reading_oversized_file() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("max_bytes");
+        cache_to_file(&fp, &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&fp, &dir.0.join("b.afp")).unwrap();
+        let one_file_bytes = fp.to_cache_bytes().len() as u64;
+
+        let limits = CacheLoadLimits {
+            max_files: None,
+            max_total_bytes: Some(one_file_bytes),
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        assert!(iter.next().unwrap().is_ok(), "first file fits byte cap");
+        match iter.next() {
+            Some(Err(AfpError::InputTooLarge { .. })) => {}
+            other => panic!("expected InputTooLarge when byte budget exhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_file_errors_and_does_not_fuse_with_limits() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 1,
+                t_anchor: 0,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("corrupt_iter");
+        cache_to_file(&fp, &dir.0.join("good.afp")).unwrap();
+        std::fs::write(dir.0.join("bad.afp"), b"not a fingerprint").unwrap();
+
+        let limits = CacheLoadLimits {
+            max_files: Some(10),
+            max_total_bytes: None,
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        let mut saw_good = false;
+        let mut saw_bad_err = false;
+        while let Some(item) = iter.next() {
+            match item {
+                Ok((path, _)) => {
+                    assert_eq!(path.file_name().unwrap(), "good.afp");
+                    saw_good = true;
+                }
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("bad.afp"),
+                        "corrupt file must surface its path: {e}"
+                    );
+                    saw_bad_err = true;
+                }
+            }
+        }
+        assert!(saw_good, "good file must load before corrupt entry fails");
+        assert!(saw_bad_err, "corrupt file must fail with path in error");
+    }
+
+    #[test]
+    fn atomic_create_new_collision_preserves_existing_temp() {
+        let fp = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0xBB,
+                t_anchor: 1,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let dir = TempDir::new("atomic_collision");
+        let target = dir.0.join("keep.afp");
+        let stem = target.file_name().unwrap().to_string_lossy();
+        let base = ATOMIC_TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let colliding = dir
+            .0
+            .join(format!(".{}.afp.tmp.{}_{}", stem, std::process::id(), base,));
+        std::fs::write(&colliding, b"unrelated stale temp").unwrap();
+
+        cache_to_file_atomic(&fp, &target).unwrap();
+        assert_eq!(
+            std::fs::read(&colliding).unwrap(),
+            b"unrelated stale temp",
+            "pre-existing colliding temp path must not be deleted on create_new failure"
+        );
+        let restored: WangFingerprint = load_from_cache(&target).unwrap();
+        assert_eq!(restored.hashes, fp.hashes);
     }
 
     #[test]

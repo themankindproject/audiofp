@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Bound cache reads on validated file handles; add atomic writes and budgeted
+  directory ingestion. Convert decoded samples directly to mono without a
+  duplicated multichannel buffer, preserve normal PCM rounding, and reject
+  strict truncation and malformed WAV header arithmetic before decoding.
+
 ### Fixed
 
 Deep-audit pass across every subsystem. No hash bytes, scores, or
