@@ -61,7 +61,7 @@ jobs:
   # Linux rather than on the 3-OS matrix (Windows runners don't expose
   # a reliable `python3`).
   usage-snippets:
-    name: doc snippet check (USAGE/README/SECURITY)
+    name: doc snippet check (USAGE/README)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

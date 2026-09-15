@@ -295,11 +295,14 @@ latency): [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the threat model (audio / PCM / ONNX / hash outputs) and how to report vulnerabilities privately. Fingerprints are **perceptual**, not cryptographic MACs — use `DecodeLimits` with `decode_to_mono_limited` for untrusted uploads.
+Fingerprints are **perceptual**, not cryptographic MACs — do not use them as
+auth tokens or integrity proofs. Treat decoded audio as untrusted input and
+cap it with `DecodeLimits` / `decode_to_mono_limited`; treat ONNX model files
+as executable code and load only pinned, reviewed weights.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Quick start:
+Quick start:
 
 ```bash
 git clone https://github.com/themankindproject/audiofp && cd audiofp

@@ -69,7 +69,7 @@ Test and harness additions:
   colliding on fixed filenames under `std::env::temp_dir()`.
 - **CI gates:** allocation regressions (`std`, no mimalloc), rustdoc under
   no-default and bare-`std` feature sets, and the doc snippet check widened
-  from USAGE.md to README.md and SECURITY.md. Each new gate is covered by
+  from USAGE.md to README.md. Each new gate is covered by
   Python regression tests (`scripts/test_*.py`) so it cannot pass vacuously.
 - `DecodeLimits`, `DecodeStats`, `DecodeReport`, `FingerprintEnvelope`, and
   `CachedFingerprint` are deliberately **not** `#[non_exhaustive]`: the

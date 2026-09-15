@@ -46,9 +46,6 @@ exclude      = [
     "rust-toolchain.toml",
 
     # Contributor / governance docs.
-    "CODE_OF_CONDUCT.md",
-    "CONTRIBUTING.md",
-    "SECURITY.md",
     "CHANGELOG.md",
     "context.md",
 

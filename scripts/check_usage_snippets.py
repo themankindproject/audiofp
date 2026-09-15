@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Compile- and runtime-check every runnable rust snippet in docs.
 
-Extracts each ```rust fenced block from USAGE.md, README.md, and
-SECURITY.md, wraps it in a scratch crate that depends on the local
-audiofp checkout, and:
+Extracts each ```rust fenced block from USAGE.md and README.md, wraps it in
+a scratch crate that depends on the local audiofp checkout, and:
 
   * compiles every block (compile validity), and
   * executes every block that has no external dependency (files, ONNX
@@ -35,7 +34,7 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-ALL_DOC_FILES = (REPO / "USAGE.md", REPO / "README.md", REPO / "SECURITY.md")
+ALL_DOC_FILES = (REPO / "USAGE.md", REPO / "README.md")
 DEFAULT_FEATURES = ("all-codecs", "neural", "watermark", "rayon")
 
 # Blocks whose code touches files / models / other crates are compile-only.
@@ -52,8 +51,6 @@ SKIP_RUN = (
     "suspect",
     "cache_to_file",
     "enroll_dir",
-    "enroll_trusted",
-    "enroll_upload",
 )
 
 # Skip entire blocks when the selected feature set does not include a gate.
@@ -180,7 +177,7 @@ def main() -> int:
     ap.add_argument(
         "--docs",
         default=None,
-        help="comma-separated doc basenames to check (default: USAGE.md, README.md, SECURITY.md)",
+        help="comma-separated doc basenames to check (default: USAGE.md, README.md)",
     )
     args = ap.parse_args()
 
