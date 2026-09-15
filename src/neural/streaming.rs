@@ -109,6 +109,12 @@ impl StreamingNeuralEmbedder {
         self.core.hop_samples
     }
 
+    /// Effective embedding rate: `sample_rate / hop_samples`.
+    #[must_use]
+    pub fn effective_frames_per_sec(&self) -> f32 {
+        self.core.cfg.sample_rate as f32 / self.core.hop_samples as f32
+    }
+
     /// Same contract as [`StreamingFingerprinter::push`] but propagates
     /// inference errors instead of panicking. Prefer this entry point
     /// when you need to surface model failures.
@@ -126,14 +132,13 @@ impl StreamingNeuralEmbedder {
     /// buffer and is overwritten on the next emit — copy out before
     /// the next iteration if you need to keep it.
     ///
-    /// Performs **no audiofp-owned allocations per embedding**: the
-    /// embedding scratch is allocated once at construction (capacity =
-    /// `embedding_dim`) and reused across every emit in every push. The
-    /// ONNX runtime itself still allocates per call (tract's `run` and
-    /// the per-window input tensor), so this is not a whole-path
-    /// zero-allocation guarantee. The sample carry grows only when a push
-    /// larger than one analysis window arrives (amortised `O(1)` per
-    /// sample).
+    /// Performs **no audiofp-owned allocations per embedding** for the
+    /// callback scratch vector (allocated once at construction). The ONNX
+    /// runtime still allocates per inference call (input tensor and tract
+    /// `run` internals), so this is **not** a whole-path zero-allocation
+    /// guarantee — see [`ZeroAllocStreaming`](crate::ZeroAllocStreaming). The sample carry
+    /// grows only when a push larger than one analysis window arrives
+    /// (amortised `O(1)` per sample).
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -335,6 +340,23 @@ mod tests {
         let s = fixture();
         // window_secs = 0.25 → 250 ms.
         assert_eq!(s.latency_ms(), 250);
+    }
+
+    #[test]
+    fn effective_rate_matches_quantized_sample_hop() {
+        let mut cfg = small_cfg();
+        cfg.hop_secs = 0.10003;
+        let rate = cfg.sample_rate;
+        let mut stream = passthrough_streaming(cfg.clone()).unwrap();
+        let hop = stream.hop_samples();
+        assert_eq!(stream.effective_frames_per_sec(), rate as f32 / hop as f32);
+        assert_ne!(stream.effective_frames_per_sec(), 1.0 / cfg.hop_secs);
+        let audio = synth_audio(1, stream.window_samples() + 2 * hop, rate);
+        let output = stream.push(&audio).unwrap();
+        assert_eq!(output.len(), 3);
+        for (i, (timestamp, _)) in output.iter().enumerate() {
+            assert_eq!(timestamp.0, (i * hop * 1000 / rate as usize) as u64);
+        }
     }
 
     #[test]

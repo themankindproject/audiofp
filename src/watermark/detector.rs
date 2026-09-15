@@ -315,6 +315,44 @@ impl WatermarkDetector {
             localization,
         })
     }
+
+    /// Like [`detect`](Self::detect), but validates detection scores before
+    /// returning them: non-finite scores become [`AfpError::Inference`],
+    /// and finite scores are clamped to `[0, 1]` for both
+    /// [`WatermarkResult::confidence`] and [`WatermarkResult::localization`].
+    /// `detected` is recomputed from the clamped confidence.
+    ///
+    /// Message decoding retains the raw model contract; this method does not
+    /// validate message logits. The legacy detection method is unchanged.
+    pub fn detect_validated(
+        &mut self,
+        samples: &[f32],
+        rate: SampleRate,
+    ) -> Result<WatermarkResult> {
+        let mut result = self.detect(samples, rate)?;
+        if !result.confidence.is_finite() {
+            return Err(AfpError::Inference(format!(
+                "non-finite confidence ({})",
+                result.confidence
+            )));
+        }
+        result.confidence = result.confidence.clamp(0.0, 1.0);
+        for (i, v) in result.localization.iter_mut().enumerate() {
+            if !v.is_finite() {
+                return Err(AfpError::Inference(format!(
+                    "non-finite localization score at index {i}"
+                )));
+            }
+            *v = v.clamp(0.0, 1.0);
+        }
+        result.detected = result.confidence > self.cfg.threshold;
+        Ok(result)
+    }
+
+    /// Alias for [`detect_validated`](Self::detect_validated).
+    pub fn detect_checked(&mut self, samples: &[f32], rate: SampleRate) -> Result<WatermarkResult> {
+        self.detect_validated(samples, rate)
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +544,91 @@ mod tests {
             }
         }
 
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    #[test]
+    fn detect_validated_clamps_out_of_range_confidence() {
+        let path = crate::watermark::test_fixture::write_identity_onnx("validated");
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load identity onnx");
+        let samples: Vec<f32> = vec![-0.9; 4096];
+        let rate = SampleRate::new(16_000).expect("rate");
+        let raw = detector.detect(&samples, rate).expect("detect");
+        assert!(raw.confidence < 0.0);
+
+        let validated = detector
+            .detect_validated(&samples, rate)
+            .expect("detect_validated");
+        assert!((0.0..=1.0).contains(&validated.confidence));
+        assert_eq!(validated.confidence, 0.0);
+        assert!(!validated.detected);
+        assert_eq!(validated.localization.len(), samples.len());
+        assert!(validated.localization.iter().all(|&v| v == 0.0));
+
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    #[test]
+    fn detect_checked_accepts_in_range_toy_onnx_output() {
+        let n = 1024usize;
+        let path =
+            crate::watermark::test_fixture::write_constant_detection_onnx("checked-good", n, 0.75);
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load constant-det onnx");
+        let samples: Vec<f32> = vec![0.1; n];
+        let rate = SampleRate::new(16_000).expect("rate");
+        let r = detector
+            .detect_checked(&samples, rate)
+            .expect("detect_checked");
+        assert!(r.detected);
+        assert!((r.confidence - 0.75).abs() < 1e-5);
+        assert_eq!(r.localization.len(), n);
+        assert!(r.localization.iter().all(|&v| (v - 0.75).abs() < 1e-5));
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    #[test]
+    fn detect_checked_rejects_nonfinite_toy_onnx_output() {
+        let n = 512usize;
+        let path = crate::watermark::test_fixture::write_constant_detection_onnx(
+            "checked-nan",
+            n,
+            f32::NAN,
+        );
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load nan-det onnx");
+        let samples: Vec<f32> = vec![0.2; n];
+        let rate = SampleRate::new(16_000).expect("rate");
+        match detector.detect_checked(&samples, rate) {
+            Err(AfpError::Inference(msg)) => {
+                assert!(msg.contains("non-finite"), "unexpected: {msg}");
+            }
+            Ok(r) => panic!("expected Inference for NaN model output, got {r:?}"),
+            Err(e) => panic!("expected Inference, got {e:?}"),
+        }
+        crate::watermark::test_fixture::cleanup(&path);
+    }
+
+    #[test]
+    fn detect_checked_clamps_above_one_toy_onnx_output() {
+        let n = 256usize;
+        let path =
+            crate::watermark::test_fixture::write_constant_detection_onnx("checked-high", n, 1.5);
+        let mut detector =
+            WatermarkDetector::new(WatermarkConfig::new(path.to_string_lossy().into_owned()))
+                .expect("load high-det onnx");
+        let samples: Vec<f32> = vec![0.3; n];
+        let rate = SampleRate::new(16_000).expect("rate");
+        let r = detector
+            .detect_checked(&samples, rate)
+            .expect("detect_checked");
+        assert_eq!(r.confidence, 1.0);
+        assert!(r.detected);
+        assert!(r.localization.iter().all(|&v| v == 1.0));
         crate::watermark::test_fixture::cleanup(&path);
     }
 }

@@ -157,8 +157,17 @@ impl ShortTimeFFT {
     /// [`magnitude`]: ShortTimeFFT::magnitude
     #[must_use]
     pub const fn n_frames(&self, n_samples: usize) -> usize {
+        if n_samples == 0 {
+            return 0;
+        }
         if self.cfg.center {
-            1 + n_samples / self.cfg.hop
+            // `n_fft == 1` has zero centre padding; the legacy `1 + n/hop`
+            // formula invents a phantom trailing frame (audit F15).
+            if self.cfg.n_fft == 1 {
+                n_samples / self.cfg.hop
+            } else {
+                1 + n_samples / self.cfg.hop
+            }
         } else if n_samples < self.cfg.n_fft {
             0
         } else {
@@ -740,5 +749,33 @@ mod tests {
         assert!(empty_buf.is_empty());
         // (Don't assert capacity here — clear() is allowed to shrink.)
         let _ = initial_cap;
+    }
+
+    #[test]
+    fn n_fft_one_centered_two_samples_has_two_frames() {
+        let cfg = StftConfig {
+            n_fft: 1,
+            hop: 1,
+            window: WindowKind::Hann,
+            center: true,
+        };
+        let s = ShortTimeFFT::new(cfg);
+        assert_eq!(s.n_frames(0), 0);
+        assert_eq!(s.n_frames(2), 2);
+    }
+
+    #[test]
+    fn n_fft_one_centered_power_matches_two_frames() {
+        let mut s = ShortTimeFFT::new(StftConfig {
+            n_fft: 1,
+            hop: 1,
+            window: WindowKind::Hann,
+            center: true,
+        });
+        let samples = [2.0_f32, 3.0];
+        let (power, n_frames, _) = s.power_flat(&samples);
+        assert_eq!(n_frames, 2);
+        assert_eq!(power.len(), 2);
+        assert_eq!(power, [4.0, 9.0]);
     }
 }

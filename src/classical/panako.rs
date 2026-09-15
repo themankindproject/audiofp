@@ -285,17 +285,8 @@ impl Panako {
         progress(0.80);
         progress(0.90);
 
-        let mut hashes = build_triplet_hashes(&peaks, &self.cfg);
+        let mut hashes = build_triplet_hashes(&peaks, &self.cfg)?;
         hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
-
-        if let Some(limit) = self.cfg.max_hashes
-            && hashes.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: hashes.len(),
-            });
-        }
 
         progress(1.0);
 
@@ -378,12 +369,18 @@ impl Ord for MinByScoreOwned {
 }
 
 /// Walk `peaks` (sorted by `(t_frame, f_bin)`) and emit triplet hashes.
-fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
+fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Result<Vec<PanakoHash>> {
     let target_zone_t = cfg.target_zone_t as i32;
     let target_zone_f = cfg.target_zone_f as i32;
     let fan_out = cfg.fan_out as usize;
+    let max_hashes = cfg.max_hashes;
+    let mut total_emits = 0usize;
 
-    let mut hashes = Vec::with_capacity(peaks.len() * fan_out);
+    let capacity = peaks
+        .len()
+        .saturating_mul(fan_out)
+        .min(max_hashes.unwrap_or(usize::MAX));
+    let mut hashes = Vec::with_capacity(capacity);
 
     // Capacity heuristics; both grow on demand.
     let mut targets: Vec<&Peak> = Vec::with_capacity(64);
@@ -458,6 +455,10 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         });
 
         for (b, c, _) in &triplets {
+            total_emits += 1;
+            if max_hashes.is_some_and(|limit| total_emits > limit) {
+                continue;
+            }
             let hash = pack_triplet(anchor, b, c);
             hashes.push(PanakoHash {
                 hash,
@@ -468,7 +469,15 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Vec<PanakoHash> {
         }
     }
 
-    hashes
+    if let Some(limit) = max_hashes
+        && total_emits > limit
+    {
+        return Err(AfpError::InputTooLarge {
+            limit,
+            provided: total_emits,
+        });
+    }
+    Ok(hashes)
 }
 
 /// Pack one anchor-b-c triplet into a 32-bit hash.
@@ -669,6 +678,40 @@ impl StreamingPanako {
             ));
         }
         anchor.targets
+    }
+
+    /// Corrected end-of-stream finalisation matching offline
+    /// [`Panako::extract`].
+    ///
+    /// See [`StreamingWang::flush_complete`](super::StreamingWang::flush_complete) for the legacy-vs-corrected
+    /// flush contract and when to opt in.
+    pub fn flush_complete(&mut self) -> Result<Vec<(TimestampMs, PanakoHash)>> {
+        let cfg = self.peak_cfg();
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_flush_complete(cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
+        Ok(core::mem::take(&mut core.emitted))
+    }
+
+    /// Callback variant of [`flush_complete`](Self::flush_complete).
+    pub fn flush_complete_with<F>(&mut self, mut callback: F) -> Result<usize>
+    where
+        F: FnMut(TimestampMs, &PanakoHash),
+    {
+        let cfg = self.peak_cfg();
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.emitted.clear();
+        core.process_flush_complete(cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        });
+        let mut n = 0usize;
+        for (t, frame) in core.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        Ok(n)
     }
 }
 
@@ -1500,6 +1543,36 @@ mod tests {
         assert_eq!(via_cb, via_flush);
     }
 
+    #[test]
+    fn complete_callback_matches_offline_across_chunk_sizes() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut expected = Panako::default()
+            .extract(&samples, SampleRate::HZ_8000)
+            .unwrap()
+            .hashes;
+        assert!(!expected.is_empty());
+        expected.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+        for chunk in [1, 127, 1_024, samples.len()] {
+            let mut stream = StreamingPanako::default();
+            let mut actual = Vec::new();
+            for part in samples.chunks(chunk) {
+                stream.push_with(part, |_, h| actual.push(*h)).unwrap();
+            }
+            let before = actual.len();
+            let emitted = stream.flush_complete_with(|_, h| actual.push(*h)).unwrap();
+            assert!(emitted > 0, "fixture must exercise buffered finalization");
+            assert_eq!(actual.len() - before, emitted);
+            assert_eq!(
+                stream
+                    .flush_complete_with(|_, _| panic!("duplicate flush"))
+                    .unwrap(),
+                0
+            );
+            actual.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+            assert_eq!(actual, expected, "chunk={chunk}");
+        }
+    }
+
     // ── OOM protection: max_input_samples enforcement ──
 
     #[test]
@@ -1623,5 +1696,51 @@ mod tests {
         let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
         assert_eq!(values[0], 0.0);
         assert_eq!(*values.last().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn legacy_flush_fewer_hashes_than_offline_at_18000_samples() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut offline = Panako::default();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+        let mut streaming = StreamingPanako::default();
+        let mut legacy: Vec<PanakoHash> = streaming
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        legacy.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
+
+        assert!(legacy.len() < off.hashes.len());
+    }
+
+    #[test]
+    fn flush_complete_matches_offline_at_18000_samples() {
+        let samples = synthetic_audio(0xF01, 18_000);
+        let mut offline = Panako::default();
+        let off = offline.extract(&samples, SampleRate::HZ_8000).unwrap();
+
+        let mut streaming = StreamingPanako::default();
+        let mut online: Vec<PanakoHash> = streaming
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        online.extend(
+            streaming
+                .flush_complete()
+                .unwrap()
+                .into_iter()
+                .map(|(_, h)| h),
+        );
+
+        let mut a = off.hashes;
+        let mut b = online;
+        a.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+        b.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+        assert_eq!(a, b);
     }
 }

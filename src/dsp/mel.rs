@@ -187,7 +187,9 @@ impl MelFilterBank {
         // Mel-spaced centre points, including the left and right "skirts".
         let mel_min = scale.hz_to_mel(fmin);
         let mel_max = scale.hz_to_mel(fmax);
-        let n_points = n_mels + 2;
+        let n_points = n_mels
+            .checked_add(2)
+            .ok_or_else(|| crate::AfpError::Config("n_mels too large".into()))?;
         let mut hz_points = Vec::with_capacity(n_points);
         for k in 0..n_points {
             let mel = mel_min + (mel_max - mel_min) * k as f32 / (n_points - 1) as f32;
@@ -558,5 +560,11 @@ mod tests {
     #[should_panic(expected = "fmin must be >= 0")]
     fn mel_filter_bank_panics_on_negative_fmin() {
         let _ = MelFilterBank::new(64, 1024, 16_000, -10.0, 8_000.0, MelScale::Slaney);
+    }
+
+    #[test]
+    fn mel_try_new_huge_n_mels_is_config_error_not_panic() {
+        let err = MelFilterBank::try_new(usize::MAX, 512, 8_000, 0.0, 4_000.0, MelScale::Htk);
+        assert!(matches!(err, Err(crate::AfpError::Config(_))));
     }
 }

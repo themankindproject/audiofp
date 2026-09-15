@@ -156,11 +156,10 @@ pub struct Haitsma {
     /// (start_bin, end_bin)` (exclusive end). Eliminates per-bin branching
     /// in the energy accumulation loop and enables SIMD auto-vectorization.
     band_ranges: Vec<(usize, usize)>,
-    /// Reused buffer for per-frame band energies across `extract` calls.
-    energies_buf: Vec<[f32; HAITSMA_N_BANDS]>,
     /// Reused buffer for packed frame hashes across `extract` calls.
     frames_buf: Vec<u32>,
-    /// Reused buffer for STFT power spectrogram across `extract` calls.
+    /// Reused per-frame power spectrum (`n_bins` elements) across `extract`
+    /// calls — one STFT frame at a time via [`ShortTimeFFT::process_frame_power`].
     power_buf: Vec<f32>,
 }
 
@@ -216,7 +215,6 @@ impl Haitsma {
             cfg,
             stft,
             band_ranges,
-            energies_buf: Vec::new(),
             frames_buf: Vec::new(),
             power_buf: Vec::new(),
         })
@@ -265,13 +263,8 @@ impl Haitsma {
 
         progress(0.0);
 
-        // Pull power directly — band energy is `Σ |X|²`, so the previous
-        // path's `m * m` after a `sqrt(|X|²)` was redundant.
-        let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.power_buf);
-        let power_flat = &self.power_buf;
+        let n_frames = self.stft.n_frames(samples.len());
         if n_frames < 2 {
-            // Frame 0 has no hash, and every hash at frame n needs frame
-            // n−1's band energies — fewer than 2 frames yields zero hashes.
             progress(1.0);
             return Ok(HaitsmaFingerprint {
                 frames: Vec::new(),
@@ -279,46 +272,37 @@ impl Haitsma {
             });
         }
 
-        // Report STFT phase progress (~50% of total work for Haitsma).
+        let n_bins = self.stft.n_bins();
+        if self.power_buf.len() != n_bins {
+            self.power_buf.resize(n_bins, 0.0);
+        }
+
         let total_frames = n_frames;
-        let stft_weight = 0.50_f32;
         let interval = HAITSMA_PROGRESS_INTERVAL;
-        {
-            let mut reported = 0usize;
-            while reported + interval < total_frames {
-                reported += interval;
-                progress(stft_weight * (reported as f32 / total_frames as f32));
-            }
-        }
-        progress(stft_weight);
-
-        self.energies_buf.clear();
-        self.energies_buf.reserve(n_frames);
-        for f in 0..n_frames {
-            let row = &power_flat[f * n_bins..(f + 1) * n_bins];
-            let e = band_energies(row, &self.band_ranges);
-            self.energies_buf.push(e);
-
-            // Report progress during band energy computation (~30% of work).
-            if (f + 1) % interval == 0 {
-                let band_progress = stft_weight + 0.30 * ((f + 1) as f32 / total_frames as f32);
-                progress(band_progress);
-            }
-        }
-        progress(0.80);
 
         self.frames_buf.clear();
-        self.frames_buf.reserve(self.energies_buf.len() - 1);
-        for n in 1..self.energies_buf.len() {
-            self.frames_buf.push(pack_frame_bits(
-                &self.energies_buf[n],
-                &self.energies_buf[n - 1],
-            ));
-        }
+        self.frames_buf.reserve(total_frames.saturating_sub(1));
 
+        let hop = HAITSMA_HOP;
+        let n_fft = HAITSMA_N_FFT;
+        let mut prev_energy: Option<[f32; HAITSMA_N_BANDS]> = None;
+        for f in 0..n_frames {
+            let start = f * hop;
+            self.stft
+                .process_frame_power(&samples[start..start + n_fft], &mut self.power_buf)
+                .expect("power_buf is sized n_bins and frames are exactly n_fft");
+            let e = band_energies(&self.power_buf, &self.band_ranges);
+            if let Some(prev) = prev_energy {
+                self.frames_buf.push(pack_frame_bits(&e, &prev));
+            }
+            prev_energy = Some(e);
+
+            if (f + 1) % interval == 0 {
+                progress((f + 1) as f32 / total_frames as f32);
+            }
+        }
         progress(1.0);
 
-        // Move ownership into the return value; the struct keeps capacity.
         Ok(HaitsmaFingerprint {
             frames: core::mem::take(&mut self.frames_buf),
             frames_per_sec: HAITSMA_FRAMES_PER_SEC,

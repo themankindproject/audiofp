@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+- Add opt-in `flush_complete` / `flush_complete_with` for Wang and Panako to
+  restore offline parity at fractional clip lengths; legacy flush is unchanged.
+  Reduce Haitsma extraction memory and compact peak candidates in place without
+  changing offline hash bytes. Harden DSP sizing, add effective neural-rate
+  extraction and validated detection-score APIs, and correct allocation claims.
+
+
 - Bound cache reads on validated file handles; add atomic writes and budgeted
   directory ingestion. Convert decoded samples directly to mono without a
   duplicated multichannel buffer, preserve normal PCM rounding, and reject
@@ -22,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Correct bakeoff resampling/timing boundaries and no-match reporting; protect
   Chromaprint resources with RAII, compare equal-work watermark calls, and
   run the separate bakeoff tests in CI. Published latency tables remain historical.
+
 
 
 

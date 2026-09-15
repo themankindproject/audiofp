@@ -211,14 +211,26 @@ impl SincResampler {
             )));
         }
 
-        let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
-        let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
         let half = quality.half_taps;
         let steps = quality.polyphase_steps as usize;
         let taps = 2 * half + 1;
+        const MAX_KERNEL_TABLE_BYTES: usize = 1 << 28; // 256 MiB of f32 table
+        let table_len = steps
+            .checked_mul(taps)
+            .ok_or_else(|| crate::AfpError::Config("polyphase kernel table too large".into()))?;
+        if table_len > MAX_KERNEL_TABLE_BYTES / core::mem::size_of::<f32>() {
+            return Err(crate::AfpError::Config(alloc::format!(
+                "polyphase kernel table ({} × {} taps) exceeds {} f32 cells",
+                steps,
+                taps,
+                MAX_KERNEL_TABLE_BYTES / core::mem::size_of::<f32>(),
+            )));
+        }
 
+        let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
+        let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
         // Precompute the polyphase kernel table.
-        let mut kernel_table = vec![0.0_f32; steps * taps];
+        let mut kernel_table = vec![0.0_f32; table_len];
         let two_cutoff = 2.0 * cutoff;
         let half_f = half as f32;
         for s in 0..steps {
@@ -722,5 +734,17 @@ mod tests {
             assert!(s.is_finite(), "non-finite sample {s}");
             assert!(s.abs() <= 0.55, "gain beyond Gibbs envelope: {s}");
         }
+    }
+
+    #[test]
+    fn excessive_kernel_table_is_rejected_before_allocation() {
+        let quality = SincQuality {
+            half_taps: 1 << 16,
+            polyphase_steps: u16::MAX,
+            ..SincQuality::default()
+        };
+        let result = SincResampler::try_with_quality(8_000, 16_000, quality);
+        assert!(matches!(result, Err(crate::AfpError::Config(ref message))
+            if message.contains("polyphase kernel table") && message.contains("exceeds")));
     }
 }
