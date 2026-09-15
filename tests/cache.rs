@@ -7,7 +7,11 @@
 
 #![cfg(feature = "std")]
 
-use audiofp::cache::{CachedFingerprint, cache_to_file, load_all_cached, load_from_cache};
+use audiofp::AfpError;
+use audiofp::cache::{
+    CacheLoadLimits, CachedFingerprint, cache_to_file, cache_to_file_atomic, iter_cached,
+    load_all_cached, load_all_cached_limited, load_from_cache,
+};
 use audiofp::classical::Wang;
 use audiofp::matching::{Matcher, WangMatchConfig, WangMatcher};
 use audiofp::{Fingerprinter, SampleRate};
@@ -175,4 +179,59 @@ fn envelope_survives_cache() {
     assert_eq!(env.sample_rate, 8_000);
     assert_eq!(env.hash_count, fp.hashes.len());
     assert_eq!(env.frames_per_sec, fp.frames_per_sec);
+}
+
+// =========================================================================
+// Public atomic write + bounded directory iterator APIs
+// =========================================================================
+
+#[test]
+fn atomic_cache_roundtrip_matches_direct_write() {
+    let pcm = synth_8k(31, 2.0);
+    let fp = Wang::default().extract(&pcm, SampleRate::HZ_8000).unwrap();
+
+    let dir = TempDir::new("atomic_public");
+    let direct = dir.0.join("direct.afp");
+    let atomic = dir.0.join("atomic.afp");
+    cache_to_file(&fp, &direct).unwrap();
+    cache_to_file_atomic(&fp, &atomic).unwrap();
+
+    let direct_bytes = std::fs::read(&direct).unwrap();
+    let atomic_bytes = std::fs::read(&atomic).unwrap();
+    assert_eq!(
+        direct_bytes, atomic_bytes,
+        "atomic write must match direct blob"
+    );
+
+    let loaded: WangFingerprint = load_from_cache(&atomic).unwrap();
+    assert_eq!(loaded.hashes, fp.hashes);
+    assert_eq!(loaded.frames_per_sec, fp.frames_per_sec);
+}
+
+#[test]
+fn iter_cached_public_api_respects_limits() {
+    let dir = TempDir::new("iter_public");
+    for seed in [41_u64, 42] {
+        let pcm = synth_8k(seed, 2.0);
+        let fp = Wang::default().extract(&pcm, SampleRate::HZ_8000).unwrap();
+        cache_to_file(&fp, &dir.0.join(format!("{seed}.afp"))).unwrap();
+    }
+
+    let limits = CacheLoadLimits {
+        max_files: Some(1),
+        max_total_bytes: None,
+    };
+    let collected: Vec<_> = iter_cached(&dir.0, limits).unwrap().collect();
+    assert_eq!(collected.len(), 2);
+    assert!(collected[0].is_ok());
+    match &collected[1] {
+        Err(AfpError::InputTooLarge {
+            limit: 1,
+            provided: 2,
+        }) => {}
+        other => panic!("expected max_files InputTooLarge, got {other:?}"),
+    }
+
+    let all = load_all_cached_limited(&dir.0, CacheLoadLimits::default()).unwrap();
+    assert_eq!(all.len(), 2);
 }

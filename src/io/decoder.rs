@@ -3,6 +3,8 @@
 use std::fs::File;
 use std::path::Path;
 
+use symphonia::core::audio::conv::IntoSample;
+use symphonia::core::audio::sample::Sample;
 use symphonia::core::audio::{Audio, AudioBuffer, GenericAudioBufferRef};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -13,6 +15,7 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::dsp::resample::SincResampler;
 use crate::error::IoError;
+use crate::io::riff_preflight::preflight_wav_from_file;
 use crate::{AfpError, Result};
 
 /// Maximum channel count `audiofp` will decode.
@@ -363,7 +366,8 @@ fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
             });
         }
     }
-    let file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    let mut file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    preflight_wav_from_file(&mut file, path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -380,6 +384,79 @@ fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
     let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
 
     Ok((mss, hint, deadline))
+}
+
+/// Average multichannel planes into mono samples, preserving ordinary
+/// f32 arithmetic for normal magnitudes and falling back to f64 when a
+/// finite f32 sum would overflow before division.
+fn downmix_planes_to_mono<S: Sample + IntoSample<f32>>(
+    buf: &AudioBuffer<S>,
+    n_chans: usize,
+    n_frames: usize,
+    samples: &mut Vec<f32>,
+) {
+    samples.reserve(n_frames);
+    if n_chans == 1 {
+        samples.extend(
+            buf.plane(0).expect("mono plane")[..n_frames]
+                .iter()
+                .map(|&v| v.into_sample()),
+        );
+        return;
+    }
+    let overflow_threshold = f32::MAX / n_chans as f32;
+    for i in 0..n_frames {
+        let mut use_f64 = false;
+        let mut sum = 0.0_f32;
+        for c in 0..n_chans {
+            let v: f32 = buf
+                .plane(c)
+                .expect("decoded buffer must have plane for each channel")[i]
+                .into_sample();
+            sum += v;
+            if !v.is_finite() || v.abs() > overflow_threshold {
+                use_f64 = true;
+                break;
+            }
+        }
+        let mono = if use_f64 {
+            let mut sum = 0.0_f64;
+            for c in 0..n_chans {
+                let value: f32 = buf
+                    .plane(c)
+                    .expect("decoded buffer must have plane for each channel")[i]
+                    .into_sample();
+                sum += f64::from(value);
+            }
+            (sum / n_chans as f64) as f32
+        } else {
+            // Preserve the original sum-then-divide rounding for ordinary PCM.
+            sum / n_chans as f32
+        };
+        samples.push(mono);
+    }
+}
+
+fn append_decoded_mono(decoded: GenericAudioBufferRef<'_>, samples: &mut Vec<f32>) {
+    let n_chans = decoded.spec().channels().count();
+    let n_frames = decoded.frames();
+    macro_rules! downmix {
+        ($buffer:expr) => {
+            downmix_planes_to_mono($buffer, n_chans, n_frames, samples)
+        };
+    }
+    match decoded {
+        GenericAudioBufferRef::U8(buf) => downmix!(buf),
+        GenericAudioBufferRef::U16(buf) => downmix!(buf),
+        GenericAudioBufferRef::U24(buf) => downmix!(buf),
+        GenericAudioBufferRef::U32(buf) => downmix!(buf),
+        GenericAudioBufferRef::S8(buf) => downmix!(buf),
+        GenericAudioBufferRef::S16(buf) => downmix!(buf),
+        GenericAudioBufferRef::S24(buf) => downmix!(buf),
+        GenericAudioBufferRef::S32(buf) => downmix!(buf),
+        GenericAudioBufferRef::F32(buf) => downmix!(buf),
+        GenericAudioBufferRef::F64(buf) => downmix!(buf),
+    }
 }
 
 fn decode_inner(
@@ -506,8 +583,9 @@ fn decode_inner_report(
         })?;
 
     let mut samples: Vec<f32> = Vec::new();
-    let mut convert_buf: Option<AudioBuffer<f32>> = None;
+
     let mut stats = DecodeStats::default();
+    let mut truncated_eof = false;
     // The rate the decoded PCM is ACTUALLY at, taken from the decoder's
     // output spec on the first successfully decoded packet. The container
     // header can disagree with the codec (e.g. a patched MP4 `mp4a`
@@ -545,6 +623,7 @@ fn decode_inner_report(
             Ok(Some(p)) => p,
             Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                truncated_eof = true;
                 break;
             }
             // ResetRequired means the reader re-synced (e.g. after a seek
@@ -629,12 +708,10 @@ fn decode_inner_report(
             return Err(AfpError::UnsupportedChannels(n_chans as u16));
         }
 
-        // Bound decoded PCM growth *before* allocating the conversion
-        // buffer: a malformed packet can report a huge frame count, and
-        // allocating `AudioBuffer::new(spec, frames)` first would blow the
-        // memory budget regardless of `max_samples`. Use `checked_mul` on
-        // the transient (frames × channels) so an adversarial frame count
-        // cannot overflow the bound.
+        // Bound decoded **mono** PCM growth before allocating conversion
+        // storage. `max_samples` is documented in mono-frame units; the
+        // transient multichannel conversion buffer is sized to the actual
+        // packet frame count, not the decoder's reserved capacity.
         if let Some(limit) = max_samples {
             let next = samples.len().saturating_add(decoded.frames());
             if next > limit {
@@ -643,40 +720,7 @@ fn decode_inner_report(
                     provided: next,
                 });
             }
-            let transient = decoded.frames().saturating_mul(n_chans);
-            if transient > limit {
-                return Err(AfpError::InputTooLarge {
-                    limit: limit / n_chans.max(1),
-                    provided: decoded.frames(),
-                });
-            }
         }
-
-        // Lazily allocate the f32 conversion buffer once the first packet
-        // tells us the channel layout / capacity. Reallocate if a later
-        // packet decodes to more frames than the current buffer can hold
-        // (the first packet's capacity is not guaranteed to bound the rest)
-        // or if the stream's audio spec changes mid-file (channel-layout
-        // switch) — a stale spec would misinterpret the planes below.
-        let needed_cap = decoded.frames().max(decoded.capacity());
-        let needs_buf = match &convert_buf {
-            None => true,
-            Some(buf) => needed_cap > buf.capacity() || buf.spec() != decoded.spec(),
-        };
-        if needs_buf {
-            let spec = decoded.spec().clone();
-            convert_buf = Some(AudioBuffer::<f32>::new(spec, needed_cap));
-        }
-        let buf = convert_buf
-            .as_mut()
-            .expect("convert_buf initialized above when needs_buf is true");
-
-        // In symphonia 0.6, copy_to requires the destination to have the
-        // same frame count as the source. Set it before copying.
-        buf.resize_uninit(decoded.frames());
-        decoded.copy_to::<f32, _>(buf);
-
-        let n_frames = buf.frames();
 
         // Record the decoder's real output rate (once). A mid-stream rate
         // change is a codec reset we do not model; adopt the first value
@@ -690,21 +734,26 @@ fn decode_inner_report(
             decoded_rate = Some(actual);
         }
 
-        if n_chans == 1 {
-            samples.extend_from_slice(
-                &buf.plane(0).expect("decoded buffer must have plane 0")[..n_frames],
-            );
-        } else {
-            samples.reserve(n_frames);
-            for i in 0..n_frames {
-                let mut sum = 0.0_f32;
-                for c in 0..n_chans {
-                    sum += buf
-                        .plane(c)
-                        .expect("decoded buffer must have plane for each channel")[i];
-                }
-                samples.push(sum / n_chans as f32);
-            }
+        // Convert individual samples with Symphonia's own conversion trait.
+        // No duplicated capacity-sized or channel-multiplied f32 buffer.
+        append_decoded_mono(decoded, &mut samples);
+    }
+
+    if integrity_mode {
+        if truncated_eof {
+            return Err(AfpError::Io(IoError::without_path(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated audio stream (unexpected end of container data)",
+            ))));
+        }
+        if stats.resets > 0 {
+            return Err(AfpError::Io(IoError::without_path(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "discontinuous container stream ({} resync(s); chained Ogg is not decoded past the first logical stream)",
+                    stats.resets
+                ),
+            ))));
         }
     }
 
@@ -720,567 +769,858 @@ fn decode_inner_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::f32::consts::PI;
 
-    fn write_test_wav(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
-        // Counter ensures each test gets a unique path so parallel runs
-        // don't clobber each other.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "audiofp-decoder-test-{}-{}-{}-{}-{}.wav",
-            std::process::id(),
-            channels,
-            sr,
-            len,
-            n,
-        ));
-        let spec = hound::WavSpec {
-            channels,
-            sample_rate: sr,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        let amp = (i16::MAX as f32) * 0.5;
-        for i in 0..len {
-            // 440 Hz tone on every channel (mono on every channel for
-            // multichannel files = identical channels, downmix is identity).
-            let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * amp;
-            for _c in 0..channels {
+    #[test]
+    fn every_decoded_sample_format_preserves_mono_values_and_frame_count() {
+        use symphonia::core::audio::sample::{i24, u24};
+        use symphonia::core::audio::{AudioSpec, Channels};
+        macro_rules! check {
+            ($type:ty, $variant:ident, $value:expr) => {{
+                let value: $type = $value;
+                let expected: f32 = value.into_sample();
+                for channels in [1, 2] {
+                    let spec = AudioSpec::new(8000, Channels::Discrete(channels));
+                    let mut buffer = AudioBuffer::<$type>::new(spec, 1024);
+                    buffer.resize(3, &vec![value; channels as usize]);
+                    let mut actual = vec![0.125];
+                    append_decoded_mono(GenericAudioBufferRef::$variant(&buffer), &mut actual);
+                    assert_eq!(actual.len(), 4, "capacity must not become decoded length");
+                    assert_eq!(actual[0], 0.125, "append must preserve prior packets");
+                    assert_eq!(&actual[1..], &[expected; 3]);
+                }
+            }};
+        }
+        check!(u8, U8, 192);
+        check!(u16, U16, 49152);
+        check!(u24, U24, u24(12582912));
+        check!(u32, U32, 3221225472);
+        check!(i8, S8, -64);
+        check!(i16, S16, -16384);
+        check!(i24, S24, i24(-4194304));
+        check!(i32, S32, -1073741824);
+        check!(f32, F32, 0.375);
+        check!(f64, F64, -0.375);
+    }
+
+    #[cfg(feature = "std-wav")]
+    mod wav_tests {
+        use super::*;
+        use core::f32::consts::PI;
+
+        fn write_test_wav(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
+            // Counter ensures each test gets a unique path so parallel runs
+            // don't clobber each other.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-test-{}-{}-{}-{}-{}.wav",
+                std::process::id(),
+                channels,
+                sr,
+                len,
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: sr,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            let amp = (i16::MAX as f32) * 0.5;
+            for i in 0..len {
+                // 440 Hz tone on every channel (mono on every channel for
+                // multichannel files = identical channels, downmix is identity).
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * amp;
+                for _c in 0..channels {
+                    writer.write_sample(s as i16).unwrap();
+                }
+            }
+            writer.finalize().unwrap();
+            path
+        }
+
+        #[test]
+        fn open_missing_file_returns_io_error() {
+            let res = decode_to_mono("/nonexistent/path/that/does/not/exist.wav");
+            match res {
+                Err(AfpError::Io(_)) => {}
+                other => panic!("expected Io error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn round_trip_mono_wav() {
+            let path = write_test_wav(1, 8_000, 8_000);
+            let result = decode_to_mono(&path);
+            std::fs::remove_file(&path).ok();
+            let (samples, sr) = result.unwrap();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 8_000);
+
+            // 16-bit truncation introduces ~3e-5 error; allow a generous bound.
+            let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 8_000.0) * 0.5;
+            assert!(
+                (samples[100] - expected).abs() < 0.01,
+                "sample[100] = {}, expected ≈ {expected}",
+                samples[100]
+            );
+        }
+
+        #[test]
+        fn stereo_wav_downmixes_to_mono() {
+            // Both channels are identical so downmix should be the same signal.
+            let path = write_test_wav(2, 16_000, 16_000);
+            let result = decode_to_mono(&path);
+            std::fs::remove_file(&path).ok();
+            let (samples, sr) = result.unwrap();
+            assert_eq!(sr, 16_000);
+            assert_eq!(samples.len(), 16_000);
+
+            let expected = libm::sinf(2.0 * PI * 440.0 * 200.0 / 16_000.0) * 0.5;
+            assert!((samples[200] - expected).abs() < 0.01);
+        }
+
+        #[test]
+        fn decode_to_mono_at_resamples() {
+            let path = write_test_wav(1, 16_000, 16_000); // 1 sec @ 16 kHz
+            let result = decode_to_mono_at(&path, 8_000);
+            std::fs::remove_file(&path).ok();
+            let samples = result.unwrap();
+            // 16k → 8k means roughly half as many samples.
+            assert!(
+                (samples.len() as i64 - 8_000).abs() < 16,
+                "resampled len = {}",
+                samples.len()
+            );
+        }
+
+        #[test]
+        fn decode_to_mono_at_passthrough_when_rates_match() {
+            let path = write_test_wav(1, 8_000, 4_000);
+            let result = decode_to_mono_at(&path, 8_000);
+            std::fs::remove_file(&path).ok();
+            let samples = result.unwrap();
+            assert_eq!(samples.len(), 4_000);
+        }
+
+        #[test]
+        fn unknown_extension_still_decodes() {
+            // Symphonia probes magic bytes too, so an extensionless file still
+            // works as long as it's a recognised format.
+            let path = write_test_wav(1, 8_000, 4_000);
+            let renamed = path.with_extension("");
+            std::fs::rename(&path, &renamed).unwrap();
+
+            let result = decode_to_mono(&renamed);
+            std::fs::remove_file(&renamed).ok();
+
+            let (samples, sr) = match result {
+                Ok(v) => v,
+                Err(e) => panic!("decode without extension failed: {e}"),
+            };
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 4_000);
+        }
+
+        /// Ensure the public APIs don't hold onto the file handle past
+        /// successful decode (otherwise removing the file would fail on
+        /// Windows; on Unix it would leak a descriptor).
+        #[test]
+        fn temp_file_can_be_deleted_after_decode() {
+            let path = write_test_wav(1, 8_000, 1_000);
+            decode_to_mono(&path).unwrap();
+            // Should not error out.
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        fn write_test_wav_float(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-float-{}-{}-{}-{}.wav",
+                std::process::id(),
+                channels,
+                sr,
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: sr,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..len {
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * 0.5;
+                for _c in 0..channels {
+                    writer.write_sample(s).unwrap();
+                }
+            }
+            writer.finalize().unwrap();
+            path
+        }
+
+        #[test]
+        fn float_wav_decodes_with_higher_precision() {
+            let path = write_test_wav_float(1, 16_000, 4_000);
+            let result = decode_to_mono(&path);
+            std::fs::remove_file(&path).ok();
+            let (samples, sr) = result.unwrap();
+            assert_eq!(sr, 16_000);
+            assert_eq!(samples.len(), 4_000);
+            // 32-bit float should give near-exact reconstruction.
+            let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 16_000.0) * 0.5;
+            assert!(
+                (samples[100] - expected).abs() < 1e-6,
+                "sample[100] = {}, expected {expected}",
+                samples[100]
+            );
+        }
+
+        #[test]
+        fn high_sample_rate_preserved() {
+            let path = write_test_wav(1, 48_000, 4_800);
+            let result = decode_to_mono(&path);
+            std::fs::remove_file(&path).ok();
+            let (samples, sr) = result.unwrap();
+            assert_eq!(sr, 48_000);
+            assert_eq!(samples.len(), 4_800);
+        }
+
+        #[test]
+        fn decode_to_mono_at_handles_upsample() {
+            let path = write_test_wav(1, 8_000, 4_000);
+            let result = decode_to_mono_at(&path, 16_000);
+            std::fs::remove_file(&path).ok();
+            let samples = result.unwrap();
+            // 8k → 16k should give roughly 2× samples.
+            assert!(
+                (samples.len() as i64 - 8_000).abs() < 16,
+                "upsampled len = {}",
+                samples.len()
+            );
+        }
+
+        #[test]
+        fn capped_rejects_oversized_file_with_input_too_large() {
+            let path = write_test_wav(1, 8_000, 8_000);
+            let meta_len = std::fs::metadata(&path).unwrap().len();
+            assert!(meta_len > 100, "expected a non-trivial wav, got {meta_len}");
+            let err = decode_to_mono_limited(&path, DecodeLimits::bytes(100)).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::InputTooLarge { limit, provided } => {
+                    assert_eq!(limit, 100);
+                    assert_eq!(provided, usize::try_from(meta_len).unwrap());
+                }
+                other => panic!("expected InputTooLarge, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn capped_accepts_file_under_byte_limit() {
+            let path = write_test_wav(1, 8_000, 1_000);
+            let meta_len = std::fs::metadata(&path).unwrap().len();
+            let (samples, sr) =
+                decode_to_mono_limited(&path, DecodeLimits::bytes(meta_len)).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 1_000);
+        }
+
+        #[test]
+        fn limited_rejects_when_decoded_samples_exceed_cap() {
+            let path = write_test_wav(1, 8_000, 4_000);
+            let err = decode_to_mono_limited(&path, DecodeLimits::samples(100)).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            assert!(
+                matches!(err, AfpError::InputTooLarge { limit: 100, .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[test]
+        fn limited_both_caps_small_file_ok() {
+            let path = write_test_wav(1, 8_000, 500);
+            let meta_len = std::fs::metadata(&path).unwrap().len();
+            let (samples, sr) =
+                decode_to_mono_limited(&path, DecodeLimits::both(meta_len, 500)).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 500);
+        }
+
+        // -- integrity mode tests --
+
+        /// Create a WAV file and corrupt some bytes in the data section.
+        /// WAV header is 44 bytes for standard PCM; corrupting bytes well
+        /// past that ensures we hit the data region, not the header.
+        fn write_corrupt_wav(sr: u32, len: usize) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-corrupt-{}-{}-{}.wav",
+                std::process::id(),
+                sr,
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: sr,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            let amp = (i16::MAX as f32) * 0.5;
+            for i in 0..len {
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * amp;
                 writer.write_sample(s as i16).unwrap();
             }
+            writer.finalize().unwrap();
+
+            // Corrupt a few bytes in the middle of the data section.
+            // For a 16-bit mono WAV, data starts at byte 44. Corrupt a
+            // chunk in the middle of the file.
+            let file_len = std::fs::metadata(&path).unwrap().len() as usize;
+            let mut bytes = std::fs::read(&path).unwrap();
+            let mid = file_len / 2;
+            for i in 0..core::cmp::min(64, file_len - mid) {
+                bytes[mid + i] = 0xFF;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            path
         }
-        writer.finalize().unwrap();
-        path
-    }
 
-    #[test]
-    fn open_missing_file_returns_io_error() {
-        let res = decode_to_mono("/nonexistent/path/that/does/not/exist.wav");
-        match res {
-            Err(AfpError::Io(_)) => {}
-            other => panic!("expected Io error, got {other:?}"),
+        #[test]
+        fn strict_builder_sets_integrity_mode() {
+            let limits = DecodeLimits::default().strict();
+            assert!(limits.integrity_mode);
+
+            let limits2 = DecodeLimits::both(1_000_000, 480_000).strict();
+            assert!(limits2.integrity_mode);
+            assert_eq!(limits2.max_bytes, 1_000_000);
+            assert_eq!(limits2.max_samples, Some(480_000));
         }
-    }
 
-    #[test]
-    fn round_trip_mono_wav() {
-        let path = write_test_wav(1, 8_000, 8_000);
-        let result = decode_to_mono(&path);
-        std::fs::remove_file(&path).ok();
-        let (samples, sr) = result.unwrap();
-        assert_eq!(sr, 8_000);
-        assert_eq!(samples.len(), 8_000);
-
-        // 16-bit truncation introduces ~3e-5 error; allow a generous bound.
-        let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 8_000.0) * 0.5;
-        assert!(
-            (samples[100] - expected).abs() < 0.01,
-            "sample[100] = {}, expected ≈ {expected}",
-            samples[100]
-        );
-    }
-
-    #[test]
-    fn stereo_wav_downmixes_to_mono() {
-        // Both channels are identical so downmix should be the same signal.
-        let path = write_test_wav(2, 16_000, 16_000);
-        let result = decode_to_mono(&path);
-        std::fs::remove_file(&path).ok();
-        let (samples, sr) = result.unwrap();
-        assert_eq!(sr, 16_000);
-        assert_eq!(samples.len(), 16_000);
-
-        let expected = libm::sinf(2.0 * PI * 440.0 * 200.0 / 16_000.0) * 0.5;
-        assert!((samples[200] - expected).abs() < 0.01);
-    }
-
-    #[test]
-    fn decode_to_mono_at_resamples() {
-        let path = write_test_wav(1, 16_000, 16_000); // 1 sec @ 16 kHz
-        let result = decode_to_mono_at(&path, 8_000);
-        std::fs::remove_file(&path).ok();
-        let samples = result.unwrap();
-        // 16k → 8k means roughly half as many samples.
-        assert!(
-            (samples.len() as i64 - 8_000).abs() < 16,
-            "resampled len = {}",
-            samples.len()
-        );
-    }
-
-    #[test]
-    fn decode_to_mono_at_passthrough_when_rates_match() {
-        let path = write_test_wav(1, 8_000, 4_000);
-        let result = decode_to_mono_at(&path, 8_000);
-        std::fs::remove_file(&path).ok();
-        let samples = result.unwrap();
-        assert_eq!(samples.len(), 4_000);
-    }
-
-    #[test]
-    fn unknown_extension_still_decodes() {
-        // Symphonia probes magic bytes too, so an extensionless file still
-        // works as long as it's a recognised format.
-        let path = write_test_wav(1, 8_000, 4_000);
-        let renamed = path.with_extension("");
-        std::fs::rename(&path, &renamed).unwrap();
-
-        let result = decode_to_mono(&renamed);
-        std::fs::remove_file(&renamed).ok();
-
-        let (samples, sr) = match result {
-            Ok(v) => v,
-            Err(e) => panic!("decode without extension failed: {e}"),
-        };
-        assert_eq!(sr, 8_000);
-        assert_eq!(samples.len(), 4_000);
-    }
-
-    /// Ensure the public APIs don't hold onto the file handle past
-    /// successful decode (otherwise removing the file would fail on
-    /// Windows; on Unix it would leak a descriptor).
-    #[test]
-    fn temp_file_can_be_deleted_after_decode() {
-        let path = write_test_wav(1, 8_000, 1_000);
-        decode_to_mono(&path).unwrap();
-        // Should not error out.
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    fn write_test_wav_float(channels: u16, sr: u32, len: usize) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "audiofp-decoder-float-{}-{}-{}-{}.wav",
-            std::process::id(),
-            channels,
-            sr,
-            n,
-        ));
-        let spec = hound::WavSpec {
-            channels,
-            sample_rate: sr,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        for i in 0..len {
-            let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * 0.5;
-            for _c in 0..channels {
-                writer.write_sample(s).unwrap();
+        #[test]
+        fn default_mode_skips_corrupt_packets() {
+            // With default (non-strict) limits, corrupted WAV data packets
+            // should be skipped and decoding should succeed (possibly with
+            // fewer samples, but no error).
+            let path = write_corrupt_wav(8_000, 8_000);
+            let result = decode_to_mono_limited(&path, DecodeLimits::default());
+            std::fs::remove_file(&path).ok();
+            // WAV is a simple container: symphonia may or may not report a
+            // per-packet decode error for corrupted PCM (it might just decode
+            // the bytes as garbage audio). Either outcome (Ok or recoverable
+            // skip) is acceptable for the default mode — the key invariant is
+            // that it does NOT return an Io error with "decode integrity".
+            match result {
+                Ok(_) => {} // fine — corrupt PCM was decoded as-is or skipped
+                Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
+                    panic!("default mode should NOT fail with integrity error: {e}");
+                }
+                Err(_) => {} // other errors (probe failure, etc.) are acceptable
             }
         }
-        writer.finalize().unwrap();
-        path
-    }
 
-    #[test]
-    fn float_wav_decodes_with_higher_precision() {
-        let path = write_test_wav_float(1, 16_000, 4_000);
-        let result = decode_to_mono(&path);
-        std::fs::remove_file(&path).ok();
-        let (samples, sr) = result.unwrap();
-        assert_eq!(sr, 16_000);
-        assert_eq!(samples.len(), 4_000);
-        // 32-bit float should give near-exact reconstruction.
-        let expected = libm::sinf(2.0 * PI * 440.0 * 100.0 / 16_000.0) * 0.5;
-        assert!(
-            (samples[100] - expected).abs() < 1e-6,
-            "sample[100] = {}, expected {expected}",
-            samples[100]
-        );
-    }
-
-    #[test]
-    fn high_sample_rate_preserved() {
-        let path = write_test_wav(1, 48_000, 4_800);
-        let result = decode_to_mono(&path);
-        std::fs::remove_file(&path).ok();
-        let (samples, sr) = result.unwrap();
-        assert_eq!(sr, 48_000);
-        assert_eq!(samples.len(), 4_800);
-    }
-
-    #[test]
-    fn decode_to_mono_at_handles_upsample() {
-        let path = write_test_wav(1, 8_000, 4_000);
-        let result = decode_to_mono_at(&path, 16_000);
-        std::fs::remove_file(&path).ok();
-        let samples = result.unwrap();
-        // 8k → 16k should give roughly 2× samples.
-        assert!(
-            (samples.len() as i64 - 8_000).abs() < 16,
-            "upsampled len = {}",
-            samples.len()
-        );
-    }
-
-    #[test]
-    fn capped_rejects_oversized_file_with_input_too_large() {
-        let path = write_test_wav(1, 8_000, 8_000);
-        let meta_len = std::fs::metadata(&path).unwrap().len();
-        assert!(meta_len > 100, "expected a non-trivial wav, got {meta_len}");
-        let err = decode_to_mono_limited(&path, DecodeLimits::bytes(100)).unwrap_err();
-        std::fs::remove_file(&path).ok();
-        match err {
-            AfpError::InputTooLarge { limit, provided } => {
-                assert_eq!(limit, 100);
-                assert_eq!(provided, usize::try_from(meta_len).unwrap());
-            }
-            other => panic!("expected InputTooLarge, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn capped_accepts_file_under_byte_limit() {
-        let path = write_test_wav(1, 8_000, 1_000);
-        let meta_len = std::fs::metadata(&path).unwrap().len();
-        let (samples, sr) = decode_to_mono_limited(&path, DecodeLimits::bytes(meta_len)).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert_eq!(sr, 8_000);
-        assert_eq!(samples.len(), 1_000);
-    }
-
-    #[test]
-    fn limited_rejects_when_decoded_samples_exceed_cap() {
-        let path = write_test_wav(1, 8_000, 4_000);
-        let err = decode_to_mono_limited(&path, DecodeLimits::samples(100)).unwrap_err();
-        std::fs::remove_file(&path).ok();
-        assert!(
-            matches!(err, AfpError::InputTooLarge { limit: 100, .. }),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn limited_both_caps_small_file_ok() {
-        let path = write_test_wav(1, 8_000, 500);
-        let meta_len = std::fs::metadata(&path).unwrap().len();
-        let (samples, sr) =
-            decode_to_mono_limited(&path, DecodeLimits::both(meta_len, 500)).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert_eq!(sr, 8_000);
-        assert_eq!(samples.len(), 500);
-    }
-
-    // -- integrity mode tests --
-
-    /// Create a WAV file and corrupt some bytes in the data section.
-    /// WAV header is 44 bytes for standard PCM; corrupting bytes well
-    /// past that ensures we hit the data region, not the header.
-    fn write_corrupt_wav(sr: u32, len: usize) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "audiofp-decoder-corrupt-{}-{}-{}.wav",
-            std::process::id(),
-            sr,
-            n,
-        ));
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: sr,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        let amp = (i16::MAX as f32) * 0.5;
-        for i in 0..len {
-            let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32) * amp;
-            writer.write_sample(s as i16).unwrap();
-        }
-        writer.finalize().unwrap();
-
-        // Corrupt a few bytes in the middle of the data section.
-        // For a 16-bit mono WAV, data starts at byte 44. Corrupt a
-        // chunk in the middle of the file.
-        let file_len = std::fs::metadata(&path).unwrap().len() as usize;
-        let mut bytes = std::fs::read(&path).unwrap();
-        let mid = file_len / 2;
-        for i in 0..core::cmp::min(64, file_len - mid) {
-            bytes[mid + i] = 0xFF;
-        }
-        std::fs::write(&path, &bytes).unwrap();
-        path
-    }
-
-    #[test]
-    fn strict_builder_sets_integrity_mode() {
-        let limits = DecodeLimits::default().strict();
-        assert!(limits.integrity_mode);
-
-        let limits2 = DecodeLimits::both(1_000_000, 480_000).strict();
-        assert!(limits2.integrity_mode);
-        assert_eq!(limits2.max_bytes, 1_000_000);
-        assert_eq!(limits2.max_samples, Some(480_000));
-    }
-
-    #[test]
-    fn default_mode_skips_corrupt_packets() {
-        // With default (non-strict) limits, corrupted WAV data packets
-        // should be skipped and decoding should succeed (possibly with
-        // fewer samples, but no error).
-        let path = write_corrupt_wav(8_000, 8_000);
-        let result = decode_to_mono_limited(&path, DecodeLimits::default());
-        std::fs::remove_file(&path).ok();
-        // WAV is a simple container: symphonia may or may not report a
-        // per-packet decode error for corrupted PCM (it might just decode
-        // the bytes as garbage audio). Either outcome (Ok or recoverable
-        // skip) is acceptable for the default mode — the key invariant is
-        // that it does NOT return an Io error with "decode integrity".
-        match result {
-            Ok(_) => {} // fine — corrupt PCM was decoded as-is or skipped
-            Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
-                panic!("default mode should NOT fail with integrity error: {e}");
-            }
-            Err(_) => {} // other errors (probe failure, etc.) are acceptable
-        }
-    }
-
-    #[test]
-    fn integrity_mode_fails_on_corrupt_packets() {
-        // With integrity_mode=true, if Symphonia reports a per-packet
-        // decode/IO error, the decode should fail.
-        let path = write_corrupt_wav(8_000, 8_000);
-        let limits = DecodeLimits::default().strict();
-        let result = decode_to_mono_limited(&path, limits);
-        std::fs::remove_file(&path).ok();
-        // WAV PCM corruption may not always trigger a Symphonia DecodeError
-        // (symphonia might just decode the garbage bytes). So this test
-        // verifies the contract: IF an error is returned, it must be the
-        // integrity error. If it succeeds, that's also fine (means
-        // symphonia didn't detect corruption in the PCM stream).
-        match result {
-            Ok(_) => {
-                // Symphonia decoded garbage as valid PCM — acceptable for
-                // raw PCM WAV since there's no checksum. The integrity
-                // check only fires when Symphonia itself raises an error.
-            }
-            Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
-                // This is exactly what we want when corruption IS detected.
-            }
-            Err(other) => {
-                // Other errors (e.g. probe failure if header was hit) are ok.
-                let _ = other;
+        #[test]
+        fn integrity_mode_fails_on_corrupt_packets() {
+            // With integrity_mode=true, if Symphonia reports a per-packet
+            // decode/IO error, the decode should fail.
+            let path = write_corrupt_wav(8_000, 8_000);
+            let limits = DecodeLimits::default().strict();
+            let result = decode_to_mono_limited(&path, limits);
+            std::fs::remove_file(&path).ok();
+            // WAV PCM corruption may not always trigger a Symphonia DecodeError
+            // (symphonia might just decode the garbage bytes). So this test
+            // verifies the contract: IF an error is returned, it must be the
+            // integrity error. If it succeeds, that's also fine (means
+            // symphonia didn't detect corruption in the PCM stream).
+            match result {
+                Ok(_) => {
+                    // Symphonia decoded garbage as valid PCM — acceptable for
+                    // raw PCM WAV since there's no checksum. The integrity
+                    // check only fires when Symphonia itself raises an error.
+                }
+                Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
+                    // This is exactly what we want when corruption IS detected.
+                }
+                Err(other) => {
+                    // Other errors (e.g. probe failure if header was hit) are ok.
+                    let _ = other;
+                }
             }
         }
-    }
 
-    /// A more reliable test: corrupt the WAV header's format chunk to
-    /// trigger a guaranteed codec-level error.
-    #[test]
-    fn integrity_mode_rejects_mangled_format() {
-        let path = write_test_wav(1, 8_000, 8_000);
-        // Mangle the "fmt " chunk by changing bits_per_sample (offset 34-35
-        // in a standard WAV) to an absurd value.
-        let mut bytes = std::fs::read(&path).unwrap();
-        // Verify this is a RIFF WAV with "fmt " at offset 12.
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[8..12], b"WAVE");
-        // bits_per_sample is at byte 34 in a standard 16-byte fmt chunk.
-        // Set it to 0 to trigger a codec init failure.
-        bytes[34] = 0;
-        bytes[35] = 0;
-        std::fs::write(&path, &bytes).unwrap();
+        /// A more reliable test: corrupt the WAV header's format chunk to
+        /// trigger a guaranteed codec-level error.
+        #[test]
+        fn integrity_mode_rejects_mangled_format() {
+            let path = write_test_wav(1, 8_000, 8_000);
+            // Mangle the "fmt " chunk by changing bits_per_sample (offset 34-35
+            // in a standard WAV) to an absurd value.
+            let mut bytes = std::fs::read(&path).unwrap();
+            // Verify this is a RIFF WAV with "fmt " at offset 12.
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            // bits_per_sample is at byte 34 in a standard 16-byte fmt chunk.
+            // Set it to 0 to trigger a codec init failure.
+            bytes[34] = 0;
+            bytes[35] = 0;
+            std::fs::write(&path, &bytes).unwrap();
 
-        // With default mode — should fail with a codec/probe error, not
-        // "decode integrity" since the codec can't even initialize.
-        let result = decode_to_mono_limited(&path, DecodeLimits::default());
-        assert!(result.is_err(), "mangled format should fail");
+            // With default mode — should fail with a codec/probe error, not
+            // "decode integrity" since the codec can't even initialize.
+            let result = decode_to_mono_limited(&path, DecodeLimits::default());
+            assert!(result.is_err(), "mangled format should fail");
 
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn timeout_zero_duration_returns_timeout_error() {
-        // A zero-duration timeout should fire immediately on the first packet.
-        let path = write_test_wav(1, 44100, 44100); // 1s of audio
-        let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_nanos(0));
-        let result = decode_to_mono_limited(&path, limits);
-        std::fs::remove_file(&path).ok();
-        match result {
-            Err(AfpError::Timeout {
-                elapsed_ms: _,
-                limit_ms,
-            }) => {
-                assert_eq!(limit_ms, 0);
-            }
-            other => panic!("expected Timeout error, got: {other:?}"),
+            std::fs::remove_file(&path).ok();
         }
-    }
 
-    #[test]
-    fn timeout_generous_succeeds() {
-        // A generous timeout should not interfere with normal decoding.
-        let path = write_test_wav(1, 44100, 44100); // 1s of audio
-        let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_secs(60));
-        let result = decode_to_mono_limited(&path, limits);
-        std::fs::remove_file(&path).ok();
-        assert!(result.is_ok(), "generous timeout should not fire");
-        let (samples, sr) = result.unwrap();
-        assert_eq!(sr, 44100);
-        assert!(!samples.is_empty());
-    }
-
-    #[test]
-    fn with_timeout_builder_sets_field() {
-        let limits =
-            DecodeLimits::both(1_000_000, 480_000).with_timeout(std::time::Duration::from_secs(30));
-        assert_eq!(limits.timeout, Some(std::time::Duration::from_secs(30)));
-        assert_eq!(limits.max_bytes, 1_000_000);
-        assert_eq!(limits.max_samples, Some(480_000));
-    }
-
-    /// Write a valid mono WAV then zero out the sample-rate field in the
-    /// `fmt ` chunk (bytes 24..28 of a canonical PCM WAV). Produces a
-    /// container that claims `sample_rate = 0`.
-    fn write_zero_rate_wav(len: usize) -> std::path::PathBuf {
-        let path = write_test_wav(1, 8_000, len);
-        let mut bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[8..12], b"WAVE");
-        assert_eq!(&bytes[12..16], b"fmt ");
-        // sample rate is the little-endian u32 at offset 24.
-        bytes[24..28].copy_from_slice(&0u32.to_le_bytes());
-        std::fs::write(&path, &bytes).unwrap();
-        path
-    }
-
-    // Regression (A3): a container reporting `sample_rate = 0` used to flow
-    // into `decode_to_mono_at` and panic inside `SincResampler::new(0, _)`.
-    // It must now surface as an error, never a panic.
-    #[test]
-    fn zero_sample_rate_returns_error_not_panic() {
-        let path = write_zero_rate_wav(1_000);
-        // `decode_to_mono_at` is the path that resamples and would have
-        // constructed `SincResampler::new(0, target)`.
-        let result = std::panic::catch_unwind(|| decode_to_mono_at(&path, 8_000));
-        std::fs::remove_file(&path).ok();
-        match result {
-            Err(_) => panic!("decode_to_mono_at panicked on zero sample rate"),
-            Ok(Ok(_)) => panic!("zero sample rate should not decode successfully"),
-            Ok(Err(e)) => {
-                // Either the new explicit zero-rate rejection or an earlier
-                // probe/codec rejection is acceptable — the invariant is
-                // "error, not panic".
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("sample rate") || matches!(e, AfpError::Io(_)),
-                    "unexpected error for zero sample rate: {e:?}"
-                );
+        #[test]
+        fn timeout_zero_duration_returns_timeout_error() {
+            // A zero-duration timeout should fire immediately on the first packet.
+            let path = write_test_wav(1, 44100, 44100); // 1s of audio
+            let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_nanos(0));
+            let result = decode_to_mono_limited(&path, limits);
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(AfpError::Timeout {
+                    elapsed_ms: _,
+                    limit_ms,
+                }) => {
+                    assert_eq!(limit_ms, 0);
+                }
+                other => panic!("expected Timeout error, got: {other:?}"),
             }
         }
-    }
 
-    // Regression (A3): the plain (non-resampling) decode path must also
-    // reject a zero sample rate instead of returning `(samples, 0)` for
-    // callers to divide by.
-    #[test]
-    fn zero_sample_rate_plain_decode_errors() {
-        let path = write_zero_rate_wav(1_000);
-        let result = std::panic::catch_unwind(|| decode_to_mono(&path));
-        std::fs::remove_file(&path).ok();
-        match result {
-            Err(_) => panic!("decode_to_mono panicked on zero sample rate"),
-            Ok(Ok((_, sr))) => panic!("zero sample rate should not succeed, got sr={sr}"),
-            Ok(Err(_)) => {} // expected
+        #[test]
+        fn timeout_generous_succeeds() {
+            // A generous timeout should not interfere with normal decoding.
+            let path = write_test_wav(1, 44100, 44100); // 1s of audio
+            let limits = DecodeLimits::default().with_timeout(std::time::Duration::from_secs(60));
+            let result = decode_to_mono_limited(&path, limits);
+            std::fs::remove_file(&path).ok();
+            assert!(result.is_ok(), "generous timeout should not fire");
+            let (samples, sr) = result.unwrap();
+            assert_eq!(sr, 44100);
+            assert!(!samples.is_empty());
         }
-    }
 
-    // Regression (H3): `decode_to_mono_at_limited` must enforce
-    // `max_samples` against the *projected* post-resample length before
-    // allocating the upsampled buffer. A low-rate file upsampled to a much
-    // higher target can legally exceed the cap even when the native-rate
-    // decode is under it.
-    #[test]
-    fn resample_limit_enforced_on_projected_length() {
-        // 1000 samples at 8 kHz. Native decode is under the cap...
-        let path = write_test_wav(1, 8_000, 1_000);
-        // ...but upsampling 8k → 48k projects 6000 samples, over the cap.
-        let limits = DecodeLimits::samples(1_500);
-        let result = decode_to_mono_at_limited(&path, 48_000, limits);
-        std::fs::remove_file(&path).ok();
-        match result {
-            Err(AfpError::InputTooLarge { limit, provided }) => {
-                assert_eq!(limit, 1_500);
-                // Projected = ceil(1000 * 48000 / 8000) = 6000.
-                assert_eq!(provided, 6_000, "should report the projected length");
+        #[test]
+        fn with_timeout_builder_sets_field() {
+            let limits = DecodeLimits::both(1_000_000, 480_000)
+                .with_timeout(std::time::Duration::from_secs(30));
+            assert_eq!(limits.timeout, Some(std::time::Duration::from_secs(30)));
+            assert_eq!(limits.max_bytes, 1_000_000);
+            assert_eq!(limits.max_samples, Some(480_000));
+        }
+
+        /// Write a valid mono WAV then zero out the sample-rate field in the
+        /// `fmt ` chunk (bytes 24..28 of a canonical PCM WAV). Produces a
+        /// container that claims `sample_rate = 0`.
+        fn write_zero_rate_wav(len: usize) -> std::path::PathBuf {
+            let path = write_test_wav(1, 8_000, len);
+            let mut bytes = std::fs::read(&path).unwrap();
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            assert_eq!(&bytes[12..16], b"fmt ");
+            // sample rate is the little-endian u32 at offset 24.
+            bytes[24..28].copy_from_slice(&0u32.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        }
+
+        // Regression (A3): a container reporting `sample_rate = 0` used to flow
+        // into `decode_to_mono_at` and panic inside `SincResampler::new(0, _)`.
+        // It must now surface as an error, never a panic.
+        #[test]
+        fn zero_sample_rate_returns_error_not_panic() {
+            let path = write_zero_rate_wav(1_000);
+            // `decode_to_mono_at` is the path that resamples and would have
+            // constructed `SincResampler::new(0, target)`.
+            let result = std::panic::catch_unwind(|| decode_to_mono_at(&path, 8_000));
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(_) => panic!("decode_to_mono_at panicked on zero sample rate"),
+                Ok(Ok(_)) => panic!("zero sample rate should not decode successfully"),
+                Ok(Err(e)) => {
+                    // Either the new explicit zero-rate rejection or an earlier
+                    // probe/codec rejection is acceptable — the invariant is
+                    // "error, not panic".
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("sample rate") || matches!(e, AfpError::Io(_)),
+                        "unexpected error for zero sample rate: {e:?}"
+                    );
+                }
             }
-            other => panic!("expected InputTooLarge with projected length, got {other:?}"),
         }
-    }
 
-    // Companion to the above: when the projected length is under the cap,
-    // the resample proceeds normally.
-    #[test]
-    fn resample_limit_allows_when_projected_under_cap() {
-        let path = write_test_wav(1, 8_000, 1_000);
-        // 8k → 16k projects 2000 samples; cap of 4000 leaves headroom.
-        let limits = DecodeLimits::samples(4_000);
-        let result = decode_to_mono_at_limited(&path, 16_000, limits);
-        std::fs::remove_file(&path).ok();
-        let samples = result.expect("projected length under cap should succeed");
-        assert!(
-            (samples.len() as i64 - 2_000).abs() < 16,
-            "resampled len = {}",
-            samples.len()
-        );
-    }
-
-    /// A byte-only cap (`max_samples = None`) must still bound the
-    /// post-resample buffer: the source rate is container-declared, so an
-    /// upsample can otherwise expand a tiny file without limit.
-    #[test]
-    fn resample_amplification_bounded_without_max_samples() {
-        // 1 Hz declared rate, 1000 samples → 48 kHz projects 48_000_000
-        // samples, over the 28.8M hard default cap — and this is the
-        // `max_samples = None` path, so nothing else bounds it.
-        let path = write_test_wav(1, 1, 1_000);
-        let limits = DecodeLimits::bytes(10_000); // byte-only: max_samples None
-        let result = decode_to_mono_at_limited(&path, 48_000, limits);
-        std::fs::remove_file(&path).ok();
-        match result {
-            Err(AfpError::InputTooLarge { provided, .. }) => {
-                assert!(
-                    provided > super::DEFAULT_MAX_RESAMPLED_SAMPLES,
-                    "projected {provided} should exceed the default cap"
-                );
+        // Regression (A3): the plain (non-resampling) decode path must also
+        // reject a zero sample rate instead of returning `(samples, 0)` for
+        // callers to divide by.
+        #[test]
+        fn zero_sample_rate_plain_decode_errors() {
+            let path = write_zero_rate_wav(1_000);
+            let result = std::panic::catch_unwind(|| decode_to_mono(&path));
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(_) => panic!("decode_to_mono panicked on zero sample rate"),
+                Ok(Ok((_, sr))) => panic!("zero sample rate should not succeed, got sr={sr}"),
+                Ok(Err(_)) => {} // expected
             }
-            // The WAV writer may refuse a 1 Hz header on some platforms;
-            // an Io/Config error is equally acceptable — the contract
-            // under test is "never returns an unbounded buffer".
-            Err(AfpError::Io(_)) | Err(AfpError::Config(_)) => {}
-            other => panic!("expected a bounded rejection, got {other:?}"),
         }
-    }
 
-    // -- DecodeReport observability --
+        // Regression (H3): `decode_to_mono_at_limited` must enforce
+        // `max_samples` against the *projected* post-resample length before
+        // allocating the upsampled buffer. A low-rate file upsampled to a much
+        // higher target can legally exceed the cap even when the native-rate
+        // decode is under it.
+        #[test]
+        fn resample_limit_enforced_on_projected_length() {
+            // 1000 samples at 8 kHz. Native decode is under the cap...
+            let path = write_test_wav(1, 8_000, 1_000);
+            // ...but upsampling 8k → 48k projects 6000 samples, over the cap.
+            let limits = DecodeLimits::samples(1_500);
+            let result = decode_to_mono_at_limited(&path, 48_000, limits);
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(AfpError::InputTooLarge { limit, provided }) => {
+                    assert_eq!(limit, 1_500);
+                    // Projected = ceil(1000 * 48000 / 8000) = 6000.
+                    assert_eq!(provided, 6_000, "should report the projected length");
+                }
+                other => panic!("expected InputTooLarge with projected length, got {other:?}"),
+            }
+        }
 
-    #[test]
-    fn report_matches_limited_on_healthy_file() {
-        // On a healthy file the report path must agree byte-for-byte with
-        // the plain path, with zero skips and a sane packet count.
-        let path = write_test_wav(1, 8_000, 8_000);
-        let (plain_samples, plain_sr) =
-            decode_to_mono_limited(&path, DecodeLimits::default()).unwrap();
-        let report = decode_to_mono_report(&path, DecodeLimits::default()).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert_eq!(report.samples, plain_samples, "report must not change PCM");
-        assert_eq!(report.sample_rate, plain_sr);
-        assert!(
-            report.stats.packets_total > 0,
-            "healthy file must inspect packets"
-        );
-        assert_eq!(
-            report.stats.packets_skipped, 0,
-            "healthy file must skip nothing"
-        );
-    }
+        // Companion to the above: when the projected length is under the cap,
+        // the resample proceeds normally.
+        #[test]
+        fn resample_limit_allows_when_projected_under_cap() {
+            let path = write_test_wav(1, 8_000, 1_000);
+            // 8k → 16k projects 2000 samples; cap of 4000 leaves headroom.
+            let limits = DecodeLimits::samples(4_000);
+            let result = decode_to_mono_at_limited(&path, 16_000, limits);
+            std::fs::remove_file(&path).ok();
+            let samples = result.expect("projected length under cap should succeed");
+            assert!(
+                (samples.len() as i64 - 2_000).abs() < 16,
+                "resampled len = {}",
+                samples.len()
+            );
+        }
+
+        /// A byte-only cap (`max_samples = None`) must still bound the
+        /// post-resample buffer: the source rate is container-declared, so an
+        /// upsample can otherwise expand a tiny file without limit.
+        #[test]
+        fn resample_amplification_bounded_without_max_samples() {
+            // 1 Hz declared rate, 1000 samples → 48 kHz projects 48_000_000
+            // samples, over the 28.8M hard default cap — and this is the
+            // `max_samples = None` path, so nothing else bounds it.
+            let path = write_test_wav(1, 1, 1_000);
+            let limits = DecodeLimits::bytes(10_000); // byte-only: max_samples None
+            let result = decode_to_mono_at_limited(&path, 48_000, limits);
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(AfpError::InputTooLarge { provided, .. }) => {
+                    assert!(
+                        provided > 48_000 * 60 * 10,
+                        "projected {provided} should exceed the default cap"
+                    );
+                }
+                // The WAV writer may refuse a 1 Hz header on some platforms;
+                // an Io/Config error is equally acceptable — the contract
+                // under test is "never returns an unbounded buffer".
+                Err(AfpError::Io(_)) | Err(AfpError::Config(_)) => {}
+                other => panic!("expected a bounded rejection, got {other:?}"),
+            }
+        }
+
+        // -- DecodeReport observability --
+
+        #[test]
+        fn report_matches_limited_on_healthy_file() {
+            // On a healthy file the report path must agree byte-for-byte with
+            // the plain path, with zero skips and a sane packet count.
+            let path = write_test_wav(1, 8_000, 8_000);
+            let (plain_samples, plain_sr) =
+                decode_to_mono_limited(&path, DecodeLimits::default()).unwrap();
+            let report = decode_to_mono_report(&path, DecodeLimits::default()).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(report.samples, plain_samples, "report must not change PCM");
+            assert_eq!(report.sample_rate, plain_sr);
+            assert!(
+                report.stats.packets_total > 0,
+                "healthy file must inspect packets"
+            );
+            assert_eq!(
+                report.stats.packets_skipped, 0,
+                "healthy file must skip nothing"
+            );
+        }
+
+        #[test]
+        fn stereo_sample_cap_counts_mono_output_frames() {
+            let path = write_test_wav(2, 8_000, 16);
+            let result = decode_to_mono_limited(&path, DecodeLimits::samples(16));
+            std::fs::remove_file(&path).ok();
+            let (samples, _) = result.expect("16 stereo frames should yield 16 mono samples");
+            assert_eq!(samples.len(), 16);
+        }
+
+        #[test]
+        fn strict_mode_rejects_truncated_wav_declared_length() {
+            let path = write_truncated_wav();
+            let limits = DecodeLimits::both(1_000_000, 10_000).strict();
+            let err = decode_to_mono_report(&path, limits).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::Io(e) => {
+                    let msg = e.source.to_string();
+                    assert!(
+                        e.source.kind() == std::io::ErrorKind::UnexpectedEof
+                            || msg.contains("truncated")
+                            || msg.contains("chunk length exceeds")
+                            || msg.contains("malformed"),
+                        "got {e}"
+                    );
+                }
+                other => panic!("expected malformed/truncated Io error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn float_max_stereo_downmix_stays_finite() {
+            let path = write_float_max_stereo_wav();
+            let limits = DecodeLimits::default().strict();
+            let report = decode_to_mono_report(&path, limits).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(report.samples.len(), 1);
+            assert!(
+                report.samples[0].is_finite(),
+                "downmix must not overflow to infinity, got {}",
+                report.samples[0]
+            );
+            assert!(
+                (report.samples[0] - f32::MAX).abs() < 1.0,
+                "expected average near f32::MAX, got {}",
+                report.samples[0]
+            );
+        }
+
+        #[test]
+        fn overflow_channel_wav_preflight_rejects_without_panic() {
+            let path = write_overflow_channel_wav_header();
+            let result = std::panic::catch_unwind(|| {
+                decode_to_mono_limited(
+                    &path,
+                    DecodeLimits::both(10_000, 1)
+                        .strict()
+                        .with_timeout(std::time::Duration::from_millis(500)),
+                )
+            });
+            std::fs::remove_file(&path).ok();
+            match result {
+                Err(_) => panic!("65535-channel wav must not panic"),
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("channels")
+                            || msg.contains("unsupported")
+                            || matches!(e, AfpError::UnsupportedChannels(_)),
+                        "unexpected error: {e:?}"
+                    );
+                }
+                Ok(Ok(_)) => panic!("pathological header should not decode successfully"),
+            }
+        }
+
+        fn write_truncated_wav() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-truncated-{}-{}.wav",
+                std::process::id(),
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 8_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..1152 {
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / 8_000.0) * 0.5;
+                writer.write_sample((s * i16::MAX as f32) as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let declared_data = 8000u32;
+            bytes[40..44].copy_from_slice(&declared_data.to_le_bytes());
+            let riff_size = (bytes.len() - 8) as u32;
+            bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        }
+
+        fn write_float_max_stereo_wav() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-floatmax-{}-{}.wav",
+                std::process::id(),
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 8_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            writer.write_sample(f32::MAX).unwrap();
+            writer.write_sample(f32::MAX).unwrap();
+            writer.finalize().unwrap();
+            path
+        }
+
+        fn write_test_wav_bits(
+            channels: u16,
+            sr: u32,
+            len: usize,
+            bits: u16,
+        ) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-bits-{}-{}-{}-{}-{}.wav",
+                std::process::id(),
+                channels,
+                sr,
+                bits,
+                n,
+            ));
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: sr,
+                bits_per_sample: bits,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            let max = (1_i64 << (bits - 1)) - 1;
+            for i in 0..len {
+                let s = libm::sinf(2.0 * PI * 440.0 * i as f32 / sr as f32);
+                let sample = (s * max as f32 * 0.5) as i32;
+                for _c in 0..channels {
+                    writer.write_sample(sample).unwrap();
+                }
+            }
+            writer.finalize().unwrap();
+            path
+        }
+
+        fn write_physically_truncated_wav() -> std::path::PathBuf {
+            let path = write_test_wav(1, 8_000, 2_048);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.truncate(128);
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        }
+
+        #[test]
+        fn decode_to_mono_at_rejects_zero_target_rate() {
+            let path = write_test_wav(1, 8_000, 64);
+            let err = decode_to_mono_at_limited(&path, 0, DecodeLimits::default()).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::Config(msg) => {
+                    assert!(msg.contains("target sample rate"), "got {msg}");
+                }
+                other => panic!("expected Config error for target_sr=0, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn eight_bit_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 8_000, 256, 8);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 256);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn twenty_four_bit_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 16_000, 128, 24);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 16_000);
+            assert_eq!(samples.len(), 128);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn thirty_two_bit_int_wav_decodes_to_mono() {
+            let path = write_test_wav_bits(1, 8_000, 64, 32);
+            let (samples, sr) = decode_to_mono(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(sr, 8_000);
+            assert_eq!(samples.len(), 64);
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
+
+        #[test]
+        fn strict_mode_rejects_physically_truncated_stream() {
+            let path = write_physically_truncated_wav();
+            let limits = DecodeLimits::default().strict();
+            let err = decode_to_mono_limited(&path, limits).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                AfpError::Io(e) => {
+                    let msg = e.source.to_string();
+                    assert!(
+                        e.source.kind() == std::io::ErrorKind::UnexpectedEof
+                            || msg.contains("truncated")
+                            || msg.contains("unexpected end"),
+                        "got {e}"
+                    );
+                }
+                other => panic!("expected truncated-stream Io error, got {other:?}"),
+            }
+        }
+
+        fn write_overflow_channel_wav_header() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audiofp-decoder-overflow-{}-{}.wav",
+                std::process::id(),
+                n,
+            ));
+            let bytes: [u8; 44] = [
+                b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't',
+                b' ', 16, 0, 0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0,
+                b'd', b'a', b't', b'a', 0, 0, 0, 0,
+            ];
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+    } // wav_tests
 
     /// Copy `tests/assets/freak.mp3` to a temp file and damage a window in
     /// the middle of the audio data. MP3 frames past a ID3 header resync

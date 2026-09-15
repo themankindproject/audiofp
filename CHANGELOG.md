@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+- Bound cache reads on validated file handles; add atomic writes and budgeted
+  directory ingestion. Convert decoded samples directly to mono without a
+  duplicated multichannel buffer, preserve normal PCM rounding, and reject
+  strict truncation and malformed WAV header arithmetic before decoding.
+
+
 - Correct Wang connected-peak selection and sparse jitter voting, Panako
   neighboring-scale consolidation, and mutable stop-hash suppression. Preserve
   hash bytes and public layouts; incorrect match decisions can change. Reuse
@@ -16,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Correct bakeoff resampling/timing boundaries and no-match reporting; protect
   Chromaprint resources with RAII, compare equal-work watermark calls, and
   run the separate bakeoff tests in CI. Published latency tables remain historical.
+
 
 
 ### Fixed
