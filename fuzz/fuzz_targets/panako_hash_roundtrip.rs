@@ -5,9 +5,12 @@ use audiofp::classical::{Panako, PanakoConfig};
 use audiofp::{Fingerprinter, SampleRate};
 use libfuzzer_sys::fuzz_target;
 
+mod pcm_seed {
+    include!("../common/pcm_seed.rs");
+}
+
 #[derive(Arbitrary, Debug)]
 struct Input {
-    samples: Vec<f32>,
     fan_out: u16,
 }
 
@@ -16,18 +19,13 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let min_len = 8_000 * 2;
-    if input.samples.len() < min_len {
-        return;
-    }
+    let samples = pcm_seed::synth_pcm(data, 8_000, pcm_seed::WANG_MIN, pcm_seed::WANG_MIN + 4_000);
 
     let cfg = {
         let mut c = PanakoConfig::default();
         c.fan_out = input.fan_out.max(1).min(10);
         c
     };
-
-    let samples = &input.samples[..min_len];
 
     let mut fp = Panako::new(cfg);
     let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {

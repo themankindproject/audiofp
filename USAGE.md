@@ -172,7 +172,7 @@ watermark detector:
 | Algorithm  | Output          | Rate  | Frame rate | Storage / s        | When to use                            |
 | ---------- | --------------- | ----- | ---------- | ------------------ | -------------------------------------- |
 | `Wang`     | Landmark pairs  | 8 kHz | 62.5 fps   | ~2.4 KB (fan-out 10) | Music ID; "Shazam-style" matching    |
-| `Panako`   | Triplet hashes  | 8 kHz | 62.5 fps   | ~2.0 KB (fan-out 5)  | Tempo-robust music ID (±5 % stretch) |
+| `Panako`   | Triplet hashes  | 8 kHz | 62.5 fps   | ~2.0 KB (fan-out 5)  | Tempo search via 2-D Hough (grid-tuned) |
 | `Haitsma`  | 32 bits / frame | 5 kHz | 78.125 fps | 312 B               | Compact dense IDs; lowest latency    |
 | `NeuralEmbedder` | f32 vector / window | model-defined | 1/`hop_secs` | `4·dim` B / window | Semantic / cover detection (BYO ONNX model) |
 | `WatermarkDetector` | message + confidence | 16 kHz | — | — | AudioSeal-style watermark detection (BYO model) |
@@ -496,8 +496,9 @@ music (~2.4 KB/s at 8 bytes per `WangHash`). Silence produces zero hashes.
 ### Panako (triplet hashes)
 
 Joren Six's Panako algorithm (start-end fingerprinting). Each anchor is
-paired with **two** targets; the geometry of the triplet survives ±5 %
-time-stretch because the hash stores *ratios*, not absolute offsets.
+paired with **two** targets; the hash stores *ratios*, not absolute offsets,
+which is the basis for Panako's tempo search (default matcher grid spans
+roughly ±25 % stretch — not a guarantee against every tempo change).
 
 **Step-by-step:**
 
@@ -547,11 +548,11 @@ compact (32 bits per frame) and extremely cheap to match (popcount).
 
 1. Resample to **5 kHz** mono. STFT with `n_fft = 2048`, `hop = 64` →
    78.125 fps, 1 025 bins.
-2. Build **33 band edges** logarithmically spaced between `fmin = 300 Hz`
-   and `fmax = 2000 Hz`:
+2. Build **34 band edges** (defining **33 bands**) logarithmically spaced
+   between `fmin = 300 Hz` and `fmax = 2000 Hz`:
 
 ```text
-edge(k) = 300 · (2000 / 300)^(k / 32),      k = 0..=32
+edge(k) = 300 · (2000 / 300)^(k / 33),      k = 0..=33
 ```
 
    Each FFT bin is assigned to the band whose edge-interval contains its
@@ -2057,7 +2058,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | ----------------------------------------------------- | ------------------- | ------- |
 | `push(&[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>>` | one `Vec<f32>`     | `Result` |
 | `try_push(&[f32]) -> Result<Vec<…>>`                  | one `Vec<f32>`     | `Result` |
-| `try_push_with(&[f32], |t, &[f32]|) -> Result<usize>` | **zero** (callback borrows a reused scratch) | `Result` |
+| `try_push_with(&[f32], |t, &[f32]|) -> Result<usize>` | reuses embedding scratch; Tract may still allocate per window | `Result` |
 
 Prefer `try_push_with` on realtime paths: the embedding scratch is sized
 once at construction (`embedding_dim`) and reused across every emit of
@@ -2239,10 +2240,8 @@ fn main() {
 
     // Hot-loop, allocation-free variant: reuse the output Vec.
     let mut out = Vec::new();
-    for chunk in [x.as_slice(), y2.as_slice()] {
-        hq.process_into(chunk, &mut out);
-        let _ = out.len(); // capacity preserved across chunks
-    }
+    hq.process_into(&x, &mut out);
+    let _ = out.len(); // capacity preserved across chunks
     let _ = y;
     let _ = y3;
 }
@@ -2442,6 +2441,9 @@ fn enroll_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("enrolled={ok} skipped={skipped} failed={failed}");
+    if failed > 0 {
+        return Err(format!("ingest aborted after {failed} fatal error(s)").into());
+    }
     Ok(())
 }
 ```

@@ -55,6 +55,12 @@ fn valid_fps(f: f32) -> f32 {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Always exercise raw parsers, even when structured generation fails.
+    let _ = WangFingerprint::from_bytes(data);
+    let _ = PanakoFingerprint::from_bytes(data);
+    let _ = HaitsmaFingerprint::from_bytes(data);
+    let _ = FingerprintEnvelope::peek(data);
+    let _ = audiofp::cache::CachedFingerprint::from_blob(data);
     let Ok(input) = Unstructured::new(data).arbitrary::<Input>() else {
         return;
     };

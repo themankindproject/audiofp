@@ -281,9 +281,9 @@ pub trait StreamingFingerprinter {
 /// [`StreamingPanako`](crate::StreamingPanako), and
 /// [`StreamingHaitsma`](crate::StreamingHaitsma) (all drain a pre-allocated
 /// `emitted` buffer; pinned by allocation-counting tests).
-/// [`neural::StreamingNeuralEmbedder`](crate::neural::StreamingNeuralEmbedder)
+/// [`neural::StreamingNeuralEmbedder`](https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html)
 /// (feature `neural`) deliberately does **not** implement this trait: even
-/// [`try_push_with`](crate::neural::StreamingNeuralEmbedder::try_push_with)
+/// [`try_push_with`](https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.try_push_with)
 /// reuses only the embedding scratch buffer — tract still allocates an input
 /// tensor and runtime workspace on every inference. Use classical streaming
 /// extractors when you need a whole-path zero-allocation contract.

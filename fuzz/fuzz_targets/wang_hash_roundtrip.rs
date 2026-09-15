@@ -6,9 +6,12 @@ use audiofp::{Fingerprinter, SampleRate};
 use bytemuck;
 use libfuzzer_sys::fuzz_target;
 
+mod pcm_seed {
+    include!("../common/pcm_seed.rs");
+}
+
 #[derive(Arbitrary, Debug)]
 struct Input {
-    samples: Vec<f32>,
     fan_out: u16,
 }
 
@@ -17,10 +20,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let min_len = 8_000 * 2;
-    if input.samples.len() < min_len {
-        return;
-    }
+    let samples = pcm_seed::synth_pcm(data, 8_000, pcm_seed::WANG_MIN, pcm_seed::WANG_MIN + 4_000);
 
     let cfg = {
         let mut c = WangConfig::default();
@@ -28,14 +28,11 @@ fuzz_target!(|data: &[u8]| {
         c
     };
 
-    let samples = &input.samples[..min_len];
-
     let mut fp = Wang::new(cfg);
     let Ok(fpr) = fp.extract(&samples, SampleRate::HZ_8000) else {
         return;
     };
 
-    // Roundtrip: hash -> bytes -> hash
     for h in &fpr.hashes {
         let bytes: [u8; 8] = bytemuck::pod_read_unaligned(bytemuck::bytes_of(h));
         let roundtripped: audiofp::classical::WangHash = bytemuck::pod_read_unaligned(&bytes);

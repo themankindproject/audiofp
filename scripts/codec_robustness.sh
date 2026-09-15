@@ -88,12 +88,21 @@ cd "$PROJECT_ROOT"
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
 
+TEST_STATUS=0
 if cargo test $TESTS --all-features -- --nocapture 2>"$TMPFILE"; then
     echo ""
     ok "All tests passed."
 else
+    TEST_STATUS=$?
     echo ""
-    fail "Some tests failed. See output above."
+    fail "Some tests failed (exit $TEST_STATUS). See output above."
+    # Surface stderr metrics before cleanup so CI logs retain the signal.
+    if [[ -s "$TMPFILE" ]]; then
+        echo ""
+        echo "--- captured test stderr ---"
+        cat "$TMPFILE"
+        echo "--- end captured stderr ---"
+    fi
 fi
 
 # ── Format results table ─────────────────────────────────────────────────
@@ -134,3 +143,5 @@ echo "  Cross-track    < 0.05    (different songs)"
 echo ""
 echo "Full methodology: ROBUSTNESS.md"
 echo "Raw test files:   tests/codec_roundtrip.rs, tests/codec_extended.rs"
+
+exit "$TEST_STATUS"
