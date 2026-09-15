@@ -7,252 +7,332 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Add opt-in `flush_complete` / `flush_complete_with` for Wang and Panako to
-  restore offline parity at fractional clip lengths; legacy flush is unchanged.
-  Reduce Haitsma extraction memory and compact peak candidates in place without
-  changing offline hash bytes. Harden DSP sizing, add effective neural-rate
-  extraction and validated detection-score APIs, and correct allocation claims.
+### Added
 
-- Exercise seed-driven PCM and raw parser fuzz paths, enforce allocation and
-  feature-isolated documentation checks, and propagate script/snippet errors.
-  Correct public examples and robustness claims; strengthen fixture generators,
-  chunk-pattern tests, and temporary-file isolation.
+New public API in this release:
 
-- Bound cache reads on validated file handles; add atomic writes and budgeted
-  directory ingestion. Convert decoded samples directly to mono without a
-  duplicated multichannel buffer, preserve normal PCM rounding, and reject
-  strict truncation and malformed WAV header arithmetic before decoding.
+| API | Path | Purpose |
+| --- | --- | --- |
+| `flush_complete`, `flush_complete_with` | `classical::{StreamingWang, StreamingPanako}` | offline-parity end-of-stream finalisation |
+| `CacheLoadLimits` | `cache` | per-scan file-count and total-byte caps |
+| `load_all_cached_limited`, `iter_cached` | `cache` | budgeted directory ingestion, lazily iterated |
+| `cache_to_file_atomic` | `cache` | temp-file + rename write; an existing file survives a failed write |
+| `effective_frames_per_sec` | `neural::{NeuralEmbedder, StreamingNeuralEmbedder}` | rate derived from the quantised sample hop |
+| `extract_with_effective_rate` | `neural::NeuralEmbedder` | embeddings plus corrected frame-rate metadata |
+| `detect_validated`, `detect_checked` | `watermark::WatermarkDetector` | rejects non-finite model scores, clamps finite ones to `[0, 1]` |
+| `is_empty_catalog` | `matching::{Wang, Haitsma, Panako}Index` | physical liveness; key-space `is_empty` stays `false` after removals |
 
-- Correct Wang connected-peak selection and sparse jitter voting, Panako
-  neighboring-scale consolidation, and mutable stop-hash suppression. Preserve
-  hash bytes and public layouts; incorrect match decisions can change. Reuse
-  query scratch across candidates and deduplicate Haitsma alignment checks.
+Enforcement limits added or tightened in this release:
 
-- Correct bakeoff resampling/timing boundaries and no-match reporting; protect
-  Chromaprint resources with RAII, compare equal-work watermark calls, and
-  run the separate bakeoff tests in CI. Published latency tables remain historical.
+| Limit | Value | Location |
+| --- | ---: | --- |
+| cache file size | 256 MiB | `cache::MAX_CACHE_FILE_BYTES` |
+| aggregate directory scan | caller-set (`CacheLoadLimits`) | `cache` |
+| decode channels | 64 | `io::decoder::MAX_DECODE_CHANNELS` |
+| resampled samples, hard default | 28 800 000 (10 min @ 48 kHz) | `io::decoder` |
+| resampler polyphase kernel table | 268 435 456 f32 cells (256 MiB) | `dsp::resample` |
+| neural batch front-end | 268 435 456 cells (1 GiB of f32) | `neural::embedder` |
+| neural `batch_size` | 4096 | `neural::embedder` |
+| watermark cached plans | 4 | `watermark::detector::MAX_CACHED_PLANS` |
+| index votes per query / per reference | 10 000 000 | `matching::index` |
+
+Test and harness additions:
+
+- **`tests/index_alloc.rs`** — deterministic allocation and heap-footprint
+  gates for the 1:N indexes: a warm `WangIndex::query` must not allocate per
+  candidate, and `estimated_bytes` must track real live bytes. It counts
+  allocator calls rather than timing them, so it cannot flake on a loaded
+  machine. Requires `std`; compiled out under `mimalloc`, like
+  `tests/zero_alloc.rs`.
+- **`benches/watermark_plans.rs`** — `WatermarkDetector::detect` at a fixed
+  versus alternating input length. The ONNX model is built in-process from
+  the prost types tract already vendors, so the bench needs no committed
+  weights and no download.
+- **`fuzz/common/pcm_seed.rs`, `fuzz/common/haitsma_cfg.rs`** — the
+  extraction fuzz targets fed on `arbitrary::Vec<f32>`, which almost never
+  reached the two-second algorithm minimum, so those code paths were
+  effectively dead. Targets now synthesise deterministic two-tone PCM from
+  the seed bytes with a fractional tail, and the Haitsma targets stop
+  passing an 8 kHz rate to a 5 kHz algorithm.
+- **`fuzz/fuzz_targets/matching_malformed.rs`** — fuzzes every matcher and
+  1:N index with structurally-malformed fingerprints (including `PanakoHash`
+  triplets violating `t_anchor < t_b < t_c`), pinning "no input may panic".
+- **`scripts/fuzz_smoke_all11.sh`** — replaces the inline CI loop, bounds
+  every target with `-runs` / `-max_total_time` / `-max_len`, and fails when
+  the target list drifts from `fuzz/Cargo.toml` (11 targets).
+- **Watermark `detect()` positive-path tests.** Every pre-existing test in
+  `watermark::detector` asserted a construction or validation *error*, so the
+  plan-build, the ≥2-output check, the confidence mean, and the LSB-first
+  message decode had no coverage. `src/watermark/test_fixture.rs` now
+  generates a valid two-output identity ONNX model on the fly.
+- **`tests/common/temp.rs`** — RAII scratch paths, so integration tests stop
+  colliding on fixed filenames under `std::env::temp_dir()`.
+- **CI gates:** allocation regressions (`std`, no mimalloc), rustdoc under
+  no-default and bare-`std` feature sets, and the doc snippet check widened
+  from USAGE.md to README.md and SECURITY.md. Each new gate is covered by
+  Python regression tests (`scripts/test_*.py`) so it cannot pass vacuously.
+- `DecodeLimits`, `DecodeStats`, `DecodeReport`, `FingerprintEnvelope`, and
+  `CachedFingerprint` are deliberately **not** `#[non_exhaustive]`: the
+  attribute is a compile break for downstream struct literals, so it is
+  deferred to 0.5.0 (issue #144, and the same decision recorded under 0.3.8).
+
+### Changed
+
+- **Streaming end-of-stream finalisation is now opt-in correctable (F01).**
+  `StreamingWang` and `StreamingPanako` gain `flush_complete` /
+  `flush_complete_with`, which finalise every remaining bucket *before*
+  emitting so later peaks can still become targets for earlier anchors. The
+  default `StreamingFingerprinter::flush` is byte-for-byte unchanged and
+  remains the choice for byte-identical legacy streams; at fractional clip
+  lengths it emits fewer hashes than offline `extract` (pinned as still
+  divergent at 18 000 samples so the gap cannot silently regress).
+  `flush_complete` parity with offline extraction is tested at 16 001 /
+  18 000 / 22 500 samples and at chunk sizes 1 / 127 / 1 024 / whole-input.
+- **Matching corrections change incorrect scores and match decisions.**
+  Wang connected-peak selection, sparse jitter voting, Panako
+  neighbouring-scale consolidation, and mutable stop-hash suppression were
+  each wrong in ways that changed *which* reference matched. `match_best` no
+  longer early-exits on the first `score >= 1.0`, so it agrees with
+  `match_ranked` and `par_match_best`. Hash bytes, public layouts, and wire
+  formats are unchanged.
+- **Decoded PCM is converted straight to mono.** The per-packet
+  multichannel `AudioBuffer<f32>` copy is gone; samples convert through
+  Symphonia's `IntoSample` into the mono vector, with an f64 fallback only
+  when a finite f32 sum could overflow before division. Ordinary PCM keeps
+  its original sum-then-divide rounding, so existing goldens are unchanged.
+- **The benchmark harness now compares equal work** (#146). Bakeoff timing
+  boundaries cover both stages, no-match runs are reported instead of
+  panicking, Chromaprint resources are RAII-scoped, and the separate bakeoff
+  tests run in CI. The published latency tables in `BENCHMARKS.md` remain
+  historical and were not regenerated.
+
+### Performance
+
+Two different baselines appear below and they are not comparable. The
+`WangIndex` and watermark tables describe the earlier audit implementation
+(criterion, this repo's benches). The A/B table is a separate standalone
+harness compiled against pristine `dfd42cc` versus the combined remediation
+tree. Neither is a universal speedup: corrected Wang voting adds work, and
+the measured index-query path is slower than the same path before the
+correctness fix.
+
+A/B on identical standalone harnesses (release, fat LTO, System allocator,
+three runs per version in A/B/B/A/A/B order; each run is the median of 15
+timed iterations after 3 warmups; memory is additional live heap during the
+call, not process RSS):
+
+| case | before ms | after ms | delta | extra heap before → after (B) | allocs before → after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `haitsma_extract_cold_30s` | 41.333 | 39.561 | −4.29% | 9 831 108 → 50 824 | 19 → 18 |
+| `haitsma_extract_warm_30s` | 40.494 | 39.686 | −1.99% | 9 244 → 9 244 | 1 → 1 |
+| `haitsma_lut_noisy_8s` | 0.302 | 0.105 | **−65.41%** | 65 056 → 65 056 | 544 → 545 |
+| `haitsma_stream_lifecycle_30s` | 40.085 | 40.155 | +0.17% | 58 220 → 58 220 | 23 → 23 |
+| `panako_extract_warm_30s` | 64.523 | 64.171 | −0.55% | 84 708 → 118 116 | 7 → 6 |
+| `panako_stream_lifecycle_30s` | 55.765 | 57.243 | +2.65% | 274 268 → 274 268 | 645 → 645 |
+| `wang_extract_warm_30s` | 62.016 | 61.248 | −1.24% | 83 872 → 117 280 | 5 → 4 |
+| `wang_index_build_n100` | 4.016 | 4.319 | +7.56% | 4 178 464 → 4 178 464 | 43 252 → 43 252 |
+| `wang_index_query_n100` | 3.872 | 4.109 | +6.11% | 56 192 → 56 192 | 800 → 700 |
+| `wang_stream_lifecycle_30s` | 53.705 | 54.426 | +1.34% | 271 376 → 271 376 | 626 → 626 |
+
+The cold-Haitsma heap reduction is 99.48%. Wang/Panako warm extraction
+allocates once less but retains a larger peak buffer; index build shows high
+run-to-run variance. These deltas are medians across three run medians, not
+confidence intervals, and desktop activity was not stopped — treat the
+sub-2% rows as noise.
+
+- **`WangIndex::query` was made 56% faster with 96% fewer per-query
+  allocations.** `bins`, `bin_vec`, `consolidated`, the plateau `Vec`, and
+  `contrib_indices` were allocated fresh for *every* candidate reference, and
+  the `per_ref: HashMap<u32, Vec<_>>` allocated one `Vec` per candidate on top
+  of that. All are now hoisted out of the candidate loop and reused via
+  `clear()`, and votes live in a single flat `Vec<(ref_id, offset, qi)>`
+  stably sorted by `ref_id`, so the `MAX_VOTES_PER_REF` truncation and the
+  deterministic lowest-id tie-break stay bit-identical. `q_max` is hoisted
+  out of the loop and a running vote `total` replaces a separate O(bins)
+  `sum_rest` pass. Criterion, 100-reference / 3-second query workload:
+
+  | metric | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | `matching/wang_index/n100_query` | 144.84 μs | ~63 μs | **≈ −56%** |
+  | allocations per warm query (`tests/index_alloc.rs`) | 369 | 16 | **−95.7%** |
+
+  Re-measured three times on a quiet machine to guard against contention
+  noise: 62.18 / 64.42 / 63.85 μs (a concurrent run during a full test suite
+  read 115.67 μs, so measure this one alone). The A/B row above shows the
+  later correctness fix adding ~6% back onto this path; the allocation count
+  is pinned by `tests/index_alloc.rs`, which counts allocator calls rather
+  than timing them, so the gain cannot silently regress.
+- **`WangIndex::query` also gained a total per-query vote cap.** The existing
+  `MAX_VOTES_PER_REF` bounded each reference independently, so peak query
+  memory was `O(references_hit × MAX_VOTES_PER_REF)`. A new
+  `MAX_VOTES_PER_QUERY` bounds the flat vote list overall.
+- **`WatermarkDetector` caches up to four concretised plans (LRU).** A single
+  slot meant alternating between input lengths rebuilt and re-optimised the
+  tract graph on every call. The cache holds `MAX_CACHED_PLANS = 4`, promoting
+  on hit and evicting the least recently used. The cap is deliberate:
+  concretising deep-clones the weights, so the cache multiplies resident model
+  memory by up to four. These rows performed unequal work and cannot
+  establish a speedup against `same_length`; PR #146 repairs call counts and
+  workload denominators, so use the corrected harness for new comparisons.
+
+  | `watermark/plan_cache` | median |
+  | --- | ---: |
+  | `same_length` (plan always reused) | 35.19 μs |
+  | `alternating_two_lengths`, one-slot cache | 97.63 μs |
+  | `alternating_two_lengths`, LRU(4) | 26.73 μs |
+
+- **`HaitsmaIndex` frame storage was measured and left unchanged.** The audit
+  estimated that replacing `frames: Vec<Vec<u32>>` with an `Arc`/offset arena
+  would "roughly halve memory". It does not — the nested form costs one `Vec`
+  header (24 B) per reference. An arena would also regress a documented
+  property, since `remove` currently frees a reference's frame memory
+  immediately and cannot do that for a middle range of a shared buffer.
+  `haitsma_frames_arena_overhead_is_measured` keeps the measurement in the
+  suite.
+
+  | layout (100 refs × 234 frames) | bytes | overhead |
+  | --- | ---: | ---: |
+  | nested `Vec<Vec<u32>>` | 96 000 | +2.6% |
+  | flat arena | 93 600 | — |
 
 ### Fixed
 
-Earlier audit fixes below preserve hash bytes. The matching corrections
-listed above intentionally change incorrect scores and match decisions;
-public APIs and wire layouts remain compatible.
+The matching corrections listed under Changed intentionally change incorrect
+scores and match decisions. Every fix below preserves hash bytes; public APIs
+and wire layouts remain compatible.
 
 - **Reachable panics from the public API on caller-constructed input.**
   `PanakoHash` documents `t_anchor < t_b < t_c` but its fields are `pub`
-  and `Pod`, so a malformed triplet is safe-Rust constructible and
-  reachable verbatim from `from_bytes`. `PanakoMatcher::match_one` and
-  `PanakoIndex::query` computed `t_c - t_anchor` unguarded — a debug
-  panic (`attempt to subtract with overflow`) and a silent release
-  wrap-around to a garbage scale. Both now use `saturating_sub` and skip
-  degenerate spans. `MelFilterBank::try_new` accepted `sr == 0`, which
-  overflowed the bin-range math (debug panic / release silent all-zero
-  filterbank returning `Ok`); it is now a `Config` error, as is a
-  non-finite `fmax`. `SincResampler::try_with_quality` accepted
-  `kaiser_beta`/`half_taps` values that produced all-NaN output or
-  panicked inside the *fallible* constructor; both are now validated.
-  `PeakPicker::pick` overflowed its capacity estimate for a huge
-  `frames_per_sec` (debug panic / release `capacity overflow` abort).
-
-- **`HaitsmaConfig` could silently produce a universal false positive.**
-  A `fmin..fmax` range narrow enough that a band receives no FFT bin
-  degenerates the whole sub-fingerprint to a constant value, after which
-  two unrelated recordings compare with BER 0 and `HaitsmaMatcher`
-  reports score 1.0 (verified: `fmin: 1000.0, fmax: 1000.5` matched
-  unrelated audio at 1.0000). `try_new` now rejects such configs for both
-  the offline and streaming extractors.
-
+  and `Pod`, so a malformed triplet is safe-Rust constructible and reachable
+  verbatim from `from_bytes`. `PanakoMatcher::match_one` and
+  `PanakoIndex::query` computed `t_c - t_anchor` unguarded — a debug panic
+  (`attempt to subtract with overflow`) and a silent release wrap-around to
+  a garbage scale. Both now use `saturating_sub` and skip degenerate spans.
+  `MelFilterBank::try_new` accepted `sr == 0`, which overflowed the bin-range
+  math (debug panic / release silent all-zero filterbank returning `Ok`); it
+  is now a `Config` error, as is a non-finite `fmax`.
+  `SincResampler::try_with_quality` accepted `kaiser_beta` / `half_taps`
+  values that produced all-NaN output or panicked inside the *fallible*
+  constructor; both are now validated. `PeakPicker::pick` overflowed its
+  capacity estimate for a huge `frames_per_sec` (debug panic / release
+  `capacity overflow` abort) and now caps the hint at the actual
+  spectrogram cell count.
+- **`HaitsmaConfig` could silently produce a universal false positive.** An
+  `fmin..fmax` range narrow enough that a band receives no FFT bin
+  degenerates the whole sub-fingerprint to a constant value, after which two
+  unrelated recordings compare with BER 0 and `HaitsmaMatcher` reports score
+  1.0 (verified: `fmin: 1000.0, fmax: 1000.5` matched unrelated audio at
+  1.0000). `try_new` now rejects such configs for both the offline and
+  streaming extractors.
 - **`matching::index` disagreed with the matchers on three documented
-  contracts.** `WangIndex`/`HaitsmaIndex`/`PanakoIndex::query` never
+  contracts.** `WangIndex` / `HaitsmaIndex` / `PanakoIndex::query` never
   checked frame-rate compatibility, so they returned a match (with a
-  wrong-rate `offset.ms`) where every matcher returns `MatchResult::NONE`
-  — `matching/mod.rs` promises the opposite "in all builds". All three
-  now enforce it per candidate. `WangIndex::query` normalised prominence
-  over the *observed vote span* rather than `WangMatcher`'s dense
+  wrong-rate `offset.ms`) where every matcher returns `MatchResult::NONE` —
+  `matching/mod.rs` promises the opposite "in all builds". All three now
+  enforce it per candidate. `WangIndex::query` normalised prominence over
+  the *observed vote span* rather than `WangMatcher`'s dense
   `[-q_max, +r_max]` range, which could reject a match the 1:1 matcher
-  accepts; the per-reference `r_max` is now stored and the span
-  reproduced exactly. `match_best` early-exited on the first
-  `score >= 1.0`, so a later reference with equal score and higher
-  prominence was ignored and `match_best` disagreed with `match_ranked`
-  and `par_match_best`; the early exit is removed.
-
-- **Index liveness API.** `is_empty()` is key-space and stays `false`
-  after every reference is removed (removal is physical but leaves empty
-  keys). Added `is_empty_catalog()` on all three indexes and documented
-  the `len`/`is_empty` semantics.
-
-- **Decoder hardening for untrusted uploads.** The post-resample
-  projection check was gated on `max_samples`, so `DecodeLimits::bytes(n)`
-  gave no protection against an upsample: a tiny file declaring 1 Hz
-  could expand ~86 000× (verified: 444 bytes → 38 MB) or burn unbounded
-  CPU outside the cooperative timeout. The projection is now bounded
-  regardless of `max_samples` (hard default: 10 minutes at 48 kHz). The
-  returned sample rate is now taken from the decoder's actual output spec
-  rather than the container header, so a mislabelled MP4/AAC sample entry
-  can no longer mislabel the PCM and warp every downstream fingerprint.
-  Added a 64-channel cap (the per-packet buffer is `frames × channels`)
-  and moved the zero-channel/oversize checks *before* the conversion
-  buffer allocation. The wall-clock deadline moved to the top of the
-  packet loop so non-audio packets and `ResetRequired` resyncs cannot
-  bypass it.
-
-- **`cache` hardening.** `load_from_cache`/`load_all_cached` read
+  accepts; the per-reference `r_max` is now stored and the span reproduced
+  exactly. `match_best` early-exited on the first `score >= 1.0`, so a later
+  reference with equal score and higher prominence was ignored and
+  `match_best` disagreed with `match_ranked` and `par_match_best`; the early
+  exit is removed.
+- **Index liveness API.** `is_empty()` is key-space and stays `false` after
+  every reference is removed (removal is physical but leaves empty keys).
+  Added `is_empty_catalog()` on all three indexes and documented the
+  `len` / `is_empty` semantics.
+- **Decoder hardening for untrusted uploads.** The post-resample projection
+  check was gated on `max_samples`, so `DecodeLimits::bytes(n)` gave no
+  protection against an upsample: a tiny file declaring 1 Hz could expand
+  ~86 000× (verified: 444 bytes → 38 MB) or burn unbounded CPU outside the
+  cooperative timeout. The projection is now bounded regardless of
+  `max_samples` (hard default 10 minutes at 48 kHz). The returned sample rate
+  is taken from the decoder's actual output spec rather than the container
+  header, so a mislabelled MP4/AAC sample entry can no longer mislabel the
+  PCM and warp every downstream fingerprint. A 64-channel cap applies before
+  the conversion buffer is allocated, the zero-channel / oversize checks
+  moved ahead of that allocation, and the wall-clock deadline moved to the
+  top of the packet loop so non-audio packets and `ResetRequired` resyncs
+  cannot bypass it. Strict mode now rejects detectable truncation
+  (unexpected container EOF, or a stream that re-synced mid-file) instead of
+  reporting a clean success, and a new RIFF/RIFX preflight walks the `fmt`
+  chunk with checked arithmetic before Symphonia probes it — a
+  65 535-channel WAVE header overflowed the probe's `u16` block-align math in
+  debug/overflow-checked builds.
+- **`cache` hardening.** `load_from_cache` / `load_all_cached` read
   unbounded files and followed symlinks; a `*.afp` symlink to `/dev/zero`
   grew until allocation failed, and a dangling symlink aborted the whole
-  scan. Only regular files are read now, with a 256 MiB cap
-  (`MAX_CACHE_FILE_BYTES`, `AfpError::InputTooLarge`).
-
+  scan. Reads now go through a validated opened handle
+  (`O_NOFOLLOW | O_NONBLOCK` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on
+  Windows, a `symlink_metadata` guard elsewhere), sized from that handle's
+  own metadata and capped at `MAX_CACHE_FILE_BYTES` (256 MiB) *plus* one
+  byte read past the cap, so growth or substitution after the check cannot
+  force an unbounded allocation. `cache_to_file_atomic` writes a private
+  temp file and renames it into place, leaving any previous file intact when
+  the write fails. `load_all_cached_limited` / `iter_cached` add optional
+  aggregate file-count and total-byte budgets. Parent directories remain the
+  caller's trust boundary; this is documented on every entry point.
 - **`neural` batch and streaming fixes.** An unbounded `batch_size` was a
   reachable `capacity overflow` panic / multi-GiB allocation in `extract`
-  (capped at 4096 now). `StreamingNeuralEmbedder::flush` discarded
-  buffered samples without advancing the timeline, so a documented-valid
-  `push` after `flush` reported a rewound `t_start`.
-
+  (capped at 4096, and the planned batch front-end is bounded by cell count).
+  `StreamingNeuralEmbedder::flush` discarded buffered samples without
+  advancing the timeline, so a documented-valid `push` after `flush` reported
+  a rewound `t_start`. `NeuralFingerprint::frames_per_sec` was `1.0 /
+  hop_secs` while the actual hop is quantised to whole samples; use
+  `effective_frames_per_sec` / `extract_with_effective_rate` when converting
+  embedding indices to wall-clock time.
 - **`std` alone is no longer a compile error.** It was a hard
   `compile_error!`, which broke feature unification (a downstream graph
   enabling `audiofp/std` could not build) and made the codec-free `cache`
   module unreachable. Bare `std` now builds and enables `cache` +
   `IoError`; `audiofp::io` simply stays absent.
-
-- **`AfpError::Io` now forwards its source** (`#[error(transparent)]`),
-  so `anyhow`/`eyre`-style chains reach the underlying `std::io::Error`
-  instead of stopping at the display string; `ModelLoad` keeps the
-  offending path for non-`NotFound` open failures.
-
-- **Performance.** Panako Hough consolidation was O(B²), not O(B·W) as
-  documented: the backward/forward scans walked the entire same-scale run
-  for every bin (measured 71 s on a 100 k-entry accumulator). Both the
-  matcher and `PanakoIndex` now stop at the offset-window boundary,
-  restoring the documented complexity. The RANSAC pair buffer is only
-  filled when `ransac_refine` is enabled, and a refined result that does
-  not clear `min_votes` now falls back to the coarse peak instead of
-  rejecting a match the coarse path accepted. Removed a dead
-  `(2·kt+1)×n_bins` ring buffer (`IncrementalPeakDetector`) that was
-  written but never read — ~127 KB and one memcpy per row.
-
-- **Streaming correctness.** `StreamingPanako` now emits an anchor's
+- **`AfpError::Io` now forwards its source** (`#[error(transparent)]`), so
+  `anyhow` / `eyre`-style chains reach the underlying `std::io::Error`
+  instead of stopping at the display string; `ModelLoad` keeps the offending
+  path for non-`NotFound` open failures.
+- **Panako Hough consolidation was O(B²), not the documented O(B·W).** The
+  backward/forward scans walked the entire same-scale run for every bin
+  (measured 71 s on a 100 k-entry accumulator). Both the matcher and
+  `PanakoIndex` now stop at the offset-window boundary, restoring the
+  documented complexity. The RANSAC pair buffer is only filled when
+  `ransac_refine` is enabled, and a refined result that does not clear
+  `min_votes` now falls back to the coarse peak instead of rejecting a match
+  the coarse path accepted. Removed a dead `(2·kt+1)×n_bins` ring buffer
+  (`IncrementalPeakDetector`) that was written but never read.
+- **Streaming and DSP correctness.** `StreamingPanako` emits an anchor's
   triplets in `(t_b, t_c)` order, honouring the documented
   `PanakoFingerprint` `(t_anchor, t_b, t_c, hash)` ordering invariant that
-  the offline path establishes. `rolling_max_1d`'s deque is now
-  NaN-consistent with the `k == 15` vectorized path (a NaN could
-  previously reach the deque front and be returned).
-
+  the offline path establishes. `rolling_max_1d`'s deque is NaN-consistent
+  with the `k == 15` vectorised path (a NaN could previously reach the deque
+  front and be returned), and the incremental detector's vertical deques no
+  longer propagate NaN. Centred framing with `n_fft == 1` no longer invents
+  a phantom trailing frame. Peak candidates are compacted in place after the
+  bucket sort, and Haitsma extraction processes one STFT frame at a time
+  instead of materialising the whole power spectrogram.
+- **Verification gaps closed (F19, F21, F22, F25).**
+  `scripts/codec_robustness.sh` returned success after a failed `cargo test`;
+  it now propagates the exit status and surfaces captured stderr. The public
+  examples in README / USAGE / SECURITY were corrected and are compiled and
+  run by CI, including the `decode_to_mono` / `NeuralEmbedder` snippets that
+  previously hid runtime errors. The doc snippet checker now refuses to pass
+  when zero snippets are runnable.
 - **Documentation corrected where it contradicted the implementation:**
-  Haitsma's band↔bit mapping (band `b` → bit `31 - b`, and
-  `reverse_bits` — not XOR/byte-swap — is the paper's conversion);
-  Panako's default hash rate (150/s hard cap, not ~250/s); the
-  resampler's real stopband at default quality (≈ -23 dB above the output
-  Nyquist, not -80 dB) and the `half_taps`-scaling requirement; the
-  calibration maps' `MatchResult::NONE` value (algorithm-dependent,
-  ≈6e-10 for Haitsma — not a shared ≈0.01); the serialization payload's
-  native endianness (not "zero-copy little-endian"); `power_to_db_wide`'s
-  up-to-1-ULP divergence from the scalar path; `PeakPickerConfig::default`'s
-  dB floor (was `1e-3`, a linear-value threshold that returned zero peaks
-  on dB spectrograms); `compute_prominence`'s formula. Documented that
-  chained Ogg streams are not followed (silent truncation signalled only
-  by `DecodeStats::resets`).
-
-### Performance
-
-The measurements below describe the earlier audit implementation, not the
-final corrected matchers or the repaired benchmark harness. Follow-up A/B
-results are attached to PRs #148 and #149: Haitsma noisy matching and cold
-extraction memory improve, while corrected Wang voting has a measured
-latency cost. These changes are not a universal speedup.
-
-- **`WangIndex::query` is 56% faster; per-query allocations are down 96%.**
-  `bins`, `bin_vec`, `consolidated`, the plateau `Vec`, and
-  `contrib_indices` were allocated fresh for *every* candidate reference,
-  and the `per_ref: HashMap<u32, Vec<_>>` allocated one `Vec` per candidate
-  on top of that. All are now hoisted out of the candidate loop and reused
-  via `clear()`, and votes live in a single flat `Vec<(ref_id, offset, qi)>`
-  that is stably sorted by `ref_id`. Because the sort is stable, each
-  reference's votes keep their original insertion order, so the
-  `MAX_VOTES_PER_REF` truncation and the deterministic lowest-id tie-break
-  are bit-identical to before — no score, offset, or `is_match` change.
-  `q_max` is hoisted out of the loop, and a running vote `total` replaces a
-  separate O(bins) `sum_rest` pass.
-
-  Measured on the 100-reference, 3-second query workload:
-
-  | metric | before | after | delta |
-  |---|---|---|---|
-  | `matching/wang_index/n100_query` (criterion median) | 144.84 µs | ~63 µs | **≈ −56%** |
-  | allocations per warm query (`tests/index_alloc.rs`) | 369 | 16 | **−95.7%** |
-
-  The timing was re-measured three times on a quiet machine to guard against
-  contention noise: 62.18 / 64.42 / 63.85 µs (a concurrent run during a full
-  test suite read 115.67 µs, so measure this one alone). The full
-  `matching` bench shows no regression in any other group.
-
-  The allocation count is pinned by the new `tests/index_alloc.rs`, which
-  counts allocator calls rather than timing them, so the gain cannot
-  silently regress on a busy or quiet machine.
-- **`WangIndex::query` now has a total per-query vote cap.** The existing
-  `MAX_VOTES_PER_REF` bounded each reference independently, so peak query
-  memory was `O(references_hit × MAX_VOTES_PER_REF)`. A new
-  `MAX_VOTES_PER_QUERY` bounds the flat vote list overall.
-- **`WatermarkDetector` caches up to four concretised plans (LRU).** A
-  single slot meant alternating between input lengths rebuilt and
-  re-optimised the tract graph on every call. The cache now holds
-  `MAX_CACHED_PLANS = 4` plans, promoting on hit and evicting the least
-  recently used. The cap is deliberate: concretising deep-clones the
-  weights, so the cache multiplies resident model memory by up to four.
-  Measured with `benches/watermark_plans.rs`, 4096- and 2048-sample inputs
-  alternating (lower is better):
-
-  | `watermark/plan_cache` | median |
-  |---|---|
-  | `same_length` (plan always reused) | 35.19 µs |
-  | `alternating_two_lengths`, one-slot cache | 97.63 µs |
-  | `alternating_two_lengths`, LRU(4) | 26.73 µs |
-
-  These historical rows performed unequal work and cannot establish a
-  speedup against `same_length`. PR #146 repairs call counts and workload
-  denominators; use the corrected harness for new comparisons.
-- **Audit §4.2 #9 (`HaitsmaIndex` frame storage) was measured and left
-  unchanged.** The audit estimated that replacing `frames: Vec<Vec<u32>>`
-  with an `Arc`/offset arena would "roughly halve memory". It does not: the
-  nested form costs one `Vec` header (24 B) per reference, which measured
-  **2.6%** over a flat arena at realistic sizes (100 refs × 234 frames:
-  96,000 B nested vs 93,600 B flat, i.e. +2,400 B total), not ~50%. The
-  index holds no duplicated frame data — the clone at build/insert copies
-  the caller's input, it is not a second resident copy. An arena would also
-  regress a documented property, since `remove` currently frees a
-  reference's frame memory immediately and cannot do that for a middle range
-  of a shared buffer. `haitsma_frames_arena_overhead_is_measured` keeps the
-  measurement in the suite.
-
-### Added
-
-- **`fuzz/fuzz_targets/matching_malformed.rs`** — fuzzes every matcher and
-  1:N index with structurally-malformed fingerprints (including
-  `PanakoHash` triplets violating `t_anchor < t_b < t_c`), pinning
-  "no input may panic". Registered in `fuzz/Cargo.toml` and the CI smoke
-  loop (now 11 targets).
-- `DecodeLimits`, `DecodeStats`, `DecodeReport`, `FingerprintEnvelope`,
-  and `CachedFingerprint` are **not** `#[non_exhaustive]`. The attribute
-  was added during this pass and reverted before release: it is a compile
-  break for downstream struct literals (and for exhaustive `match` on
-  `CachedFingerprint`), so it cannot ship in a patch release. Deferred to
-  **0.5.0** — see issue #144, and the same decision recorded under 0.3.8.
-- **`tests/index_alloc.rs`** — deterministic allocation and heap-footprint
-  gates for the 1:N indexes: a warm `WangIndex::query` must not allocate per
-  candidate, and `estimated_bytes` must track real live bytes. Counts
-  allocator calls instead of timing them, so it cannot flake on a loaded
-  machine. Requires `std` and is compiled out under `mimalloc` (which
-  installs its own `#[global_allocator]`), like `tests/zero_alloc.rs`.
-- **`benches/watermark_plans.rs`** — measures `WatermarkDetector::detect`
-  at a fixed input length vs alternating lengths. The ONNX model is built
-  in-process with the prost types tract already vendors, so the bench needs
-  no committed weights and no download.
-- **Watermark `detect()` now has positive-path tests.** Every pre-existing
-  test in `watermark::detector` asserted a construction or validation
-  *error*, so the plan-build, the ≥2-output check, the confidence mean, and
-  the LSB-first message decode had no coverage. `src/watermark/test_fixture.rs`
-  generates a valid two-output identity ONNX model on the fly, and three new
-  tests exercise the real path (detection, message decode, and length
-  interleaving). This closes audit §4.3 #13.
+  Haitsma's band↔bit mapping (band `b` → bit `31 - b`, and `reverse_bits` —
+  not XOR/byte-swap — is the paper's conversion); Panako's default hash rate
+  (150/s hard cap, not ~250/s); the resampler's real stopband at default
+  quality (≈ -23 dB above the output Nyquist, not -80 dB) and the
+  `half_taps`-scaling requirement; the calibration maps' `MatchResult::NONE`
+  value (algorithm-dependent, ≈6e-10 for Haitsma — not a shared ≈0.01); the
+  serialization payload's native endianness (not "zero-copy little-endian");
+  `power_to_db_wide`'s up-to-1-ULP divergence from the scalar path;
+  `PeakPickerConfig::default`'s dB floor (was `1e-3`, a linear-value
+  threshold that returned zero peaks on dB spectrograms);
+  `compute_prominence`'s formula. Also documented that chained Ogg streams
+  are not followed (silent truncation signalled only by
+  `DecodeStats::resets`), and that `ZeroAllocStreaming` covers the classical
+  streaming extractors — the neural streamer reuses only its embedding
+  scratch, since tract still allocates an input tensor and runtime workspace
+  per inference.
 
 ## [0.4.2] - 2026-09-06
 
