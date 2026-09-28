@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+Faster Wang/Panako extraction and streaming, far lower peak memory for
+offline extraction, and smaller 1:N indexes. **Hash output is unchanged** —
+bit-identical to 0.4.3 on the golden corpus, 7 real-audio files, and
+randomized spectra, offline and streaming (legacy `flush` and
+`flush_complete`). No public API changes.
+
+Speed: `cargo bench` medians, same machine (Intel i5-1135G7) and settings
+before and after. Haitsma's code path is untouched, so its rows are a
+control for run-to-run noise.
+
+#### Extraction
+
+| Benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `wang/extract/2s` | 4.17 ms | 1.46 ms | −65 % (2.86×) |
+| `wang/extract/5s` | 10.30 ms | 3.75 ms | −64 % (2.75×) |
+| `wang/extract/30s` | 66.60 ms | 22.80 ms | −66 % (2.92×) |
+| `panako/extract/2s` | 4.24 ms | 1.51 ms | −65 % (2.82×) |
+| `panako/extract/5s` | 10.52 ms | 4.01 ms | −62 % (2.62×) |
+| `panako/extract/30s` | 68.90 ms | 25.78 ms | −63 % (2.67×) |
+| `haitsma/extract/30s` (control) | 42.02 ms | 40.35 ms | −4 % (noise) |
+
+#### Streaming (10 s of audio per session)
+
+| Benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `streaming/wang/push_flush_session/small_chunk_256` | 9.02 ms | 3.97 ms | −56 % (2.27×) |
+| `streaming/wang/push_flush_session/large_chunk_1s` | 8.94 ms | 3.88 ms | −57 % (2.30×) |
+| `streaming/wang/push_with_callback_warmed/small_chunk_256` | 57.3 µs | 24.1 µs | −58 % (2.38×) |
+| `streaming/panako/push_flush_session/small_chunk_256` | 9.42 ms | 4.25 ms | −55 % (2.22×) |
+| `streaming/panako/push_flush_session/large_chunk_1s` | 9.24 ms | 4.19 ms | −55 % (2.20×) |
+| `streaming/panako/push_with_callback_warmed/small_chunk_256` | 57.8 µs | 24.7 µs | −57 % (2.34×) |
+| `streaming/haitsma/push_flush_session/small_chunk_256` (control) | 6.50 ms | 6.33 ms | −3 % (noise) |
+
+#### Matching (1:N index)
+
+| Benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `matching/wang_index/n100_query` | 76.2 µs | 69.9 µs | −8 % |
+| `matching/wang_index_insert/insert_one_into_n100` | 114.0 µs | 105.0 µs | −8 % |
+| `matching/wang_index_insert/rebuild_n101` | 13.12 ms | 10.23 ms | −22 % |
+
+1:1 matchers (`WangMatcher`, `PanakoMatcher`, `HaitsmaMatcher`) are
+unchanged, within ±2 %.
+
+#### Memory
+
+Measured with a counting global allocator on synthetic music.
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `Wang` / `Panako` offline extract, 30 s — peak heap | 11.6 MB | 0.27 MB | −98 % |
+| `Wang` / `Panako` offline extract, 5 min — peak heap | 116.2 MB | 0.81 MB | −99 % |
+| `WangIndex`, 300 tracks × 20 s — live heap | 56.9 MB | 37.0 MB | −35 % |
+| `WangIndex`, 300 tracks × 20 s — allocations in `build` | 695 100 | 146 905 | −79 % |
+| `WangIndex`, 1 000 tracks × 20 s — live heap | 121.7 MB | 87.5 MB | −28 % |
+| `PanakoIndex`, 300 tracks × 20 s — live heap | 67.2 MB | 38.5 MB | −43 % |
+
+#### What changed
+
+- **Peak picking** (`dsp::peaks`): the 2-D rolling max runs the horizontal
+  pass by doubling over a NaN-padded row and the vertical pass as a
+  streaming van Herk / Gil-Werman block max, with an 8-wide bitmask
+  candidate scan. Both are exact, so peaks are identical.
+  `IncrementalPeakDetector` uses the same kernels and still allocates
+  nothing after construction.
+- **Offline Wang/Panako front-end:** computes, converts, and peak-picks
+  one STFT frame at a time instead of materialising the spectrogram. The
+  dB conversion reproduces the previous whole-buffer SIMD/scalar rounding
+  split exactly.
+- **Index postings:** `WangIndex`, `HaitsmaIndex`, and `PanakoIndex` store
+  single-posting keys (82–85 % of keys on measured catalogs) inline in the
+  map slot instead of in a separate heap allocation.
+
+### Notes
+
+`realfft` is still built with `default-features = false`, so `rustfft` runs
+its scalar FFT. Enabling its SIMD backends is a further speed-up and left
+all hashes identical on an AVX2 host (same machine, synthetic music, harness
+medians):
+
+| Workload (30 s of audio) | Scalar FFT (default) | SIMD FFT (opt-in) |
+| --- | ---: | ---: |
+| `Wang` extract | 21.0 ms | 14.1 ms |
+| `Panako` extract | 23.3 ms | 16.6 ms |
+| `Haitsma` extract | 35.0 ms | 14.8 ms |
+
+This crate does not enable it by default: `rustfft` picks the instruction
+set at runtime and its FFT output is not bit-identical across backends, so
+hashes could differ between machines. Applications that accept that
+trade-off can opt in with
+`realfft = { version = "3.5", default-features = false, features = ["avx", "sse", "neon"] }`
+in their own dependencies.
+
 ## [0.4.3] - 2026-09-16
 
 ### Added

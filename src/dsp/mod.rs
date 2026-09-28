@@ -9,7 +9,7 @@
 //! | [`windows`]           | Tapered Hann / Hamming / Blackman generators             |
 //! | [`stft`]              | Pre-planned real-input STFT with reusable scratch        |
 //! | [`mel`]               | Triangular mel filterbank (HTK + Slaney scales)          |
-//! | [`peaks`]             | 2-D peak picker (Lemire monotonic-deque rolling max)     |
+//! | [`peaks`]             | 2-D peak picker (streaming separable rolling max)        |
 //! | [`resample`]          | Linear and windowed-sinc Kaiser resamplers               |
 //!
 //! All modules compile under `no_std + alloc` so they can be reused on
