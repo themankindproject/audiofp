@@ -60,16 +60,24 @@ pub(crate) fn report_stft_progress(
 }
 
 /// Shared offline front-end for the landmark fingerprinters: Hann STFT,
-/// pooled dB log-magnitude buffer, and a pooled peak picker.
+/// per-frame dB conversion, and a pooled row-streaming peak picker.
 ///
 /// [`Wang`](super::Wang) and [`Panako`](super::Panako) embed one and
 /// differ only in hash emission, so construction and the
 /// STFT→dB→pick pipeline live here once.
+///
+/// Frames are transformed, converted, and fed to the picker one at a
+/// time, so the spectrogram is never materialised: scratch is
+/// `O(neighborhood · n_bins)` (≈ 190 KB) instead of three
+/// `n_frames × n_bins` buffers (≈ 39 MB per minute of audio). The peaks
+/// are bit-identical to picking over the full dB spectrogram — see
+/// [`crate::dsp::simd::db_into_split`] for the one rounding detail that
+/// has to be reproduced.
 pub(crate) struct FrontEnd {
     stft: ShortTimeFFT,
     picker: PeakPicker,
-    /// Pooled log-magnitude buffer reused between calls.
-    log_spec: alloc::vec::Vec<f32>,
+    /// Pooled single-frame power / dB row.
+    frame: alloc::vec::Vec<f32>,
 }
 
 impl FrontEnd {
@@ -95,10 +103,11 @@ impl FrontEnd {
             min_magnitude_linear: None,
             target_per_sec: peaks_per_sec,
         });
+        let frame = alloc::vec![0.0_f32; stft.n_bins()];
         Self {
             stft,
             picker,
-            log_spec: alloc::vec::Vec::new(),
+            frame,
         }
     }
 
@@ -111,11 +120,34 @@ impl FrontEnd {
         frames_per_sec: f32,
         log_floor_power: f32,
     ) -> (usize, alloc::vec::Vec<Peak>) {
-        let (n_frames, n_bins) = self.stft.power_flat_into(samples, &mut self.log_spec);
-        crate::dsp::power_to_db_wide(&mut self.log_spec, log_floor_power);
-        let peaks = self
-            .picker
-            .pick(&self.log_spec, n_frames, n_bins, frames_per_sec);
-        (n_frames, peaks)
+        let n_frames = self.stft.n_frames(samples.len());
+        let n_bins = self.stft.n_bins();
+        if n_frames == 0 {
+            return (0, alloc::vec::Vec::new());
+        }
+        let n_fft = self.stft.config().n_fft;
+        let hop = self.stft.config().hop;
+        // The dB conversion used to run over the whole flat spectrogram,
+        // whose last `len % 8` cells took the scalar path. Keep exactly
+        // that split so the dB values — and therefore the peaks — are
+        // bit-identical.
+        let total = n_frames * n_bins;
+        let simd_end = total - total % 8;
+        self.picker.begin(n_frames, n_bins, frames_per_sec);
+        for f in 0..n_frames {
+            let start = f * hop;
+            self.stft
+                .process_frame_power(&samples[start..start + n_fft], &mut self.frame)
+                .expect("frame is sized n_bins and every frame is exactly n_fft");
+            let scalar_from = simd_end.saturating_sub(f * n_bins);
+            crate::dsp::simd::db_into_split(
+                &mut self.frame,
+                log_floor_power,
+                crate::dsp::DB_LOG2_FACTOR,
+                scalar_from,
+            );
+            self.picker.push_row(&self.frame);
+        }
+        (n_frames, self.picker.finish(frames_per_sec))
     }
 }

@@ -47,6 +47,123 @@ pub(crate) fn hashmap_new<K: Ord, V>() -> HashMap<K, V> {
 
 use alloc::vec::Vec;
 
+/// A posting list that stores a single posting inline.
+///
+/// `P` is the posting tuple: `(ref_id, position)` for the Wang and Haitsma
+/// indexes, `(ref_id, t_anchor, t_b, t_c)` for Panako.
+///
+/// Measured on 300-reference catalogs, 82 % (Wang) and 85 % (Panako) of
+/// hash keys have exactly one posting. As a `Vec<P>` each of those costs a
+/// separate heap allocation (rounded up by the allocator) on top of the
+/// 24-byte `Vec` header in the map slot. Here the singleton lives in the
+/// slot itself — for both posting sizes the enum is the same 24 bytes as a
+/// `Vec` — so the common case allocates nothing and reading it needs no
+/// pointer chase.
+///
+/// Behaviour is exactly that of the `Vec` it replaces: postings are kept in
+/// insertion order, `retain` preserves the order of survivors, and iteration
+/// yields postings in the same order, so index queries are bit-identical.
+/// An empty list stays in the map (as before) as `Empty`.
+#[derive(Clone, Debug)]
+pub(crate) enum Postings<P> {
+    /// No postings (a list emptied by `remove`).
+    Empty,
+    /// Exactly one posting, stored inline.
+    One(P),
+    /// Two or more postings (or a list that shrank from two or more).
+    Many(Vec<P>),
+}
+
+impl<P> Default for Postings<P> {
+    #[inline]
+    fn default() -> Self {
+        Postings::Empty
+    }
+}
+
+impl<P: Copy> Postings<P> {
+    /// Append a posting.
+    #[inline]
+    pub(crate) fn push(&mut self, p: P) {
+        match self {
+            Postings::Empty => *self = Postings::One(p),
+            Postings::One(first) => *self = Postings::Many(alloc::vec![*first, p]),
+            Postings::Many(v) => v.push(p),
+        }
+    }
+
+    /// The postings as a slice, in insertion order.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[P] {
+        match self {
+            Postings::Empty => &[],
+            Postings::One(p) => core::slice::from_ref(p),
+            Postings::Many(v) => v,
+        }
+    }
+
+    /// Number of postings.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// `true` if the list holds no postings.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// Iterate postings by reference, in insertion order.
+    #[inline]
+    pub(crate) fn iter(&self) -> core::slice::Iter<'_, P> {
+        self.as_slice().iter()
+    }
+
+    /// Keep only the postings for which `keep` returns `true`, preserving
+    /// order (same contract as [`Vec::retain`]).
+    #[inline]
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&P) -> bool) {
+        match self {
+            Postings::Empty => {}
+            Postings::One(p) => {
+                if !keep(p) {
+                    *self = Postings::Empty;
+                }
+            }
+            Postings::Many(v) => v.retain(|p| keep(p)),
+        }
+    }
+
+    /// Heap bytes owned by this list (0 unless spilled to a `Vec`).
+    #[inline]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Postings::Many(v) => v.capacity() * core::mem::size_of::<P>(),
+            _ => 0,
+        }
+    }
+}
+
+impl<'a, P: Copy> IntoIterator for &'a Postings<P> {
+    type Item = &'a P;
+    type IntoIter = core::slice::Iter<'a, P>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+// The inline singleton must not grow the map slot beyond a `Vec` header.
+const _: () = assert!(
+    core::mem::size_of::<Postings<(u32, u32)>>() == core::mem::size_of::<Vec<(u32, u32)>>()
+);
+const _: () = assert!(
+    core::mem::size_of::<Postings<(u32, u32, u32, u32)>>()
+        == core::mem::size_of::<Vec<(u32, u32, u32, u32)>>()
+);
+
 /// A sorted inverted index for `(hash, t_anchor)` pairs.
 ///
 /// Replaces `HashMap<hash, Vec<t_anchor>>` with a single sort + three
@@ -314,5 +431,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `Postings` must behave exactly like the `Vec` it replaced under any
+    /// interleaving of push and retain (order, contents, emptiness).
+    #[test]
+    fn postings_matches_vec_under_random_push_retain() {
+        let mut x: u32 = 0xA11CE;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..2000 {
+            let mut p: Postings<(u32, u32)> = Postings::default();
+            let mut v: Vec<(u32, u32)> = Vec::new();
+            for _ in 0..(next() % 12) {
+                if next() % 3 == 0 {
+                    let kill = next() % 4;
+                    p.retain(|&(r, _)| r != kill);
+                    v.retain(|&(r, _)| r != kill);
+                } else {
+                    let e = (next() % 4, next());
+                    p.push(e);
+                    v.push(e);
+                }
+                assert_eq!(p.as_slice(), v.as_slice());
+                assert_eq!(p.len(), v.len());
+                assert_eq!(p.is_empty(), v.is_empty());
+                assert_eq!((&p).into_iter().copied().collect::<Vec<_>>(), v);
+            }
+        }
+        // A singleton owns no heap; a spilled list reports its capacity.
+        let mut p: Postings<(u32, u32)> = Postings::default();
+        p.push((1, 2));
+        assert_eq!(p.heap_bytes(), 0);
+        p.push((3, 4));
+        assert!(p.heap_bytes() >= 2 * core::mem::size_of::<(u32, u32)>());
     }
 }

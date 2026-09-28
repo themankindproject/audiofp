@@ -24,7 +24,7 @@ use crate::matching::{MatchResult, Matcher};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::matching::maps::{HashMap, hashmap_new, hashmap_with_capacity};
+use crate::matching::maps::{HashMap, Postings, hashmap_new, hashmap_with_capacity};
 
 /// Soft cap on votes recorded per reference in [`WangIndex::query`].
 ///
@@ -285,8 +285,10 @@ fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: Ma
 /// - **Query cost:** `O(Q × avg_postings + C)` where `Q` = query hash
 ///   count, `avg_postings` = mean posting list length, `C` = candidate
 ///   references that received any vote (scored individually).
-/// - **Memory:** roughly `8 bytes × total_hashes` (after stop-hash
-///   removal) plus HashMap overhead.
+/// - **Memory:** `8 bytes × total_hashes` of postings (after stop-hash
+///   removal) plus HashMap overhead. Single-posting keys — the large
+///   majority on real catalogs — are stored inline in the map slot with no
+///   separate allocation.
 ///
 /// For catalogs above ~10 000 tracks, raise `min_votes` / `min_score`
 /// pre-filters or shard the index.
@@ -296,7 +298,7 @@ pub struct WangIndex {
     /// `ref_id` is stored as `u32` (8 bytes per posting instead of 16 for
     /// `(usize, u32)` on 64-bit). Reference counts above `u32::MAX` are
     /// rejected at build time.
-    map: HashMap<u32, alloc::vec::Vec<(u32, u32)>>,
+    map: HashMap<u32, Postings<(u32, u32)>>,
     /// Frame rates are stored per-reference for offset conversion.
     fps: alloc::vec::Vec<f32>,
     /// Largest `t_anchor` per reference, stored so `query` can reproduce
@@ -342,7 +344,7 @@ impl WangIndex {
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut map: HashMap<u32, Vec<(u32, u32)>> = super::maps::hashmap_with_capacity(
+        let mut map: HashMap<u32, Postings<(u32, u32)>> = super::maps::hashmap_with_capacity(
             refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
         );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
@@ -622,9 +624,9 @@ impl WangIndex {
         // `map.len() * size_of::<K>()` term would count each live key
         // twice (audit §4.2 #10).
         let mut bytes = map_slot_count(&self.map)
-            * (size_of::<u32>() + size_of::<Vec<(u32, u32)>>() + map_overhead_per_slot());
+            * (size_of::<u32>() + size_of::<Postings<(u32, u32)>>() + map_overhead_per_slot());
         for list in self.map.values() {
-            bytes += list.capacity() * size_of::<(u32, u32)>();
+            bytes += list.heap_bytes();
         }
         bytes += self.fps.capacity() * size_of::<f32>();
         bytes += self.r_max.capacity() * size_of::<u32>();
@@ -884,7 +886,7 @@ pub struct HaitsmaIndex {
     ///
     /// `ref_id` is stored as `u32` (8 bytes per posting instead of 16 for
     /// `(usize, u32)` on 64-bit).
-    lut: HashMap<u32, Vec<(u32, u32)>>,
+    lut: HashMap<u32, Postings<(u32, u32)>>,
     /// Per-reference frame slices for BER verification.
     frames: Vec<Vec<u32>>,
     /// Per-reference frame rates for offset conversion.
@@ -926,7 +928,7 @@ impl HaitsmaIndex {
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut lut: HashMap<u32, Vec<(u32, u32)>> = super::maps::hashmap_with_capacity(
+        let mut lut: HashMap<u32, Postings<(u32, u32)>> = super::maps::hashmap_with_capacity(
             refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2,
         );
         let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
@@ -1151,9 +1153,9 @@ impl HaitsmaIndex {
         // No separate `lut.len() * size_of::<u32>()` key term: the slot
         // count below already includes one key per slot (audit §4.2 #10).
         let mut bytes = map_slot_count(&self.lut)
-            * (size_of::<u32>() + size_of::<Vec<(u32, u32)>>() + map_overhead_per_slot());
+            * (size_of::<u32>() + size_of::<Postings<(u32, u32)>>() + map_overhead_per_slot());
         for list in self.lut.values() {
-            bytes += list.capacity() * size_of::<(u32, u32)>();
+            bytes += list.heap_bytes();
         }
         for f in &self.frames {
             bytes += f.capacity() * size_of::<u32>();
@@ -1380,7 +1382,7 @@ pub struct PanakoIndex {
     ///
     /// `ref_id` is stored as `u32` (16 bytes per posting instead of 24
     /// for `(usize, u32, u32, u32)` on 64-bit).
-    map: HashMap<u32, Vec<(u32, u32, u32, u32)>>,
+    map: HashMap<u32, Postings<(u32, u32, u32, u32)>>,
     /// Per-reference frame rates for offset conversion.
     fps: Vec<f32>,
     /// Liveness bit parallel to `fps` (bookkeeping for
@@ -1409,9 +1411,10 @@ impl PanakoIndex {
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut map: HashMap<u32, Vec<(u32, u32, u32, u32)>> = super::maps::hashmap_with_capacity(
-            refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
-        );
+        let mut map: HashMap<u32, Postings<(u32, u32, u32, u32)>> =
+            super::maps::hashmap_with_capacity(
+                refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
+            );
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
@@ -1620,9 +1623,11 @@ impl PanakoIndex {
         // No separate `map.len() * size_of::<u32>()` key term: the slot
         // count below already includes one key per slot (audit §4.2 #10).
         let mut bytes = map_slot_count(&self.map)
-            * (size_of::<u32>() + size_of::<Vec<(u32, u32, u32, u32)>>() + map_overhead_per_slot());
+            * (size_of::<u32>()
+                + size_of::<Postings<(u32, u32, u32, u32)>>()
+                + map_overhead_per_slot());
         for list in self.map.values() {
-            bytes += list.capacity() * size_of::<(u32, u32, u32, u32)>();
+            bytes += list.heap_bytes();
         }
         bytes += self.fps.capacity() * size_of::<f32>();
         bytes += self.live.capacity() * size_of::<bool>();

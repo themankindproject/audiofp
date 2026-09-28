@@ -152,6 +152,52 @@ pub(crate) fn db_into(buf: &mut [f32], floor: f32, factor: f32) {
     }
 }
 
+/// Row-wise [`db_into`] that reproduces the rounding of one [`db_into`]
+/// call over a larger buffer this row is part of.
+///
+/// `db_into` converts every element of a buffer 8-wide except its last
+/// `len % 8` elements, which take the scalar path (the two can differ by
+/// 1 ULP). Each vector lane depends only on its own input — the ops are
+/// lane-wise and the special-value fixups in `ln` are per-lane selects —
+/// so an element's result is fixed by its value and by which side of
+/// that split it falls on, not by its neighbours. Elements
+/// `[0, scalar_from)` of `row` are converted on the vector path and
+/// `[scalar_from, len)` on the scalar path; with `scalar_from` taken from
+/// the enclosing buffer's split, the output is bit-identical to having
+/// converted the whole buffer at once. This lets a front-end convert one
+/// spectrogram row at a time without materialising the spectrogram.
+#[inline]
+pub(crate) fn db_into_split(row: &mut [f32], floor: f32, factor: f32, scalar_from: usize) {
+    let scalar_from = scalar_from.min(row.len());
+    let vector_part = scalar_from - scalar_from % 8;
+    db_into_vector_lanes(&mut row[..vector_part], floor, factor);
+    if vector_part < scalar_from {
+        // Remainder of the vector region: run it through one padded vector
+        // so it gets vector-path rounding. The pad value is irrelevant
+        // (lanes are independent); 1.0 keeps the lanes finite.
+        let rem = &mut row[vector_part..scalar_from];
+        let mut lanes = [1.0_f32; 8];
+        lanes[..rem.len()].copy_from_slice(rem);
+        db_into_vector_lanes(&mut lanes, floor, factor);
+        rem.copy_from_slice(&lanes[..rem.len()]);
+    }
+    for v in &mut row[scalar_from..] {
+        *v = factor * v.max(floor).log2();
+    }
+}
+
+/// Vector-path body of [`db_into`]; `buf.len()` must be a multiple of 8.
+#[inline]
+fn db_into_vector_lanes(buf: &mut [f32], floor: f32, factor: f32) {
+    debug_assert_eq!(buf.len() % 8, 0);
+    let floor_v = f32x8::splat(floor);
+    let factor_v = f32x8::splat(factor);
+    for off in (0..buf.len()).step_by(8) {
+        let clamped = load8(buf, off).max(floor_v);
+        store8(buf, off, factor_v * clamped.log2());
+    }
+}
+
 /// Load the real and imaginary parts of 8 complex spectrum bins.
 #[inline]
 pub(crate) fn load_complex8(complex: &[num_complex::Complex<f32>], off: usize) -> (f32x8, f32x8) {
@@ -220,5 +266,48 @@ fn complex_power_impl<const SQRT: bool>(complex: &[num_complex::Complex<f32>], d
         let c = &complex[i];
         let p = c.re * c.re + c.im * c.im;
         dst[i] = if SQRT { libm::sqrtf(p) } else { p };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn db_into_split_rows_match_whole_buffer_bit_for_bit() {
+        let factor = crate::dsp::DB_LOG2_FACTOR;
+        let floor = 1e-12_f32;
+        let mut x: u32 = 0xD1B;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for n_bins in [1usize, 3, 7, 8, 9, 15, 16, 17, 129, 513, 1025] {
+            for n_rows in [1usize, 2, 3, 5, 8] {
+                // Powers spanning the floor, subnormals, zeros, and large values.
+                let flat: Vec<f32> = (0..n_rows * n_bins)
+                    .map(|_| match next() % 7 {
+                        0 => 0.0,
+                        1 => 1e-40,
+                        2 => 1e-13,
+                        _ => f32::from_bits(next() % 0x7F00_0000),
+                    })
+                    .collect();
+                let mut whole = flat.clone();
+                db_into(&mut whole, floor, factor);
+
+                let total = flat.len();
+                let simd_end = total - total % 8;
+                let mut rows = flat.clone();
+                for (r, row) in rows.chunks_exact_mut(n_bins).enumerate() {
+                    db_into_split(row, floor, factor, simd_end.saturating_sub(r * n_bins));
+                }
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&rows), bits(&whole), "n_bins={n_bins} n_rows={n_rows}");
+            }
+        }
     }
 }

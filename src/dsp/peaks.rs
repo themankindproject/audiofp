@@ -4,15 +4,17 @@
 //! (2·neighborhood_f+1)` box around each cell, filters by magnitude floor,
 //! and applies a per-second target count so dense regions don't dominate.
 //!
-//! The 2-D rolling max is computed separably with Lemire's monotonic deque
-//! along each axis, giving amortised O(N·M) over the whole spectrogram
-//! independent of the neighbourhood size.
+//! The 2-D rolling max is separable. The horizontal (frequency) pass uses
+//! doubling over a NaN-padded row — `log2(window)` contiguous SIMD max
+//! passes — and the vertical (time) pass streams rows through a van Herk /
+//! Gil-Werman block max (about three vector max ops per row for any window
+//! size). Both are exact, so results are identical to a brute-force
+//! window max, and only `O(neighborhood_t · n_bins)` scratch is held.
 
 use alloc::collections::VecDeque;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
-use bytemuck::Zeroable;
 
 /// One peak emitted by [`PeakPicker`].
 ///
@@ -112,14 +114,18 @@ impl Default for PeakPickerConfig {
 /// ```
 pub struct PeakPicker {
     cfg: PeakPickerConfig,
-    /// Pooled scratch — re-used across `pick` calls instead of allocating
-    /// fresh buffers every time.
-    max_buf: Vec<f32>,
-    temp_2d: Vec<f32>,
-    col_in: Vec<f32>,
-    col_out: Vec<f32>,
-    /// Pooled monotonic deque for the 1-D rolling max passes.
-    dq: VecDeque<usize>,
+    /// NaN-padded horizontal scratch (`n_bins + 2·neighborhood_f`).
+    hpad: Vec<f32>,
+    /// Streaming vertical max over the horizontal-max rows.
+    vert: VertMax,
+    /// Ring of the last `neighborhood_t + 1` raw rows: a row's candidates
+    /// are tested once its full vertical window has been seen.
+    raw_ring: Vec<f32>,
+    /// 2-D max row of the centre currently being emitted.
+    vmax_row: Vec<f32>,
+    /// Geometry of the in-progress `begin` … `finish` pass.
+    n_bins: usize,
+    rows_pushed: usize,
     /// Pooled candidate buffer — avoids a per-call heap allocation.
     candidates: Vec<Peak>,
 }
@@ -128,16 +134,14 @@ impl PeakPicker {
     /// Build a picker with the given config.
     #[must_use]
     pub fn new(cfg: PeakPickerConfig) -> Self {
-        // A 1-D Lemire deque holds at most 2k+1 indices; size for the
-        // larger of the two axes.
-        let dq_cap = 2 * cfg.neighborhood_t.max(cfg.neighborhood_f) + 2;
         Self {
             cfg,
-            max_buf: Vec::new(),
-            temp_2d: Vec::new(),
-            col_in: Vec::new(),
-            col_out: Vec::new(),
-            dq: VecDeque::with_capacity(dq_cap),
+            hpad: Vec::new(),
+            vert: VertMax::default(),
+            raw_ring: Vec::new(),
+            vmax_row: Vec::new(),
+            n_bins: 0,
+            rows_pushed: 0,
             candidates: Vec::new(),
         }
     }
@@ -181,42 +185,45 @@ impl PeakPicker {
             return Vec::new();
         }
         assert_eq!(spec.len(), n_frames * n_bins, "spec length mismatch");
+        self.begin(n_frames, n_bins, frames_per_sec);
+        for row in spec.chunks_exact(n_bins) {
+            self.push_row(row);
+        }
+        self.finish(frames_per_sec)
+    }
+
+    /// Start a row-streaming pick over an `(n_frames, n_bins)`
+    /// spectrogram. Feed exactly `n_frames` rows with
+    /// [`push_row`](Self::push_row), then call [`finish`](Self::finish).
+    ///
+    /// Produces the same peaks as [`pick`](Self::pick) on the same rows
+    /// (`pick` is implemented on top of it) while holding only
+    /// `O((neighborhood_t + 1) · n_bins)` floats of scratch instead of the
+    /// whole spectrogram, so front-ends can compute rows on the fly.
+    pub(crate) fn begin(&mut self, n_frames: usize, n_bins: usize, frames_per_sec: f32) {
         // `Peak::f_bin` is a u16; a larger spectrogram would wrap the bin
         // index. Unreachable for any realistic n_fft (see "Bin-index range").
         debug_assert!(
             n_bins <= u16::MAX as usize + 1,
             "n_bins {n_bins} exceeds u16 range of Peak::f_bin"
         );
-
-        #[inline]
-        fn prepare_vec(v: &mut Vec<f32>, new_len: usize) {
-            v.clear();
-            v.resize(new_len, 0.0);
+        let kt = self.cfg.neighborhood_t;
+        let kf = self.cfg.neighborhood_f;
+        self.n_bins = n_bins;
+        self.rows_pushed = 0;
+        resize_scratch(&mut self.hpad, n_bins + 2 * kf);
+        resize_scratch(&mut self.raw_ring, (kt + 1) * n_bins);
+        resize_scratch(&mut self.vmax_row, n_bins);
+        self.vert.reset(2 * kt + 1, n_bins);
+        // Leading edge: the window of row 0 is clamped at the start. NaN
+        // rows never win a max, so `kt` NaN rows reproduce the clamp
+        // exactly (and cannot complete a window yet: kt < 2·kt + 1).
+        for _ in 0..kt {
+            self.vert.next_slot().fill(f32::NAN);
+            self.vert.commit(None);
         }
 
-        // Resize pooled scratch (no-op when capacity already covers it).
-        prepare_vec(&mut self.max_buf, spec.len());
-        prepare_vec(&mut self.temp_2d, spec.len());
-        prepare_vec(&mut self.col_in, n_frames);
-        prepare_vec(&mut self.col_out, n_frames);
-
-        rolling_max_2d_pooled(
-            spec,
-            n_frames,
-            n_bins,
-            self.cfg.neighborhood_t,
-            self.cfg.neighborhood_f,
-            &mut self.max_buf,
-            &mut self.temp_2d,
-            &mut self.col_in,
-            &mut self.col_out,
-            &mut self.dq,
-        );
-
-        let min_mag = self.cfg.min_magnitude_db;
-        let min_mag_linear = self.cfg.min_magnitude_linear;
         let target_per_sec = self.cfg.target_per_sec;
-
         // Upper bound on candidate peaks (fps × target/s), doubled as
         // headroom, floored at 64 so the reserve is non-trivial even when
         // the per-second cap is disabled.
@@ -240,31 +247,43 @@ impl PeakPicker {
             64
         };
         self.candidates.clear();
-        // `self.candidates` is moved out of `self` by the `mem::take` at the
-        // end of this method (the caller owns the returned peaks), so its
-        // capacity is NOT retained across `pick` calls — this reserve runs
-        // once per call. That is amortised over the whole spectrogram, so
-        // per-call allocation is not on the hot path.
+        // `self.candidates` is moved out of `self` by the `mem::take` in
+        // `finish` (the caller owns the returned peaks), so its capacity is
+        // NOT retained across passes — this reserve runs once per pass.
+        // That is amortised over the whole spectrogram, so per-call
+        // allocation is not on the hot path.
         if self.candidates.capacity() < upper {
             self.candidates.reserve(upper - self.candidates.capacity());
         }
-        for t in 0..n_frames {
-            for f in 0..n_bins {
-                let idx = t * n_bins + f;
-                let v = spec[idx];
-                let above_floor = v > min_mag && min_mag_linear.map(|lin| v > lin).unwrap_or(true);
-                // >= (not >) so every cell of a flat plateau is emitted as
-                // a peak, matching streaming behavior.
-                if above_floor && v >= self.max_buf[idx] {
-                    self.candidates.push(Peak {
-                        t_frame: t as u32,
-                        f_bin: f as u16,
-                        mag: v,
-                        ..Peak::zeroed()
-                    });
-                }
-            }
+    }
+
+    /// Feed the next spectrogram row (length `n_bins` from
+    /// [`begin`](Self::begin)).
+    pub(crate) fn push_row(&mut self, row: &[f32]) {
+        let n_bins = self.n_bins;
+        debug_assert_eq!(row.len(), n_bins);
+        let ring_rows = self.cfg.neighborhood_t + 1;
+        let slot = self.rows_pushed % ring_rows;
+        self.raw_ring[slot * n_bins..(slot + 1) * n_bins].copy_from_slice(row);
+        self.rows_pushed += 1;
+        hmax_row(
+            row,
+            self.cfg.neighborhood_f,
+            &mut self.hpad,
+            self.vert.next_slot(),
+        );
+        self.commit_and_emit();
+    }
+
+    /// Drain the trailing edge and return the peaks sorted by
+    /// `(t_frame, f_bin)`.
+    pub(crate) fn finish(&mut self, frames_per_sec: f32) -> Vec<Peak> {
+        // Trailing edge: NaN rows reproduce the end-of-spectrogram clamp.
+        for _ in 0..self.cfg.neighborhood_t {
+            self.vert.next_slot().fill(f32::NAN);
+            self.commit_and_emit();
         }
+        let target_per_sec = self.cfg.target_per_sec;
 
         if target_per_sec > 0 && frames_per_sec > 0.0 && !self.candidates.is_empty() {
             let capped = adaptive_per_second(
@@ -278,6 +297,296 @@ impl PeakPicker {
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
         core::mem::take(&mut self.candidates)
+    }
+
+    /// Commit the row just written into the vertical engine's slot; when a
+    /// centre row's full window is complete, test its cells.
+    #[inline]
+    fn commit_and_emit(&mut self) {
+        let w = self.vert.w;
+        let pos = self.vert.pos;
+        if pos + 1 < w {
+            self.vert.commit(None);
+            return;
+        }
+        self.vert.commit(Some(&mut self.vmax_row));
+        // Padded row `pos` completed the window of padded row
+        // `pos + 1 - w`, which is original row `pos + 1 - w` (the `kt`
+        // leading pads shift both window ends equally).
+        let t = pos + 1 - w;
+        let n_bins = self.n_bins;
+        let slot = t % (self.cfg.neighborhood_t + 1);
+        emit_candidates(
+            &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
+            &self.vmax_row,
+            t as u32,
+            self.cfg.min_magnitude_db,
+            self.cfg.min_magnitude_linear,
+            &mut self.candidates,
+        );
+    }
+}
+
+/// Clear and zero-resize a scratch vector (no allocation once warm).
+#[inline]
+fn resize_scratch(v: &mut Vec<f32>, len: usize) {
+    v.clear();
+    v.resize(len, 0.0);
+}
+
+/// `buf[i] = max(buf[i], buf[i + d])` for `i in 0..m`, in place.
+///
+/// Ascending order keeps every read at an index that is not yet
+/// written, and each 8-wide chunk loads both operands before storing, so
+/// the in-place update equals the out-of-place one. Requires
+/// `m + d <= buf.len()`.
+#[inline]
+fn max_shift_in_place(buf: &mut [f32], d: usize, m: usize) {
+    use crate::dsp::simd::{load8, store8};
+    debug_assert!(m + d <= buf.len());
+    let mut i = 0;
+    while i + 8 <= m {
+        let v = load8(buf, i).max(load8(buf, i + d));
+        store8(buf, i, v);
+        i += 8;
+    }
+    while i < m {
+        buf[i] = buf[i].max(buf[i + d]);
+        i += 1;
+    }
+}
+
+/// `out[i] = max(a[i], b[i])`.
+#[inline]
+fn max_pair_into(a: &[f32], b: &[f32], out: &mut [f32]) {
+    use crate::dsp::simd::{load8, store8};
+    debug_assert!(a.len() == out.len() && b.len() == out.len());
+    let n = out.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        store8(out, i, load8(a, i).max(load8(b, i)));
+        i += 8;
+    }
+    while i < n {
+        out[i] = a[i].max(b[i]);
+        i += 1;
+    }
+}
+
+/// `acc[i] = max(acc[i], x[i])`.
+#[inline]
+fn max_assign(acc: &mut [f32], x: &[f32]) {
+    use crate::dsp::simd::{load8, store8};
+    debug_assert_eq!(acc.len(), x.len());
+    let n = acc.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = load8(acc, i).max(load8(x, i));
+        store8(acc, i, v);
+        i += 8;
+    }
+    while i < n {
+        acc[i] = acc[i].max(x[i]);
+        i += 1;
+    }
+}
+
+/// Horizontal sliding max: `out[i] = max(row[max(0, i-k) ..= min(n-1, i+k)])`.
+///
+/// Same contract (and bit-identical values) as [`rolling_max_1d`]: the
+/// window is clamped at both edges, maxima are exact, and a NaN never
+/// wins (`f32::max` / `f32x8::max` semantics; an all-NaN window yields
+/// NaN).
+///
+/// Uses doubling on a NaN-padded copy: after `log2(p)` in-place passes
+/// (`p` = largest power of two `≤ 2k+1`) `pad[j]` holds the max of
+/// `pad[j .. j+p]`, and two overlapping `p`-windows cover each
+/// `(2k+1)`-window. For Wang/Panako (`k = 15`) that is 5 vector max
+/// passes per row instead of 30, and every pass is contiguous SIMD.
+/// NaN padding reproduces the edge clamp exactly because NaN never wins.
+///
+/// `pad` must have length `row.len() + 2k`.
+fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
+    let n = row.len();
+    debug_assert_eq!(out.len(), n);
+    debug_assert_eq!(pad.len(), n + 2 * k);
+    if k == 0 || n == 0 {
+        out.copy_from_slice(row);
+        return;
+    }
+    pad[..k].fill(f32::NAN);
+    pad[k..k + n].copy_from_slice(row);
+    pad[k + n..].fill(f32::NAN);
+    let w = 2 * k + 1;
+    let p = 1usize << (usize::BITS - 1 - w.leading_zeros());
+    let len = pad.len();
+    let mut d = 1;
+    while d < p {
+        // After this pass `pad[j] = max(pad[j .. j + 2d])` for every
+        // `j <= len - 2d` — every index the final combine reads.
+        max_shift_in_place(pad, d, len + 1 - 2 * d);
+        d *= 2;
+    }
+    let s = w - p;
+    max_pair_into(&pad[..n], &pad[s..s + n], out);
+}
+
+/// Streaming vertical sliding max over rows (van Herk / Gil-Werman).
+///
+/// Rows are grouped into blocks of `w`; a window `[s, s + w)` spans the
+/// suffix of one block and the prefix of the next, so its max is
+/// `max(suffix[s], prefix[s + w - 1])` — about three vector max ops per
+/// row regardless of `w`. Only two blocks of rows are held, so memory is
+/// `O(w · n_bins)` independent of the spectrogram length.
+#[derive(Default)]
+struct VertMax {
+    /// Window length in rows (`2·kt + 1`).
+    w: usize,
+    n_bins: usize,
+    /// Rows of the block being filled.
+    cur: Vec<f32>,
+    /// Suffix maxima of the previous complete block.
+    prev: Vec<f32>,
+    /// Running prefix max of the current block.
+    g: Vec<f32>,
+    /// Rows committed so far (padding included).
+    pos: usize,
+}
+
+impl VertMax {
+    fn reset(&mut self, w: usize, n_bins: usize) {
+        self.w = w;
+        self.n_bins = n_bins;
+        resize_scratch(&mut self.cur, w * n_bins);
+        resize_scratch(&mut self.prev, w * n_bins);
+        resize_scratch(&mut self.g, n_bins);
+        self.pos = 0;
+    }
+
+    /// Slot the next row must be written into before [`commit`](Self::commit).
+    #[inline]
+    fn next_slot(&mut self) -> &mut [f32] {
+        let j = self.pos % self.w;
+        &mut self.cur[j * self.n_bins..(j + 1) * self.n_bins]
+    }
+
+    /// Commit the row in [`next_slot`](Self::next_slot). When `out` is
+    /// `Some`, write the max over rows `[max(0, pos + 1 - w), pos]` into it
+    /// (the window ending at this row, clamped at the stream start).
+    fn commit(&mut self, out: Option<&mut [f32]>) {
+        let w = self.w;
+        let nb = self.n_bins;
+        let j = self.pos % w;
+        let row = &self.cur[j * nb..(j + 1) * nb];
+        if j == 0 {
+            self.g.copy_from_slice(row);
+        } else {
+            max_assign(&mut self.g, row);
+        }
+        if let Some(out) = out {
+            if j == w - 1 || self.pos < w {
+                // The window lies inside this block: its prefix max.
+                out.copy_from_slice(&self.g);
+            } else {
+                // Suffix of the previous block from `j + 1`, plus this
+                // block's prefix through `j`.
+                max_pair_into(&self.prev[(j + 1) * nb..(j + 2) * nb], &self.g, out);
+            }
+        }
+        if j == w - 1 {
+            // Block complete: turn it into suffix maxima for the next block.
+            for i in (0..w - 1).rev() {
+                let (lo, hi) = self.cur.split_at_mut((i + 1) * nb);
+                max_assign(&mut lo[i * nb..], &hi[..nb]);
+            }
+            core::mem::swap(&mut self.cur, &mut self.prev);
+        }
+        self.pos += 1;
+    }
+
+    /// Max over rows `[a, pos - 1]` (a window ending at the last committed
+    /// row, at most `w` rows long) without changing any state — used to
+    /// drain right-clamped tail windows at end of stream while leaving the
+    /// stream resumable.
+    fn max_since(&self, a: usize, out: &mut [f32]) {
+        let w = self.w;
+        let nb = self.n_bins;
+        debug_assert!(self.pos > 0 && a < self.pos && self.pos - a <= w);
+        let last = self.pos - 1;
+        let j_last = last % w;
+        let row = |i: usize| i * nb..(i + 1) * nb;
+        if a / w == last / w {
+            if j_last == w - 1 {
+                // The block was just finalised into suffix maxima.
+                out.copy_from_slice(&self.prev[row(a % w)]);
+            } else {
+                // Raw rows of the open block.
+                out.copy_from_slice(&self.cur[row(a % w)]);
+                for i in a % w + 1..=j_last {
+                    max_assign(out, &self.cur[row(i)]);
+                }
+            }
+        } else {
+            // `a` is in the previous (finalised) block and the open block
+            // holds rows through `j_last` (a window of at most `w` rows
+            // cannot span a finalised current block plus an earlier one).
+            debug_assert!(j_last < w - 1);
+            max_pair_into(&self.prev[row(a % w)], &self.g, out);
+        }
+    }
+}
+
+/// Push every cell of row `t` that clears the floors and equals its
+/// neighbourhood max (`>=`, so plateau cells all count), in ascending
+/// bin order.
+///
+/// Branch-free 8-wide compare + bitmask: peaks are sparse, so most
+/// chunks are rejected with one mask test. Lane-for-lane the predicate is
+/// the scalar one — ordered comparisons are `false` for NaN in both.
+#[inline]
+fn emit_candidates(
+    raw: &[f32],
+    vmax: &[f32],
+    t: u32,
+    min_mag: f32,
+    min_mag_linear: Option<f32>,
+    out: &mut Vec<Peak>,
+) {
+    use crate::dsp::simd::load8;
+    use wide::f32x8;
+
+    debug_assert_eq!(raw.len(), vmax.len());
+    let n = raw.len();
+    let floor = f32x8::splat(min_mag);
+    let lin = min_mag_linear.map(f32x8::splat);
+    let mut push = |f: usize| {
+        out.push(Peak {
+            t_frame: t,
+            f_bin: f as u16,
+            _pad: 0,
+            mag: raw[f],
+        });
+    };
+    let mut off = 0;
+    while off + 8 <= n {
+        let v = load8(raw, off);
+        let mut m = v.simd_gt(floor) & v.simd_ge(load8(vmax, off));
+        if let Some(lin) = lin {
+            m &= v.simd_gt(lin);
+        }
+        let mut bits = m.to_bitmask();
+        while bits != 0 {
+            push(off + bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+        }
+        off += 8;
+    }
+    for f in off..n {
+        let v = raw[f];
+        let above_floor = v > min_mag && min_mag_linear.is_none_or(|lin| v > lin);
+        if above_floor && v >= vmax[f] {
+            push(f);
+        }
     }
 }
 
@@ -553,9 +862,11 @@ fn max31_vec(input: &[f32], output: &mut [f32]) {
 
 /// Incremental 2-D rolling-max for streaming peak detection.
 ///
-/// Caches the horizontal rolling-max once per row and maintains per-column
-/// vertical Lemire deques so the 2-D max for a single ripe row is produced
-/// in amortised O(n_bins) instead of recomputing the full window.
+/// Computes the horizontal rolling-max once per row and streams it through
+/// a van Herk / Gil-Werman vertical max, so the 2-D max for each ripe row
+/// costs a few vector passes over `n_bins` regardless of the window size.
+/// All state is allocated at construction; `push_row` and `flush` never
+/// allocate.
 ///
 /// Useful as a building block for any pipeline that needs to pick peaks
 /// from a streaming spectrogram (tempo, onset, beat tracking, etc.).
@@ -573,11 +884,10 @@ pub struct IncrementalPeakDetector {
     // re-emitted — this is what makes `flush` idempotent and
     // `push`-after-`flush` duplicate-free. -1 = nothing emitted yet.
     last_emitted: i64,
-    // Per-column vertical Lemire deques: (abs_row_index, value).
-    vert_deques: Vec<VecDeque<(u32, f32)>>,
-    // Scratch for horizontal rolling-max.
-    horiz_scratch: Vec<f32>,
-    dq: VecDeque<usize>,
+    // Streaming vertical max over the horizontal-max rows.
+    vert: VertMax,
+    // NaN-padded horizontal scratch (`n_bins + 2·kf`).
+    hpad: Vec<f32>,
 }
 
 impl IncrementalPeakDetector {
@@ -587,19 +897,16 @@ impl IncrementalPeakDetector {
     /// hot path.
     #[must_use]
     pub fn new(kt: usize, kf: usize, n_bins: usize) -> Self {
-        let window_cap = 2 * kt + 1;
-        let vert_deques = (0..n_bins)
-            .map(|_| VecDeque::with_capacity(window_cap))
-            .collect();
+        let mut vert = VertMax::default();
+        vert.reset(2 * kt + 1, n_bins);
         Self {
             kt,
             kf,
             n_bins,
             n_pushed: 0,
             last_emitted: -1,
-            vert_deques,
-            horiz_scratch: alloc::vec![0.0_f32; n_bins],
-            dq: VecDeque::with_capacity(2 * kf + 2),
+            vert,
+            hpad: alloc::vec![0.0_f32; n_bins + 2 * kf],
         }
     }
 
@@ -622,61 +929,32 @@ impl IncrementalPeakDetector {
         let abs = self.n_pushed;
         self.n_pushed += 1;
 
-        // 1. Horizontal rolling-max of the new row into reusable scratch.
-        //    The vertical deques below consume it directly and store the
-        //    values themselves, so no ring copy is needed.
-        rolling_max_1d(row, self.kf, &mut self.horiz_scratch, &mut self.dq);
+        // 1. Horizontal rolling-max of the new row, written straight into
+        //    the vertical engine's slot for this row.
+        hmax_row(row, self.kf, &mut self.hpad, self.vert.next_slot());
 
-        // 2. Update vertical deques with the new horizontal-maxed values.
-        for col in 0..self.n_bins {
-            let val = self.horiz_scratch[col];
-            let dq = &mut self.vert_deques[col];
-            // Maintain decreasing monotonicity.
-            while let Some(&(_, back_val)) = dq.back() {
-                // Match horizontal `f32::max` semantics: NaN never wins.
-                if f32::max(back_val, val) == val {
-                    dq.pop_back();
-                } else {
-                    break;
-                }
+        // 2. A row is ripe once its forward context (`kt` rows) has been
+        //    pushed; skip rows an earlier `flush` already emitted —
+        //    re-emitting would duplicate peaks downstream.
+        let kt = self.kt as u32;
+        let ripe_abs = abs
+            .checked_sub(kt)
+            .filter(|&r| r as i64 > self.last_emitted);
+
+        // 3. Commit to the vertical engine. For a ripe row the window
+        //    [ripe_abs - kt, ripe_abs + kt] = [abs - 2·kt, abs] (clamped at
+        //    the stream start) is exactly the window ending at `abs`.
+        match ripe_abs {
+            Some(ripe_abs) => {
+                self.vert.commit(Some(out_max));
+                self.last_emitted = ripe_abs as i64;
+                Some(ripe_abs)
             }
-            dq.push_back((abs, val));
-        }
-
-        // 3. Check if a ripe row exists (need at least kt+1 rows pushed)
-        //    and hasn't already been emitted by a prior `flush`.
-        if abs < self.kt as u32 {
-            return None;
-        }
-
-        let ripe_abs = abs - self.kt as u32;
-        if ripe_abs as i64 <= self.last_emitted {
-            // This row's 2-D max was already emitted by an earlier
-            // `flush` (the flush drain covers rows that `push_row` would
-            // otherwise ripen later). Skip it — re-emitting would
-            // duplicate peaks downstream.
-            return None;
-        }
-        // The vertical window for the ripe row: [ripe_abs - kt, ripe_abs + kt]
-        // = [abs - 2*kt, abs]. Expire entries before that.
-        let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
-
-        for (col, out) in out_max.iter_mut().enumerate().take(self.n_bins) {
-            let dq = &mut self.vert_deques[col];
-            while let Some(&(idx, _)) = dq.front() {
-                if idx < vert_window_start {
-                    dq.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if let Some(&(_, v)) = dq.front() {
-                *out = v;
+            None => {
+                self.vert.commit(None);
+                None
             }
         }
-
-        self.last_emitted = ripe_abs as i64;
-        Some(ripe_abs)
     }
 
     /// Flush remaining rows that haven't become ripe during normal push.
@@ -708,28 +986,14 @@ impl IncrementalPeakDetector {
         // cursor unconditionally — even when the range below is empty.
         self.last_emitted = self.n_pushed as i64 - 1;
 
-        // For flush frames, we can't push new rows — the deques already
-        // contain all the data. The vertical window shrinks on the right.
-        // For ripe_abs in [first_flush, last_flush]:
-        //   window = [ripe_abs.saturating_sub(kt), min(ripe_abs + kt, n_pushed - 1)]
-        //   = [ripe_abs.saturating_sub(kt), n_pushed - 1]  (since ripe_abs + kt >= n_pushed - 1 for flush frames)
-        // The deques contain all entries up to abs = n_pushed - 1.
-        // We just need to expire entries below the window start.
+        // Tail windows are right-clamped at the last pushed row:
+        //   window = [ripe_abs.saturating_sub(kt), n_pushed - 1]
+        // (ripe_abs + kt >= n_pushed - 1 for every flush frame). They are
+        // read without mutating the engine, so a later `push_row`
+        // continues the same stream.
         for ripe_abs in first_flush..=last_flush {
-            let vert_window_start = ripe_abs.saturating_sub(self.kt as u32);
-            for (col, out) in out_max.iter_mut().enumerate().take(self.n_bins) {
-                let dq = &mut self.vert_deques[col];
-                while let Some(&(idx, _)) = dq.front() {
-                    if idx < vert_window_start {
-                        dq.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                if let Some(&(_, v)) = dq.front() {
-                    *out = v;
-                }
-            }
+            let start = ripe_abs.saturating_sub(self.kt as u32) as usize;
+            self.vert.max_since(start, out_max);
             emit_fn(ripe_abs, out_max);
         }
     }
@@ -743,9 +1007,7 @@ impl IncrementalPeakDetector {
     pub fn reset(&mut self) {
         self.n_pushed = 0;
         self.last_emitted = -1;
-        for dq in &mut self.vert_deques {
-            dq.clear();
-        }
+        self.vert.reset(2 * self.kt + 1, self.n_bins);
     }
 }
 
@@ -1118,7 +1380,7 @@ mod tests {
     //
     // These pin the contract of the post-226e0f2 failable reads in
     // `push_row` and `flush`. The reads are guarded by `if let Some`,
-    // so a future bug that empties the vert_deques at a read site would
+    // so a future bug that leaves a read site unwritten would
     // silently leave `out_max` at 0.0 (the pre-zeroed default) instead
     // of panicking. The tests below exercise the invariant directly:
     // the detector's per-row output must equal the brute-force 2-D
@@ -1353,5 +1615,186 @@ mod tests {
         }
         det.flush(&mut out, |_, _| re_emitted += 1);
         assert_eq!(re_emitted, 5, "reset must restart the emission cursor");
+    }
+
+    /// xorshift32 in `[lo, lo + span)`; every 97th value is NaN.
+    fn noisy_values(seed: u32, n: usize, lo: f32, span: u32) -> Vec<f32> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                if x.is_multiple_of(97) {
+                    f32::NAN
+                } else {
+                    lo + (x % span) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// The pre-streaming `pick`: full 2-D max via `rolling_max_2d`, then a
+    /// scalar candidate scan. Kept as the oracle for the streaming picker.
+    fn legacy_pick(
+        cfg: &PeakPickerConfig,
+        spec: &[f32],
+        nf: usize,
+        nb: usize,
+        fps: f32,
+    ) -> Vec<Peak> {
+        let mut max = vec![0.0_f32; spec.len()];
+        rolling_max_2d(
+            spec,
+            nf,
+            nb,
+            cfg.neighborhood_t,
+            cfg.neighborhood_f,
+            &mut max,
+        );
+        let mut out = Vec::new();
+        for t in 0..nf {
+            for f in 0..nb {
+                let v = spec[t * nb + f];
+                let above =
+                    v > cfg.min_magnitude_db && cfg.min_magnitude_linear.is_none_or(|l| v > l);
+                if above && v >= max[t * nb + f] {
+                    out.push(Peak {
+                        t_frame: t as u32,
+                        f_bin: f as u16,
+                        _pad: 0,
+                        mag: v,
+                    });
+                }
+            }
+        }
+        if cfg.target_per_sec > 0 && fps > 0.0 && !out.is_empty() {
+            out = adaptive_per_second(out, fps, cfg.target_per_sec);
+        }
+        out.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
+        out
+    }
+
+    #[test]
+    fn hmax_row_matches_rolling_max_1d_bit_for_bit() {
+        let mut dq = VecDeque::new();
+        for n in [1usize, 2, 7, 8, 9, 30, 31, 32, 63, 64, 65, 513] {
+            let row = noisy_values(n as u32 * 31 + 5, n, -60.0, 40);
+            for k in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 40] {
+                let mut want = vec![0.0; n];
+                rolling_max_1d(&row, k, &mut want, &mut dq);
+                let mut pad = vec![0.0; n + 2 * k];
+                let mut got = vec![0.0; n];
+                hmax_row(&row, k, &mut pad, &mut got);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "n={n} k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_pick_matches_full_spectrogram_oracle() {
+        let mut x: u32 = 0x5EED;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        // One picker reused across shapes also pins scratch reuse.
+        for case in 0..400 {
+            let nf = (next() % 70 + 1) as usize;
+            let nb = (next() % 60 + 1) as usize;
+            let cfg = PeakPickerConfig {
+                neighborhood_t: (next() % 18) as usize,
+                neighborhood_f: (next() % 18) as usize,
+                min_magnitude_db: -55.0,
+                min_magnitude_linear: if case % 4 == 0 { Some(-45.0) } else { None },
+                target_per_sec: [0, 2, 30][case % 3],
+            };
+            let spec = noisy_values(next(), nf * nb, -60.0, 30);
+            let mut picker = PeakPicker::new(cfg.clone());
+            for _ in 0..2 {
+                let got = picker.pick(&spec, nf, nb, 10.0);
+                assert_eq!(
+                    got,
+                    legacy_pick(&cfg, &spec, nf, nb, 10.0),
+                    "case {case}: {nf}x{nb} {cfg:?}"
+                );
+            }
+        }
+    }
+
+    /// Randomized sessions: pushes interleaved with flushes (push-after-
+    /// flush continues the stream) and resets, NaN cells included. Every
+    /// emitted row must equal the brute-force window max over the rows
+    /// pushed so far, with the window right-clamped at the push cursor.
+    #[test]
+    fn incremental_random_sessions_match_brute_force() {
+        let mut x: u32 = 0xF1A5;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for case in 0..150 {
+            let kt = (next() % 9) as usize;
+            let kf = (next() % 9) as usize;
+            let nb = (next() % 40 + 1) as usize;
+            let mut det = IncrementalPeakDetector::new(kt, kf, nb);
+            let mut out = vec![0.0_f32; nb];
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            let mut emitted: Vec<u32> = Vec::new();
+            let check = |rows: &[Vec<f32>], r: u32, got: &[f32]| {
+                let r = r as usize;
+                let hi = (r + kt).min(rows.len() - 1);
+                for f in 0..nb {
+                    let mut want = f32::NAN;
+                    for row in &rows[r.saturating_sub(kt)..=hi] {
+                        for &v in &row[f.saturating_sub(kf)..=(f + kf).min(nb - 1)] {
+                            want = want.max(v);
+                        }
+                    }
+                    // `==` treats ±0 as equal; NaN only for an all-NaN window.
+                    assert!(
+                        got[f] == want || (got[f].is_nan() && want.is_nan()),
+                        "case {case} kt={kt} kf={kf} row {r} bin {f}: got {} want {want}",
+                        got[f]
+                    );
+                }
+            };
+            for _ in 0..(next() % 6 + 1) {
+                for _ in 0..(next() % 40) {
+                    let row = noisy_values(next(), nb, -10.0, 20);
+                    rows.push(row);
+                    if let Some(r) = det.push_row(rows.last().unwrap(), &mut out) {
+                        check(&rows, r, &out);
+                        emitted.push(r);
+                    }
+                }
+                match next() % 3 {
+                    0 => {}
+                    1 => det.flush(&mut out, |r, m| {
+                        check(&rows, r, m);
+                        emitted.push(r);
+                    }),
+                    _ => {
+                        det.flush(&mut out, |r, m| {
+                            check(&rows, r, m);
+                            emitted.push(r);
+                        });
+                        let want: Vec<u32> = (0..rows.len() as u32).collect();
+                        assert_eq!(
+                            emitted, want,
+                            "case {case}: every row exactly once, in order"
+                        );
+                        det.reset();
+                        rows.clear();
+                        emitted.clear();
+                    }
+                }
+            }
+        }
     }
 }
