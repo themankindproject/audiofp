@@ -43,7 +43,9 @@ use crate::matching::MatchResult;
 
 #[inline]
 fn logistic(z: f32) -> f32 {
-    1.0 / (1.0 + (-z).exp())
+    // `libm` rather than `f32::exp`: std defers to the platform C library,
+    // so the same score could map to a different probability per OS.
+    1.0 / (1.0 + libm::expf(-z))
 }
 
 /// Wang v1 calibration: score gap (0.001, 0.405) on the corpus →
@@ -125,6 +127,32 @@ mod tests {
             score,
             ..MatchResult::NONE
         }
+    }
+
+    #[test]
+    fn maps_are_bit_exact_everywhere() {
+        // `logistic` goes through `libm`, so these bits are the same on
+        // every target and OS; `f32::exp` would make them depend on the
+        // platform C library.
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for i in 0..=1000_u16 {
+            let r = scored(f32::from(i) / 1000.0);
+            for p in [
+                calibrated_wang(&r),
+                calibrated_panako(&r),
+                calibrated_haitsma(&r),
+                calibrated_neural(&r, 0.8),
+            ] {
+                for b in p.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        assert_eq!(
+            h, 0x1ccd_8561_823d_5401,
+            "calibrated outputs changed: {h:#018x}"
+        );
     }
 
     #[test]

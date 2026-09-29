@@ -13,9 +13,125 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use num_complex::Complex;
-use realfft::{RealFftPlanner, RealToComplex};
+use rustfft::{Fft, FftPlannerScalar};
 
 use crate::dsp::windows::{WindowKind, make_window};
+
+/// Forward real-input FFT with a fixed, target-independent backend.
+///
+/// The complex FFT comes from rustfft's **scalar** planner, never
+/// `FftPlanner::new()`: that one switches to AVX/SSE/NEON code whenever
+/// rustfft's SIMD features are on — and any crate in the dependency graph
+/// can turn them on — and those backends round differently, which changed
+/// fingerprints depending on the host CPU and on what else the
+/// application depended on.
+///
+/// The even-length packing and post-processing are the algorithm of
+/// `realfft`'s `RealToComplexEven` (the crate's previous backend), kept
+/// operation-for-operation so spectra are bit-identical to before; the
+/// only change is that its twiddles come from `libm` instead of the
+/// platform C library.
+struct RealFft {
+    len: usize,
+    /// Complex FFT of length `len / 2`; `None` when `len == 1`.
+    fft: Option<Arc<dyn Fft<f32>>>,
+    /// `0.5 * e^{-2πik/len}` for `k in 1..ceil(len/4)`.
+    twiddles: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl RealFft {
+    fn new(len: usize) -> Self {
+        debug_assert!(len.is_power_of_two());
+        if len == 1 {
+            return Self {
+                len,
+                fft: None,
+                twiddles: Vec::new(),
+                scratch: Vec::new(),
+            };
+        }
+        let twiddle_count = if len.is_multiple_of(4) {
+            len / 4
+        } else {
+            len / 4 + 1
+        };
+        let twiddles = (1..twiddle_count)
+            .map(|k| {
+                let angle = -2.0 * core::f64::consts::PI / len as f64 * k as f64;
+                Complex::new(libm::cos(angle) as f32, libm::sin(angle) as f32) * 0.5
+            })
+            .collect();
+        let fft = FftPlannerScalar::new().plan_fft_forward(len / 2);
+        let scratch = vec![Complex::new(0.0, 0.0); fft.get_outofplace_scratch_len()];
+        Self {
+            len,
+            fft: Some(fft),
+            twiddles,
+            scratch,
+        }
+    }
+
+    /// Transform `input` (`len` samples; used as scratch) into `output`
+    /// (`len / 2 + 1` bins, DC and Nyquist purely real).
+    fn process(&mut self, input: &mut [f32], output: &mut [Complex<f32>]) {
+        debug_assert_eq!(input.len(), self.len);
+        debug_assert_eq!(output.len(), self.len / 2 + 1);
+        let Some(fft) = &self.fft else {
+            output[0] = Complex::new(input[0], 0.0);
+            return;
+        };
+
+        // Treat the real samples as `len / 2` interleaved complex values.
+        let half = self.len / 2;
+        let packed: &mut [Complex<f32>] = bytemuck::cast_slice_mut(input);
+        fft.process_outofplace_with_scratch(packed, &mut output[..half], &mut self.scratch);
+
+        let (left, right) = output.split_at_mut(output.len() / 2);
+        let (Some(first), Some(last)) = (left.first_mut(), right.last_mut()) else {
+            return;
+        };
+        let dc = *first;
+        *first = Complex::new(dc.re + dc.im, 0.0);
+        *last = Complex::new(dc.re - dc.im, 0.0);
+        let right_len = right.len();
+        let left = &mut left[1..];
+        let right = &mut right[..right_len - 1];
+
+        for (twiddle, (out, out_rev)) in self
+            .twiddles
+            .iter()
+            .zip(left.iter_mut().zip(right.iter_mut().rev()))
+        {
+            let sum = *out + *out_rev;
+            let diff = *out - *out_rev;
+            let twiddled_re_sum = sum * twiddle.re;
+            let twiddled_im_sum = sum * twiddle.im;
+            let twiddled_re_diff = diff * twiddle.re;
+            let twiddled_im_diff = diff * twiddle.im;
+            let half_sum_re = 0.5 * sum.re;
+            let half_diff_im = 0.5 * diff.im;
+
+            let output_twiddled_real = twiddled_re_sum.im + twiddled_im_diff.re;
+            let output_twiddled_im = twiddled_im_sum.im - twiddled_re_diff.re;
+
+            *out = Complex::new(
+                half_sum_re + output_twiddled_real,
+                half_diff_im + output_twiddled_im,
+            );
+            *out_rev = Complex::new(
+                half_sum_re - output_twiddled_real,
+                output_twiddled_im - half_diff_im,
+            );
+        }
+
+        // Odd bin count: the centre bin has no partner; conjugate it.
+        if output.len() % 2 == 1 {
+            let centre = output.len() / 2;
+            output[centre].im = -output[centre].im;
+        }
+    }
+}
 
 /// Parameters controlling an [`ShortTimeFFT`] instance.
 #[derive(Clone, Debug)]
@@ -81,11 +197,10 @@ impl StftConfig {
 /// ```
 pub struct ShortTimeFFT {
     cfg: StftConfig,
-    fft: Arc<dyn RealToComplex<f32>>,
+    fft: RealFft,
     window: Vec<f32>,
     scratch_in: Vec<f32>,
     scratch_out: Vec<Complex<f32>>,
-    fft_scratch: Vec<Complex<f32>>,
 }
 
 impl ShortTimeFFT {
@@ -122,12 +237,10 @@ impl ShortTimeFFT {
             )));
         }
 
-        let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(cfg.n_fft);
+        let fft = RealFft::new(cfg.n_fft);
         let window = make_window(cfg.window, cfg.n_fft);
-        let scratch_in = fft.make_input_vec();
-        let scratch_out = fft.make_output_vec();
-        let fft_scratch = fft.make_scratch_vec();
+        let scratch_in = vec![0.0_f32; cfg.n_fft];
+        let scratch_out = vec![Complex::new(0.0_f32, 0.0); cfg.n_fft / 2 + 1];
 
         Ok(Self {
             cfg,
@@ -135,7 +248,6 @@ impl ShortTimeFFT {
             window,
             scratch_in,
             scratch_out,
-            fft_scratch,
         })
     }
 
@@ -229,12 +341,7 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process_with_scratch(
-                    &mut self.scratch_in,
-                    &mut self.scratch_out,
-                    &mut self.fft_scratch,
-                )
-                .expect("FFT process: input/output length mismatch");
+                .process(&mut self.scratch_in, &mut self.scratch_out);
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
             compute_power_wide(&self.scratch_out, row);
@@ -319,12 +426,7 @@ impl ShortTimeFFT {
             self.fill_windowed(samples, start);
 
             self.fft
-                .process_with_scratch(
-                    &mut self.scratch_in,
-                    &mut self.scratch_out,
-                    &mut self.fft_scratch,
-                )
-                .expect("FFT process: input/output length mismatch");
+                .process(&mut self.scratch_in, &mut self.scratch_out);
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
             compute_magnitude_wide(&self.scratch_out, row);
@@ -401,12 +503,7 @@ impl ShortTimeFFT {
         apply_window_wide(frame, &self.window, &mut self.scratch_in);
 
         self.fft
-            .process_with_scratch(
-                &mut self.scratch_in,
-                &mut self.scratch_out,
-                &mut self.fft_scratch,
-            )
-            .expect("FFT process: input/output length mismatch");
+            .process(&mut self.scratch_in, &mut self.scratch_out);
 
         compute(&self.scratch_out, out);
 
@@ -465,9 +562,7 @@ fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
 /// Vectorises the sqrt that the scalar path must take through `libm::sqrtf`,
 /// which cannot be auto-vectorised. `f32x8::sqrt` is the hardware IEEE sqrt
 /// (or the same musl-derived software sqrt in `wide`'s no-SIMD fallback), so
-/// on default builds results are bit-identical to the scalar loop. On FMA
-/// builds the `mul_add` fuses one rounding, matching the existing
-/// `compute_power_wide` behaviour.
+/// results are bit-identical to the scalar loop on every target.
 fn compute_magnitude_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
     crate::dsp::simd::complex_magnitude_into(complex, dst);
 }

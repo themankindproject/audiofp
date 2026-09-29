@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+**Fingerprints are now bit-identical on every CPU.** Output depended on the
+target's floating-point code path, so the same audio could produce different
+Haitsma frames on aarch64 (Apple silicon, Graviton), on x86_64 builds with FMA
+enabled (`target-cpu=native`, `x86-64-v3`), or in any application whose
+dependency graph enabled rustfft's SIMD features. Spectra differed in their
+low bits in every case, resampled audio in all but the rustfft one; Wang and
+Panako hashes absorbed the differences on the test corpus, Haitsma's did not.
+The fingerprint goldens missed this because they check only final hashes on
+one configuration.
+
+Files identical to baseline x86_64 on the 47-file test corpus before the fix
+(Wang and Panako were 47/47 throughout). After the fix, every configuration
+is 47/47 on every stage and every offline and streaming output.
+
+| Configuration | Resampled audio | Spectra | Haitsma |
+| --- | ---: | ---: | ---: |
+| aarch64 (NEON) | ≤ 1/47 | 0/47 | 46/47 |
+| x86_64, `-C target-cpu=x86-64-v3` (FMA, AVX2) | ≤ 1/47 | 0/47 | 45/47 |
+| x86_64, `-C target-cpu=native` on an AVX-512 host | ≤ 1/47 | 0/47 | 45/47 |
+| rustfft SIMD features enabled in the dependency graph | 47/47 | 0/47 | 44/47 |
+
+Causes, each removed:
+
+- `wide`'s `mul_add` rounds once on NEON and FMA-enabled x86 and twice
+  elsewhere. The dot-product, sum-of-squares, and complex-power kernels now
+  multiply and add separately.
+- `wide`'s horizontal sum pairs lanes differently on AVX. Lanes are now
+  summed in a fixed order.
+- `wide`'s `f32x8::log2` evaluates its polynomial with `mul_add` (its docs
+  call the precision platform-dependent). The dB conversion now uses an
+  FMA-free port that matches `wide`'s baseline-x86_64 output for all 2³²
+  inputs.
+- `realfft` plans through rustfft's `FftPlanner::new()`, which picks an
+  AVX/SSE/NEON FFT at runtime whenever rustfft's SIMD features are on — and
+  any crate in the graph can turn them on. The STFT now uses rustfft's
+  scalar planner through an in-crate port of realfft's real-to-complex step;
+  `realfft` is no longer a dependency.
+- Scalar `log2` and `exp`, and the FFT twiddle factors, came from the
+  platform C library. They now come from `libm`.
+
+Baseline x86_64 output is unchanged: every intermediate stage and fingerprint
+is bit-identical to before and the goldens pass unmodified. Fingerprints
+computed on the other configurations can differ from earlier releases in
+isolated bits (on the corpus, 1 of 67,460 Haitsma frames on aarch64).
+`calibrated_*` probabilities move by at most 2 ULP (94 of 3,003 sampled
+values on x86_64 Linux). `tests/cross_platform_determinism.rs` pins the
+resampler, STFT, and mel outputs; it runs on the macOS (aarch64) CI runners
+and in a new `x86-64-v3` CI job.
+
 **32-bit targets compile again.** The compact index postings below failed to
 build for wasm32 and 32-bit ARM: a layout assertion assumed 64-bit pointers.
 CI now checks both targets.
@@ -16,10 +65,10 @@ CI now checks both targets.
 ### Performance
 
 Faster Wang/Panako extraction and streaming, far lower peak memory for
-offline extraction, and smaller 1:N indexes. **Hash output is unchanged** —
-bit-identical to 0.4.3 on the golden corpus, 7 real-audio files, and
-randomized spectra, offline and streaming (legacy `flush` and
-`flush_complete`). No public API changes.
+offline extraction, and smaller 1:N indexes. **The optimisations leave hash
+output unchanged** — bit-identical to 0.4.3 on the golden corpus, 7
+real-audio files, and randomized spectra, offline and streaming (legacy
+`flush` and `flush_complete`). No public API changes.
 
 Speed: `cargo bench` medians, same machine (Intel i5-1135G7) and settings
 before and after. Haitsma's code path is untouched, so its rows are a
@@ -91,23 +140,18 @@ Measured with a counting global allocator on synthetic music.
 
 ### Notes
 
-`realfft` is still built with `default-features = false`, so `rustfft` runs
-its scalar FFT. Enabling its SIMD backends is a further speed-up and left
-all hashes identical on an AVX2 host (same machine, synthetic music, harness
-medians):
+The STFT always runs rustfft's scalar FFT. rustfft's SIMD backends are faster
+(AVX2 host, synthetic music, harness medians):
 
-| Workload (30 s of audio) | Scalar FFT (default) | SIMD FFT (opt-in) |
+| Workload (30 s of audio) | Scalar FFT (used) | SIMD FFT (not used) |
 | --- | ---: | ---: |
 | `Wang` extract | 21.0 ms | 14.1 ms |
 | `Panako` extract | 23.3 ms | 16.6 ms |
 | `Haitsma` extract | 35.0 ms | 14.8 ms |
 
-This crate does not enable it by default: `rustfft` picks the instruction
-set at runtime and its FFT output is not bit-identical across backends, so
-hashes could differ between machines. Applications that accept that
-trade-off can opt in with
-`realfft = { version = "3.5", default-features = false, features = ["avx", "sse", "neon"] }`
-in their own dependencies.
+but rustfft selects them per CPU at runtime and they do not round like the
+scalar code or like each other, so fingerprints would depend on the machine.
+Enabling rustfft's `avx`/`sse`/`neon` features no longer affects this crate.
 
 ## [0.4.3] - 2026-09-16
 

@@ -120,9 +120,10 @@ fn bench_l2_normalize(c: &mut Criterion) {
             for i in 0..chunks {
                 let off = i * 8;
                 let x = f32x8::new(v[off..off + 8].try_into().unwrap());
-                acc = x.mul_add(x, acc);
+                acc = x * x + acc;
             }
-            let mut sumsq = acc.reduce_add();
+            let l = acc.to_array();
+            let mut sumsq = (((l[0] + l[1]) + l[2]) + l[3]) + (((l[4] + l[5]) + l[6]) + l[7]);
             for &x in &v[tail..] {
                 sumsq += x * x;
             }

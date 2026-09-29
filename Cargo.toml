@@ -143,8 +143,13 @@ thiserror   = { version = "2.0.18", default-features = false }
 mimalloc    = { version = "0.1.50", default-features = false, optional = true }
 libm        = "0.2.16"
 num-traits  = { version = "0.2.19", default-features = false }
-num-complex = { version = "0.4.6", default-features = false }
-realfft     = { version = "3.5.0", default-features = false }
+# `bytemuck`: lets the real FFT view its sample buffer as packed complex
+# values without a copy or `unsafe`.
+num-complex = { version = "0.4.6", default-features = false, features = ["bytemuck"] }
+# Scalar FFT only. `dsp::stft` plans through `FftPlannerScalar`, so enabling
+# rustfft's SIMD features elsewhere in a dependency graph cannot change
+# this crate's output.
+rustfft     = { version = "6.4.1", default-features = false }
 # wide 1.6.1 requires safe_arch >= 1.2.0 (1.6.1 + safe_arch 1.1.0 is
 # broken: missing AVX-512 intrinsics). A fresh resolve picks safe_arch
 # 1.2.0 automatically; 1.6.0 is yanked upstream, so it must not be
@@ -175,6 +180,11 @@ proptest  = { version = "1.11", default-features = false, features = ["std"] }
 # building a model needs the matching prost version named here. Dev
 # dependencies are not part of the published dependency graph.
 prost     = "0.14"
+# Test-only: turns on rustfft's SIMD backends through feature unification,
+# as any downstream crate that also depends on rustfft does, so
+# `tests/cross_platform_determinism.rs` fails if the STFT ever plans
+# through the runtime-dispatched `FftPlanner` again.
+rustfft   = "6.4.1"
 
 [[bench]]
 name    = "extract"

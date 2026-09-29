@@ -36,19 +36,19 @@ pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
 /// Equivalent to:
 /// ```ignore
 /// for v in buf.iter_mut() {
-///     *v = DB_LOG2_FACTOR * v.max(floor).log2();
+///     *v = DB_LOG2_FACTOR * libm::log2f(v.max(floor));
 /// }
 /// ```
 ///
 /// Uses `wide::f32x8` to process 8 elements at a time with vectorized
-/// `max` and `log2`.
+/// `max` and [`simd::log2_lanes`].
 ///
-/// **Not bit-identical to the scalar loop.** `wide::f32x8::log2()` is a
-/// polynomial approximation that can differ from `f32::log2()` by 1 ULP
+/// **Not bit-identical to the scalar loop.** The vector `log2` is a
+/// polynomial approximation that can differ from `libm::log2f` by 1 ULP
 /// on some inputs, so the 8-wide body and the scalar tail of the same row
 /// can disagree in the last bit. The difference is far below any
 /// fingerprinting threshold, but do not rely on exact equality against a
-/// scalar reference.
+/// scalar reference. Each path is bit-identical across targets.
 #[inline]
 pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
     simd::db_into(buf, floor, DB_LOG2_FACTOR);
@@ -56,8 +56,10 @@ pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
 
 /// SIMD-accelerated dot product: `sum(a[i] * b[i])` via `wide::f32x8`.
 ///
-/// Processes 8 elements at a time with fused multiply-add, then reduces.
-/// Used by the polyphase resampler and mel filterbank hot paths.
+/// Processes 8 elements at a time (multiply and add rounded separately),
+/// then reduces the lanes in a fixed order, so the result is the same on
+/// every target. Used by the polyphase resampler and mel filterbank hot
+/// paths.
 #[inline]
 pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
     simd::dot_core(a, b)
@@ -65,8 +67,9 @@ pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
 
 /// SIMD-accelerated squared dot product: `sum(a[i] * b[i]²)` via `wide::f32x8`.
 ///
-/// Processes 8 elements at a time: squares `b`, then fused multiply-adds
-/// with `a`. Used by the mel filterbank `log_mel` hot path to avoid a
+/// Processes 8 elements at a time: squares `b`, multiplies by `a`, and
+/// accumulates, with the same target-independent rounding as
+/// [`dot_wide`]. Used by the mel filterbank `log_mel` hot path to avoid a
 /// separate power-spectrum allocation when starting from magnitudes.
 #[inline]
 pub(crate) fn dot_sq_wide(a: &[f32], b: &[f32]) -> f32 {

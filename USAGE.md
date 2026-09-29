@@ -2567,11 +2567,13 @@ fn main() {
    overhead; fixed-length watermark inputs reuse the cached plan.
 
 9. **Consider `target-cpu=native` for a single-machine deployment.** The
-   SIMD kernels (`wide::f32x8`) and the FFT dispatch at runtime on a
-   portable baseline; compiling for the host CPU additionally unlocks
-   hardware POPCNT, AVX2, and FMA. Measure before adopting — the win is
-   workload-dependent (Haitsma BER and RANSAC inlier counting benefit
-   most).
+   SIMD kernels (`wide::f32x8`) compile to SSE2 by default; compiling for
+   the host CPU lets them use AVX2 or AVX-512 and hardware POPCNT.
+   Fingerprints are bit-identical either way (the kernels never use FMA
+   and fix their reduction order — see
+   [Determinism Guarantees](#determinism-guarantees)). Measure before
+   adopting — the win is workload-dependent (Haitsma BER and RANSAC
+   inlier counting benefit most).
 
    ```bash
    RUSTFLAGS="-C target-cpu=native" cargo build --release
@@ -2670,6 +2672,19 @@ fn fingerprint_here(samples: &[f32]) -> audiofp::Result<audiofp::classical::Wang
   config produce bit-identical hashes on every call, every run, every
   supported target. No RNG, no time, no hash-order leakage anywhere in the
   extract path — including streaming under arbitrary chunking.
+- **Independent of CPU, OS, and build flags.** The DSP uses only
+  correctly rounded float operations in a fixed order: no fused
+  multiply-add, horizontal sums in a fixed lane order, math functions from
+  `libm` rather than the platform C library, and an FFT backend that is
+  fixed at compile time (rustfft's scalar planner — enabling rustfft's
+  SIMD features elsewhere in your dependency graph does not change it).
+  Verified bit-identical on x86_64 (SSE2 baseline, `x86-64-v3` with FMA
+  and AVX2, and AVX-512), aarch64, and 32-bit ARM; CI re-checks x86_64
+  with and without FMA, and aarch64, on every change. This covers the
+  classical fingerprinters, the `dsp` primitives, and the `calibrated_*`
+  probabilities; `neural` and `watermark` outputs depend on tract's
+  CPU-specific kernels and are not guaranteed bit-identical across
+  machines.
 - **Deterministic matching.** All matchers and indexes break ties by total
   orders (offset, `(t, f)` position, reference id) — never by hash-map
   iteration order. Repeated 1:N queries return the same winner every run.

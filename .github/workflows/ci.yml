@@ -216,6 +216,26 @@ jobs:
       - name: check armv7 (all codecs)
         run: cargo check --lib --features all-codecs --target armv7-unknown-linux-gnueabihf
 
+  # Output must be bit-identical on every target. The `test` matrix already
+  # runs `tests/cross_platform_determinism.rs` on aarch64 (macOS runners,
+  # where NEON fuses multiply-adds); this job covers x86_64 compiled with
+  # FMA and AVX2, the other configuration in which `wide` changes rounding.
+  determinism-fma:
+    name: cross-platform determinism (x86-64-v3)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: stage hashes (resampler, STFT, mel)
+        run: cargo test --test cross_platform_determinism
+      - name: SIMD kernels and calibration
+        run: cargo test --lib -- dsp::simd matching::calibration
+      - name: fingerprint goldens
+        run: cargo test --features all-codecs --test regression --test real_audio_golden
+
   no-std-test:
     name: test no_std (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
