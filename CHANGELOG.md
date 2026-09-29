@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+**32-bit targets compile again.** The compact index postings below failed to
+build for wasm32 and 32-bit ARM: a layout assertion assumed 64-bit pointers.
+CI now checks both targets.
+
 ### Performance
 
 Faster Wang/Panako extraction and streaming, far lower peak memory for

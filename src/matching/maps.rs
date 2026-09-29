@@ -55,10 +55,11 @@ use alloc::vec::Vec;
 /// Measured on 300-reference catalogs, 82 % (Wang) and 85 % (Panako) of
 /// hash keys have exactly one posting. As a `Vec<P>` each of those costs a
 /// separate heap allocation (rounded up by the allocator) on top of the
-/// 24-byte `Vec` header in the map slot. Here the singleton lives in the
-/// slot itself — for both posting sizes the enum is the same 24 bytes as a
-/// `Vec` — so the common case allocates nothing and reading it needs no
-/// pointer chase.
+/// `Vec` header in the map slot. Here the singleton lives in the slot
+/// itself, so the common case allocates nothing and reading it needs no
+/// pointer chase. The enum is exactly the size of a `Vec` for both posting
+/// sizes on 64-bit targets (24 bytes); on 32-bit targets it is for
+/// `(ref_id, position)` and 8 bytes larger for Panako's 16-byte posting.
 ///
 /// Behaviour is exactly that of the `Vec` it replaces: postings are kept in
 /// insertion order, `retain` preserves the order of survivors, and iteration
@@ -159,6 +160,11 @@ impl<'a, P: Copy> IntoIterator for &'a Postings<P> {
 const _: () = assert!(
     core::mem::size_of::<Postings<(u32, u32)>>() == core::mem::size_of::<Vec<(u32, u32)>>()
 );
+// A 16-byte Panako posting fits in a 64-bit `Vec` header's niche (24 bytes)
+// but not in a 32-bit one (12 bytes); there the enum is 20 bytes and each
+// singleton still saves a heap allocation, so only 64-bit targets can hold
+// it to the `Vec` size.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     core::mem::size_of::<Postings<(u32, u32, u32, u32)>>()
         == core::mem::size_of::<Vec<(u32, u32, u32, u32)>>()

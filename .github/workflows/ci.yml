@@ -197,6 +197,25 @@ jobs:
       - name: check no_std (default target)
         run: cargo check --no-default-features
 
+  # 32-bit targets have a 12-byte `Vec` header, so layout const-asserts
+  # written against 64-bit sizes fail to compile there. `cargo check`
+  # evaluates them.
+  check-32bit:
+    name: 32-bit targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: wasm32-unknown-unknown, armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: check wasm32 (no default features)
+        run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
+      - name: check wasm32 (bare std)
+        run: cargo check --lib --features std --target wasm32-unknown-unknown
+      - name: check armv7 (all codecs)
+        run: cargo check --lib --features all-codecs --target armv7-unknown-linux-gnueabihf
+
   no-std-test:
     name: test no_std (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

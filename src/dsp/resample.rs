@@ -744,7 +744,10 @@ mod tests {
             ..SincQuality::default()
         };
         let result = SincResampler::try_with_quality(8_000, 16_000, quality);
+        // 64-bit: the table size is computed and exceeds the cap. 32-bit:
+        // `steps * taps` overflows `usize` first. Both are rejections.
         assert!(matches!(result, Err(crate::AfpError::Config(ref message))
-            if message.contains("polyphase kernel table") && message.contains("exceeds")));
+            if message.contains("polyphase kernel table")
+                && (message.contains("exceeds") || message.contains("too large"))));
     }
 }
