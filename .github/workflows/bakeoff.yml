@@ -19,7 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: install libchromaprint
         run: sudo apt-get update && sudo apt-get install -y libchromaprint-dev
       - name: run invariants

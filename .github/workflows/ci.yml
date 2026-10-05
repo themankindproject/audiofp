@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
 
 # Jobs run in parallel unless they have explicit dependencies.
+# Build caching is kache (content-addressed store, zero-copy restores) rather
+# than target-dir tarballs. `pr-comment: false` on every use: ~19 jobs would
+# otherwise each post a sticky PR comment; per-job summaries stay on.
 jobs:
   fmt:
     name: rustfmt
@@ -29,7 +32,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: clippy (no default features)
@@ -47,7 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: unit and integration tests
         run: cargo test --all-features -- --skip golden
       - name: doc tests
@@ -66,7 +73,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: compile + run rust snippets
         run: python3 scripts/check_usage_snippets.py
       - name: checker regression tests
@@ -81,7 +90,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: zero-alloc streaming + index allocation tests
         run: cargo test --features std --test zero_alloc --test index_alloc
 
@@ -91,7 +102,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: cargo doc --no-default-features
         run: cargo doc --no-deps --no-default-features
         env:
@@ -103,7 +116,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: cargo doc --features std
         run: cargo doc --no-deps --features std
         env:
@@ -115,7 +130,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: regression (bit-exact hash output)
         run: cargo test --test regression --all-features
 
@@ -125,7 +142,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: cross-codec matching + index identification (Wang/Haitsma/Panako)
         run: cargo test --test matching_real_audio --features std-wav,std-mp3,std-flac,std-ogg
 
@@ -137,7 +156,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: generate coverage (lcov)
@@ -157,7 +178,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: install cargo-audit
         run: cargo install cargo-audit@0.22.1 --locked
       - name: cargo audit
@@ -169,7 +192,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: property-based tests (256 cases)
         run: cargo test --test property --all-features
         env:
@@ -181,7 +206,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: check (all features, MSRV)
         run: cargo check --all-features
       - name: test (MSRV)
@@ -193,7 +220,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: check no_std (default target)
         run: cargo check --no-default-features
 
@@ -208,7 +237,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: wasm32-unknown-unknown, armv7-unknown-linux-gnueabihf
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: check wasm32 (no default features)
         run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
       - name: check wasm32 (bare std)
@@ -228,7 +259,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: stage hashes (resampler, STFT, mel)
         run: cargo test --test cross_platform_determinism
       - name: SIMD kernels and calibration
@@ -246,7 +279,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: cargo test (no default features)
         run: cargo test --no-default-features
 
@@ -285,10 +320,10 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
         if: steps.changes.outputs.run == 'true'
         with:
-          workspaces: bakeoff
+          pr-comment: false
       - name: install libchromaprint
         if: steps.changes.outputs.run == 'true'
         run: sudo apt-get update && sudo apt-get install -y libchromaprint-dev
@@ -314,7 +349,9 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          pr-comment: false
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
       - name: fuzz smoke test (all 11 targets, bounded runs)
