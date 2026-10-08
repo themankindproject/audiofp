@@ -32,7 +32,8 @@ exclude      = [
     # Fuzz harnesses.
     "fuzz/",
 
-    # Chromaprint bakeoff harness (dev-only, system-lib dep) + its report.
+    # Bakeoff harnesses (dev-only) + their reports: chromaprint (issue #88,
+    # system-lib dep) and classical watermarking (issue #153).
     "bakeoff/",
     "BENCHMARKS.md",
 

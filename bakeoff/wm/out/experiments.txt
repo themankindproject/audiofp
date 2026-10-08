@@ -1,0 +1,68 @@
+=== duration/capacity sweep ===
+frames/sec = 31.25
+  secs  frames  fr/bit64   BER(64bit)   BER(32bit)
+     4     125       2.0        0.078        0.000
+     8     250       3.9        0.062        0.000
+    12     375       5.9        0.047        0.000
+    16     500       7.8        0.047        0.000
+    20     625       9.8        0.016        0.000
+    24     750      11.7        0.016        0.000
+    30     937      14.6        0.000        0.000
+    45    1406      22.0        0.016        0.000
+    60    1875      29.3        0.000        0.000
+
+=== false-positive / key calibration ===
+assets/galway.flac: signal=68.16 unwm=40.25 wrongkey=42.12 1char=44.53 BERok=0.047 BERwk=0.469
+assets/freak.flac: signal=69.25 unwm=44.65 wrongkey=47.99 1char=42.74 BERok=0.109 BERwk=0.578
+assets/acidjazz.flac: signal=70.09 unwm=23.71 wrongkey=24.66 1char=23.64 BERok=0.000 BERwk=0.562
+assets/digya.flac: signal=62.47 unwm=32.81 wrongkey=32.52 1char=36.46 BERok=0.062 BERwk=0.469
+assets/grieg.ogg: signal=122.53 unwm=47.86 wrongkey=45.04 1char=49.96 BERok=0.000 BERwk=0.359
+assets/mozart.ogg: signal=128.38 unwm=36.57 wrongkey=41.20 1char=44.94 BERok=0.000 BERwk=0.453
+
+-- distributions --
+signal  (wm, correct key): mean=86.81 sd=27.48 max=128.38
+null A (unwatermarked):    mean=37.64 sd=7.95 p95=23.71 max=47.86
+null B (wrong key):        mean=38.92 sd=7.95 max=47.99
+null C (1-char key diff):  mean=40.38 sd=8.47 max=49.96
+
+separation (signal mean - null mean)/null sd = 6.2 sigma
+BER correct key: mean=0.0365 max=0.1094
+BER wrong key:   mean=0.4818
+
+-- payload discrimination (same audio, different payload) --
+wm(payload) vs payload:      BER=0.047
+wm(payload) vs inverted:     BER=0.953
+wm(pl2)     vs pl2:          BER=0.062
+
+=== z-score statistic ===
+track                 stat(sig) z(sig)  stat(null) z(null)  BER
+assets/galway.flac      68.16   6.29       40.25    2.95  0.047
+assets/freak.flac       69.25   6.23       44.65    3.19  0.109
+assets/acidjazz.flac    70.09   7.20       23.71    2.08  0.000
+assets/digya.flac       62.47   6.94       32.81    2.49  0.062
+assets/grieg.ogg       122.53   7.17       47.86    2.36  0.000
+assets/mozart.ogg      128.38   7.23       36.57    2.37  0.000
+
+-- raw max-statistic --
+signal mean=86.81 sd=27.48 | null mean=37.64 sd=7.95 | separation=6.19 sigma
+-- z-score statistic --
+signal mean=6.84 sd=0.42 | null mean=2.57 sd=0.38 | separation=11.27 sigma
+
+clean BER mean=0.0365 max=0.1094
+
+=== throughput ===
+   5s: embed 17.9 ms (   279.1x rt) | detect 88.4 ms (    56.5x rt)
+  30s: embed 105.7 ms (   283.8x rt) | detect 587.2 ms (    51.1x rt)
+  60s: embed 201.2 ms (   298.3x rt) | detect 1208.8 ms (    49.6x rt)
+ 300s: embed 1040.3 ms (   288.4x rt) | detect 6256.6 ms (    47.9x rt)
+30s detect WITHOUT sync: 43.4 ms (691.9x rt)
+
+=== quality vs alpha ===
+galway alpha=0.1 SNR=  40.1dB LSD=0.37dB requant_snr=  40.1dB
+galway alpha=0.2 SNR=  34.1dB LSD=0.65dB requant_snr=  34.1dB
+galway alpha=0.4 SNR=  28.1dB LSD=1.14dB requant_snr=  28.1dB
+galway alpha=0.8 SNR=  22.1dB LSD=1.95dB requant_snr=  22.1dB
+grieg alpha=0.1 SNR=  34.7dB LSD=0.33dB requant_snr=  34.7dB
+grieg alpha=0.2 SNR=  28.7dB LSD=0.61dB requant_snr=  28.7dB
+grieg alpha=0.4 SNR=  22.6dB LSD=1.08dB requant_snr=  22.6dB
+grieg alpha=0.8 SNR=  16.6dB LSD=1.89dB requant_snr=  16.6dB

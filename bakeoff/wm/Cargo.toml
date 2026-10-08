@@ -1,0 +1,25 @@
+# Dev-only classical-watermark algorithm bakeoff (issue #153). NOT a workspace
+# member, not published (root Cargo.toml excludes bakeoff/). Committed so the
+# issue's measured results stay reproducible from a fresh clone; archived run
+# outputs live in out/.
+[package]
+name = "audiofp-wm-bakeoff"
+
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+name = "audiofp_wm_bakeoff"
+path = "src/lib.rs"
+
+[dependencies]
+libm    = "0.2.16"
+rustfft = { version = "6.4.1", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = false

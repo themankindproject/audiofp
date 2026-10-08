@@ -1,0 +1,27 @@
+
+=========== candidate: mag_dsss ===========
+  track galway clean: BER=0.047 score=0.0295 embedSNR=22.6dB LSD=1.0dB
+  track freak clean: BER=0.109 score=0.0292 embedSNR=24.0dB LSD=1.4dB
+  track acidjazz clean: BER=0.000 score=0.0299 embedSNR=22.5dB LSD=1.0dB
+  track digya clean: BER=0.062 score=0.0267 embedSNR=23.1dB LSD=1.1dB
+  track grieg clean: BER=0.000 score=0.0279 embedSNR=23.2dB LSD=1.0dB
+  track mozart clean: BER=0.000 score=0.0292 embedSNR=23.0dB LSD=1.2dB
+  wrong-key rejected 6/6 tracks
+
+=========== candidate: log_dsss ===========
+  track galway clean: BER=0.469 score=0.0128 embedSNR=47.3dB LSD=0.1dB
+  track freak clean: BER=0.516 score=0.0078 embedSNR=47.7dB LSD=0.1dB
+  track acidjazz clean: BER=0.484 score=0.0062 embedSNR=48.0dB LSD=0.1dB
+  track digya clean: BER=0.484 score=0.0023 embedSNR=48.7dB LSD=0.1dB
+  track grieg clean: BER=0.422 score=0.0116 embedSNR=48.4dB LSD=0.1dB
+  track mozart clean: BER=0.453 score=0.0045 embedSNR=48.1dB LSD=0.0dB
+  wrong-key rejected 6/6 tracks
+
+=========== candidate: qim_logmag ===========
+  track galway clean: BER=0.594 score=0.0367 embedSNR=128.3dB LSD=0.0dB
+  track freak clean: BER=0.391 score=0.0364 embedSNR=50.5dB LSD=0.0dB
+  track acidjazz clean: BER=0.547 score=0.0354 embedSNR=37.2dB LSD=0.0dB
+  track digya clean: BER=0.625 score=0.0454 embedSNR=42.8dB LSD=0.0dB
+  track grieg clean: BER=0.562 score=0.0526 embedSNR=92.4dB LSD=0.0dB
+  track mozart clean: BER=0.547 score=0.0291 embedSNR=42.3dB LSD=0.0dB
+  wrong-key rejected 6/6 tracks
