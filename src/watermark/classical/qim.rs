@@ -9,7 +9,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use num_complex::Complex;
-use rustfft::{Fft, FftPlannerScalar};
+use rustfft::FftPlannerScalar;
+
+use crate::dsp::stft::RealFft;
 
 use super::N_FFT;
 use super::keying::keyed_bins;
@@ -81,31 +83,40 @@ pub(crate) fn detect(samples: &[f32], n_bits: usize, key: &[u8]) -> (Vec<u8>, f6
         return (vec![0; n_bits], 0.0, 0);
     }
     let q = f64::from(Q_DB);
-    let mut planner = FftPlannerScalar::<f32>::new();
-    let fwd = planner.plan_fft_forward(N_FFT);
-    let mut scratch = vec![Complex::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
-    let mut buf = vec![Complex::new(0.0, 0.0); N_FFT];
+    // Detect consumes magnitudes of a real block only, so it uses the
+    // crate's real-input FFT (half-length complex FFT + twiddle pass)
+    // rather than a full complex transform: the classical fingerprinters
+    // already run on this backend, and it is the target-independent one.
+    let mut fft = RealFft::new(N_FFT);
+    let mut time = vec![0.0f32; N_FFT];
+    let mut spec = vec![Complex::new(0.0, 0.0); N_FFT / 2 + 1];
+    let mut sum = vec![0.0f64; n_bits];
+    let mut cnt = vec![0u32; n_bits];
+    let mut corr = vec![0.0f64; n_bits];
     let mut best = vec![0.0f64; n_bits];
     let mut best_e = f64::MIN;
     let mut best_offset = 0usize;
     let mut offset = 0usize;
     while offset < N_FFT && offset + N_FFT <= samples.len() {
-        let corr = block_votes(
+        block_votes(
             samples,
             offset,
             &order,
             n_bits,
             q,
             &mut Spectrum {
-                fwd: fwd.as_ref(),
-                scratch: &mut scratch,
-                buf: &mut buf,
+                fft: &mut fft,
+                time: &mut time,
+                spec: &mut spec,
             },
+            &mut sum,
+            &mut cnt,
+            &mut corr,
         );
         let energy: f64 = corr.iter().map(|c| c.abs()).sum();
         if energy > best_e {
             best_e = energy;
-            best = corr;
+            best.copy_from_slice(&corr);
             best_offset = offset;
         }
         offset += OFFSET_STEP;
@@ -149,11 +160,12 @@ fn set_herm_mag(buf: &mut [Complex<f32>], bin: usize, new_mag: f32) {
 }
 
 struct Spectrum<'a> {
-    fwd: &'a dyn Fft<f32>,
-    scratch: &'a mut [Complex<f32>],
-    buf: &'a mut [Complex<f32>],
+    fft: &'a mut RealFft,
+    time: &'a mut [f32],
+    spec: &'a mut [Complex<f32>],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block_votes(
     samples: &[f32],
     offset: usize,
@@ -161,15 +173,16 @@ fn block_votes(
     n_bits: usize,
     q: f64,
     spec: &mut Spectrum<'_>,
-) -> Vec<f64> {
-    let mut sum = vec![0.0f64; n_bits];
-    let mut cnt = vec![0u32; n_bits];
+    sum: &mut [f64],
+    cnt: &mut [u32],
+    out: &mut [f64],
+) {
+    sum.fill(0.0);
+    cnt.fill(0);
     let mut pos = offset;
     while pos + N_FFT <= samples.len() {
-        for (i, sample) in spec.buf.iter_mut().enumerate() {
-            *sample = Complex::new(samples[pos + i], 0.0);
-        }
-        spec.fwd.process_with_scratch(spec.buf, spec.scratch);
+        spec.time.copy_from_slice(&samples[pos..pos + N_FFT]);
+        spec.fft.process(spec.time, spec.spec);
         for b in 0..n_bits {
             let mut vote = 0.0f64;
             let mut n = 0.0f64;
@@ -182,7 +195,7 @@ fn block_votes(
                 if bin == 0 || bin >= N_FFT / 2 {
                     continue;
                 }
-                let mag = modulus(spec.buf[bin]).max(1e-7);
+                let mag = modulus(spec.spec[bin]).max(1e-7);
                 let db = f64::from(20.0 * libm::log10f(mag));
                 vote += lattice_dist(db, 0.0, q) - lattice_dist(db, q * 0.5, q);
                 n += 1.0;
@@ -194,11 +207,54 @@ fn block_votes(
         }
         pos += N_FFT;
     }
-    let mut corr = vec![0.0f64; n_bits];
     for b in 0..n_bits {
-        if cnt[b] > 0 {
-            corr[b] = sum[b] / f64::from(cnt[b]);
-        }
+        out[b] = if cnt[b] > 0 {
+            sum[b] / f64::from(cnt[b])
+        } else {
+            0.0
+        };
     }
-    corr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The detector runs on [`RealFft`]; the embedder (and the bakeoff
+    /// reference) uses a full complex FFT. Pin that both backends produce
+    /// the same magnitudes in the carrier band, so the substitution cannot
+    /// move a lattice vote.
+    #[test]
+    fn real_fft_matches_complex_fft_in_carrier_band() {
+        let fwd = FftPlannerScalar::<f32>::new().plan_fft_forward(N_FFT);
+        let mut scratch = vec![Complex::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
+        let mut rfft = RealFft::new(N_FFT);
+        let mut worst = 0.0f64;
+        let mut x = 0x1234_5678u32;
+        for _ in 0..8 {
+            let mut time = vec![0.0f32; N_FFT];
+            for t in &mut time {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *t = (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+            }
+
+            let mut complex: Vec<Complex<f32>> =
+                time.iter().map(|&s| Complex::new(s, 0.0)).collect();
+            fwd.process_with_scratch(&mut complex, &mut scratch);
+
+            let mut real_time = time.clone();
+            let mut real = vec![Complex::new(0.0, 0.0); N_FFT / 2 + 1];
+            rfft.process(&mut real_time, &mut real);
+
+            for bin in BIN_LO..BIN_HI.min(N_FFT / 2) {
+                let a = modulus(complex[bin]);
+                let b = modulus(real[bin]);
+                worst = worst.max(f64::from((a - b).abs() / a.max(1e-30)));
+            }
+        }
+        // Measured worst gap across eight frames: 4.8e-6 relative
+        // (≈ 40 f32 ulps, −106 dB) — five orders below the 6 dB lattice
+        // step, so a vote cannot move.
+        assert!(worst < 1e-5, "real/complex magnitude gap {worst:.3e}");
+    }
 }

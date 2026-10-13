@@ -11,7 +11,10 @@ use super::keying::{ChaCha, derive_key, keyed_bins};
 use super::stft::{ComplexStft, modulus};
 use super::{HOP, N_FFT};
 
-const DB_ALPHA: f32 = 3.0;
+/// Linear gain for a +3 dB chip: `10^(3/20)`.
+const GAIN_UP: f32 = 1.412_537_6;
+/// Linear gain for a −3 dB chip: `10^(-3/20)`.
+const GAIN_DOWN: f32 = 0.707_945_8;
 const BIN_LO: usize = 10;
 const BIN_HI_FRAC: f32 = 0.75;
 const BINS_PER_FRAME: usize = 300;
@@ -22,19 +25,25 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     let n_bits = bits.len().max(1);
+    let n_ord = order.len();
+    let chips = chips(key, n_bits, n_ord);
     for f in 0..n_frames {
-        let bit = bits[f % n_bits];
-        let sign = bit_sign(bit);
-        let mut rng = ChaCha::new(&derive_key(key, b"log-host-spread"), (f % n_bits) as u64);
-        for &bin in &order {
-            let chip = hard_chip(&mut rng);
+        let b = f % n_bits;
+        let row = &chips[b * n_ord..(b + 1) * n_ord];
+        // Bit 0 flips every chip; the chip itself picks the ±3 dB direction.
+        let negate = bits[b] == 0;
+        for (i, &bin) in order.iter().enumerate() {
             let cell = &mut spec[f * nb + bin];
             let mag = modulus(*cell);
             if mag < 1e-7 {
                 continue;
             }
-            let db = 20.0 * libm::log10f(mag);
-            let new_mag = libm::powf(10.0, (db + sign * chip * DB_ALPHA) / 20.0).max(1e-7);
+            let gain = if (row[i] > 0.0) != negate {
+                GAIN_UP
+            } else {
+                GAIN_DOWN
+            };
+            let new_mag = (mag * gain).max(1e-7);
             *cell *= new_mag / mag;
         }
     }
@@ -55,25 +64,37 @@ pub(crate) fn detect(samples: &[f32], n_bits: usize, key: &[u8]) -> (Vec<u8>, f6
     }
     let n_ord = order.len();
     let mut db = vec![0.0f64; n_frames * n_ord];
+    let mut mean = vec![0.0f64; n_ord];
     for f in 0..n_frames {
         for (i, &bin) in order.iter().enumerate() {
             let mag = modulus(spec[f * nb + bin]).max(1e-7);
-            db[f * n_ord + i] = f64::from(20.0 * libm::log10f(mag));
-        }
-    }
-    let mut mean = vec![0.0f64; n_ord];
-    for f in 0..n_frames {
-        for i in 0..n_ord {
-            mean[i] += db[f * n_ord + i];
+            let v = f64::from(20.0 * libm::log10f(mag));
+            db[f * n_ord + i] = v;
+            mean[i] += v;
         }
     }
     let inv = 1.0 / n_frames as f64;
     for m in &mut mean {
         *m *= inv;
     }
-    pick_phase(n_bits, |ph0| {
-        correlate(&db, &mean, n_frames, n_ord, n_bits, ph0, key)
-    })
+    let chips = chips(key, n_bits, n_ord);
+    pick_phase(&db, &mean, n_frames, n_bits, &chips)
+}
+
+/// One ±1 chip row per bit, drawn from that bit's domain-separated stream.
+///
+/// The rows repeat every frame, so embed and detect consume them from this
+/// table instead of rebuilding a keystream per frame — the previous shape
+/// allocated one `derive_key` buffer per (phase, frame) pair.
+fn chips(key: &[u8], n_bits: usize, n_ord: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n_bits * n_ord);
+    for b in 0..n_bits {
+        let mut rng = ChaCha::new(&derive_key(key, b"log-host-spread"), b as u64);
+        for _ in 0..n_ord {
+            out.push(hard_chip(&mut rng));
+        }
+    }
+    out
 }
 
 fn log_order(key: &[u8], nb: usize) -> Vec<usize> {
@@ -81,47 +102,37 @@ fn log_order(key: &[u8], nb: usize) -> Vec<usize> {
     keyed_bins(key, b"log-host-bins", BIN_LO, bin_hi, BINS_PER_FRAME)
 }
 
-fn correlate(
+fn pick_phase(
     db: &[f64],
     mean: &[f64],
     n_frames: usize,
-    n_ord: usize,
     n_bits: usize,
-    ph0: usize,
-    key: &[u8],
-) -> Vec<f64> {
+    chips: &[f32],
+) -> (Vec<u8>, f64, usize) {
+    let n_ord = mean.len();
     let mut corr = vec![0.0f64; n_bits];
-    for f in 0..n_frames {
-        let b = (f + ph0) % n_bits;
-        let mut rng = ChaCha::new(&derive_key(key, b"log-host-spread"), b as u64);
-        for i in 0..n_ord {
-            let chip = f64::from(hard_chip(&mut rng));
-            corr[b] += (db[f * n_ord + i] - mean[i]) * chip;
-        }
-    }
-    corr
-}
-
-fn pick_phase(n_bits: usize, correlate_at: impl Fn(usize) -> Vec<f64>) -> (Vec<u8>, f64, usize) {
+    let mut best = vec![0.0f64; n_bits];
+    let mut best_e = f64::NEG_INFINITY;
     let mut best_phase = 0usize;
-    let mut best = correlate_at(0);
-    let mut best_e: f64 = best.iter().map(|c| c.abs()).sum();
-    for ph0 in 1..n_bits {
-        let corr = correlate_at(ph0);
+    for ph0 in 0..n_bits {
+        corr.fill(0.0);
+        for f in 0..n_frames {
+            let b = (f + ph0) % n_bits;
+            let row = &chips[b * n_ord..(b + 1) * n_ord];
+            for i in 0..n_ord {
+                corr[b] += (db[f * n_ord + i] - mean[i]) * f64::from(row[i]);
+            }
+        }
         let energy: f64 = corr.iter().map(|c| c.abs()).sum();
         if energy > best_e {
             best_e = energy;
-            best = corr;
+            best.copy_from_slice(&corr);
             best_phase = ph0;
         }
     }
     let bits: Vec<u8> = best.iter().map(|&c| u8::from(c >= 0.0)).collect();
     let mean = best.iter().map(|c| c.abs()).sum::<f64>() / n_bits.max(1) as f64;
     (bits, mean, best_phase)
-}
-
-fn bit_sign(bit: u8) -> f32 {
-    if bit == 0 { -1.0 } else { 1.0 }
 }
 
 fn hard_chip(rng: &mut ChaCha) -> f32 {
