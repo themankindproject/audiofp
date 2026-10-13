@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+**Classical watermarking** (`classical-watermark` feature, issue #153). A keyed
+embedder and blind detector at `audiofp::watermark::classical` for two measured
+algorithms — non-overlapping 6 dB block QIM (default) and overlapped
+log-magnitude DSSS with per-bin host subtraction. Mono 16 kHz; the payload is
+framed with a CRC-32 and only returned when it matches. FFT + `alloc` only:
+does not imply `std` and does not pull in `tract-onnx`. Round-trip, wrong-key,
+and unmarked-audio tests included; the measured attack matrix is in
+`bakeoff/wm/ISSUE.md`.
+
+### Performance
+
+**`watermark::classical` allocation and FFT cost.** LogHost detect rebuilt a
+ChaCha keystream per (phase, frame) — 90,167 allocations and 705 ms for 30 s of
+audio. One chip row per bit is now drawn once and shared by embed and detect,
+the ±3 dB chip is applied as a linear gain constant instead of `log10`+`powf`
+per cell, and the host mean folds into the dB fill. QIM detect reuses its vote
+buffers and transforms with `dsp::stft::RealFft` instead of a full complex FFT.
+
+| Path (30 s of audio) | Time       | Realtime  | Allocations / call |
+| -------------------- | ---------: | --------: | -----------------: |
+| LogHost detect       | 705 → 170 ms | 42× → 176× | 90,167 → 122   |
+| LogHost embed        | 111 → 78 ms  | 270× → 384× | 961 → 120      |
+| QIM detect           | 377 → 280 ms | 80× → 107×  | 111 → 19       |
+
 ## [0.4.4] - 2026-09-29
 
 ### Fixed

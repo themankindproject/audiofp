@@ -225,6 +225,8 @@ jobs:
           pr-comment: false
       - name: check no_std (default target)
         run: cargo check --no-default-features
+      - name: check no_std (classical-watermark)
+        run: cargo check --no-default-features --features classical-watermark
 
   # 32-bit targets have a 12-byte `Vec` header, so layout const-asserts
   # written against 64-bit sizes fail to compile there. `cargo check`
@@ -242,6 +244,8 @@ jobs:
           pr-comment: false
       - name: check wasm32 (no default features)
         run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
+      - name: check wasm32 (classical-watermark)
+        run: cargo check --lib --no-default-features --features classical-watermark --target wasm32-unknown-unknown
       - name: check wasm32 (bare std)
         run: cargo check --lib --features std --target wasm32-unknown-unknown
       - name: check armv7 (all codecs)

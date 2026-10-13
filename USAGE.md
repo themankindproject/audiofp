@@ -41,6 +41,7 @@
   - [Cache files (.afp)](#cache-files-afp)
 - [Audio File Decoding](#audio-file-decoding)
 - [Watermark Detection](#watermark-detection)
+- [Classical Watermarking (embed + detect)](#classical-watermarking-embed--detect)
 - [Neural Embedder](#neural-embedder)
 - [DSP Primitives](#dsp-primitives)
 - [Async, batching, and models](#async-batching-and-models)
@@ -166,8 +167,9 @@ at scale, yet stable across re-encoding, modest noise, and (for Panako) small
 tempo changes. Two recordings of the same song share many hashes; two
 unrelated recordings do not.
 
-`audiofp` ships three classical fingerprinters, one neural embedder, and one
-watermark detector:
+`audiofp` ships three classical fingerprinters, one neural embedder, one
+AudioSeal-compatible watermark detector, and one keyed classical watermark
+embedder/detector:
 
 | Algorithm  | Output          | Rate  | Frame rate | Storage / s        | When to use                            |
 | ---------- | --------------- | ----- | ---------- | ------------------ | -------------------------------------- |
@@ -176,6 +178,7 @@ watermark detector:
 | `Haitsma`  | 32 bits / frame | 5 kHz | 78.125 fps | 312 B               | Compact dense IDs; lowest latency    |
 | `NeuralEmbedder` | f32 vector / window | model-defined | 1/`hop_secs` | `4·dim` B / window | Semantic / cover detection (BYO ONNX model) |
 | `WatermarkDetector` | message + confidence | 16 kHz | — | — | AudioSeal-style watermark detection (BYO model) |
+| `QimBlock` / `LogHost` (classical watermark) | payload + CRC-32 | 16 kHz | — | — | Keyed provenance / asset IDs; blind detection, no model |
 
 All three classical fingerprinters:
 
@@ -1932,6 +1935,75 @@ cargo run --example watermark_detect --features watermark,std-wav -- /path/to/au
 
 ---
 
+## Classical Watermarking (embed + detect)
+
+Available with the `classical-watermark` feature. A keyed embedder writes a
+payload into the signal and a blind detector recovers it with only the key —
+no reference copy and no ONNX model. FFT + `alloc` only: unlike `watermark`,
+this feature does **not** imply `std` and does not pull in `tract-onnx`.
+
+```toml
+[dependencies]
+audiofp = { version = "0.4", features = ["classical-watermark"] }
+```
+
+`Algorithm` selects the measured algorithm (default `QimBlock`):
+
+| `Algorithm` | Domain                                                     | Detector                                                       |
+| ----------- | ---------------------------------------------------------- | -------------------------------------------------------------- |
+| `QimBlock`  | non-overlapping 2048-point DFT, 6 dB lattice, 4 bins / bit | per-block lattice votes, searched over a 64-sample block offset |
+| `LogHost`   | overlapped Hann STFT (2048/512), ±3 dB keyed chips         | per-bin host subtraction, searched over every bit phase         |
+
+Mono 16 kHz only (`UnsupportedSampleRate` otherwise; resample first). The
+embedded string is `payload bytes ++ CRC-32`; `ClassicalResult::payload` is
+`Some` only when that CRC matches, and `detected()` is exactly that condition.
+`ClassicalResult::score` is **not** comparable between the two algorithms and
+is not a detection threshold. Non-finite PCM fails with `NonFiniteSample`;
+input too short for the framed payload fails with `AudioTooShort`. Time-scale
+modification and pitch shift are outside the contract — the measured attack
+matrix is in `bakeoff/wm/ISSUE.md`.
+
+### Embed + detect
+
+```rust
+use audiofp::SampleRate;
+use audiofp::watermark::classical::{ClassicalConfig, ClassicalDetector, ClassicalEmbedder};
+
+fn main() -> Result<(), audiofp::AfpError> {
+    let payload = [0xA1u8, 0xB2, 0xC3, 0xD4];
+    let key = b"asset-key-42";
+
+    // 8 s of deterministic noise-rich mono audio at the required 16 kHz.
+    let mut x = 0x1234_5678u32;
+    let samples: Vec<f32> = (0..16_000 * 8)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as i32 as f32 / i32::MAX as f32) * 0.2
+        })
+        .collect();
+
+    // Embed: the output has the same length as the input.
+    let embedder = ClassicalEmbedder::try_new(ClassicalConfig::new(payload.len()), key, &payload)?;
+    let marked = embedder.embed(&samples, SampleRate::HZ_16000)?;
+
+    // Detect blindly — the payload comes back `Some` only when the CRC matches.
+    let detector = ClassicalDetector::try_new(ClassicalConfig::new(payload.len()), key)?;
+    let result = detector.detect(&marked, SampleRate::HZ_16000)?;
+    assert!(result.detected());
+    assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+    println!("score {:.3}, sync offset {}", result.score, result.sync_offset);
+    Ok(())
+}
+```
+
+The embedder and detector carry no state across calls and are `Clone`; build
+them once and reuse. See [Error Handling](#error-handling) for the `Result`
+contract and the crate's conventions.
+
+---
+
 ## Neural Embedder
 
 Available with the `neural` feature. A generic ONNX log-mel audio embedder:
@@ -2613,6 +2685,7 @@ Default = `[]` (no_std + alloc, no codecs):
 | `all-codecs` | every codec feature above — the pre-0.4.0 monolithic `std`                    |
 | `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` + parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies std) |
 | `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`)                   |
+| `classical-watermark` | keyed classical watermark embed + blind detect (`audiofp::watermark::classical`); FFT + `alloc` only — does not imply `std` |
 | `neural`     | `tract-onnx`; enables `audiofp::neural` (implies `std`)                      |
 | `mimalloc`   | `mimalloc` as process-wide `#[global_allocator]` (implies `std`)             |
 
@@ -2631,14 +2704,17 @@ audiofp = { version = "0.4", default-features = false }
 
 # Watermark only:
 audiofp = { version = "0.4", default-features = false, features = ["watermark"] }
+
+# Keyed classical watermark only (no_std + alloc, no ONNX):
+audiofp = { version = "0.4", default-features = false, features = ["classical-watermark"] }
 ```
 
 ---
 
 ## no_std / Embedded
 
-The DSP primitives, classical fingerprinters, matching, and serialisation
-compile under `no_std + alloc`:
+The DSP primitives, classical fingerprinters, matching, serialisation, and the
+classical watermarker compile under `no_std + alloc`:
 
 ```rust
 #![no_std]
@@ -2658,6 +2734,7 @@ fn fingerprint_here(samples: &[f32]) -> audiofp::Result<audiofp::classical::Wang
 | `audiofp::dsp` / `classical` / `matching` / `serial` | host-only no_std (rustfft transitively reaches std; your crate itself is `#![no_std]`) |
 | `audiofp::io`         | requires a `std-*` codec feature or `all-codecs`                    |
 | `audiofp::neural` / `watermark` | require `std`                                              |
+| `audiofp::watermark::classical` | `classical-watermark` — FFT + `alloc` only, no `std` requirement |
 
 > **Bare-metal caveat.** `rustfft` (the STFT backend) transitively pulls
 > `num-traits` with `std`, so the no_std build runs on hosted targets where

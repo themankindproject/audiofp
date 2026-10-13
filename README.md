@@ -8,7 +8,7 @@
 ![Crates.io Downloads](https://img.shields.io/crates/d/audiofp)
 ![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 
-Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, and **AudioSeal-compatible watermark detection**.
+Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, **keyed classical watermarking**, and **AudioSeal-compatible watermark detection**.
 
 ## Overview
 
@@ -22,6 +22,7 @@ Audio fingerprinting library for Rust with **classical landmark and band-power a
 | **Matching** | In-memory ID (`WangMatcher`, `HaitsmaMatcher`, …) | — | — | — |
 | **Streaming** | Real-time hash emission | (per algorithm) | (per algorithm) | Bit-exact offline parity |
 | **Watermark** | AudioSeal detection (BYO ONNX) | 16 kHz | (per model) | Detection + 16-bit message |
+| **Classical watermark** | Keyed embed + blind detect (no model) | 16 kHz | — | Payload + CRC-32 |
 
 Perfect for:
 - Music identification ("what is this song?")
@@ -40,6 +41,7 @@ Perfect for:
 - **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
 - **High-Quality Resampling** - Built-in windowed-sinc Kaiser resampler with auto anti-aliasing cutoff
 - **Watermark Detection** - AudioSeal-compatible ONNX wrapper (Tract backend); typed model is cached per input length and rebuilt automatically when the length changes
+- **Keyed Classical Watermarking** - Embed a payload and recover it blindly in the signal domain (`classical-watermark`; FFT + `alloc` only, no ONNX). Payloads are framed with a CRC-32 and returned only on a match
 - **Neural Embedder** - Generic ONNX log-mel embedder with offline + streaming modes; `try_push_with` reuses a caller-sized embedding scratch buffer (Tract may still allocate per inference window — see `neural::StreamingNeuralEmbedder` docs)
 - **DSP Primitives Reusable** - Public `dsp::stft`, `dsp::mel`, `dsp::peaks`, `dsp::resample`, `dsp::windows`
 - **Low-Allocation Hot Path** - Classical streaming `push` reuses pre-allocated scratch after warmup (`ZeroAllocStreaming`; neural/watermark ONNX paths may still allocate per inference window)
@@ -75,6 +77,7 @@ once (the pre-0.4.0 `std` behavior).
 | `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
 | `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` (implies `std`) |
 | `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`) |
+| `classical-watermark` | No | Keyed classical watermark embed + blind detect (`audiofp::watermark::classical`). FFT + `alloc` only — does not imply `std` |
 | `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
 | `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |
 

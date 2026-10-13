@@ -35,7 +35,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ALL_DOC_FILES = (REPO / "USAGE.md", REPO / "README.md")
-DEFAULT_FEATURES = ("all-codecs", "neural", "watermark", "rayon")
+DEFAULT_FEATURES = ("all-codecs", "neural", "watermark", "classical-watermark", "rayon")
 
 # Blocks whose code touches files / models / other crates are compile-only.
 SKIP_RUN = (
@@ -59,6 +59,7 @@ FEATURE_GATES: tuple[tuple[str, str], ...] = (
     ("audiofp::neural", "neural"),
     ("watermark::", "watermark"),
     ("audiofp::watermark", "watermark"),
+    ("watermark::classical", "classical-watermark"),
     ("fingerprint_batch_parallel", "rayon"),
     ("par_match_best", "rayon"),
     ("decode_to_mono", "std-wav"),
