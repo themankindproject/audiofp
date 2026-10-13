@@ -1,48 +1,38 @@
-//! Audio watermark detection (AudioSeal-compatible).
+//! Audio watermarks.
 //!
-//! A thin wrapper around [`tract-onnx`] that loads a watermark-detector
-//! ONNX model, runs it on an audio buffer, and decodes the model's two
-//! outputs (detection scores + message logits) into a
-//! [`WatermarkResult`].
+//! Two independent subsystems live here.
 //!
-//! The crate ships only the loader and decoder — the caller supplies
-//! the ONNX export themselves. Meta's [AudioSeal v0.2] is the reference
-//! target; any model that follows the contract documented on
-//! [`WatermarkConfig`] will work. See [`WatermarkResult::localization`]
-//! for the detection-score / time-base contract (length is model-defined;
-//! `audiofp` does not resample or realign it).
+//! # ONNX detector
 //!
-//! Available only when the `watermark` feature is enabled:
+//! Feature `watermark` (implies `std` and `tract-onnx`). An AudioSeal-compatible
+//! loader and decoder. The caller supplies the ONNX model. Types are
+//! `WatermarkConfig`, `WatermarkDetector`, and `WatermarkResult`, both from
+//! `audiofp::watermark::detector` and re-exported at `audiofp::watermark`.
 //!
 //! ```toml
 //! [dependencies]
 //! audiofp = { version = "0.4", features = ["watermark"] }
 //! ```
 //!
-//! # Example
+//! # Classical embed and detect
 //!
-//! ```no_run
-//! use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-//! use audiofp::{SampleRate};
+//! Feature `classical-watermark`. A keyed embedder and detector at
+//! `audiofp::watermark::classical`. FFT and `alloc` only: it does not imply
+//! `std` and it does not pull in `tract-onnx`.
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut det = WatermarkDetector::new(WatermarkConfig::new("audioseal_v0.2.onnx"))?;
-//! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-//! let r = det.detect(&samples, SampleRate::new(16_000).unwrap())?;
-//!
-//! if r.detected {
-//!     println!("watermarked, confidence {:.3}, message {:#018b}",
-//!              r.confidence, r.message);
-//! }
-//! # Ok(()) }
+//! ```toml
+//! [dependencies]
+//! audiofp = { version = "0.4", features = ["classical-watermark"] }
 //! ```
-//!
-//! [AudioSeal v0.2]: https://github.com/facebookresearch/audioseal
-//! [`tract-onnx`]: https://docs.rs/tract-onnx
 
+#[cfg(feature = "watermark")]
 pub mod detector;
 
-#[cfg(test)]
+#[cfg(feature = "classical-watermark")]
+pub mod classical;
+
+#[cfg(all(test, feature = "watermark"))]
 mod test_fixture;
 
+#[cfg(feature = "watermark")]
 pub use detector::{WatermarkConfig, WatermarkDetector, WatermarkResult};

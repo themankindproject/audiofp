@@ -123,6 +123,10 @@ neural = ["std", "dep:tract-onnx"]
 # AudioSeal-compatible watermark detector. Requires std.
 watermark = ["std", "dep:tract-onnx"]
 
+# Keyed classical embedder and detector (issue #153). FFT + alloc only:
+# does not imply `std` and does not pull in tract-onnx.
+classical-watermark = []
+
 # Multi-threaded batch fingerprinting via rayon, plus the
 # parallel matcher entry points par_match_best / par_match_ranked.
 # Requires std.
