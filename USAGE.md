@@ -1847,6 +1847,14 @@ Notes:
 
 ## Watermark Detection
 
+> **Deprecated since 0.4.5 — removed in 0.5.0.** This ONNX AudioSeal detector
+> leaves the crate together with the `watermark` feature and its `tract-onnx`
+> dependency. Use
+> [Classical Watermarking (embed + detect)](#classical-watermarking-embed--detect)
+> instead — keyed payload embed + blind recovery, no model and no `std`. The
+> two are not interchangeable: AudioSeal verifies a *provider's* neural mark,
+> the classical subsystem works on payloads you embed and control.
+
 Available with the `watermark` feature. Wraps `tract-onnx` to run an
 AudioSeal-compatible detector; the model is **not** bundled.
 
@@ -2684,7 +2692,7 @@ Default = `[]` (no_std + alloc, no codecs):
 | `std-alac`   | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                       |
 | `all-codecs` | every codec feature above — the pre-0.4.0 monolithic `std`                    |
 | `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` + parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies std) |
-| `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`)                   |
+| `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`). **Deprecated — removed in 0.5.0**; migrate to `classical-watermark` |
 | `classical-watermark` | keyed classical watermark embed + blind detect (`audiofp::watermark::classical`); FFT + `alloc` only — does not imply `std` |
 | `neural`     | `tract-onnx`; enables `audiofp::neural` (implies `std`)                      |
 | `mimalloc`   | `mimalloc` as process-wide `#[global_allocator]` (implies `std`)             |

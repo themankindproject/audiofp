@@ -17,7 +17,7 @@ Usage:
 
     --keep       keep the scratch crate under target/usage-check for inspection
     --features   comma-separated Cargo features for the audiofp dependency
-                 (default: all-codecs,neural,watermark,rayon)
+                 (default: all-codecs,neural,watermark,classical-watermark,rayon)
     --docs       comma-separated doc basenames to check (default: all three)
 
 Exit status 0 = all snippets compile and all runnable tests pass.

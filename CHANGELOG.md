@@ -33,6 +33,17 @@ buffers and transforms with `dsp::stft::RealFft` instead of a full complex FFT.
 | LogHost embed        | 111 → 78 ms  | 270× → 384× | 961 → 120      |
 | QIM detect           | 377 → 280 ms | 80× → 107×  | 111 → 19       |
 
+### Deprecated
+
+**`audiofp::watermark` (AudioSeal ONNX detector) — removed in 0.5.0.** The
+`watermark` feature, its `WatermarkConfig` / `WatermarkDetector` /
+`WatermarkResult` types, and the `tract-onnx` dependency they pull in are
+deprecated as of 0.4.5; every use emits a compiler deprecation warning.
+Watermarking continues as the classical keyed embedder/detector
+(`classical-watermark`), which needs no model and no `std`. The two are not
+interchangeable: AudioSeal verifies a *provider's* neural mark, while the
+classical subsystem embeds and recovers a payload you control.
+
 ## [0.4.4] - 2026-09-29
 
 ### Fixed
