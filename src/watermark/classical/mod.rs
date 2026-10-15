@@ -419,6 +419,58 @@ mod tests {
         }
     }
 
+    /// FNV-1a over the little-endian bit patterns of `samples`.
+    fn fnv1a(samples: &[f32]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for s in samples {
+            for byte in s.to_bits().to_le_bytes() {
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// The embedded format is frozen: detector work must not move a single
+    /// output bit. The hashes were recorded on the PR #154 head (`25dff11`)
+    /// before any detector change. Update them only for a deliberate format
+    /// change, together with the algorithm id.
+    #[test]
+    fn embed_output_is_bit_identical_to_pr_154_head() {
+        const KEY: &[u8] = b"bakeoff-secret-key-0123456789";
+        let cases: [(Algorithm, &[u8], usize); 5] = [
+            (
+                Algorithm::QimBlock,
+                &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                16_000 * 8,
+            ),
+            (Algorithm::QimBlock, &[0xA5], 5_000),
+            (Algorithm::QimBlock, &[0x5A; 11], 20_001),
+            (
+                Algorithm::LogHost,
+                &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                16_000 * 8,
+            ),
+            (Algorithm::LogHost, &[0xC3; 12], 70_001),
+        ];
+        const EXPECTED: [u64; 5] = [
+            0x9908_3145_030d_bed5,
+            0x3bd2_b4d9_7cc4_f6a4,
+            0x36bb_61f2_ff4f_5f5e,
+            0xdc83_0b4b_b56e_021d,
+            0xf820_0486_1f02_6bbf,
+        ];
+        let got: Vec<u64> = cases
+            .iter()
+            .map(|&(algorithm, payload, n)| {
+                let config = ClassicalConfig::new(payload.len()).with_algorithm(algorithm);
+                let embedder = ClassicalEmbedder::try_new(config, KEY, payload).unwrap();
+                fnv1a(&embedder.embed(&noise(n), SampleRate::HZ_16000).unwrap())
+            })
+            .collect();
+        assert_eq!(got, EXPECTED, "embed output changed; got {got:#x?}");
+    }
+
     #[test]
     fn rejects_empty_key_and_qim_payload_that_does_not_fit() {
         let err = ClassicalEmbedder::try_new(ClassicalConfig::new(8), b"", &[0; 8]).unwrap_err();
