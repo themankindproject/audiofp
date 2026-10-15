@@ -251,4 +251,20 @@ mod send_sync_assertions {
         assert_send_sync::<matching::HaitsmaMatchConfig>();
         assert_send_sync::<matching::PanakoMatchConfig>();
     }
+
+    /// Keyed classical watermark: shared across threads like every other
+    /// public type, so a detector built once can serve a thread pool.
+    #[cfg(feature = "classical-watermark")]
+    #[test]
+    fn classical_watermark_types_are_send_sync() {
+        use watermark::classical::{
+            Algorithm, ClassicalConfig, ClassicalDetector, ClassicalEmbedder, ClassicalResult,
+        };
+
+        assert_send_sync::<Algorithm>();
+        assert_send_sync::<ClassicalConfig>();
+        assert_send_sync::<ClassicalEmbedder>();
+        assert_send_sync::<ClassicalDetector>();
+        assert_send_sync::<ClassicalResult>();
+    }
 }

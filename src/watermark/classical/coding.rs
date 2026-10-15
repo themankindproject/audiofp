@@ -38,6 +38,36 @@ pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     bits
 }
 
+/// Hard decisions from soft bit votes: positive is 1, negative is 0.
+///
+/// A vote that is exactly zero (a tie, or a bit nothing voted on) or not
+/// finite is an erasure, and a single erasure fails the whole decision.
+/// Resolving it to a bit instead would let evidence-free input decode to a
+/// fixed frame, and `crc32(0xFF * 4) == 0xFFFF_FFFF` makes the all-ones
+/// frame a valid 4-byte payload.
+pub(crate) fn hard_bits(votes: &[f64]) -> Option<Vec<u8>> {
+    votes
+        .iter()
+        .map(|&v| match v {
+            v if !v.is_finite() => None,
+            v if v > 0.0 => Some(1),
+            v if v < 0.0 => Some(0),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`unframe`] of `bits`, then of their complement.
+///
+/// QIM cannot tell a 3 dB level shift from inverted bits: the two lattices
+/// are 3 dB apart. Each polarity is a separate CRC trial.
+pub(crate) fn unframe_either_polarity(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
+    unframe(bits, payload_len).or_else(|| {
+        let inverted: Vec<u8> = bits.iter().map(|&b| b ^ 1).collect();
+        unframe(&inverted, payload_len)
+    })
+}
+
 /// Inverse of [`frame`]. `None` when the CRC does not match.
 pub(crate) fn unframe(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
     let n_bits = framed_bit_len(payload_len)?;
@@ -66,11 +96,63 @@ pub(crate) fn unframe(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::{crc32, frame, hard_bits, unframe, unframe_either_polarity};
+
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn ieee_vector() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    /// The root cause behind the silence false positive: the all-ones frame
+    /// is a *valid* 4-byte frame, because `crc32([0xFF; 4]) == 0xFFFF_FFFF`.
+    /// Nothing else up to 4096 bytes collides, which is why only
+    /// `payload_len = 4` ever returned a payload for silence.
+    #[test]
+    fn degenerate_frames_are_valid_only_for_four_bytes() {
+        let ones: Vec<usize> = (1..=4096)
+            .filter(|&len| unframe(&vec![1u8; len * 8 + 32], len).is_some())
+            .collect();
+        assert_eq!(ones, [4]);
+        assert_eq!(unframe(&[1u8; 64], 4), Some(vec![0xFF; 4]));
+        let zeros: Vec<usize> = (1..=4096)
+            .filter(|&len| unframe(&vec![0u8; len * 8 + 32], len).is_some())
+            .collect();
+        assert!(zeros.is_empty(), "{zeros:?}");
+    }
+
+    #[test]
+    fn hard_bits_turns_ties_and_non_finite_votes_into_erasures() {
+        assert_eq!(
+            hard_bits(&[0.5, -0.5, 1e-300, -1e-300]),
+            Some(vec![1, 0, 1, 0])
+        );
+        assert_eq!(hard_bits(&[0.5, 0.0, -0.5]), None);
+        assert_eq!(hard_bits(&[-0.0]), None);
+        assert_eq!(hard_bits(&[1.0, f64::NAN]), None);
+        assert_eq!(hard_bits(&[1.0, f64::INFINITY]), None);
+        assert_eq!(hard_bits(&[f64::NEG_INFINITY]), None);
+        assert_eq!(hard_bits(&[0.0; 64]), None);
+    }
+
+    #[test]
+    fn either_polarity_accepts_a_frame_and_its_complement() {
+        let payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let bits = frame(&payload);
+        let inverted: Vec<u8> = bits.iter().map(|&b| b ^ 1).collect();
+        assert_eq!(
+            unframe_either_polarity(&bits, 8).as_deref(),
+            Some(&payload[..])
+        );
+        assert_eq!(
+            unframe_either_polarity(&inverted, 8).as_deref(),
+            Some(&payload[..])
+        );
+        let mut broken = bits.clone();
+        broken[3] ^= 1;
+        assert_eq!(unframe_either_polarity(&broken, 8), None);
     }
 }

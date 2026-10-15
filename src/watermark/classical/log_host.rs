@@ -2,14 +2,17 @@
 //!
 //! Geometry matches the bakeoff `log_host`: FFT 2048, hop 512, ±3 dB chips,
 //! 300 bins from bin 10 to 75% of the spectrum. The detector searches every
-//! bit phase and keeps the one with the largest absolute correlation.
+//! bit phase and keeps the one with the largest absolute correlation. A bit
+//! nothing voted on, or one whose correlation is exactly zero, is an erasure:
+//! it is never read as a 1.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::coding::{hard_bits, unframe};
 use super::keying::{ChaCha, derive_key, keyed_bins};
 use super::stft::{ComplexStft, modulus};
-use super::{HOP, N_FFT};
+use super::{Detection, HOP, N_FFT};
 
 /// Linear gain for a +3 dB chip: `10^(3/20)`.
 const GAIN_UP: f32 = 1.412_537_6;
@@ -18,6 +21,24 @@ const GAIN_DOWN: f32 = 0.707_945_8;
 const BIN_LO: usize = 10;
 const BIN_HI_FRAC: f32 = 0.75;
 const BINS_PER_FRAME: usize = 300;
+/// Frames on each side of a frame that its per-bin host estimate averages
+/// over (17 frames, about 0.5 s). A clip-wide mean leaves the host's spectral
+/// drift in the correlation; this window follows it. Picked from 2..=33 on
+/// ten tracks, which are also the tracks the recovery figures in the
+/// changelog come from.
+const LOCAL_MEAN_RADIUS: usize = 8;
+
+/// STFT frames per framed bit a clip needs before recovery stops depending
+/// on how loud the host is next to the mark. See [`usable_min_samples`].
+const USABLE_FRAMES_PER_BIT: usize = 5;
+
+/// Clip length this algorithm can be expected to decode from: every bit read
+/// from [`USABLE_FRAMES_PER_BIT`] frames. The structural minimum is one.
+pub(crate) const fn usable_min_samples(n_bits: usize) -> usize {
+    n_bits
+        .saturating_mul(USABLE_FRAMES_PER_BIT)
+        .saturating_mul(HOP)
+}
 
 pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
     let mut stft = ComplexStft::new(N_FFT, HOP);
@@ -50,35 +71,33 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
     stft.synthesize(&spec, n_frames, samples.len())
 }
 
-/// Recovered bits, mean absolute correlation, and the winning bit phase.
-pub(crate) fn detect(samples: &[f32], n_bits: usize, key: &[u8]) -> (Vec<u8>, f64, usize) {
+/// Detect a payload: correlate against every bit phase, keep the strongest,
+/// check the CRC.
+///
+/// `score` is the mean absolute correlation of the winning phase and
+/// `sync_offset` that bit phase, counted in frames.
+pub(crate) fn detect(samples: &[f32], payload_len: usize, n_bits: usize, key: &[u8]) -> Detection {
     if n_bits == 0 {
-        return (Vec::new(), 0.0, 0);
+        return Detection::none();
     }
     let mut stft = ComplexStft::new(N_FFT, HOP);
     let (spec, n_frames) = stft.analyze(samples);
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     if n_frames == 0 || order.is_empty() {
-        return (vec![0; n_bits], 0.0, 0);
+        return Detection::none();
     }
     let n_ord = order.len();
     let mut db = vec![0.0f64; n_frames * n_ord];
-    let mut mean = vec![0.0f64; n_ord];
     for f in 0..n_frames {
         for (i, &bin) in order.iter().enumerate() {
             let mag = modulus(spec[f * nb + bin]).max(1e-7);
-            let v = f64::from(20.0 * libm::log10f(mag));
-            db[f * n_ord + i] = v;
-            mean[i] += v;
+            db[f * n_ord + i] = f64::from(20.0 * libm::log10f(mag));
         }
     }
-    let inv = 1.0 / n_frames as f64;
-    for m in &mut mean {
-        *m *= inv;
-    }
+    drop(spec);
     let chips = chips(key, n_bits, n_ord);
-    pick_phase(&db, &mean, n_frames, n_bits, &chips)
+    pick_phase(&db, n_frames, n_bits, &chips, payload_len)
 }
 
 /// One ±1 chip row per bit, drawn from that bit's domain-separated stream.
@@ -102,39 +121,366 @@ fn log_order(key: &[u8], nb: usize) -> Vec<usize> {
     keyed_bins(key, b"log-host-bins", BIN_LO, bin_hi, BINS_PER_FRAME)
 }
 
+/// Per-bin mean of the log-magnitudes over the frames within
+/// [`LOCAL_MEAN_RADIUS`] of the frame being read, frames clipped to the clip.
+///
+/// The window slides: `residual` must be asked for frames in non-decreasing
+/// order, and each call only adds and drops the frames that moved in or out.
+struct LocalMean<'a> {
+    /// `(n_frames, n_ord)`, row-major.
+    db: &'a [f64],
+    n_frames: usize,
+    n_ord: usize,
+    /// Per-bin sum over frames `lo..hi`.
+    window: Vec<f64>,
+    lo: usize,
+    hi: usize,
+}
+
+impl<'a> LocalMean<'a> {
+    fn new(db: &'a [f64], n_frames: usize, n_ord: usize) -> Self {
+        Self {
+            db,
+            n_frames,
+            n_ord,
+            window: vec![0.0; n_ord],
+            lo: 0,
+            hi: 0,
+        }
+    }
+
+    /// Write frame `f` minus its local mean into `out`.
+    fn residual(&mut self, f: usize, out: &mut [f64]) {
+        let (db, n_ord) = (self.db, self.n_ord);
+        let frame = |f: usize| &db[f * n_ord..(f + 1) * n_ord];
+        let want_hi = (f + LOCAL_MEAN_RADIUS + 1).min(self.n_frames);
+        while self.hi < want_hi {
+            for (w, &d) in self.window.iter_mut().zip(frame(self.hi)) {
+                *w += d;
+            }
+            self.hi += 1;
+        }
+        let want_lo = f.saturating_sub(LOCAL_MEAN_RADIUS);
+        while self.lo < want_lo {
+            for (w, &d) in self.window.iter_mut().zip(frame(self.lo)) {
+                *w -= d;
+            }
+            self.lo += 1;
+        }
+        // Dividing, not multiplying by a reciprocal: a window of identical
+        // frames must leave a residual of exactly zero. The terms are `f32`
+        // values widened to `f64`, so the sum of up to 17 copies of one is
+        // exact, and so is the quotient.
+        let count = (self.hi - self.lo) as f64;
+        for ((r, &d), &w) in out.iter_mut().zip(frame(f)).zip(&self.window) {
+            *r = d - w / count;
+        }
+    }
+}
+
+/// Correlate every frame with every bit's chip row after removing the host,
+/// pool the correlations under each bit phase, and keep the strongest phase.
+///
+/// A frame carries a different bit from its neighbours, so the mark largely
+/// averages out of the local mean while the host's own spectral drift stays
+/// in it.
 fn pick_phase(
     db: &[f64],
-    mean: &[f64],
     n_frames: usize,
     n_bits: usize,
     chips: &[f32],
-) -> (Vec<u8>, f64, usize) {
-    let n_ord = mean.len();
-    let mut corr = vec![0.0f64; n_bits];
-    let mut best = vec![0.0f64; n_bits];
-    let mut best_e = f64::NEG_INFINITY;
-    let mut best_phase = 0usize;
-    for ph0 in 0..n_bits {
-        corr.fill(0.0);
-        for f in 0..n_frames {
-            let b = (f + ph0) % n_bits;
-            let row = &chips[b * n_ord..(b + 1) * n_ord];
-            for i in 0..n_ord {
-                corr[b] += (db[f * n_ord + i] - mean[i]) * f64::from(row[i]);
-            }
+    payload_len: usize,
+) -> Detection {
+    let n_ord = chips.len() / n_bits;
+    let mut host = LocalMean::new(db, n_frames, n_ord);
+    let mut residual = vec![0.0f64; n_ord];
+    // `by_phase[p * n_bits + b]`: correlation of bit `b` when frame `f`
+    // carries bit `(f + p) % n_bits`.
+    let mut by_phase = vec![0.0f64; n_bits * n_bits];
+    let mut evidence = false;
+    for f in 0..n_frames {
+        host.residual(f, &mut residual);
+        if residual.iter().all(|&r| r == 0.0) {
+            // A frame that equals its neighbours adds exactly nothing.
+            continue;
         }
-        let energy: f64 = corr.iter().map(|c| c.abs()).sum();
-        if energy > best_e {
-            best_e = energy;
-            best.copy_from_slice(&corr);
-            best_phase = ph0;
+        evidence = true;
+        let slot = f % n_bits;
+        for b in 0..n_bits {
+            let row = &chips[b * n_ord..(b + 1) * n_ord];
+            let c: f64 = residual
+                .iter()
+                .zip(row)
+                .map(|(&r, &chip)| r * f64::from(chip))
+                .sum();
+            by_phase[(b + n_bits - slot) % n_bits * n_bits + b] += c;
         }
     }
-    let bits: Vec<u8> = best.iter().map(|&c| u8::from(c >= 0.0)).collect();
-    let mean = best.iter().map(|c| c.abs()).sum::<f64>() / n_bits.max(1) as f64;
-    (bits, mean, best_phase)
+    if !evidence {
+        // Every frame equals its neighbours (digital silence, or a constant
+        // host): there is nothing to correlate, so no bit has a vote.
+        return Detection::none();
+    }
+
+    decide(&by_phase, n_bits, payload_len)
+}
+
+/// Decode the bit phase with the largest total absolute correlation.
+///
+/// `by_phase[p * n_bits + b]` is bit `b`'s correlation under phase `p`. A
+/// correlation of exactly zero is a tie, and a tie is an erasure.
+fn decide(by_phase: &[f64], n_bits: usize, payload_len: usize) -> Detection {
+    let (mut best_phase, mut best_energy) = (0usize, f64::NEG_INFINITY);
+    for (phase, corr) in by_phase.chunks_exact(n_bits).enumerate() {
+        let energy: f64 = corr.iter().map(|c| c.abs()).sum();
+        if energy > best_energy {
+            best_energy = energy;
+            best_phase = phase;
+        }
+    }
+    let best = &by_phase[best_phase * n_bits..(best_phase + 1) * n_bits];
+    Detection {
+        payload: hard_bits(best).and_then(|bits| unframe(&bits, payload_len)),
+        score: best_energy / n_bits as f64,
+        sync_offset: best_phase,
+    }
 }
 
 fn hard_chip(rng: &mut ChaCha) -> f32 {
     if rng.u32() & 1 == 0 { -1.0 } else { 1.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::watermark::classical::coding::frame;
+    use crate::watermark::classical::keying::ChaCha;
+    use crate::watermark::classical::testing::{noise, through_pcm16};
+
+    const KEY: &[u8] = b"bakeoff-secret-key-0123456789";
+    const PAYLOAD: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+    /// Log-magnitudes as the detector sees them: `f32` values in dB.
+    fn random_db(n_frames: usize, n_ord: usize) -> Vec<f64> {
+        let mut rng = ChaCha::new(b"local-mean", 7);
+        (0..n_frames * n_ord)
+            .map(|_| {
+                f64::from(
+                    (f64::from(rng.u32() >> 8) / f64::from(1u32 << 24) * 200.0 - 140.0) as f32,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_mean_residual_matches_a_direct_window_mean() {
+        let (n_frames, n_ord) = (60, 5);
+        let db = random_db(n_frames, n_ord);
+        let mut host = LocalMean::new(&db, n_frames, n_ord);
+        let mut residual = vec![0.0; n_ord];
+        for f in 0..n_frames {
+            host.residual(f, &mut residual);
+            let lo = f.saturating_sub(LOCAL_MEAN_RADIUS);
+            let hi = (f + LOCAL_MEAN_RADIUS + 1).min(n_frames);
+            for (i, &r) in residual.iter().enumerate() {
+                let sum: f64 = (lo..hi).map(|g| db[g * n_ord + i]).sum();
+                // The running sum is exact, so this is the same value to the bit.
+                assert_eq!(
+                    r,
+                    db[f * n_ord + i] - sum / (hi - lo) as f64,
+                    "frame {f} bin {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_mean_window_is_clipped_at_both_ends_of_the_clip() {
+        // 3 frames: every window is the whole clip, so the residuals sum to zero.
+        let db = random_db(3, 4);
+        let mut host = LocalMean::new(&db, 3, 4);
+        let mut total = vec![0.0; 4];
+        let mut residual = vec![0.0; 4];
+        for f in 0..3 {
+            host.residual(f, &mut residual);
+            total.iter_mut().zip(&residual).for_each(|(t, r)| *t += r);
+        }
+        assert!(total.iter().all(|t| t.abs() < 1e-9), "{total:?}");
+    }
+
+    #[test]
+    fn identical_frames_leave_a_residual_of_exactly_zero() {
+        let n_ord = 9;
+        let frame: Vec<f64> = (0..n_ord)
+            .map(|i| f64::from((-100.0 + i as f64 * 0.37) as f32))
+            .collect();
+        let db: Vec<f64> = frame.iter().copied().cycle().take(40 * n_ord).collect();
+        let mut host = LocalMean::new(&db, 40, n_ord);
+        let mut residual = vec![1.0; n_ord];
+        for f in 0..40 {
+            host.residual(f, &mut residual);
+            assert!(
+                residual.iter().all(|&r| r == 0.0),
+                "frame {f}: {residual:?}"
+            );
+        }
+    }
+
+    /// What digital silence, DC and any other constant host analyse to:
+    /// identical frames. For every payload length, the whole 1..=64 range
+    /// that a LogHost payload is likely to use.
+    #[test]
+    fn identical_frames_decode_to_no_payload_for_every_payload_length() {
+        let n_ord = 300;
+        for payload_len in 1..=64usize {
+            let n_bits = payload_len * 8 + 32;
+            // Never read: there is no evidence to correlate.
+            let chips = vec![1.0f32; n_bits * n_ord];
+            for host in [
+                |_: usize| -140.0,
+                |i: usize| f64::from((-100.0 + i as f64 * 0.37) as f32),
+            ] {
+                let n_frames = n_bits + 30;
+                let db: Vec<f64> = (0..n_frames * n_ord).map(|k| host(k % n_ord)).collect();
+                let found = pick_phase(&db, n_frames, n_bits, &chips, payload_len);
+                assert!(found.payload.is_none(), "payload_len {payload_len}");
+                assert_eq!((found.score, found.sync_offset), (0.0, 0));
+            }
+        }
+    }
+
+    /// A frame sequence as the detector reads it: a host whose spectrum
+    /// drifts over time, plus the ±3 dB chips for the framed `PAYLOAD`.
+    fn marked_analysis(n_frames: usize) -> (Vec<f64>, Vec<f32>) {
+        let (n_bits, n_ord) = (96, 300);
+        let chips = chips(KEY, n_bits, n_ord);
+        let bits = frame(&PAYLOAD);
+        let step = 20.0 * libm::log10(f64::from(GAIN_UP));
+        let mut db = vec![0.0f64; n_frames * n_ord];
+        for f in 0..n_frames {
+            let b = f % n_bits;
+            let sign = if bits[b] == 1 { 1.0 } else { -1.0 };
+            for i in 0..n_ord {
+                let drift = 18.0 * libm::sin(f as f64 / 11.0 + i as f64 / 23.0);
+                let host = 45.0 - 0.05 * i as f64 + drift;
+                db[f * n_ord + i] =
+                    f64::from((host + sign * step * f64::from(chips[b * n_ord + i])) as f32);
+            }
+        }
+        (db, chips)
+    }
+
+    /// Root-mean-square of what is left of the host after subtracting its
+    /// estimate, over every frame and bin.
+    fn residual_rms(db: &[f64], n_frames: usize, n_ord: usize, clip_wide: bool) -> f64 {
+        let mut host = LocalMean::new(db, n_frames, n_ord);
+        let mut residual = vec![0.0; n_ord];
+        let mut energy = 0.0;
+        for f in 0..n_frames {
+            if clip_wide {
+                for i in 0..n_ord {
+                    let mean: f64 =
+                        (0..n_frames).map(|g| db[g * n_ord + i]).sum::<f64>() / n_frames as f64;
+                    residual[i] = db[f * n_ord + i] - mean;
+                }
+            } else {
+                host.residual(f, &mut residual);
+            }
+            energy += residual.iter().map(|r| r * r).sum::<f64>();
+        }
+        libm::sqrt(energy / (n_frames * n_ord) as f64)
+    }
+
+    #[test]
+    fn a_drifting_host_decodes_and_leaves_far_less_host_than_the_clip_wide_mean() {
+        let n_frames = 96 * 6;
+        let (db, chips) = marked_analysis(n_frames);
+        let found = pick_phase(&db, n_frames, 96, &chips, PAYLOAD.len());
+        assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+        assert_eq!(found.sync_offset, 0);
+        assert!(found.score > 0.0);
+        // The drift is an 18 dB sinusoid (12.7 dB RMS) next to ±3 dB chips.
+        let local = residual_rms(&db, n_frames, 300, false);
+        let clip_wide = residual_rms(&db, n_frames, 300, true);
+        assert!(clip_wide > 12.0, "{clip_wide}");
+        assert!(local < 0.3 * clip_wide, "{local} vs {clip_wide}");
+        // What remains is mostly the chips themselves.
+        assert!(local > 2.5, "{local}");
+    }
+
+    #[test]
+    fn the_bit_phase_follows_a_clip_that_starts_part_way_through_the_frame() {
+        let n_frames = 96 * 6;
+        let (db, chips) = marked_analysis(n_frames);
+        let skipped = 7;
+        let rest = &db[skipped * 300..];
+        let found = pick_phase(rest, n_frames - skipped, 96, &chips, PAYLOAD.len());
+        assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+        assert_eq!(found.sync_offset, skipped);
+    }
+
+    /// Correlations that read as the framed `PAYLOAD` under `phase`.
+    fn table_for(phase: usize, n_bits: usize) -> Vec<f64> {
+        let bits = frame(&PAYLOAD);
+        let mut table = vec![0.0f64; n_bits * n_bits];
+        for (b, &bit) in bits.iter().enumerate() {
+            table[phase * n_bits + b] = if bit == 1 { 40.0 } else { -40.0 };
+        }
+        table
+    }
+
+    #[test]
+    fn a_tied_bit_is_an_erasure_not_a_one() {
+        let bits = frame(&PAYLOAD);
+        let table = table_for(3, 96);
+        let found = decide(&table, 96, PAYLOAD.len());
+        assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+        assert_eq!(found.sync_offset, 3);
+        // Zero one bit that is a 1 in the frame. Reading ties as 1 would
+        // still decode this; an erasure must not.
+        let one = bits.iter().position(|&b| b == 1).unwrap();
+        let mut tied = table.clone();
+        tied[3 * 96 + one] = 0.0;
+        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
+        tied[3 * 96 + one] = -0.0;
+        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
+        // And one that is a 0: the same.
+        let zero = bits.iter().position(|&b| b == 0).unwrap();
+        let mut tied = table;
+        tied[3 * 96 + zero] = 0.0;
+        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
+    }
+
+    #[test]
+    fn a_table_of_ties_decodes_to_nothing_for_every_payload_length() {
+        for payload_len in 1..=64usize {
+            let n_bits = payload_len * 8 + 32;
+            let found = decide(&vec![0.0; n_bits * n_bits], n_bits, payload_len);
+            assert!(found.payload.is_none(), "payload_len {payload_len}");
+            assert_eq!(found.score, 0.0);
+        }
+    }
+
+    #[test]
+    fn decodes_marked_noise_through_pcm16() {
+        let samples = noise(16_000 * 18);
+        let bits = frame(&PAYLOAD);
+        let marked = through_pcm16(&embed(&samples, &bits, KEY));
+        let found = detect(&marked, PAYLOAD.len(), 96, KEY);
+        assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+        assert_eq!(found.sync_offset, 0);
+        assert!(found.score > 1.0, "{}", found.score);
+        // The wrong key finds nothing, and cannot tie its way to a payload.
+        let wrong = detect(&marked, PAYLOAD.len(), 96, b"another-key-A");
+        assert!(wrong.payload.is_none());
+        assert!(wrong.score < found.score);
+    }
+
+    #[test]
+    fn usable_length_is_five_frames_per_bit() {
+        assert_eq!(usable_min_samples(96), 96 * 5 * HOP);
+        // About 16 s for the 8-byte payload the review measured.
+        assert!((15.0..16.0).contains(&(usable_min_samples(96) as f64 / 16_000.0)));
+        assert_eq!(usable_min_samples(usize::MAX), usize::MAX);
+    }
 }
