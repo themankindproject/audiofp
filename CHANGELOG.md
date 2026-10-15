@@ -18,6 +18,77 @@ does not imply `std` and does not pull in `tract-onnx`. Round-trip, wrong-key,
 and unmarked-audio tests included; the measured attack matrix is in
 `bakeoff/wm/ISSUE.md`.
 
+**`ClassicalConfig::min_samples()`** — the shortest clip a configuration can be
+expected to recover its payload from: 67,584 samples (4.2 s) for QIM, and
+245,760 (15.4 s) for an 8-byte LogHost payload, growing with the payload.
+`embed` and `detect` still accept the structural minimum (2048 samples for QIM,
+one STFT frame per framed bit for LogHost), where LogHost recovered 0 of 30
+clean round trips from 3.04 s of real audio.
+
+### Fixed
+
+**`watermark::classical` detectors (pre-release review of #154).** The embedded
+format, the public types and the error behaviour are unchanged — `embed` output
+is bit-identical to the PR head, which a hash test pins — and only what the
+detectors read changed. The feature has not shipped, so nothing here affects a
+released version.
+
+- **Silence no longer decodes.** Ties and bits with no evidence resolved to 1,
+  digital silence became an all-ones frame, and `crc32([0xFF; 4]) == 0xFFFF_FFFF`
+  made that a valid payload: with `payload_len = 4` (the `USAGE.md`
+  configuration) both algorithms returned `detected() == true` with
+  `[FF, FF, FF, FF]` on silence, under any key. A bit with no evidence, or an
+  exact tie, is now an erasure and the result is `payload: None`. QIM skips
+  carriers below the embedder's `1e-6` floor when ranking alignments and when
+  voting, as the embedder does. Regression tests run all-zero, `-0.0`, DC and
+  near-silent input through every payload length QIM carries (1–11) end to end,
+  and through LogHost's decision for 1–64 and end to end for 1 and 4.
+- **QIM tracks level and alignment.** Both lattices are multiples of 3 dB, so
+  the circular mean of `exp(2πi·dB/3)` over a block's carriers is the block's
+  gain modulo 3 dB. It is unwrapped across blocks and both bit polarities are
+  tried against the CRC, so a 3 dB shift that swaps every bit no longer fails.
+  The alignment is searched to the sample (32, then 8, then 1) on at most 24
+  evenly spaced blocks that can hold a carrier, and the best three are decoded
+  on every block; silent blocks cost nothing. `sync_offset` is now any sample
+  in `0..2048`, not a multiple of 64.
+- **LogHost subtracts a local host estimate.** The per-bin mean is taken over
+  the 17 frames around each frame instead of the whole clip.
+- **`Debug` redacts secrets.** `ClassicalEmbedder` and `ClassicalDetector` no
+  longer print the key and payload.
+
+Measured on ten real tracks (6 to 30 s, `tests/assets`) with three key and
+payload pairs each, an 8-byte payload and a PCM16 round trip. Cells are 30
+trials unless noted; "before" is the PR head.
+
+| Case | Before | After |
+| ---- | -----: | ----: |
+| QIM clean | 30/30 | 30/30 |
+| QIM gain −7.5, −3, −1.5, +1.5, +3, +9 dB | 0/30 each | 30/30 each |
+| QIM volume +3 dB, −7.5 dB (ffmpeg, 18) | 0/18, 0/18 | 18/18, 18/18 |
+| QIM `loudnorm` I=−16 (dynamic gain, 18) | 9/18 | 17/18 |
+| QIM lead trim 1 / 17 / 32 / 100 samples | 25 / 16 / 11 / 12 | 30 / 29 / 30 / 30 |
+| QIM 8 s cut 17 / 32 samples off the grid (24) | 9, 6 | 23, 24 |
+| QIM MP3-128 then 17 / 32 sample shift (18) | 2, 1 | 17, 18 |
+| QIM 90% digital silence | 0/30 | 30/30 |
+| LogHost clean | 16/30 | 27/30 |
+| LogHost 12 s / 16 s clips (24, 21) | 7, 14 | 13, 19 |
+| Silence, `payload_len = 4` | `Some([FF; 4])` | `None` |
+| QIM / LogHost detect, 30 s clip, one thread | 257 / 171 ms | 117 / 94 ms |
+
+Not fixed: QIM after an EQ (+6 dB at 1 kHz: 0/18 before and after) and lossy
+codecs. Two codec rows moved the wrong way: Opus 32k 13/18 → 12/18, Vorbis q2
+4/18 → 2/18. LogHost still needs about 16 s for 8 bytes.
+
+The LogHost window (8 frames) and the number of ranking blocks (24) were chosen
+on the same ten tracks as the table, so the table is not a held-out result.
+Seven other 30 s tracks from the same Musopen catalogue (21 trials per row, not
+used to tune) were measured too: QIM gain 21/21 at every level from −12 to
++12 dB (0/21 before at ±1.5, ±3, −7.5, +7.5, +9), 21/21 at every lead trim
+(13–21 before), 90% silence 21/21 (0/21 before), LogHost 16 s 20/21 (6/21
+before) and 30 s 19/21 (18/21 before). They are all orchestral recordings of
+one collection: speech, pop and other sources and sample rates are still to be
+measured.
+
 ### Performance
 
 **`watermark::classical` allocation and FFT cost.** LogHost detect rebuilt a
