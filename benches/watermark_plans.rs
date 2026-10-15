@@ -19,6 +19,11 @@
 //! The identity ONNX stub exercises plan-cache plumbing only. Absolute timings
 //! and any relative speedup between arms are model-dependent and must not be
 //! treated as production watermark performance.
+//!
+//! Deprecated with the detector it measures: removed in 0.5.0.
+
+// Deliberate: this bench measures the deprecated ONNX detector's plan cache.
+#![allow(deprecated)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;

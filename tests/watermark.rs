@@ -4,8 +4,13 @@
 //! validation, and result types. End-to-end inference is not tested here
 //! because it requires a shipped ONNX model; in-tree unit tests cover
 //! Tract wiring via corrupt-file validation.
+//!
+//! The detector is deprecated since 0.4.5 and removed in 0.5.0; this file
+//! goes with it.
 
 #![cfg(feature = "watermark")]
+// Deliberate: the test target exists to pin the deprecated detector's contract.
+#![allow(deprecated)]
 
 use audiofp::AfpError;
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};

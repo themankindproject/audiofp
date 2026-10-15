@@ -8,6 +8,12 @@
 //! <https://github.com/facebookresearch/audioseal> — audiofp does not
 //! bundle them. Without a second path argument, runs on 1 s of silence
 //! at 16 kHz (useful as a smoke test that the model loads).
+//!
+//! Deprecated with the detector itself: removed in 0.5.0. See
+//! `audiofp::watermark::classical` for the supported subsystem.
+
+// Deliberate: this example demonstrates the deprecated ONNX detector.
+#![allow(deprecated)]
 
 use audiofp::SampleRate;
 use audiofp::watermark::{WatermarkConfig, WatermarkDetector};

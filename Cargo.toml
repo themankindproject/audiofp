@@ -121,7 +121,14 @@ all-codecs = [
 neural = ["std", "dep:tract-onnx"]
 
 # AudioSeal-compatible watermark detector. Requires std.
+#
+# DEPRECATED (since 0.4.5): removed in 0.5.0 together with the `tract-onnx`
+# dependency it pulls in — use `classical-watermark`.
 watermark = ["std", "dep:tract-onnx"]
+
+# Keyed classical embedder and detector (issue #153). FFT + alloc only:
+# does not imply `std` and does not pull in tract-onnx.
+classical-watermark = []
 
 # Multi-threaded batch fingerprinting via rayon, plus the
 # parallel matcher entry points par_match_best / par_match_ranked.

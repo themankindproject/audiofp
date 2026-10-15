@@ -31,7 +31,10 @@ use crate::dsp::windows::{WindowKind, make_window};
 /// operation-for-operation so spectra are bit-identical to before; the
 /// only change is that its twiddles come from `libm` instead of the
 /// platform C library.
-struct RealFft {
+///
+/// `pub(crate)`: the classical watermark detector also transforms real
+/// windows and only needs the `n_fft / 2 + 1` bins this emits.
+pub(crate) struct RealFft {
     len: usize,
     /// Complex FFT of length `len / 2`; `None` when `len == 1`.
     fft: Option<Arc<dyn Fft<f32>>>,
@@ -41,7 +44,7 @@ struct RealFft {
 }
 
 impl RealFft {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         debug_assert!(len.is_power_of_two());
         if len == 1 {
             return Self {
@@ -74,7 +77,7 @@ impl RealFft {
 
     /// Transform `input` (`len` samples; used as scratch) into `output`
     /// (`len / 2 + 1` bins, DC and Nyquist purely real).
-    fn process(&mut self, input: &mut [f32], output: &mut [Complex<f32>]) {
+    pub(crate) fn process(&mut self, input: &mut [f32], output: &mut [Complex<f32>]) {
         debug_assert_eq!(input.len(), self.len);
         debug_assert_eq!(output.len(), self.len / 2 + 1);
         let Some(fft) = &self.fft else {

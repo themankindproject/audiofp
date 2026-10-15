@@ -1,4 +1,55 @@
 //! AudioSeal-compatible ONNX watermark detector.
+//!
+//! # Deprecation
+//!
+//! **Deprecated since 0.4.5; removed in 0.5.0.** The ONNX AudioSeal detector —
+//! this module, the `watermark` feature, and the `tract-onnx` dependency it
+//! pulls in — leaves the crate in 0.5.0. Watermarking continues as the
+//! classical keyed embedder/detector in `audiofp::watermark::classical`
+//! (feature `classical-watermark`), which needs no model and no `std`.
+//!
+//! Migration: replace `WatermarkDetector::detect` (model inference on a
+//! provider's mark) with `ClassicalDetector::detect` (blind recovery of a
+//! payload you embedded with `ClassicalEmbedder`). The two are not
+//! interchangeable: AudioSeal verifies *someone else's* neural mark, the
+//! classical subsystem embeds and recovers *your* keyed payload.
+//!
+//! A thin wrapper around [tract-onnx] that loads a watermark-detector ONNX
+//! model, runs it on an audio buffer, and decodes the model's two outputs
+//! (detection scores + message logits) into a [`WatermarkResult`].
+//!
+//! The crate ships only the loader and decoder — the caller supplies the ONNX
+//! export themselves. Meta's [AudioSeal v0.2] is the reference target; any
+//! model that follows the contract documented on [`WatermarkConfig`] will
+//! work. See [`WatermarkResult::localization`] for the detection-score /
+//! time-base contract (length is model-defined; `audiofp` does not resample
+//! or realign it).
+//!
+//! ```no_run
+//! use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
+//! use audiofp::SampleRate;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut det = WatermarkDetector::new(WatermarkConfig::new("audioseal_v0.2.onnx"))?;
+//! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
+//! let r = det.detect(&samples, SampleRate::new(16_000).unwrap())?;
+//!
+//! if r.detected {
+//!     println!(
+//!         "watermarked, confidence {:.3}, message {:#018b}",
+//!         r.confidence, r.message
+//!     );
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! [AudioSeal v0.2]: https://github.com/facebookresearch/audioseal
+//! [tract-onnx]: https://docs.rs/tract-onnx
+
+// This module *is* the deprecated surface: its implementation, its tests, and
+// the fixture helpers necessarily use the deprecated types. Downstream users
+// still get the deprecation warnings.
+#![allow(deprecated)]
 
 use crate::SampleRate;
 use alloc::format;
@@ -28,6 +79,10 @@ type Runnable = Arc<TypedSimplePlan>;
 /// 2. **message logits** — `f32` logits for the embedded message bits;
 ///    bits are recovered as `logit ≥ 0`.
 #[derive(Clone, Debug)]
+#[deprecated(
+    since = "0.4.5",
+    note = "the ONNX AudioSeal detector is removed in 0.5.0; use the classical watermarker at audiofp::watermark::classical"
+)]
 pub struct WatermarkConfig {
     /// Filesystem path to the ONNX model.
     pub model_path: String,
@@ -63,6 +118,10 @@ impl WatermarkConfig {
 
 /// One detection result from [`WatermarkDetector::detect`].
 #[derive(Clone, Debug)]
+#[deprecated(
+    since = "0.4.5",
+    note = "the ONNX AudioSeal detector is removed in 0.5.0; use the classical watermarker at audiofp::watermark::classical"
+)]
 pub struct WatermarkResult {
     /// `true` if the mean detection score exceeds `WatermarkConfig::threshold`.
     pub detected: bool,
@@ -127,6 +186,10 @@ const MAX_CACHED_PLANS: usize = 4;
 /// flight (bounded by the cache size).
 ///
 /// [`detect`]: WatermarkDetector::detect
+#[deprecated(
+    since = "0.4.5",
+    note = "the ONNX AudioSeal detector is removed in 0.5.0; use the classical watermarker at audiofp::watermark::classical"
+)]
 pub struct WatermarkDetector {
     cfg: WatermarkConfig,
     model: InferenceModel,

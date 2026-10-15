@@ -9,9 +9,12 @@
 //! feature is disabled, but the current FFT dependency chain still
 //! keeps the no_std path host-only today. The file decoder
 //! ([`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html), behind
-//! `std-*` codec features) and watermark detector
+//! `std-*` codec features) and the ONNX watermark detector
 //! ([`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html),
-//! feature `watermark`) live behind feature flags and require `std`.
+//! feature `watermark`) live behind feature flags and require `std`. The
+//! ONNX AudioSeal detector is **deprecated** and is removed in 0.5.0;
+//! classical watermarking (`classical-watermark`) is the supported
+//! watermark subsystem and does not require `std`.
 //!
 //! # Quick tour
 //!
@@ -98,7 +101,8 @@
 //! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
 //! | `all-codecs` |         | Every format/codec above at once → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html) (the pre-0.4.0 `std`). |
 //! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] (implies `std`). |
-//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html) (implies `std`). |
+//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html) (implies `std`). **Deprecated** — removed in 0.5.0; migrate to `classical-watermark`. |
+//! | `classical-watermark` | | Keyed classical embed and detect ([`watermark::classical`](https://docs.rs/audiofp/latest/audiofp/watermark/classical/index.html)). Does not imply `std`. |
 //! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`](https://docs.rs/audiofp/latest/audiofp/neural/index.html)); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator (implies `std`). |
 //!
@@ -119,7 +123,8 @@
 // own is nonetheless a **valid** configuration: it enables `cache`
 // (plain `std::fs`, no Symphonia) and `IoError`, and simply leaves `io`
 // absent. Features that imply `std` (`neural`, `watermark`, `rayon`,
-// `mimalloc`) behave the same way.
+// `mimalloc`) behave the same way. `classical-watermark` is FFT + alloc
+// only and does not imply `std`.
 //
 // (`std` used to be a hard `compile_error!`. That broke feature
 // unification: a downstream graph that enabled `audiofp/std` through a
@@ -157,7 +162,7 @@ pub mod neural;
 /// [`prelude`] for details.
 pub mod prelude;
 pub mod serial;
-#[cfg(feature = "watermark")]
+#[cfg(any(feature = "watermark", feature = "classical-watermark"))]
 pub mod watermark;
 
 mod error;
@@ -245,5 +250,21 @@ mod send_sync_assertions {
         assert_send_sync::<matching::WangMatchConfig>();
         assert_send_sync::<matching::HaitsmaMatchConfig>();
         assert_send_sync::<matching::PanakoMatchConfig>();
+    }
+
+    /// Keyed classical watermark: shared across threads like every other
+    /// public type, so a detector built once can serve a thread pool.
+    #[cfg(feature = "classical-watermark")]
+    #[test]
+    fn classical_watermark_types_are_send_sync() {
+        use watermark::classical::{
+            Algorithm, ClassicalConfig, ClassicalDetector, ClassicalEmbedder, ClassicalResult,
+        };
+
+        assert_send_sync::<Algorithm>();
+        assert_send_sync::<ClassicalConfig>();
+        assert_send_sync::<ClassicalEmbedder>();
+        assert_send_sync::<ClassicalDetector>();
+        assert_send_sync::<ClassicalResult>();
     }
 }
