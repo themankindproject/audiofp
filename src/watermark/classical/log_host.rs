@@ -27,6 +27,9 @@ const BINS_PER_FRAME: usize = 300;
 /// ten tracks, which are also the tracks the recovery figures in the
 /// changelog come from.
 const LOCAL_MEAN_RADIUS: usize = 8;
+/// Correlations [`pick_phase`] keeps alive at once (8 MiB of `f64`). Every
+/// payload up to 124 bytes fits in one pass.
+const PHASE_TABLE_ENTRIES: usize = 1 << 20;
 
 /// STFT frames per framed bit a clip needs before recovery stops depending
 /// on how loud the host is next to the mark. See [`usable_min_samples`].
@@ -191,58 +194,112 @@ fn pick_phase(
     chips: &[f32],
     payload_len: usize,
 ) -> Detection {
+    pick_phase_in_blocks(
+        db,
+        n_frames,
+        n_bits,
+        chips,
+        payload_len,
+        PHASE_TABLE_ENTRIES,
+    )
+}
+
+/// [`pick_phase`] with at most `table_entries` correlations alive at once.
+///
+/// Phase `p` reads frame `f` as bit `(f + p) % n_bits`, so every phase needs
+/// its own row of `n_bits` correlations. All of them at once is `n_bits^2`
+/// numbers, which is nothing for a few bytes of payload and gigabytes for a
+/// few kilobytes, so the phases are taken in blocks that fit. The work is the
+/// same: each (frame, phase) pair is correlated once, whatever the blocks.
+fn pick_phase_in_blocks(
+    db: &[f64],
+    n_frames: usize,
+    n_bits: usize,
+    chips: &[f32],
+    payload_len: usize,
+    table_entries: usize,
+) -> Detection {
     let n_ord = chips.len() / n_bits;
     let mut host = LocalMean::new(db, n_frames, n_ord);
-    let mut residual = vec![0.0f64; n_ord];
-    // `by_phase[p * n_bits + b]`: correlation of bit `b` when frame `f`
-    // carries bit `(f + p) % n_bits`.
-    let mut by_phase = vec![0.0f64; n_bits * n_bits];
-    let mut evidence = false;
-    for f in 0..n_frames {
-        host.residual(f, &mut residual);
-        if residual.iter().all(|&r| r == 0.0) {
-            // A frame that equals its neighbours adds exactly nothing.
-            continue;
-        }
-        evidence = true;
-        let slot = f % n_bits;
-        for b in 0..n_bits {
-            let row = &chips[b * n_ord..(b + 1) * n_ord];
-            let c: f64 = residual
-                .iter()
-                .zip(row)
-                .map(|(&r, &chip)| r * f64::from(chip))
-                .sum();
-            by_phase[(b + n_bits - slot) % n_bits * n_bits + b] += c;
-        }
+    let mut residual = vec![0.0f64; n_frames * n_ord];
+    for (f, row) in residual.chunks_exact_mut(n_ord).enumerate() {
+        host.residual(f, row);
     }
-    if !evidence {
+    // A frame that equals its neighbours adds exactly nothing.
+    let live: Vec<bool> = residual
+        .chunks_exact(n_ord)
+        .map(|row| row.iter().any(|&r| r != 0.0))
+        .collect();
+    if !live.contains(&true) {
         // Every frame equals its neighbours (digital silence, or a constant
         // host): there is nothing to correlate, so no bit has a vote.
         return Detection::none();
     }
 
-    decide(&by_phase, n_bits, payload_len)
-}
-
-/// Decode the bit phase with the largest total absolute correlation.
-///
-/// `by_phase[p * n_bits + b]` is bit `b`'s correlation under phase `p`. A
-/// correlation of exactly zero is a tie, and a tie is an erasure.
-fn decide(by_phase: &[f64], n_bits: usize, payload_len: usize) -> Detection {
-    let (mut best_phase, mut best_energy) = (0usize, f64::NEG_INFINITY);
-    for (phase, corr) in by_phase.chunks_exact(n_bits).enumerate() {
-        let energy: f64 = corr.iter().map(|c| c.abs()).sum();
-        if energy > best_energy {
-            best_energy = energy;
-            best_phase = phase;
+    let block = (table_entries / n_bits).clamp(1, n_bits);
+    // `table[(p - first) * n_bits + b]`: correlation of bit `b` under phase `p`.
+    let mut table = vec![0.0f64; block * n_bits];
+    let mut strongest = Strongest::new();
+    for first in (0..n_bits).step_by(block) {
+        let phases = first..(first + block).min(n_bits);
+        table.fill(0.0);
+        for (f, frame) in residual.chunks_exact(n_ord).enumerate() {
+            if !live[f] {
+                continue;
+            }
+            for p in phases.clone() {
+                let b = (f + p) % n_bits;
+                let row = &chips[b * n_ord..(b + 1) * n_ord];
+                let c: f64 = frame
+                    .iter()
+                    .zip(row)
+                    .map(|(&r, &chip)| r * f64::from(chip))
+                    .sum();
+                table[(p - first) * n_bits + b] += c;
+            }
+        }
+        for p in phases {
+            strongest.offer(p, &table[(p - first) * n_bits..(p - first + 1) * n_bits]);
         }
     }
-    let best = &by_phase[best_phase * n_bits..(best_phase + 1) * n_bits];
-    Detection {
-        payload: hard_bits(best).and_then(|bits| unframe(&bits, payload_len)),
-        score: best_energy / n_bits as f64,
-        sync_offset: best_phase,
+    strongest.decode(payload_len)
+}
+
+/// The bit phase with the largest total absolute correlation seen so far.
+struct Strongest {
+    energy: f64,
+    phase: usize,
+    corr: Vec<f64>,
+}
+
+impl Strongest {
+    fn new() -> Self {
+        Self {
+            energy: f64::NEG_INFINITY,
+            phase: 0,
+            corr: Vec::new(),
+        }
+    }
+
+    /// Consider `corr`, one correlation per bit, as the reading under `phase`.
+    fn offer(&mut self, phase: usize, corr: &[f64]) {
+        let energy: f64 = corr.iter().map(|c| c.abs()).sum();
+        if energy > self.energy {
+            self.energy = energy;
+            self.phase = phase;
+            self.corr.clear();
+            self.corr.extend_from_slice(corr);
+        }
+    }
+
+    /// Decode the strongest phase. A correlation of exactly zero is a tie,
+    /// and a tie is an erasure.
+    fn decode(&self, payload_len: usize) -> Detection {
+        Detection {
+            payload: hard_bits(&self.corr).and_then(|bits| unframe(&bits, payload_len)),
+            score: self.energy / self.corr.len().max(1) as f64,
+            sync_offset: self.phase,
+        }
     }
 }
 
@@ -419,46 +476,98 @@ mod tests {
         assert_eq!(found.sync_offset, skipped);
     }
 
-    /// Correlations that read as the framed `PAYLOAD` under `phase`.
-    fn table_for(phase: usize, n_bits: usize) -> Vec<f64> {
-        let bits = frame(&PAYLOAD);
-        let mut table = vec![0.0f64; n_bits * n_bits];
-        for (b, &bit) in bits.iter().enumerate() {
-            table[phase * n_bits + b] = if bit == 1 { 40.0 } else { -40.0 };
-        }
-        table
+    /// Correlations that read as the framed `PAYLOAD`.
+    fn correlations_of_payload() -> Vec<f64> {
+        frame(&PAYLOAD)
+            .iter()
+            .map(|&bit| if bit == 1 { 40.0 } else { -40.0 })
+            .collect()
     }
 
     #[test]
     fn a_tied_bit_is_an_erasure_not_a_one() {
         let bits = frame(&PAYLOAD);
-        let table = table_for(3, 96);
-        let found = decide(&table, 96, PAYLOAD.len());
+        let corr = correlations_of_payload();
+        let mut strongest = Strongest::new();
+        strongest.offer(3, &corr);
+        let found = strongest.decode(PAYLOAD.len());
         assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
         assert_eq!(found.sync_offset, 3);
         // Zero one bit that is a 1 in the frame. Reading ties as 1 would
-        // still decode this; an erasure must not.
-        let one = bits.iter().position(|&b| b == 1).unwrap();
-        let mut tied = table.clone();
-        tied[3 * 96 + one] = 0.0;
-        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
-        tied[3 * 96 + one] = -0.0;
-        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
-        // And one that is a 0: the same.
-        let zero = bits.iter().position(|&b| b == 0).unwrap();
-        let mut tied = table;
-        tied[3 * 96 + zero] = 0.0;
-        assert!(decide(&tied, 96, PAYLOAD.len()).payload.is_none());
+        // still decode this; an erasure must not. Nor a tie on a 0 bit.
+        for (bit, name) in [(1u8, "a 1"), (0, "a 0")] {
+            let at = bits.iter().position(|&b| b == bit).unwrap();
+            for zero in [0.0, -0.0] {
+                let mut tied = Strongest::new();
+                let mut row = corr.clone();
+                row[at] = zero;
+                tied.offer(3, &row);
+                assert!(
+                    tied.decode(PAYLOAD.len()).payload.is_none(),
+                    "{name} {zero:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn a_table_of_ties_decodes_to_nothing_for_every_payload_length() {
         for payload_len in 1..=64usize {
             let n_bits = payload_len * 8 + 32;
-            let found = decide(&vec![0.0; n_bits * n_bits], n_bits, payload_len);
+            let mut strongest = Strongest::new();
+            for phase in 0..n_bits {
+                strongest.offer(phase, &vec![0.0; n_bits]);
+            }
+            let found = strongest.decode(payload_len);
             assert!(found.payload.is_none(), "payload_len {payload_len}");
             assert_eq!(found.score, 0.0);
         }
+    }
+
+    #[test]
+    fn the_strongest_phase_wins_whatever_order_the_blocks_arrive_in() {
+        let n_bits = 96;
+        let weak = vec![1.0; n_bits];
+        let strong = correlations_of_payload();
+        let mut a = Strongest::new();
+        a.offer(0, &weak);
+        a.offer(5, &strong);
+        a.offer(9, &weak);
+        let mut b = Strongest::new();
+        b.offer(9, &weak);
+        b.offer(5, &strong);
+        b.offer(0, &weak);
+        for found in [a.decode(PAYLOAD.len()), b.decode(PAYLOAD.len())] {
+            assert_eq!(found.sync_offset, 5);
+            assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+        }
+        // On a tie the earlier phase wins.
+        let mut c = Strongest::new();
+        c.offer(2, &strong);
+        c.offer(7, &strong);
+        assert_eq!(c.decode(PAYLOAD.len()).sync_offset, 2);
+    }
+
+    #[test]
+    fn taking_the_phases_in_blocks_changes_nothing() {
+        let n_frames = 96 * 3;
+        let (db, chips) = marked_analysis(n_frames);
+        let whole = pick_phase(&db, n_frames, 96, &chips, PAYLOAD.len());
+        assert_eq!(whole.payload.as_deref(), Some(&PAYLOAD[..]));
+        // Blocks of 96, 17, 7 and 1 phases: a table of 96 * block entries.
+        for block in [96, 17, 7, 1] {
+            let found = pick_phase_in_blocks(&db, n_frames, 96, &chips, PAYLOAD.len(), 96 * block);
+            assert_eq!(found.payload, whole.payload, "block {block}");
+            assert_eq!(found.sync_offset, whole.sync_offset, "block {block}");
+            assert_eq!(
+                found.score.to_bits(),
+                whole.score.to_bits(),
+                "block {block}"
+            );
+        }
+        // A table too small for even one phase is one phase at a time.
+        let tiny = pick_phase_in_blocks(&db, n_frames, 96, &chips, PAYLOAD.len(), 1);
+        assert_eq!(tiny.payload, whole.payload);
     }
 
     #[test]
