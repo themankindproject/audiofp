@@ -53,6 +53,7 @@ released version.
   in `0..2048`, not a multiple of 64.
 - **LogHost subtracts a local host estimate.** The per-bin mean is taken over
   the 17 frames around each frame instead of the whole clip.
+- **LogHost memory is bounded.** The bit-phase table is processed in blocks of at most 8 MiB instead of `n_bits²` numbers (541 MB at a 1 KB payload, 8.6 GB at 4 KB); results are unchanged.
 - **`Debug` redacts secrets.** `ClassicalEmbedder` and `ClassicalDetector` no
   longer print the key and payload.
 

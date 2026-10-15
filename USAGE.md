@@ -1959,8 +1959,8 @@ audiofp = { version = "0.4", features = ["classical-watermark"] }
 
 | `Algorithm` | Domain                                                     | Detector                                                       |
 | ----------- | ---------------------------------------------------------- | -------------------------------------------------------------- |
-| `QimBlock`  | non-overlapping 2048-point DFT, 6 dB lattice, 4 bins / bit | per-block lattice votes, searched over a 64-sample block offset |
-| `LogHost`   | overlapped Hann STFT (2048/512), ±3 dB keyed chips         | per-bin host subtraction, searched over every bit phase         |
+| `QimBlock`  | non-overlapping 2048-point DFT, 6 dB lattice, 4 bins / bit | per-block lattice votes; tracks the level (both polarities tried) and the block alignment to the sample |
+| `LogHost`   | overlapped Hann STFT (2048/512), ±3 dB keyed chips         | per-bin host subtraction over ±8 frames, searched over every bit phase |
 
 Mono 16 kHz only (`UnsupportedSampleRate` otherwise; resample first). The
 embedded string is `payload bytes ++ CRC-32`; `ClassicalResult::payload` is
@@ -1970,6 +1970,30 @@ is not a detection threshold. Non-finite PCM fails with `NonFiniteSample`;
 input too short for the framed payload fails with `AudioTooShort`. Time-scale
 modification and pitch shift are outside the contract — the measured attack
 matrix is in `bakeoff/wm/ISSUE.md`.
+
+**Capacity.** QIM carries at most 11 payload bytes (4 bins per framed bit in
+bins 20..512); a longer payload is rejected by `try_new` with `Config`. LogHost
+has no bin budget but needs more audio the longer the payload.
+
+**Length.** `embed` and `detect` accept any clip that holds the framed bits
+once (2048 samples for QIM; `(8 * payload_len + 31) * 512` for LogHost, 3.04 s
+for 8 bytes), but that is not a usable length: LogHost recovered 0 of 30 clean
+round trips at 3.04 s. Size inputs with `ClassicalConfig::min_samples()` —
+67,584 samples (4.2 s) for QIM, 245,760 (15.4 s) for an 8-byte LogHost payload.
+
+**What the detector will not guess.** A bit with no evidence, or an exact tie,
+is an erasure and the result is `payload: None`: digital silence, a constant
+offset and audio too quiet for any carrier to reach the embedder's floor never
+decode, for any payload length or key.
+
+**Limits.** QIM follows a constant or slowly changing gain of any size (including
+the 3 dB steps that swap every bit), starts at any sample (`sync_offset` is the
+sample offset of the first block, `0..2048`), and tolerates mostly silent hosts.
+It does not follow equalisation or a level that jumps part-way through, and
+lossy codecs and noise cost recovery. LogHost is level-invariant but still
+misses some clean round trips on real audio. These rates were measured on ten
+tracks that the detector's parameters were also tuned on (see `CHANGELOG.md`).
+`Debug` on the embedder and detector redacts the key and payload.
 
 ### Embed + detect
 
