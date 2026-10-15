@@ -2,8 +2,8 @@
 # Bounded smoke run for every libFuzzer target in fuzz/Cargo.toml.
 #
 # Usage:
-#   ./scripts/fuzz_smoke_all11.sh
-#   MAX_RUNS=500 MAX_TOTAL_TIME=15 ./scripts/fuzz_smoke_all11.sh
+#   ./scripts/fuzz_smoke.sh
+#   MAX_RUNS=500 MAX_TOTAL_TIME=15 ./scripts/fuzz_smoke.sh
 #
 # Exits non-zero when any target fails or when the target list drifts.
 
@@ -28,10 +28,11 @@ TARGETS=(
   decode_resample
   serial_roundtrip
   matching_malformed
+  classical_watermark
 )
 
-if [[ "${#TARGETS[@]}" -ne 11 ]]; then
-  echo "expected 11 fuzz targets, found ${#TARGETS[@]}" >&2
+if [[ "${#TARGETS[@]}" -ne 12 ]]; then
+  echo "expected 12 fuzz targets, found ${#TARGETS[@]}" >&2
   exit 1
 fi
 

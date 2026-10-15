@@ -25,6 +25,14 @@ expected to recover its payload from: 67,584 samples (4.2 s) for QIM, and
 one STFT frame per framed bit for LogHost), where LogHost recovered 0 of 30
 clean round trips from 3.04 s of real audio.
 
+**Fuzz target `classical_watermark`** — arbitrary keys, payload lengths, sample
+rates and clips (silence, constants, noise, square waves, raw floats) through
+`try_new`, `embed`, `detect` and `min_samples`, checking that nothing panics,
+that a result is coherent, that `AudioTooShort` names a length that is enough,
+and that audio that was never marked never decodes. It found the flat-spectrum
+false positive described under Fixed. The smoke script is now
+`scripts/fuzz_smoke.sh` and covers 12 targets.
+
 ### Fixed
 
 **`watermark::classical` detectors (pre-release review of #154).** The embedded

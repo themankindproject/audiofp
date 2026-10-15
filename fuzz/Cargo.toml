@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 arbitrary = { version = "1.3", features = ["derive"] }
 bytemuck = "1.25.0"
-audiofp = { path = "..", features = ["all-codecs"] }
+audiofp = { path = "..", features = ["all-codecs", "classical-watermark"] }
 
 [[bin]]
 name = "wang_hash_roundtrip"
@@ -86,6 +86,13 @@ bench = false
 [[bin]]
 name = "serial_roundtrip"
 path = "fuzz_targets/serial_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classical_watermark"
+path = "fuzz_targets/classical_watermark.rs"
 test = false
 doc = false
 bench = false

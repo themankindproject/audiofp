@@ -82,7 +82,7 @@ jobs:
         run: |
           python3 scripts/test_check_usage_snippets.py
           python3 scripts/test_shell_scripts.py
-          python3 scripts/test_fuzz_smoke_all11.py
+          python3 scripts/test_fuzz_smoke.py
 
   allocation-tests:
     name: allocation regressions (std, no mimalloc)
@@ -358,5 +358,5 @@ jobs:
           pr-comment: false
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
-      - name: fuzz smoke test (all 11 targets, bounded runs)
-        run: bash scripts/fuzz_smoke_all11.sh
+      - name: fuzz smoke test (all 12 targets, bounded runs)
+        run: bash scripts/fuzz_smoke.sh

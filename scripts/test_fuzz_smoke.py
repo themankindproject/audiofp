@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/fuzz_smoke_all11.sh."""
+"""Regression tests for scripts/fuzz_smoke.sh."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import subprocess
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "fuzz_smoke_all11.sh"
+SCRIPT = REPO / "scripts" / "fuzz_smoke.sh"
 FUZZ_TOML = REPO / "fuzz" / "Cargo.toml"
 
 
-class FuzzSmokeAll11Tests(unittest.TestCase):
-    def test_script_lists_exactly_eleven_targets(self) -> None:
+class FuzzSmokeTests(unittest.TestCase):
+    def test_script_lists_exactly_twelve_targets(self) -> None:
         text = SCRIPT.read_text()
         names = re.findall(r'^\s+([a-z0-9_]+)\s*$', text, re.M)
         # Only entries inside the TARGETS=( ... ) array.
@@ -22,7 +22,7 @@ class FuzzSmokeAll11Tests(unittest.TestCase):
         end = text.index(")", start)
         block = text[start:end]
         targets = re.findall(r'^\s+([a-z0-9_]+)\s*$', block, re.M)
-        self.assertEqual(len(targets), 11)
+        self.assertEqual(len(targets), 12)
 
     def test_script_targets_match_cargo_fuzz_bins(self) -> None:
         text = SCRIPT.read_text()
@@ -58,8 +58,8 @@ class FuzzSmokeAll11Tests(unittest.TestCase):
                     #!/usr/bin/env bash
                     set -euo pipefail
                     TARGETS=(only_one)
-                    if [[ "${#TARGETS[@]}" -ne 11 ]]; then
-                      echo "expected 11 fuzz targets, found ${#TARGETS[@]}" >&2
+                    if [[ "${#TARGETS[@]}" -ne 12 ]]; then
+                      echo "expected 12 fuzz targets, found ${#TARGETS[@]}" >&2
                       exit 1
                     fi
                     """
@@ -68,7 +68,7 @@ class FuzzSmokeAll11Tests(unittest.TestCase):
             bad.chmod(0o755)
             proc = subprocess.run([str(bad)], capture_output=True, text=True)
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("expected 11 fuzz targets", proc.stderr)
+            self.assertIn("expected 12 fuzz targets", proc.stderr)
 
 
 if __name__ == "__main__":
