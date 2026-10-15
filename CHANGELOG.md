@@ -28,10 +28,10 @@ clean round trips from 3.04 s of real audio.
 ### Fixed
 
 **`watermark::classical` detectors (pre-release review of #154).** The embedded
-format, the public types and the error behaviour are unchanged — `embed` output
-is bit-identical to the PR head, which a hash test pins — and only what the
-detectors read changed. The feature has not shipped, so nothing here affects a
-released version.
+format and the public types are unchanged — `embed` output is bit-identical to
+the PR head, which a hash test pins — and only what the detectors read changed,
+with one addition to the error behaviour (the flat-spectrum bullet below). The
+feature has not shipped, so nothing here affects a released version.
 
 - **Silence no longer decodes.** Ties and bits with no evidence resolved to 1,
   digital silence became an all-ones frame, and `crc32([0xFF; 4]) == 0xFFFF_FFFF`
@@ -43,6 +43,17 @@ released version.
   voting, as the embedder does. Regression tests run all-zero, `-0.0`, DC and
   near-silent input through every payload length QIM carries (1–11) end to end,
   and through LogHost's decision for 1–64 and end to end for 1 and 4.
+- **A flat spectrum no longer decodes.** Silence was not the only input with
+  nothing to read. A click in silence has a flat spectrum, so every carrier bin
+  sits at one level, and the QIM detector reads one level as one bit value. With
+  `payload_len = 4` it returned `[FF, FF, FF, FF]`, under any key, for a single
+  click of any amplitude and for a click track. The PR head returned the same
+  payload for the same clips before these fixes, so this closes a false positive
+  that the silence bullet left open. A bit string of identical bits is now never
+  a payload, in either polarity. The one payload that frames to such a string,
+  `[0xFF; 4]`, is refused by `ClassicalEmbedder::try_new` with `AfpError::Config`
+  rather than embedded and never found. Every other payload, and every `embed`
+  output, is unchanged. Found by fuzzing the detector.
 - **QIM tracks level and alignment.** Both lattices are multiples of 3 dB, so
   the circular mean of `exp(2πi·dB/3)` over a block's carriers is the block's
   gain modulo 3 dB. It is unwrapped across blocks and both bit polarities are

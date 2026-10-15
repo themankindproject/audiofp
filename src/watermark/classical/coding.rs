@@ -68,8 +68,40 @@ pub(crate) fn unframe_either_polarity(bits: &[u8], payload_len: usize) -> Option
     })
 }
 
-/// Inverse of [`frame`]. `None` when the CRC does not match.
+/// True when every bit of `bits` is the same.
+///
+/// That is what audio with no structure decodes to. Digital silence is the
+/// obvious case, but any spectrum that is flat across the carrier bins puts
+/// every carrier at one level (a single click in silence is enough), and a
+/// detector that follows the level reads one level as one bit value. Such a
+/// string is evidence of nothing, so it is never a payload.
+pub(crate) fn is_constant(bits: &[u8]) -> bool {
+    bits.windows(2).all(|pair| pair[0] == pair[1])
+}
+
+/// True when `payload` frames to a constant bit string, which the detector
+/// can never return: see [`is_constant`].
+///
+/// A constant frame is all ones or all zeros, so the payload bytes and the CRC
+/// would have to match it. Of the payloads up to 4096 bytes only `[0xFF; 4]`
+/// does: `crc32([0xFF; 4])` is `0xFFFF_FFFF`, while the CRC of no run of zero
+/// bytes is zero.
+pub(crate) fn frames_to_constant(payload: &[u8]) -> bool {
+    is_constant(&frame(payload))
+}
+
+/// Inverse of [`frame`] for bits read from audio. `None` when the CRC does not
+/// match, and also when every bit is the same: see [`is_constant`].
 pub(crate) fn unframe(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
+    if is_constant(bits) {
+        return None;
+    }
+    check_crc(bits, payload_len)
+}
+
+/// Inverse of [`frame`], with no opinion on what the bits are evidence of.
+/// `None` when the CRC does not match.
+fn check_crc(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
     let n_bits = framed_bit_len(payload_len)?;
     if bits.len() != n_bits {
         return None;
@@ -96,7 +128,10 @@ pub(crate) fn unframe(bits: &[u8], payload_len: usize) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32, frame, hard_bits, unframe, unframe_either_polarity};
+    use super::{
+        check_crc, crc32, frame, frames_to_constant, hard_bits, is_constant, unframe,
+        unframe_either_polarity,
+    };
 
     use alloc::vec;
     use alloc::vec::Vec;
@@ -114,14 +149,57 @@ mod tests {
     #[test]
     fn degenerate_frames_are_valid_only_for_four_bytes() {
         let ones: Vec<usize> = (1..=4096)
-            .filter(|&len| unframe(&vec![1u8; len * 8 + 32], len).is_some())
+            .filter(|&len| check_crc(&vec![1u8; len * 8 + 32], len).is_some())
             .collect();
         assert_eq!(ones, [4]);
-        assert_eq!(unframe(&[1u8; 64], 4), Some(vec![0xFF; 4]));
+        assert_eq!(check_crc(&[1u8; 64], 4), Some(vec![0xFF; 4]));
         let zeros: Vec<usize> = (1..=4096)
-            .filter(|&len| unframe(&vec![0u8; len * 8 + 32], len).is_some())
+            .filter(|&len| check_crc(&vec![0u8; len * 8 + 32], len).is_some())
             .collect();
         assert!(zeros.is_empty(), "{zeros:?}");
+    }
+
+    /// Silence is not the only input that decodes to a constant string: a
+    /// spectrum that is flat across the carriers (one click in silence) puts
+    /// every carrier at one level, and a detector that tracks the level reads
+    /// that as one bit value. Such a string is never a payload, in either
+    /// polarity, even where it passes the CRC.
+    #[test]
+    fn a_constant_bit_string_never_decodes() {
+        assert_eq!(check_crc(&[1u8; 64], 4), Some(vec![0xFF; 4]));
+        assert_eq!(unframe(&[1u8; 64], 4), None);
+        assert_eq!(unframe(&[0u8; 64], 4), None);
+        assert_eq!(unframe_either_polarity(&[1u8; 64], 4), None);
+        assert_eq!(unframe_either_polarity(&[0u8; 64], 4), None);
+        for len in 1..=64 {
+            for bit in [0u8, 1] {
+                let bits = vec![bit; len * 8 + 32];
+                assert_eq!(unframe(&bits, len), None, "len {len}, bit {bit}");
+                assert_eq!(unframe_either_polarity(&bits, len), None);
+            }
+        }
+    }
+
+    #[test]
+    fn is_constant_means_every_bit_equal() {
+        assert!(is_constant(&[]));
+        assert!(is_constant(&[1]));
+        assert!(is_constant(&[0, 0, 0]));
+        assert!(!is_constant(&[1, 1, 0]));
+        assert!(!is_constant(&[0, 1]));
+    }
+
+    /// The embedder has to refuse what the detector can never return, or a
+    /// mark would embed fine and never be found.
+    #[test]
+    fn only_four_ff_bytes_frame_to_a_constant_string() {
+        let ones: Vec<usize> = (1..=4096)
+            .filter(|&len| frames_to_constant(&vec![0xFF; len]))
+            .collect();
+        assert_eq!(ones, [4]);
+        assert!((1..=4096).all(|len| !frames_to_constant(&vec![0x00; len])));
+        assert!(!frames_to_constant(&[0xFF, 0xFF, 0xFF, 0xFE]));
+        assert!(!frames_to_constant(&[0x00; 4]));
     }
 
     #[test]

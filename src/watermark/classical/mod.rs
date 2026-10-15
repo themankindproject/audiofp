@@ -26,6 +26,14 @@
 //! Resolving such bits to 1 would turn them into an all-ones frame, and
 //! `crc32([0xFF; 4]) == 0xFFFF_FFFF` makes that a valid 4-byte payload.
 //!
+//! Evidence that says the same thing everywhere is no evidence either. A
+//! spectrum that is flat across the carrier bins, which a single click in
+//! silence has, puts every carrier at one level, and the QIM detector reads
+//! one level as one bit value. A bit string of identical bits is therefore
+//! never a payload. The one payload that frames to such a string,
+//! `[0xFF; 4]`, is refused by [`ClassicalEmbedder::try_new`] rather than
+//! embedded and never found.
+//!
 //! # What it tolerates
 //!
 //! The embedded format has not changed; the detectors read it more robustly.
@@ -44,6 +52,15 @@
 //!   no longer drowns the chips, but it needs far more audio than QIM
 //!   (below) and still misses some clean round trips on real audio.
 //!
+//! # Capacity
+//!
+//! [`Algorithm::QimBlock`] gives every framed bit four of the 492 bins in
+//! `20..512`, so it carries at most 11 payload bytes (`8 * 11 + 32 = 120`
+//! framed bits). A longer payload is rejected with [`AfpError::Config`] by
+//! [`ClassicalEmbedder::try_new`] and [`ClassicalDetector::try_new`].
+//! [`Algorithm::LogHost`] has no bin budget; it needs more audio the longer
+//! the payload is (below).
+//!
 //! # Minimum length
 //!
 //! [`ClassicalEmbedder::embed`] and [`ClassicalDetector::detect`] accept any
@@ -54,23 +71,53 @@
 //! size inputs by: about 4 s for QIM, and about 16 s for an 8-byte LogHost
 //! payload, growing with the payload.
 //!
+//! # What the mark is not
+//!
+//! The CRC-32 catches accidental damage. It does not authenticate the
+//! payload. The key chooses the carrier bins and their order, but it does not
+//! hide a QIM mark: the quantisation lattice is public, so the block grid and
+//! nearly all of the carrier bins can be picked out of one marked clip
+//! without the key. Marks do not stack either. A second embed, whether of
+//! another payload or of the same one under another key, quantises bins the
+//! first mark also uses, and the first mark did not survive in any of the
+//! cases measured. Use the payload as an identifier that survives ordinary
+//! processing, not as a secret and not as proof of origin.
+//!
 //! # Example
 //!
-//! ```no_run
+//! The host needs spectral content in every block, so a constant level or
+//! silence cannot carry a mark. Deterministic noise stands in for a real
+//! 16 kHz mono clip here.
+//!
+//! ```
 //! use audiofp::watermark::classical::{ClassicalConfig, ClassicalDetector, ClassicalEmbedder};
 //! use audiofp::SampleRate;
 //!
 //! let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
 //! let key = b"secret-key";
 //! let config = ClassicalConfig::new(payload.len());
+//!
+//! let mut x = 0x1234_5678u32;
+//! let samples: Vec<f32> = (0..config.min_samples())
+//!     .map(|_| {
+//!         x ^= x << 13;
+//!         x ^= x >> 17;
+//!         x ^= x << 5;
+//!         (x as i32 as f32 / i32::MAX as f32) * 0.2
+//!     })
+//!     .collect();
+//!
 //! let embedder = ClassicalEmbedder::try_new(config, key, &payload)?;
-//! let samples = vec![0.1f32; 16_000];
 //! let marked = embedder.embed(&samples, SampleRate::HZ_16000)?;
+//! assert_ne!(marked, samples, "the embedder changed the audio");
+//!
 //! let detector = ClassicalDetector::try_new(config, key)?;
-//! let result = detector.detect(&marked, SampleRate::HZ_16000)?;
-//! if result.detected() {
-//!     assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
-//! }
+//! let found = detector.detect(&marked, SampleRate::HZ_16000)?;
+//! assert_eq!(found.payload.as_deref(), Some(payload.as_slice()));
+//!
+//! // Audio that was never marked decodes to no payload at all.
+//! let clean = detector.detect(&samples, SampleRate::HZ_16000)?;
+//! assert!(!clean.detected());
 //! # Ok::<(), audiofp::AfpError>(())
 //! ```
 
@@ -220,12 +267,19 @@ impl ClassicalEmbedder {
     /// # Errors
     ///
     /// - [`AfpError::Config`] — `key` is empty, `payload.len()` is not
-    ///   `config.payload_len`, the payload length is zero, or a
-    ///   [`Algorithm::QimBlock`] payload does not fit the carrier bins.
+    ///   `config.payload_len`, the payload length is zero, a
+    ///   [`Algorithm::QimBlock`] payload does not fit the carrier bins, or the
+    ///   payload is four `0xFF` bytes. That frame is all ones, which is also
+    ///   what a flat spectrum decodes to, so the detector never accepts it.
     pub fn try_new(config: ClassicalConfig, key: &[u8], payload: &[u8]) -> Result<Self> {
         validate(&config, key)?;
         if payload.len() != config.payload_len {
             return Err(config_err("payload length does not match configuration"));
+        }
+        if coding::frames_to_constant(payload) {
+            return Err(config_err(
+                "payload frames to a constant bit string, which the detector never accepts",
+            ));
         }
         Ok(Self {
             config,
@@ -628,7 +682,19 @@ mod tests {
         );
     }
 
-    /// Inputs with nothing in the carrier bins for a detector to read.
+    /// `n` samples of silence with one click of height `amp` every `period`
+    /// samples, the first at `first`. A click has a flat spectrum, so it puts
+    /// every carrier bin at one level.
+    fn clicks(n: usize, first: usize, period: usize, amp: f32) -> Vec<f32> {
+        let mut samples = vec![0.0; n];
+        for at in (first..n).step_by(period) {
+            samples[at] = amp;
+        }
+        samples
+    }
+
+    /// Inputs with nothing in the carrier bins for a detector to read: no
+    /// signal at all, or a signal that says the same thing in every bin.
     fn degenerate(n: usize) -> Vec<(&'static str, Vec<f32>)> {
         vec![
             ("all-zero", vec![0.0; n]),
@@ -640,6 +706,8 @@ mod tests {
                     .map(|i| if i % 2 == 0 { 1e-9 } else { -1e-9 })
                     .collect(),
             ),
+            ("one click", clicks(n, n / 2, n, 0.7)),
+            ("a click per block", clicks(n, 100, 2048, 0.5)),
         ]
     }
 
@@ -686,6 +754,59 @@ mod tests {
                     result.payload
                 );
             }
+        }
+    }
+
+    /// Found by fuzzing the detector. A click in silence is not silence: its
+    /// spectrum is flat, so every carrier sits at one level, which the
+    /// level-tracking QIM detector read as all-equal bits at any amplitude.
+    /// With `payload_len = 4` the all-ones frame is a valid frame, so the click
+    /// "contained" `[0xFF; 4]` under every key. The PR head before the review
+    /// fixes returned the same payload for the same clips.
+    #[test]
+    fn a_click_in_silence_decodes_to_no_payload_at_any_level() {
+        let detector =
+            ClassicalDetector::try_new(ClassicalConfig::new(4), b"asset-key-42").unwrap();
+        for amp in [0.05, 0.12, 0.355, 0.5, 0.708, 0.9, 1.0, 1.41, 8.0] {
+            for samples in [
+                clicks(2048 * 40, 2048 * 20 + 17, 2048 * 40, amp),
+                clicks(16_000 * 6, 100, 16_000, amp),
+            ] {
+                let result = detector.detect(&samples, SampleRate::HZ_16000).unwrap();
+                assert!(
+                    result.payload.is_none() && !result.detected(),
+                    "click of {amp}: {:?}",
+                    result.payload
+                );
+            }
+        }
+        let config = ClassicalConfig::new(4).with_algorithm(Algorithm::LogHost);
+        let detector = ClassicalDetector::try_new(config, b"asset-key-42").unwrap();
+        for amp in [0.05, 0.708, 1.41] {
+            let samples = clicks(16_000 * 3, 100, 16_000, amp);
+            let result = detector.detect(&samples, SampleRate::HZ_16000).unwrap();
+            assert!(result.payload.is_none(), "LogHost click of {amp}");
+        }
+    }
+
+    /// The other side of the same rule: the one payload whose frame is a
+    /// constant string would embed and then never be found, so the embedder
+    /// refuses it. Its neighbours are fine.
+    #[test]
+    fn embedder_refuses_the_payload_whose_frame_is_constant() {
+        for algorithm in [Algorithm::QimBlock, Algorithm::LogHost] {
+            let config = ClassicalConfig::new(4).with_algorithm(algorithm);
+            let err = ClassicalEmbedder::try_new(config, b"key", &[0xFF; 4]).unwrap_err();
+            assert!(matches!(err, AfpError::Config(_)), "{err:?}");
+            for payload in [[0xFF, 0xFF, 0xFF, 0xFE], [0x7F; 4], [0; 4]] {
+                assert!(ClassicalEmbedder::try_new(config, b"key", &payload).is_ok());
+            }
+            assert!(ClassicalDetector::try_new(config, b"key").is_ok());
+        }
+        // Every other payload length is untouched.
+        for len in [1, 2, 3, 5, 8, 11] {
+            let config = ClassicalConfig::new(len);
+            assert!(ClassicalEmbedder::try_new(config, b"key", &vec![0xFF; len]).is_ok());
         }
     }
 

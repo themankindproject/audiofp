@@ -1984,7 +1984,11 @@ round trips at 3.04 s. Size inputs with `ClassicalConfig::min_samples()` —
 **What the detector will not guess.** A bit with no evidence, or an exact tie,
 is an erasure and the result is `payload: None`: digital silence, a constant
 offset and audio too quiet for any carrier to reach the embedder's floor never
-decode, for any payload length or key.
+decode, for any payload length or key. Nor does a spectrum that says the same
+thing in every bin, such as a single click in silence: a string of identical
+bits is never a payload. The one payload that frames to such a string,
+`[0xFF; 4]`, is rejected by `ClassicalEmbedder::try_new` with `Config` instead
+of being embedded and never found.
 
 **Limits.** QIM follows a constant or slowly changing gain of any size (including
 the 3 dB steps that swap every bit), starts at any sample (`sync_offset` is the
@@ -1994,6 +1998,15 @@ lossy codecs and noise cost recovery. LogHost is level-invariant but still
 misses some clean round trips on real audio. These rates were measured on ten
 tracks that the detector's parameters were also tuned on (see `CHANGELOG.md`).
 `Debug` on the embedder and detector redacts the key and payload.
+
+**What the mark is not.** The CRC-32 catches accidental damage; it does not
+authenticate the payload. The key chooses the carrier bins and their order but
+does not hide a QIM mark: the lattice is public, so the block grid and nearly
+all of the carrier bins can be picked out of one marked clip without the key.
+Marks do not stack: a second embed, of another payload or of the same one under
+another key, quantises bins the first mark also uses, and the first mark did not
+survive in any case measured. Treat the payload as an identifier that survives
+ordinary processing, not as a secret or as proof of origin.
 
 ### Embed + detect
 
