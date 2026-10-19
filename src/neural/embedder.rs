@@ -160,6 +160,30 @@ pub struct NeuralFingerprint {
     pub frames_per_sec: f32,
 }
 
+/// A neural fingerprint paired with a caller-maintained model and front-end ID.
+///
+/// The ID should change whenever the ONNX weights or preprocessing settings
+/// change. This wrapper leaves the existing [`NeuralFingerprint`] layout and
+/// matching API intact while enabling checked comparisons.
+#[derive(Clone, Debug)]
+pub struct IdentifiedNeuralFingerprint {
+    /// Embeddings and timing produced by the model.
+    pub fingerprint: NeuralFingerprint,
+    /// Stable identifier for the model weights and preprocessing settings.
+    pub model_id: String,
+}
+
+impl IdentifiedNeuralFingerprint {
+    /// Pair a fingerprint with its model and front-end identifier.
+    #[must_use]
+    pub fn new(fingerprint: NeuralFingerprint, model_id: impl Into<String>) -> Self {
+        Self {
+            fingerprint,
+            model_id: model_id.into(),
+        }
+    }
+}
+
 /// Tract's typed runnable model. Expensive to build; we build it once
 /// in [`NeuralEmbedder::new`] and reuse it for every call.
 pub(crate) type Runnable = Arc<TypedSimplePlan>;

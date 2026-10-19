@@ -44,11 +44,11 @@ const FORMAT_VERSION: u8 = 1;
 
 /// Fixed-size header: magic (8) + version (1) + algorithm_id (1) +
 /// hash_count (4) + fps (4) = 18 bytes.
-const HEADER_SIZE: usize = 8 + 1 + 1 + 4 + 4;
+pub(crate) const HEADER_SIZE: usize = 8 + 1 + 1 + 4 + 4;
 
-const ALG_WANG: u8 = 0;
-const ALG_PANAKO: u8 = 1;
-const ALG_HAITSMA: u8 = 2;
+pub(crate) const ALG_WANG: u8 = 0;
+pub(crate) const ALG_PANAKO: u8 = 1;
+pub(crate) const ALG_HAITSMA: u8 = 2;
 
 /// Metadata envelope for a serialized fingerprint.
 ///
@@ -139,6 +139,26 @@ fn write_header(buf: &mut Vec<u8>, alg_id: u8, hash_count: u32, fps: f32) {
     buf.extend_from_slice(&fps.to_le_bytes());
 }
 
+/// Write the unchanged v1 bytes without first allocating a full blob.
+#[cfg(feature = "std")]
+pub(crate) fn write_pod_blob<T: bytemuck::Pod>(
+    writer: &mut dyn std::io::Write,
+    values: &[T],
+    alg_id: u8,
+    fps: f32,
+) -> std::io::Result<()> {
+    let count = u32::try_from(values.len())
+        .expect("fingerprint hash count exceeds u32::MAX and cannot be serialized");
+    let mut header = [0u8; HEADER_SIZE];
+    header[..8].copy_from_slice(&MAGIC);
+    header[8] = FORMAT_VERSION;
+    header[9] = alg_id;
+    header[10..14].copy_from_slice(&count.to_le_bytes());
+    header[14..18].copy_from_slice(&fps.to_le_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(cast_slice(values))
+}
+
 /// Parse and validate the fixed header, returning `(algorithm_id, hash_count, fps)`.
 ///
 /// With `expected_alg = None` the algorithm id is accepted as-is (used
@@ -146,7 +166,7 @@ fn write_header(buf: &mut Vec<u8>, alg_id: u8, hash_count: u32, fps: f32) {
 /// known-algorithm table itself).
 ///
 /// [`FingerprintEnvelope::peek`]: FingerprintEnvelope::peek
-fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)> {
+pub(crate) fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)> {
     if bytes.len() < HEADER_SIZE {
         return Err(AfpError::Deserialize(format!(
             "buffer too short: {} bytes, need at least {}",
@@ -241,6 +261,23 @@ fn read_payload<T: bytemuck::Pod>(bytes: &[u8], alg_id: u8, kind: &str) -> Resul
     Ok((values, fps))
 }
 
+/// Preserve the permissive v1 reader while offering validation for blobs
+/// produced by the fixed-rate built-in extractors.
+fn read_payload_strict<T: bytemuck::Pod>(
+    bytes: &[u8],
+    alg_id: u8,
+    kind: &str,
+    expected_fps: f32,
+) -> Result<(Vec<T>, f32)> {
+    let (_, _, fps) = read_header(bytes, Some(alg_id))?;
+    if fps != expected_fps {
+        return Err(AfpError::Deserialize(format!(
+            "invalid frame rate for algorithm {alg_id}: got {fps}, expected {expected_fps}"
+        )));
+    }
+    read_payload(bytes, alg_id, kind)
+}
+
 /// Build a metadata envelope from the per-algorithm constants.
 fn envelope(
     algorithm: &'static str,
@@ -275,6 +312,18 @@ impl WangFingerprint {
         })
     }
 
+    /// Deserialize a built-in Wang fingerprint, rejecting noncanonical frame rates.
+    /// Legacy [`from_bytes`](Self::from_bytes) remains permissive for callers
+    /// that used the public fingerprint fields to build custom data.
+    pub fn from_bytes_strict(bytes: &[u8]) -> Result<Self> {
+        let (hashes, frames_per_sec) =
+            read_payload_strict::<WangHash>(bytes, ALG_WANG, "hashes", 62.5)?;
+        Ok(Self {
+            hashes,
+            frames_per_sec,
+        })
+    }
+
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
         envelope("wang-v1", 8_000, self.frames_per_sec, self.hashes.len())
@@ -291,6 +340,16 @@ impl PanakoFingerprint {
     /// [`to_bytes`](Self::to_bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (hashes, frames_per_sec) = read_payload::<PanakoHash>(bytes, ALG_PANAKO, "hashes")?;
+        Ok(Self {
+            hashes,
+            frames_per_sec,
+        })
+    }
+
+    /// Deserialize a built-in Panako fingerprint, rejecting noncanonical frame rates.
+    pub fn from_bytes_strict(bytes: &[u8]) -> Result<Self> {
+        let (hashes, frames_per_sec) =
+            read_payload_strict::<PanakoHash>(bytes, ALG_PANAKO, "hashes", 62.5)?;
         Ok(Self {
             hashes,
             frames_per_sec,
@@ -319,6 +378,16 @@ impl HaitsmaFingerprint {
         })
     }
 
+    /// Deserialize a built-in Haitsma fingerprint, rejecting noncanonical frame rates.
+    pub fn from_bytes_strict(bytes: &[u8]) -> Result<Self> {
+        let (frames, frames_per_sec) =
+            read_payload_strict::<u32>(bytes, ALG_HAITSMA, "frames", 78.125)?;
+        Ok(Self {
+            frames,
+            frames_per_sec,
+        })
+    }
+
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
         envelope("haitsma-v1", 5_000, self.frames_per_sec, self.frames.len())
@@ -340,6 +409,37 @@ mod tests {
         let fp2 = WangFingerprint::from_bytes(&bytes).unwrap();
         assert_eq!(fp.hashes, fp2.hashes);
         assert_eq!(fp.frames_per_sec, fp2.frames_per_sec);
+    }
+
+    #[test]
+    fn strict_reader_rejects_wrong_positive_rate_without_breaking_v1_reader() {
+        let mut wang = WangFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        }
+        .to_bytes();
+        wang[14..18].copy_from_slice(&1.0f32.to_le_bytes());
+        assert_eq!(
+            WangFingerprint::from_bytes(&wang).unwrap().frames_per_sec,
+            1.0
+        );
+        assert!(matches!(
+            WangFingerprint::from_bytes_strict(&wang),
+            Err(AfpError::Deserialize(_))
+        ));
+
+        let panako = PanakoFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        }
+        .to_bytes();
+        assert!(PanakoFingerprint::from_bytes_strict(&panako).is_ok());
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![],
+            frames_per_sec: 78.125,
+        }
+        .to_bytes();
+        assert!(HaitsmaFingerprint::from_bytes_strict(&haitsma).is_ok());
     }
 
     #[test]

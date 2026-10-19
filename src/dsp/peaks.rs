@@ -11,7 +11,7 @@
 //! size). Both are exact, so results are identical to a brute-force
 //! window max, and only `O(neighborhood_t · n_bins)` scratch is held.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BinaryHeap, VecDeque};
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
@@ -128,6 +128,42 @@ pub struct PeakPicker {
     rows_pushed: usize,
     /// Pooled candidate buffer — avoids a per-call heap allocation.
     candidates: Vec<Peak>,
+    /// A per-row scratch buffer and a worst-first top-K heap for the
+    /// current one-second bucket. Rows arrive in time order.
+    row_candidates: Vec<Peak>,
+    bucket_heap: BinaryHeap<BucketPeak>,
+    bucket_id: Option<u32>,
+    bucket_rate: f32,
+}
+
+/// Heap ordering is worst-first: weakest magnitude, then latest position.
+/// The adaptive cap's old sort uses exactly the reverse ordering.
+#[derive(Copy, Clone, Debug)]
+struct BucketPeak(Peak);
+
+impl PartialEq for BucketPeak {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for BucketPeak {}
+
+impl PartialOrd for BucketPeak {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BucketPeak {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        other
+            .0
+            .mag
+            .partial_cmp(&self.0.mag)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| (self.0.t_frame, self.0.f_bin).cmp(&(other.0.t_frame, other.0.f_bin)))
+    }
 }
 
 impl PeakPicker {
@@ -143,6 +179,10 @@ impl PeakPicker {
             n_bins: 0,
             rows_pushed: 0,
             candidates: Vec::new(),
+            row_candidates: Vec::new(),
+            bucket_heap: BinaryHeap::new(),
+            bucket_id: None,
+            bucket_rate: 0.0,
         }
     }
 
@@ -211,6 +251,9 @@ impl PeakPicker {
         let kf = self.cfg.neighborhood_f;
         self.n_bins = n_bins;
         self.rows_pushed = 0;
+        self.bucket_heap.clear();
+        self.bucket_id = None;
+        self.bucket_rate = frames_per_sec;
         resize_scratch(&mut self.hpad, n_bins + 2 * kf);
         resize_scratch(&mut self.raw_ring, (kt + 1) * n_bins);
         resize_scratch(&mut self.vmax_row, n_bins);
@@ -252,8 +295,10 @@ impl PeakPicker {
         // NOT retained across passes — this reserve runs once per pass.
         // That is amortised over the whole spectrogram, so per-call
         // allocation is not on the hot path.
-        if self.candidates.capacity() < upper {
-            self.candidates.reserve(upper - self.candidates.capacity());
+        let initial = upper.min(4096);
+        if self.candidates.capacity() < initial {
+            self.candidates
+                .reserve(initial - self.candidates.capacity());
         }
     }
 
@@ -277,21 +322,14 @@ impl PeakPicker {
 
     /// Drain the trailing edge and return the peaks sorted by
     /// `(t_frame, f_bin)`.
-    pub(crate) fn finish(&mut self, frames_per_sec: f32) -> Vec<Peak> {
+    pub(crate) fn finish(&mut self, _frames_per_sec: f32) -> Vec<Peak> {
         // Trailing edge: NaN rows reproduce the end-of-spectrogram clamp.
         for _ in 0..self.cfg.neighborhood_t {
             self.vert.next_slot().fill(f32::NAN);
             self.commit_and_emit();
         }
-        let target_per_sec = self.cfg.target_per_sec;
-
-        if target_per_sec > 0 && frames_per_sec > 0.0 && !self.candidates.is_empty() {
-            let capped = adaptive_per_second(
-                core::mem::take(&mut self.candidates),
-                frames_per_sec,
-                target_per_sec,
-            );
-            self.candidates = capped;
+        if self.cfg.target_per_sec > 0 && self.bucket_rate > 0.0 {
+            self.flush_bucket();
         }
 
         self.candidates
@@ -316,14 +354,49 @@ impl PeakPicker {
         let t = pos + 1 - w;
         let n_bins = self.n_bins;
         let slot = t % (self.cfg.neighborhood_t + 1);
-        emit_candidates(
-            &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
-            &self.vmax_row,
-            t as u32,
-            self.cfg.min_magnitude_db,
-            self.cfg.min_magnitude_linear,
-            &mut self.candidates,
-        );
+        if self.cfg.target_per_sec > 0 && self.bucket_rate > 0.0 {
+            self.row_candidates.clear();
+            emit_candidates(
+                &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
+                &self.vmax_row,
+                t as u32,
+                self.cfg.min_magnitude_db,
+                self.cfg.min_magnitude_linear,
+                &mut self.row_candidates,
+            );
+            for i in 0..self.row_candidates.len() {
+                self.accept_bucket_peak(self.row_candidates[i]);
+            }
+        } else {
+            emit_candidates(
+                &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
+                &self.vmax_row,
+                t as u32,
+                self.cfg.min_magnitude_db,
+                self.cfg.min_magnitude_linear,
+                &mut self.candidates,
+            );
+        }
+    }
+
+    fn accept_bucket_peak(&mut self, peak: Peak) {
+        let bucket = (peak.t_frame as f32 / self.bucket_rate) as u32;
+        if self.bucket_id != Some(bucket) {
+            self.flush_bucket();
+            self.bucket_id = Some(bucket);
+        }
+        let entry = BucketPeak(peak);
+        if self.bucket_heap.len() < self.cfg.target_per_sec {
+            self.bucket_heap.push(entry);
+        } else if self.bucket_heap.peek().is_some_and(|worst| entry < *worst) {
+            self.bucket_heap.pop();
+            self.bucket_heap.push(entry);
+        }
+    }
+
+    fn flush_bucket(&mut self) {
+        self.candidates
+            .extend(self.bucket_heap.drain().map(|entry| entry.0));
     }
 }
 
@@ -591,6 +664,7 @@ fn emit_candidates(
 }
 
 /// Keep the top `target` peaks per one-second bucket (by magnitude).
+#[cfg(test)]
 fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize) -> Vec<Peak> {
     // Sort by (bucket asc, mag desc, position asc) so we can stream-select
     // per bucket. The `(t_frame, f_bin)` tiebreak is unique per peak, making
@@ -1217,6 +1291,32 @@ mod tests {
         let mut mags: Vec<f32> = peaks_tight.iter().map(|p| p.mag).collect();
         mags.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(mags, vec![8.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn dense_plateau_keeps_only_bounded_bucket_candidates() {
+        let mut picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: 0,
+            neighborhood_f: 0,
+            min_magnitude_db: 0.0,
+            min_magnitude_linear: None,
+            target_per_sec: 3,
+        });
+        let row = [1.0f32; 64];
+        picker.begin(1_000, row.len(), 100.0);
+        for _ in 0..1_000 {
+            picker.push_row(&row);
+            assert!(picker.candidates.len() <= 30);
+            assert!(picker.bucket_heap.len() <= 3);
+            assert!(picker.row_candidates.len() <= row.len());
+        }
+        let peaks = picker.finish(100.0);
+        assert_eq!(peaks.len(), 30);
+        for bucket in 0..10 {
+            let kept = &peaks[bucket * 3..bucket * 3 + 3];
+            assert!(kept.iter().all(|p| p.t_frame == (bucket * 100) as u32));
+            assert_eq!(kept.iter().map(|p| p.f_bin).collect::<Vec<_>>(), [0, 1, 2]);
+        }
     }
 
     #[test]

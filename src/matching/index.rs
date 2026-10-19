@@ -48,6 +48,30 @@ const MAX_VOTES_PER_REF: usize = 10_000_000;
 /// budgets stay the same order of magnitude.
 const MAX_VOTES_PER_QUERY: usize = 10_000_000;
 
+/// Add one posting and discard a stop hash as soon as it crosses the cap.
+/// This bounds temporary posting storage even for a single repetitive input.
+#[inline]
+fn push_bounded<P: Copy>(
+    map: &mut HashMap<u32, Postings<P>>,
+    stopped: &mut HashMap<u32, ()>,
+    key: u32,
+    posting: P,
+    limit: usize,
+) {
+    if stopped.contains_key(&key) {
+        return;
+    }
+    let over_limit = {
+        let list = map.entry(key).or_default();
+        list.push(posting);
+        list.len() > limit
+    };
+    if over_limit {
+        map.remove(&key);
+        stopped.insert(key, ());
+    }
+}
+
 /// Find the single best-matching reference.
 ///
 /// Returns `Some((index, result))` if any reference clears its
@@ -318,10 +342,6 @@ pub struct WangIndex {
     /// Live reference count (`live` set bits). Maintained incrementally so
     /// [`WangIndex::live_count`] is O(1).
     live_count: usize,
-    /// Scratch for [`WangIndex::insert`]: keys observed over the stop-hash
-    /// limit during the current insert (usually empty — the common case
-    /// prunes zero keys). Reused across calls; empty outside `insert`.
-    touched: alloc::vec::Vec<u32>,
     /// Stop-hash tombstones: keys pruned for exceeding the posting cap stay
     /// suppressed for the lifetime of this index (append-only fixed policy).
     /// Lowering `max_postings_per_hash` on a later insert can add more keys;
@@ -344,9 +364,8 @@ impl WangIndex {
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut map: HashMap<u32, Postings<(u32, u32)>> = super::maps::hashmap_with_capacity(
-            refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
-        );
+        let mut map: HashMap<u32, Postings<(u32, u32)>> = hashmap_new();
+        let mut stopped = hashmap_new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
         let r_max: Vec<u32> = refs
             .iter()
@@ -355,19 +374,15 @@ impl WangIndex {
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for h in &fp.hashes {
-                map.entry(h.hash)
-                    .or_default()
-                    .push((ref_id as u32, h.t_anchor));
+                push_bounded(
+                    &mut map,
+                    &mut stopped,
+                    h.hash,
+                    (ref_id as u32, h.t_anchor),
+                    max_postings_per_hash as usize,
+                );
             }
         }
-
-        let mut stopped = hashmap_new();
-        for (key, v) in &map {
-            if (v.len() as u32) > max_postings_per_hash {
-                stopped.insert(*key, ());
-            }
-        }
-        map.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         let live_count = refs.len();
         let live = alloc::vec![true; live_count];
@@ -378,7 +393,6 @@ impl WangIndex {
             live,
             vacant: Vec::new(),
             live_count,
-            touched: Vec::new(),
             stopped,
         }
     }
@@ -386,9 +400,8 @@ impl WangIndex {
     /// Append one fingerprint to the catalog, returning its stable `ref_id`.
     ///
     /// Applies the same stop-hash policy as [`WangIndex::build`] to the
-    /// posting lists this fingerprint touches: appending only grows lists, so
-    /// pruning touched lists yields exactly the map state a full
-    /// `build` + `retain` would produce for the same input sequence
+    /// posting lists this fingerprint touches. Keys that exceed the cap are
+    /// discarded immediately, yielding the same map state as a full build
     /// (pinned by the `insert_matches_build_parity` test; parity is over
     /// append-only histories — interleaved `remove` calls physically delete
     /// postings, which `build` has no equivalent for).
@@ -399,12 +412,8 @@ impl WangIndex {
     ///
     /// # Performance
     ///
-    /// `O(H)` amortised for `H` hashes: one map lookup per hash; the
-    /// stop-hash prune pass is empty in the common case (over-limit keys
-    /// are recorded inline while the list is borrowed — no second lookup).
-    /// The map is pre-reserved and the over-limit scratch is reused across
-    /// calls, so steady-state insertion performs no auxiliary allocation
-    /// beyond posting pushes (and rare map growth).
+    /// `O(H)` amortised for `H` hashes. Over-limit posting lists are freed
+    /// as soon as they cross the cap; map growth follows distinct live keys.
     ///
     /// # Panics
     ///
@@ -416,46 +425,15 @@ impl WangIndex {
         max_postings_per_hash: u32,
     ) -> usize {
         let (ref_id, rid) = assign_ref_id(self.fps.len(), &mut self.vacant);
-        // Pre-reserve map slots: ~half the new hashes are unique (same
-        // heuristic as `build`'s `/2` capacity guess). BTreeMap fallback
-        // (no_std) has no `reserve` — reservation is `std`-only.
-        #[cfg(feature = "std")]
-        self.map.reserve(fp.hashes.len() / 2);
-        self.touched.clear();
-        self.touched.reserve(fp.hashes.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for h in &fp.hashes {
-            if self.stopped.contains_key(&h.hash) {
-                continue;
-            }
-            // Single-lookup insert: `entry` hashes once. Stop-hash
-            // bookkeeping rides on the post-push length while the list is
-            // already borrowed — no second lookup:
-            //
-            // - Every pre-existing list satisfies the policy (build retained,
-            //   prior inserts pruned), and appends only grow. So a list that
-            //   violates the policy at end of insert MUST have crossed the
-            //   limit during one of this insert's pushes (lengths grow 1 by
-            //   1), exactly when we hold it here.
-            // - Record the key the first time a post-push length exceeds the
-            //   limit. Later pushes to the same key re-record harmlessly
-            //   (prune is idempotent; `drain` clears all). Common case:
-            //   NOTHING exceeds → `touched` stays empty and the prune pass
-            //   below iterates zero keys (vs one `get` per unique key).
-            let list = self.map.entry(h.hash).or_default();
-            list.push((rid, h.t_anchor));
-            if list.len() > limit {
-                self.touched.push(h.hash);
-            }
-        }
-        // Prune only over-limit keys (usually none). Tombstone pruned keys so
-        // a later insert cannot resurrect them with a short posting list.
-        for key in self.touched.drain(..) {
-            let drop = self.map.get(&key).is_some_and(|v| v.len() > limit);
-            if drop {
-                self.stopped.insert(key, ());
-                self.map.remove(&key);
-            }
+            push_bounded(
+                &mut self.map,
+                &mut self.stopped,
+                h.hash,
+                (rid, h.t_anchor),
+                limit,
+            );
         }
         let t_max = fp.hashes.iter().map(|h| h.t_anchor).max().unwrap_or(0);
         if ref_id < self.fps.len() {
@@ -611,7 +589,7 @@ impl WangIndex {
 
     /// Measured heap footprint in bytes: posting lists (capacity × 8 bytes
     /// per `(u32, u32)` posting) + map slots (capacity × key size + slot
-    /// overhead) + `fps` / `live` / `vacant` / `touched` storage.
+    /// overhead) + `fps` / `live` / `vacant` storage.
     /// O(map size) — call rarely (capacity planning, shard-split decisions),
     /// not per query.
     ///
@@ -632,7 +610,6 @@ impl WangIndex {
         bytes += self.r_max.capacity() * size_of::<u32>();
         bytes += self.live.capacity() * size_of::<bool>();
         bytes += self.vacant.capacity() * size_of::<u32>();
-        bytes += self.touched.capacity() * size_of::<u32>();
         bytes += map_slot_count(&self.stopped) * (size_of::<u32>() + map_overhead_per_slot());
         bytes
     }
@@ -900,8 +877,6 @@ pub struct HaitsmaIndex {
     vacant: alloc::vec::Vec<u32>,
     /// Live reference count, maintained incrementally (O(1) read).
     live_count: usize,
-    /// Reused touched-key scratch for [`HaitsmaIndex::insert`].
-    touched: alloc::vec::Vec<u32>,
     /// Stop-hash tombstones (see [`WangIndex::stopped`]).
     stopped: HashMap<u32, ()>,
 }
@@ -924,35 +899,43 @@ impl HaitsmaIndex {
         refs: &[crate::classical::HaitsmaFingerprint],
         max_postings_per_hash: u32,
     ) -> Self {
+        Self::build_owned(refs.to_vec(), max_postings_per_hash)
+    }
+
+    /// Consume fingerprints to build the catalog without cloning their
+    /// frame vectors. Use this when the catalog takes ownership of the
+    /// reference fingerprints; [`build`](Self::build) retains borrowed input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `refs.len()` exceeds `u32::MAX`.
+    pub fn build_owned(
+        refs: Vec<crate::classical::HaitsmaFingerprint>,
+        max_postings_per_hash: u32,
+    ) -> Self {
         assert!(
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut lut: HashMap<u32, Postings<(u32, u32)>> = super::maps::hashmap_with_capacity(
-            refs.iter().map(|r| r.frames.len()).sum::<usize>() / 2,
-        );
-        let frames: Vec<Vec<u32>> = refs.iter().map(|r| r.frames.clone()).collect();
-        let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
-
-        for (ref_id, fp) in refs.iter().enumerate() {
-            for (pos, &frame) in fp.frames.iter().enumerate() {
-                lut.entry(frame)
-                    .or_default()
-                    .push((ref_id as u32, pos as u32));
-            }
-        }
-
+        let mut lut: HashMap<u32, Postings<(u32, u32)>> = hashmap_new();
         let mut stopped = hashmap_new();
-        for (key, v) in &lut {
-            if (v.len() as u32) > max_postings_per_hash {
-                stopped.insert(*key, ());
-            }
-        }
-        // Silence/DC frames produce enormous posting lists; prune them so
-        // memory and query time stay bounded.
-        lut.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
-
         let live_count = refs.len();
+        let mut frames = Vec::with_capacity(live_count);
+        let mut fps = Vec::with_capacity(live_count);
+        for (ref_id, fp) in refs.into_iter().enumerate() {
+            for (pos, &frame) in fp.frames.iter().enumerate() {
+                push_bounded(
+                    &mut lut,
+                    &mut stopped,
+                    frame,
+                    (ref_id as u32, pos as u32),
+                    max_postings_per_hash as usize,
+                );
+            }
+            fps.push(fp.frames_per_sec);
+            frames.push(fp.frames);
+        }
+
         let live = alloc::vec![true; live_count];
         Self {
             lut,
@@ -961,16 +944,14 @@ impl HaitsmaIndex {
             live,
             vacant: Vec::new(),
             live_count,
-            touched: Vec::new(),
             stopped,
         }
     }
 
     /// Append one fingerprint to the catalog, returning its stable `ref_id`.
     ///
-    /// Same stop-hash parity contract as [`WangIndex::insert`]: pruning the
-    /// touched LUT lists yields exactly the map state a full `build` +
-    /// `retain` would produce for the same append-only input sequence
+    /// Same stop-hash parity contract as [`WangIndex::insert`]: immediate
+    /// pruning yields the same map state for the same append-only sequence
     /// (pinned by the `insert_matches_build_parity` test; parity is over
     /// append-only histories — interleaved `remove` calls physically delete
     /// postings, which `build` has no equivalent for).
@@ -981,10 +962,8 @@ impl HaitsmaIndex {
     ///
     /// # Performance
     ///
-    /// `O(F)` amortised for `F` frames: one LUT lookup per frame plus
-    /// touched-list pruning. Pre-reserved map capacity and reused
-    /// touched-key scratch keep steady-state insertion free of auxiliary
-    /// allocation beyond posting pushes (and rare map growth).
+    /// `O(F)` amortised for `F` frames. Over-limit lists are freed when
+    /// they cross the cap; map growth follows distinct live keys.
     ///
     /// # Panics
     ///
@@ -996,30 +975,15 @@ impl HaitsmaIndex {
         max_postings_per_hash: u32,
     ) -> usize {
         let (ref_id, rid) = assign_ref_id(self.fps.len(), &mut self.vacant);
-        #[cfg(feature = "std")]
-        self.lut.reserve(fp.frames.len() / 2);
-        self.touched.clear();
-        self.touched.reserve(fp.frames.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for (pos, &frame) in fp.frames.iter().enumerate() {
-            if self.stopped.contains_key(&frame) {
-                continue;
-            }
-            // Same over-limit recording as WangIndex::insert: the prune pass
-            // below is empty in the common case.
-            let list = self.lut.entry(frame).or_default();
-            list.push((rid, pos as u32));
-            if list.len() > limit {
-                self.touched.push(frame);
-            }
-        }
-        // Prune only over-limit keys (usually none).
-        for key in self.touched.drain(..) {
-            let drop = self.lut.get(&key).is_some_and(|v| v.len() > limit);
-            if drop {
-                self.stopped.insert(key, ());
-                self.lut.remove(&key);
-            }
+            push_bounded(
+                &mut self.lut,
+                &mut self.stopped,
+                frame,
+                (rid, pos as u32),
+                limit,
+            );
         }
         if ref_id < self.frames.len() {
             self.frames[ref_id] = fp.frames.clone();
@@ -1145,7 +1109,7 @@ impl HaitsmaIndex {
     /// Measured heap footprint in bytes: LUT posting lists (capacity × 8
     /// bytes per `(u32, u32)` posting) + map slots + per-reference frame
     /// vectors (capacity × 4 bytes — the dominant term) + `fps` / `live` /
-    /// `vacant` / `touched` storage. O(map size) — call rarely, not per
+    /// `vacant` storage. O(map size) — call rarely, not per
     /// query. Documented approximation (±table overhead, allocator
     /// rounding); for alerting and sharding, not billing.
     #[must_use]
@@ -1164,7 +1128,6 @@ impl HaitsmaIndex {
         bytes += self.fps.capacity() * size_of::<f32>();
         bytes += self.live.capacity() * size_of::<bool>();
         bytes += self.vacant.capacity() * size_of::<u32>();
-        bytes += self.touched.capacity() * size_of::<u32>();
         bytes
     }
 
@@ -1185,11 +1148,13 @@ impl HaitsmaIndex {
         query: &crate::classical::HaitsmaFingerprint,
         cfg: &crate::matching::HaitsmaMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use super::haitsma::{hamming_at_offset, overlap_at};
+        use super::haitsma::{
+            hamming_at_offset, informative_frames, informative_overlap, overlap_at,
+        };
 
         let q_frames = &query.frames;
         let q_len = q_frames.len();
-        if q_len == 0 || self.lut.is_empty() {
+        if q_len == 0 || self.lut.is_empty() || !informative_frames(q_frames) {
             return None;
         }
 
@@ -1283,7 +1248,15 @@ impl HaitsmaIndex {
                     continue;
                 }
                 let ber = h as f64 / (overlap as f64 * 32.0);
-                if ber < best_ber {
+                let better = ber < best_ber
+                    || (ber == best_ber
+                        && (overlap > best_overlap
+                            || (overlap == best_overlap
+                                && (delta.unsigned_abs(), delta)
+                                    < (best_delta.unsigned_abs(), best_delta))));
+                if better
+                    && informative_overlap(q_frames, &self.frames[*ref_id as usize], delta, overlap)
+                {
                     best_ber = ber;
                     best_hamming = h;
                     best_delta = delta;
@@ -1393,8 +1366,6 @@ pub struct PanakoIndex {
     vacant: alloc::vec::Vec<u32>,
     /// Live reference count, maintained incrementally (O(1) read).
     live_count: usize,
-    /// Reused touched-key scratch for [`PanakoIndex::insert`].
-    touched: alloc::vec::Vec<u32>,
     /// Stop-hash tombstones (see [`WangIndex::stopped`]).
     stopped: HashMap<u32, ()>,
 }
@@ -1411,27 +1382,21 @@ impl PanakoIndex {
             refs.len() <= u32::MAX as usize,
             "reference count exceeds u32::MAX"
         );
-        let mut map: HashMap<u32, Postings<(u32, u32, u32, u32)>> =
-            super::maps::hashmap_with_capacity(
-                refs.iter().map(|r| r.hashes.len()).sum::<usize>() / 2,
-            );
+        let mut map: HashMap<u32, Postings<(u32, u32, u32, u32)>> = hashmap_new();
+        let mut stopped = hashmap_new();
         let fps: Vec<f32> = refs.iter().map(|r| r.frames_per_sec).collect();
 
         for (ref_id, fp) in refs.iter().enumerate() {
             for h in &fp.hashes {
-                map.entry(h.hash)
-                    .or_default()
-                    .push((ref_id as u32, h.t_anchor, h.t_b, h.t_c));
+                push_bounded(
+                    &mut map,
+                    &mut stopped,
+                    h.hash,
+                    (ref_id as u32, h.t_anchor, h.t_b, h.t_c),
+                    max_postings_per_hash as usize,
+                );
             }
         }
-
-        let mut stopped = hashmap_new();
-        for (key, v) in &map {
-            if (v.len() as u32) > max_postings_per_hash {
-                stopped.insert(*key, ());
-            }
-        }
-        map.retain(|_, v| (v.len() as u32) <= max_postings_per_hash);
 
         let live_count = refs.len();
         let live = alloc::vec![true; live_count];
@@ -1441,16 +1406,14 @@ impl PanakoIndex {
             live,
             vacant: Vec::new(),
             live_count,
-            touched: Vec::new(),
             stopped,
         }
     }
 
     /// Append one fingerprint to the catalog, returning its stable `ref_id`.
     ///
-    /// Same stop-hash parity contract as [`WangIndex::insert`]: pruning the
-    /// touched lists yields exactly the map state a full `build` + `retain`
-    /// would produce for the same append-only input sequence (pinned by the
+    /// Same stop-hash parity contract as [`WangIndex::insert`]: immediate
+    /// pruning yields the same map state for the append-only input sequence (pinned by the
     /// `insert_matches_build_parity` test; parity is over append-only
     /// histories — interleaved `remove` calls physically delete postings,
     /// which `build` has no equivalent for). Ids of live references never
@@ -1458,10 +1421,8 @@ impl PanakoIndex {
     ///
     /// # Performance
     ///
-    /// `O(H)` amortised for `H` triplet hashes: one map lookup per hash plus
-    /// touched-list pruning. Pre-reserved map capacity and reused
-    /// touched-key scratch keep steady-state insertion free of auxiliary
-    /// allocation beyond posting pushes (and rare map growth).
+    /// `O(H)` amortised for `H` triplet hashes. Over-limit lists are freed
+    /// when they cross the cap; map growth follows distinct live keys.
     ///
     /// # Panics
     ///
@@ -1473,30 +1434,15 @@ impl PanakoIndex {
         max_postings_per_hash: u32,
     ) -> usize {
         let (ref_id, rid) = assign_ref_id(self.fps.len(), &mut self.vacant);
-        #[cfg(feature = "std")]
-        self.map.reserve(fp.hashes.len() / 2);
-        self.touched.clear();
-        self.touched.reserve(fp.hashes.len().min(1024));
         let limit = max_postings_per_hash as usize;
         for h in &fp.hashes {
-            if self.stopped.contains_key(&h.hash) {
-                continue;
-            }
-            // Same over-limit recording as WangIndex::insert: the prune pass
-            // below is empty in the common case.
-            let list = self.map.entry(h.hash).or_default();
-            list.push((rid, h.t_anchor, h.t_b, h.t_c));
-            if list.len() > limit {
-                self.touched.push(h.hash);
-            }
-        }
-        // Prune only over-limit keys (usually none).
-        for key in self.touched.drain(..) {
-            let drop = self.map.get(&key).is_some_and(|v| v.len() > limit);
-            if drop {
-                self.stopped.insert(key, ());
-                self.map.remove(&key);
-            }
+            push_bounded(
+                &mut self.map,
+                &mut self.stopped,
+                h.hash,
+                (rid, h.t_anchor, h.t_b, h.t_c),
+                limit,
+            );
         }
         if ref_id < self.fps.len() {
             self.fps[ref_id] = fp.frames_per_sec;
@@ -1615,7 +1561,7 @@ impl PanakoIndex {
 
     /// Measured heap footprint in bytes: posting lists (capacity × 16 bytes
     /// per `(u32, u32, u32, u32)` posting) + map slots + `fps` / `live` /
-    /// `vacant` / `touched` storage. O(map size) — call rarely, not per
+    /// `vacant` storage. O(map size) — call rarely, not per
     /// query. Documented approximation (±table overhead, allocator
     /// rounding); for alerting and sharding, not billing.
     #[must_use]
@@ -1632,7 +1578,6 @@ impl PanakoIndex {
         bytes += self.fps.capacity() * size_of::<f32>();
         bytes += self.live.capacity() * size_of::<bool>();
         bytes += self.vacant.capacity() * size_of::<u32>();
-        bytes += self.touched.capacity() * size_of::<u32>();
         bytes
     }
 
@@ -2102,6 +2047,42 @@ mod tests {
             frames: frames.to_vec(),
             frames_per_sec: fps,
         }
+    }
+
+    #[test]
+    fn haitsma_index_rejects_silent_query_even_without_stop_hash_pruning() {
+        let fp = mk_haitsma_fp(&vec![0; 400], 78.125);
+        let index = HaitsmaIndex::build(core::slice::from_ref(&fp), 1000);
+        assert!(index.query(&fp, &HaitsmaMatchConfig::default()).is_none());
+    }
+
+    #[test]
+    fn stop_hash_build_does_not_reserve_for_repeated_frames() {
+        let fp = mk_haitsma_fp(&vec![0; 100_000], 78.125);
+        let index = HaitsmaIndex::build(&[fp], 100);
+        assert_eq!(index.len(), 0);
+        // The index retains one owned copy of the reference frames (~400 KB).
+        // A map reserved from the raw frame count used to add ~4 MB more.
+        assert!(index.estimated_bytes() < 800_000);
+    }
+
+    #[test]
+    fn haitsma_build_owned_moves_frame_storage_and_matches_borrowed_build() {
+        let fp = mk_haitsma_fp(
+            &(0..600)
+                .map(|i| (i as u32).wrapping_mul(0x0101_0101))
+                .collect::<Vec<_>>(),
+            78.125,
+        );
+        let borrowed = HaitsmaIndex::build(core::slice::from_ref(&fp), 1_000);
+        // `build_owned` takes its input by value. The allocation supplied to
+        // it survives in the index instead of being cloned a second time.
+        let moved_ptr = fp.frames.as_ptr();
+        let owned = HaitsmaIndex::build_owned(alloc::vec![fp], 1_000);
+        assert_eq!(owned.frames[0].as_ptr(), moved_ptr);
+        let query = mk_haitsma_fp(&owned.frames[0], 78.125);
+        let cfg = HaitsmaMatchConfig::default();
+        assert_eq!(borrowed.query(&query, &cfg), owned.query(&query, &cfg));
     }
 
     #[test]

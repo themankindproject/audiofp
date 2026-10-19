@@ -5,8 +5,10 @@
 //! - [`linear`] — straight linear interpolation. Cheap but introduces audible
 //!   aliasing on downsamples; only suitable for non-critical paths or as a
 //!   sanity baseline.
-//! - [`SincResampler`] — windowed-sinc convolution with a Kaiser window.
+//! - [`SincResampler`] — one-shot windowed-sinc convolution with a Kaiser window.
 //!   Higher quality at the cost of `O(N · taps)` work per output sample.
+//! - [`StreamingSincResampler`] — the same filter with phase and sample
+//!   history carried across arbitrary input chunks.
 //!
 //! Both treat any out-of-range input as silence (zero-pad). Mono `f32` only;
 //! callers downmix multi-channel inputs upstream.
@@ -300,8 +302,9 @@ impl SincResampler {
     ///
     /// Same semantics as [`process`](Self::process) but writes into `out`
     /// (cleared and resized to the correct length) instead of allocating
-    /// a new buffer, so callers in a hot loop can reuse the allocation
-    /// across chunks.
+    /// a new buffer, so callers in a hot loop can reuse the allocation.
+    /// Each call is an independent signal with zero-padded boundaries;
+    /// use [`StreamingSincResampler`] for successive chunks of one signal.
     pub fn process_into(&self, input: &[f32], out: &mut Vec<f32>) {
         if input.is_empty() {
             out.clear();
@@ -393,6 +396,172 @@ impl SincResampler {
     }
 }
 
+/// Stateful sinc resampling across arbitrary input chunks.
+///
+/// [`push`](Self::push) emits only samples whose filter support is already
+/// available. [`finish`](Self::finish) emits the final zero-padded boundary
+/// samples. Concatenating every push result and the finish result matches a
+/// single [`SincResampler::process`] call over the combined input.
+///
+/// A push after `finish` starts a fresh signal; call [`reset`](Self::reset)
+/// explicitly when changing sources without finishing the previous one.
+pub struct StreamingSincResampler {
+    filter: SincResampler,
+    carry: Vec<f32>,
+    carry_start: u64,
+    input_len: u64,
+    next_output: u64,
+    finished: bool,
+}
+
+impl StreamingSincResampler {
+    /// Build a stream with default sinc quality.
+    #[must_use]
+    pub fn new(from_sr: u32, to_sr: u32) -> Self {
+        Self::with_quality(from_sr, to_sr, SincQuality::default())
+    }
+
+    /// Build a stream with custom sinc quality.
+    ///
+    /// # Panics
+    ///
+    /// Panics on invalid rates or quality; use [`try_with_quality`](Self::try_with_quality)
+    /// to receive an error instead.
+    #[must_use]
+    pub fn with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> Self {
+        Self::try_with_quality(from_sr, to_sr, quality)
+            .expect("invalid StreamingSincResampler config")
+    }
+
+    /// Fallible constructor with default sinc quality.
+    pub fn try_new(from_sr: u32, to_sr: u32) -> crate::Result<Self> {
+        Self::try_with_quality(from_sr, to_sr, SincQuality::default())
+    }
+
+    /// Fallible constructor with custom sinc quality.
+    pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
+        Ok(Self {
+            filter: SincResampler::try_with_quality(from_sr, to_sr, quality)?,
+            carry: Vec::new(),
+            carry_start: 0,
+            input_len: 0,
+            next_output: 0,
+            finished: false,
+        })
+    }
+
+    /// Feed more input and return every output sample now fully determined.
+    #[must_use]
+    pub fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.push_into(input, &mut out);
+        out
+    }
+
+    /// Write newly determined output into a reusable caller-owned vector.
+    pub fn push_into(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        if self.finished {
+            self.reset();
+        }
+        out.clear();
+        if self.filter.from_sr == self.filter.to_sr {
+            out.extend_from_slice(input);
+            self.input_len += input.len() as u64;
+            self.next_output += input.len() as u64;
+            return;
+        }
+        let block = self.filter.quality.half_taps.saturating_mul(8).max(4096);
+        for chunk in input.chunks(block) {
+            self.carry.extend_from_slice(chunk);
+            self.input_len += chunk.len() as u64;
+            self.emit_available(out, false);
+            self.discard_past_samples();
+        }
+    }
+
+    /// Emit the final zero-padded samples. Repeated calls return an empty vector.
+    #[must_use]
+    pub fn finish(&mut self) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.finish_into(&mut out);
+        out
+    }
+
+    /// Write final boundary samples into a reusable caller-owned vector.
+    pub fn finish_into(&mut self, out: &mut Vec<f32>) {
+        out.clear();
+        if self.finished {
+            return;
+        }
+        self.emit_available(out, true);
+        self.finished = true;
+        self.carry.clear();
+    }
+
+    /// Start a new independent signal while retaining allocated capacity.
+    pub fn reset(&mut self) {
+        self.carry.clear();
+        self.carry_start = 0;
+        self.input_len = 0;
+        self.next_output = 0;
+        self.finished = false;
+    }
+
+    fn emit_available(&mut self, out: &mut Vec<f32>, final_chunk: bool) {
+        if self.filter.from_sr == self.filter.to_sr {
+            return;
+        }
+        let half = self.filter.quality.half_taps;
+        let taps = half * 2 + 1;
+        let steps = self.filter.quality.polyphase_steps as usize;
+        let ratio = self.filter.from_sr as f64 / self.filter.to_sr as f64;
+        let final_output = self
+            .input_len
+            .saturating_mul(self.filter.to_sr as u64)
+            .div_ceil(self.filter.from_sr as u64);
+        loop {
+            if final_chunk && self.next_output >= final_output {
+                break;
+            }
+            let pos = self.next_output as f64 * ratio;
+            let centre = pos.floor() as u64;
+            if !final_chunk && centre.saturating_add(half as u64) >= self.input_len {
+                break;
+            }
+            let frac = (pos - pos.floor()) as f32;
+            let step = ((frac * steps as f32) as usize).min(steps - 1);
+            let kernel = &self.filter.kernel_table[step * taps..(step + 1) * taps];
+            let value =
+                if centre >= half as u64 && centre.saturating_add(half as u64) < self.input_len {
+                    let start = (centre - half as u64 - self.carry_start) as usize;
+                    super::dot_wide(&self.carry[start..start + taps], kernel)
+                } else {
+                    let mut acc = 0.0f32;
+                    for (k, &coeff) in kernel.iter().enumerate() {
+                        let idx = centre as i64 + k as i64 - half as i64;
+                        if idx >= 0 && (idx as u64) < self.input_len {
+                            acc += self.carry[(idx as u64 - self.carry_start) as usize] * coeff;
+                        }
+                    }
+                    acc
+                };
+            out.push(value);
+            self.next_output += 1;
+        }
+    }
+
+    fn discard_past_samples(&mut self) {
+        let ratio = self.filter.from_sr as f64 / self.filter.to_sr as f64;
+        let next_centre = (self.next_output as f64 * ratio).floor() as u64;
+        let keep_from = next_centre
+            .saturating_sub(self.filter.quality.half_taps as u64)
+            .min(self.input_len);
+        let drop = keep_from.saturating_sub(self.carry_start) as usize;
+        self.carry.drain(..drop);
+        self.carry_start = keep_from;
+    }
+}
+
 /// Normalised sinc: `sin(π·x) / (π·x)`, with `sinc(0) = 1`.
 #[inline]
 fn sinc(x: f32) -> f32 {
@@ -439,6 +608,51 @@ mod tests {
     use alloc::vec;
     use approx::assert_relative_eq;
     use core::f32::consts::PI;
+
+    #[test]
+    fn streaming_sinc_matches_one_shot_across_irregular_chunks() {
+        let input: Vec<f32> = (0..88_200)
+            .map(|i| libm::sinf(2.0 * PI * 997.0 * i as f32 / 44_100.0))
+            .collect();
+        for (from, to, chunk_size) in [(44_100, 8_000, 997), (8_000, 44_100, 113)] {
+            let input = if from == 44_100 {
+                &input[..]
+            } else {
+                &input[..8_000]
+            };
+            let expected = SincResampler::new(from, to).process(input);
+            let mut stream = StreamingSincResampler::new(from, to);
+            let mut actual = Vec::new();
+            for chunk in input.chunks(chunk_size) {
+                actual.extend(stream.push(chunk));
+            }
+            actual.extend(stream.finish());
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                assert!((a - b).abs() <= 1e-6, "{from}->{to} sample {i}: {a} vs {b}");
+            }
+            assert!(stream.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_sinc_handles_short_signals_and_reset() {
+        for len in [0, 1, 7, 31, 64] {
+            let input: Vec<f32> = (0..len).map(|i| i as f32 * 0.125).collect();
+            let expected = SincResampler::new(16_000, 8_000).process(&input);
+            let mut stream = StreamingSincResampler::new(16_000, 8_000);
+            let mut actual = Vec::new();
+            for chunk in input.chunks(3) {
+                actual.extend(stream.push(chunk));
+            }
+            actual.extend(stream.finish());
+            assert_eq!(actual, expected);
+            stream.reset();
+            let mut again = stream.push(&input);
+            again.extend(stream.finish());
+            assert_eq!(again, expected);
+        }
+    }
 
     #[test]
     fn linear_passthrough_when_rates_match() {

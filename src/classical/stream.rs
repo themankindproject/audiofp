@@ -570,36 +570,39 @@ impl<F> StreamCore<F> {
         emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
-        pcm::extend_sanitized(&mut self.sample_carry, samples);
-
         let n_fft = self.n_fft;
         let hop = self.hop;
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= n_fft {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + n_fft],
-                    &mut self.frame_scratch,
-                )
-                .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
-            power_to_db_wide(&mut self.frame_scratch, self.log_floor_power);
-            self.append_frame_scratch_row();
+        // Keep the carry bounded independently of the caller's push size.
+        // Finalising buckets remains outside this loop, so chunk boundaries
+        // do not alter peak or hash selection.
+        for chunk in samples.chunks(n_fft * 4) {
+            pcm::extend_sanitized(&mut self.sample_carry, chunk);
+            let mut off = 0usize;
+            while self.sample_carry.len() - off >= n_fft {
+                self.stft
+                    .process_frame_power(
+                        &self.sample_carry[off..off + n_fft],
+                        &mut self.frame_scratch,
+                    )
+                    .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
+                power_to_db_wide(&mut self.frame_scratch, self.log_floor_power);
+                self.append_frame_scratch_row();
 
-            self.n_frames_total += 1;
-            off += hop;
+                self.n_frames_total += 1;
+                off += hop;
 
-            if let Some(ripe_abs) = self
-                .peak_det
-                .push_row(&self.frame_scratch, &mut self.peak_row_max)
-            {
-                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
-                self.detect_rows_range(cfg, row_idx, row_idx);
-                self.last_pd_frame = ripe_abs as i32;
+                if let Some(ripe_abs) = self
+                    .peak_det
+                    .push_row(&self.frame_scratch, &mut self.peak_row_max)
+                {
+                    let row_idx = (ripe_abs - self.spec_first_frame) as usize;
+                    self.detect_rows_range(cfg, row_idx, row_idx);
+                    self.last_pd_frame = ripe_abs as i32;
+                }
             }
-        }
-
-        if off > 0 {
-            self.sample_carry.drain(0..off);
+            if off > 0 {
+                self.sample_carry.drain(0..off);
+            }
         }
 
         self.finalize_buckets(cfg, &mut add_target);

@@ -10,10 +10,11 @@
 //! Most offsets die in the first few frames.
 //!
 //! **Sub-fingerprint LUT** — when `reference.len() > 512`, build a
-//! hash map `u32 → Vec<pos>` over reference frames. Haitsma's key
-//! property: when `BER < ~0.35`, at least one query frame is bit-exact,
-//! so probe each query frame's exact `u32` (plus optional 1–2 bit-flip
-//! probes) → candidate offsets → run exact BER verification only there.
+//! hash map `u32 → Vec<pos>` over reference frames. Probe each query
+//! frame's exact `u32` (plus optional 1–2 bit-flip probes) → candidate
+//! offsets → run exact BER verification only there. A low overall BER
+//! does not guarantee any one frame is exact; use
+//! [`HaitsmaMatcher::match_one_with_fallback`] when recall matters.
 //! Turns `O(Q·R)` into `O(Q + candidates·overlap)`.
 //!
 //! # Performance
@@ -95,6 +96,45 @@ pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
     }
 }
 
+/// A matching region must contain more than a repeated silence/DC pattern.
+/// Keep the historical behaviour for explicitly requested very short
+/// overlaps; below 32 frames there is too little evidence for this check.
+#[inline]
+pub(crate) fn informative_frames(frames: &[u32]) -> bool {
+    if frames.len() < 32 {
+        return true;
+    }
+    let mut seen = [0u32; 4];
+    let mut distinct = 0usize;
+    let mut any = 0u32;
+    let mut all = u32::MAX;
+    for &frame in frames {
+        any |= frame;
+        all &= frame;
+        if !seen[..distinct].contains(&frame) && distinct < seen.len() {
+            seen[distinct] = frame;
+            distinct += 1;
+        }
+        if distinct == seen.len() && (any ^ all).count_ones() >= 4 {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+pub(crate) fn informative_overlap(
+    query: &[u32],
+    reference: &[u32],
+    delta: i64,
+    overlap: usize,
+) -> bool {
+    let q_start = if delta >= 0 { 0 } else { (-delta) as usize };
+    let r_start = if delta >= 0 { delta as usize } else { 0 };
+    informative_frames(&query[q_start..q_start + overlap])
+        && informative_frames(&reference[r_start..r_start + overlap])
+}
+
 /// Running best alignment across candidate offsets, compared by **BER**
 /// (hamming ÷ overlap-bits) — not by raw hamming.
 ///
@@ -128,10 +168,8 @@ impl BestAlignment {
         self.ber < f64::INFINITY
     }
 
-    /// Verify `delta` and update the incumbent if its BER is strictly
-    /// better. Ties keep the first-found candidate (the exact path
-    /// scans deltas in ascending order; the LUT path probes query
-    /// frames in order), so selection is deterministic.
+    /// Verify `delta` and keep the best informative alignment. Equal-BER
+    /// ties prefer more evidence, then an offset nearer zero.
     #[inline]
     fn consider(
         &mut self,
@@ -154,7 +192,13 @@ impl BestAlignment {
             return; // aborted: rate cannot beat the incumbent
         }
         let ber = h as f64 / (overlap as f64 * 32.0);
-        if ber < self.ber {
+        let better = ber < self.ber
+            || (ber == self.ber
+                && (overlap > self.overlap
+                    || (overlap == self.overlap
+                        && (delta.unsigned_abs(), delta)
+                            < (self.delta.unsigned_abs(), self.delta))));
+        if better && informative_overlap(query, reference, delta, overlap) {
             self.ber = ber;
             self.hamming = h;
             self.delta = delta;
@@ -250,6 +294,28 @@ pub struct HaitsmaMatcher {
 }
 
 impl HaitsmaMatcher {
+    /// Match quickly with the configured LUT, then retry an unmatched query
+    /// with exhaustive BER search. This recovers noisy alignments that have
+    /// no bit-exact frame without changing [`match_one`](Matcher::match_one)
+    /// or the default lookup cost. When the LUT is already disabled or the
+    /// reference is short, this is identical to `match_one`.
+    ///
+    /// The fallback has worst-case `O(query_frames × reference_frames)` time.
+    #[must_use]
+    pub fn match_one_with_fallback(
+        &self,
+        query: &HaitsmaFingerprint,
+        reference: &HaitsmaFingerprint,
+    ) -> MatchResult {
+        let fast = self.match_one(query, reference);
+        if fast.is_match || !self.cfg.use_lut || reference.frames.len() <= 512 {
+            return fast;
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.use_lut = false;
+        Self::new(cfg).match_one(query, reference)
+    }
+
     /// Estimated P(same recording | Haitsma evidence): logistic map of the
     /// `1 − BER` score, versioned `haitsma-v1` (see
     /// `matching::calibration`).
@@ -287,7 +353,11 @@ impl Matcher for HaitsmaMatcher {
         let q_len = q_frames.len();
         let r_len = r_frames.len();
 
-        if q_len == 0 || r_len == 0 {
+        if q_len == 0
+            || r_len == 0
+            || !informative_frames(q_frames)
+            || !informative_frames(r_frames)
+        {
             return MatchResult::NONE;
         }
 
@@ -322,7 +392,7 @@ impl Matcher for HaitsmaMatcher {
                     1 => probe_1flip(q_frame, &lut, &mut consider),
                     _ => probe_2flip(q_frame, &lut, &mut consider),
                 }
-                if best.ber == 0.0 {
+                if best.ber == 0.0 && best.overlap == q_len.min(r_len) && best.delta == 0 {
                     break;
                 }
             }
@@ -342,8 +412,7 @@ impl Matcher for HaitsmaMatcher {
             );
         }
 
-        // Exact BER path (scan all offsets, ascending delta so
-        // BER ties resolve to the smallest offset deterministically).
+        // Exact BER path (scan all offsets, ascending delta).
         let dmin: i64 = -((q_len as i64).saturating_sub(1));
         let dmax: i64 = (r_len as i64).saturating_sub(1);
 
@@ -442,6 +511,8 @@ impl Default for HaitsmaMatcher {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// Build a synthetic Haitsma fingerprint from known 32-bit frame values.
@@ -486,6 +557,24 @@ mod tests {
                 v
             })
             .collect()
+    }
+
+    #[test]
+    fn fallback_recovers_noisy_match_without_exact_frame_hits() {
+        let mut rng = XorShift(0x7654_3210);
+        let reference = make_fp(&(0..800).map(|_| rng.next()).collect::<Vec<_>>());
+        let query = make_fp(
+            &reference.frames[100..500]
+                .iter()
+                .map(|f| f ^ 1)
+                .collect::<Vec<_>>(),
+        );
+        let matcher = HaitsmaMatcher::default();
+        assert!(!matcher.match_one(&query, &reference).is_match);
+        let recovered = matcher.match_one_with_fallback(&query, &reference);
+        assert!(recovered.is_match, "{recovered:?}");
+        assert_eq!(recovered.offset.frames, 100);
+        assert_eq!(recovered.score, 1.0 - 1.0 / 32.0);
     }
 
     #[test]
@@ -559,6 +648,29 @@ mod tests {
         let q = make_fp(&[0xAAAAAAAA, 0x55555555]);
         let r = make_fp(&[]);
         assert_eq!(m.match_one(&q, &r), MatchResult::NONE);
+    }
+
+    #[test]
+    fn silence_and_repeated_frames_are_not_evidence() {
+        let matcher = HaitsmaMatcher::default();
+        for frames in [
+            vec![0; 400],
+            (0..400).map(|i| i as u32 % 2).collect::<Vec<_>>(),
+        ] {
+            let fp = make_fp(&frames);
+            assert_eq!(matcher.match_one(&fp, &fp), MatchResult::NONE);
+        }
+    }
+
+    #[test]
+    fn equal_ber_prefers_full_overlap() {
+        let matcher = HaitsmaMatcher::default();
+        let frames: Vec<u32> = (0..400).map(|i| (i as u32).wrapping_mul(7919)).collect();
+        let fp = make_fp(&frames);
+        let result = matcher.match_one(&fp, &fp);
+        assert!(result.is_match);
+        assert_eq!(result.offset.frames, 0);
+        assert_eq!(result.votes, 400);
     }
 
     #[test]

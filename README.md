@@ -67,6 +67,7 @@ once (the pre-0.4.0 `std` behavior).
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `std` | No | Standard-library cache and I/O error support; no codec dependency |
 | `std-wav` | No | WAV + raw PCM decoding via Symphonia (`audiofp::io`) |
 | `std-mp3` | No | MP3 decoding via Symphonia |
 | `std-flac` | No | FLAC decoding via Symphonia |

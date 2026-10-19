@@ -231,6 +231,16 @@ impl Panako {
         );
         Self { cfg, frontend }
     }
+
+    /// Build a Panako extractor, rejecting nonfinite magnitude thresholds.
+    /// The infallible [`new`](Self::new) keeps its existing clamping API and
+    /// substitutes the default threshold when given NaN.
+    pub fn try_new(cfg: PanakoConfig) -> Result<Self> {
+        if !cfg.min_anchor_mag_db.is_finite() {
+            return Err(AfpError::Config("min_anchor_mag_db must be finite".into()));
+        }
+        Ok(Self::new(cfg))
+    }
 }
 
 /// Progress callback reporting interval for Panako (62.5 fps):
@@ -573,10 +583,38 @@ impl StreamingPanako {
         }
     }
 
+    /// Build a streaming Panako extractor, rejecting nonfinite magnitude thresholds.
+    pub fn try_new(cfg: PanakoConfig) -> Result<Self> {
+        if !cfg.min_anchor_mag_db.is_finite() {
+            return Err(AfpError::Config("min_anchor_mag_db must be finite".into()));
+        }
+        Ok(Self::new(cfg))
+    }
+
     /// Borrow the configuration this stream was built with.
     #[must_use]
     pub fn config(&self) -> &PanakoConfig {
         &self.cfg
+    }
+
+    /// Feed a complete chunk or return an error before changing stream state.
+    /// Unlike the legacy [`push`](StreamingFingerprinter::push), this rejects
+    /// a chunk over `max_push_samples` and nonfinite PCM instead of dropping
+    /// or replacing samples.
+    pub fn push_checked(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, PanakoHash)>> {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push(samples)
+    }
+
+    /// Callback variant of [`push_checked`](Self::push_checked).
+    pub fn push_with_checked<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
+    where
+        F: FnMut(TimestampMs, &PanakoHash),
+    {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push_with(samples, callback)
     }
 
     /// Reset all internal state. The stream behaves as if freshly
@@ -795,6 +833,29 @@ mod tests {
     use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
+
+    #[test]
+    fn nan_peak_floor_is_safe_and_fallible_constructor_rejects_it() {
+        let bad = PanakoConfig {
+            min_anchor_mag_db: f32::NAN,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Panako::try_new(bad.clone()),
+            Err(AfpError::Config(_))
+        ));
+        assert!(matches!(
+            StreamingPanako::try_new(bad.clone()),
+            Err(AfpError::Config(_))
+        ));
+        let audio = synthetic_audio(7, 40_000);
+        let mut safe = Panako::new(bad);
+        let mut default = Panako::default();
+        let expected = default.extract(&audio, SampleRate::HZ_8000).unwrap();
+        let actual = safe.extract(&audio, SampleRate::HZ_8000).unwrap();
+        assert!(!expected.hashes.is_empty());
+        assert_eq!(actual.hashes, expected.hashes);
+    }
 
     fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(len);

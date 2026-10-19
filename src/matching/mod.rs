@@ -83,10 +83,34 @@ pub struct TimeOffset {
 
 impl TimeOffset {
     /// Build from a frame index offset and a reference frame rate.
+    /// An invalid rate produces a zero millisecond offset. Use
+    /// [`try_from_frames`](Self::try_from_frames) to detect invalid rates or
+    /// millisecond overflow explicitly.
     #[must_use]
     pub fn from_frames(frames: i64, frames_per_sec: f32) -> Self {
+        if !frames_per_sec.is_finite() || frames_per_sec <= 0.0 {
+            return Self { frames, ms: 0 };
+        }
         let ms = (frames as f64 * 1000.0 / frames_per_sec as f64).round() as i64;
         Self { frames, ms }
+    }
+
+    /// Convert frames to milliseconds, rejecting invalid rates and offsets
+    /// outside the signed 64-bit millisecond range.
+    #[must_use]
+    pub fn try_from_frames(frames: i64, frames_per_sec: f32) -> Option<Self> {
+        if !frames_per_sec.is_finite() || frames_per_sec <= 0.0 {
+            return None;
+        }
+        let millis = (frames as f64 * 1000.0 / frames_per_sec as f64).round();
+        if !millis.is_finite() || millis < i64::MIN as f64 || millis >= 9_223_372_036_854_775_808.0
+        {
+            return None;
+        }
+        Some(Self {
+            frames,
+            ms: millis as i64,
+        })
     }
 
     /// The zero offset — query and reference are exactly aligned.
@@ -240,11 +264,18 @@ pub fn match_result_compare_desc(a: &MatchResult, b: &MatchResult) -> Ordering {
     }
 }
 
-/// Clamp a score into `[0.0, 1.0]`.
+/// Clamp a score into `[0.0, 1.0]`. NaN maps to `0.0`.
 #[inline]
 #[must_use]
 pub fn clamp_score(s: f32) -> f32 {
-    s.clamp(0.0, 1.0)
+    if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0) }
+}
+
+/// Compute prominence without panicking on an invalid peak index.
+/// Returns `None` when `peak_idx` is outside `values`.
+#[must_use]
+pub fn try_compute_prominence(values: &[u32], peak_idx: usize) -> Option<f32> {
+    (peak_idx < values.len()).then(|| compute_prominence(values, peak_idx))
 }
 
 /// Compute prominence: `peak / (mean_of_rest + 1.0)`.
@@ -314,6 +345,16 @@ mod tests {
     }
 
     #[test]
+    fn invalid_frame_rate_has_checked_failure_and_no_garbage_milliseconds() {
+        for rate in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(TimeOffset::try_from_frames(20, rate), None);
+            assert_eq!(TimeOffset::from_frames(20, rate).ms, 0);
+        }
+        assert_eq!(TimeOffset::try_from_frames(i64::MAX, 0.001), None);
+        assert_eq!(TimeOffset::try_from_frames(20, 62.5).unwrap().ms, 320);
+    }
+
+    #[test]
     fn match_result_none_is_default() {
         let n = MatchResult::NONE;
         assert!(!n.is_match);
@@ -333,6 +374,7 @@ mod tests {
         assert_eq!(clamp_score(-0.5), 0.0);
         assert_eq!(clamp_score(0.5), 0.5);
         assert_eq!(clamp_score(1.5), 1.0);
+        assert_eq!(clamp_score(f32::NAN), 0.0);
     }
 
     #[test]
@@ -351,6 +393,13 @@ mod tests {
             p < 2.0,
             "expected low prominence for flat histogram, got {p}"
         );
+    }
+
+    #[test]
+    fn checked_prominence_rejects_out_of_range_peak() {
+        assert_eq!(try_compute_prominence(&[], 0), None);
+        assert_eq!(try_compute_prominence(&[3, 5], 2), None);
+        assert_eq!(try_compute_prominence(&[3, 5], 1), Some(1.25));
     }
 
     #[test]

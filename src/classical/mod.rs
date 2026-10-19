@@ -53,6 +53,11 @@ macro_rules! sanitize_cfg {
             $cfg.max_push_samples = Some(1);
         }
         $cfg.target_zone_f = $cfg.target_zone_f.clamp(1, 512);
+        // `f32::clamp` leaves NaN unchanged, which otherwise suppresses
+        // every peak while extraction still returns `Ok`.
+        if $cfg.min_anchor_mag_db.is_nan() {
+            $cfg.min_anchor_mag_db = -50.0;
+        }
         $cfg.min_anchor_mag_db = $cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
     }};
 }

@@ -29,7 +29,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
-use crate::neural::{NeuralEmbedding, NeuralFingerprint};
+use crate::neural::{IdentifiedNeuralFingerprint, NeuralEmbedding, NeuralFingerprint};
 
 /// Aggregation strategy for comparing two embedding sequences.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -69,6 +69,27 @@ pub struct NeuralMatcher {
 }
 
 impl NeuralMatcher {
+    /// Compare fingerprints only when their model and preprocessing IDs agree.
+    /// The existing [`Matcher::match_one`] remains available for legacy data
+    /// without identifiers.
+    pub fn match_identified(
+        &self,
+        query: &IdentifiedNeuralFingerprint,
+        reference: &IdentifiedNeuralFingerprint,
+    ) -> crate::Result<MatchResult> {
+        if query.model_id.is_empty() || reference.model_id.is_empty() {
+            return Err(crate::AfpError::Config(
+                "neural model_id must not be empty".into(),
+            ));
+        }
+        if query.model_id != reference.model_id {
+            return Err(crate::AfpError::Config(
+                "neural fingerprints use different model_id values".into(),
+            ));
+        }
+        Ok(self.match_one(&query.fingerprint, &reference.fingerprint))
+    }
+
     /// Estimated P(same recording | neural evidence): logistic map of the
     /// cosine score anchored at this matcher's own `min_cosine` (the
     /// decision boundary maps to exactly 0.5).
@@ -165,6 +186,8 @@ impl NeuralMatcher {
         let (short, long) = if query_is_short { (q, r) } else { (r, q) };
         let m = short.len();
         let n = long.len();
+        let short_norms = (!assume_norm).then(|| embedding_norms(short));
+        let long_norms = (!assume_norm).then(|| embedding_norms(long));
 
         let mut best_cos = f32::NEG_INFINITY;
         let mut best_j = 0usize;
@@ -174,7 +197,11 @@ impl NeuralMatcher {
         for j in 0..=(n - m) {
             let mut acc = 0.0_f32;
             for i in 0..m {
-                acc += cosine(&short[i].vector, &long[j + i].vector, assume_norm);
+                let d = dot(&short[i].vector, &long[j + i].vector);
+                acc += match (&short_norms, &long_norms) {
+                    (Some(a), Some(b)) => cosine_from_dot(d, a[i], b[j + i]),
+                    _ => d,
+                };
             }
             let mean = acc / m as f32;
             sum_means += mean;
@@ -222,6 +249,8 @@ impl NeuralMatcher {
     ) -> MatchResult {
         let m = q.len();
         let n = r.len();
+        let q_norms = (!assume_norm).then(|| embedding_norms(q));
+        let r_norms = (!assume_norm).then(|| embedding_norms(r));
 
         // Rolling two-row DP. cost = 1 − cosine ∈ [0, 2].
         let mut prev = vec![f32::INFINITY; n + 1];
@@ -231,7 +260,12 @@ impl NeuralMatcher {
         for i in 1..=m {
             curr[0] = f32::INFINITY;
             for j in 1..=n {
-                let dist = 1.0 - cosine(&q[i - 1].vector, &r[j - 1].vector, assume_norm);
+                let d = dot(&q[i - 1].vector, &r[j - 1].vector);
+                let cos = match (&q_norms, &r_norms) {
+                    (Some(a), Some(b)) => cosine_from_dot(d, a[i - 1], b[j - 1]),
+                    _ => d,
+                };
+                let dist = 1.0 - cos;
                 let best_prev = prev[j].min(curr[j - 1]).min(prev[j - 1]);
                 curr[j] = dist + best_prev;
             }
@@ -294,16 +328,15 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     crate::dsp::simd::dot_core(a, b)
 }
 
-/// Cosine similarity. When `assume_norm` is `true` the inputs are taken
-/// to be unit vectors and the dot product is returned directly.
+/// Compute each embedding norm once for sliding and DTW comparisons.
+fn embedding_norms(embs: &[NeuralEmbedding]) -> Vec<f32> {
+    embs.iter()
+        .map(|e| crate::neural::embedder::sumsq_wide(&e.vector).sqrt())
+        .collect()
+}
+
 #[inline]
-fn cosine(a: &[f32], b: &[f32], assume_norm: bool) -> f32 {
-    let d = dot(a, b);
-    if assume_norm {
-        return d;
-    }
-    let na = crate::neural::embedder::sumsq_wide(a).sqrt();
-    let nb = crate::neural::embedder::sumsq_wide(b).sqrt();
+fn cosine_from_dot(d: f32, na: f32, nb: f32) -> f32 {
     if na < 1e-12 || nb < 1e-12 {
         0.0
     } else {
@@ -362,6 +395,20 @@ mod tests {
         assert!((c.min_cosine - 0.80).abs() < 1e-6);
         assert_eq!(c.aggregation, Aggregation::SlidingMax);
         assert!(c.assume_normalized);
+    }
+
+    #[test]
+    fn identified_matching_rejects_different_models_with_same_dimensions() {
+        let matcher = NeuralMatcher::new(NeuralMatchConfig::default());
+        let fingerprint = fp(vec![emb(&[1.0, 0.0], 0)], 2);
+        let a = IdentifiedNeuralFingerprint::new(fingerprint.clone(), "model-a/front-end-1");
+        let b = IdentifiedNeuralFingerprint::new(fingerprint.clone(), "model-b/front-end-1");
+        assert!(matches!(
+            matcher.match_identified(&a, &b),
+            Err(crate::AfpError::Config(_))
+        ));
+        let same = IdentifiedNeuralFingerprint::new(fingerprint, "model-a/front-end-1");
+        assert!(matcher.match_identified(&a, &same).unwrap().is_match);
     }
 
     #[test]

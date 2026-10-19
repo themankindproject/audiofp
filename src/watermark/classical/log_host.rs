@@ -6,8 +6,11 @@
 //! nothing voted on, or one whose correlation is exactly zero, is an erasure:
 //! it is never read as a 1.
 
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
+
+use num_complex::Complex;
 
 use super::coding::{hard_bits, unframe};
 use super::keying::{ChaCha, derive_key, keyed_bins};
@@ -27,7 +30,7 @@ const BINS_PER_FRAME: usize = 300;
 /// ten tracks, which are also the tracks the recovery figures in the
 /// changelog come from.
 const LOCAL_MEAN_RADIUS: usize = 8;
-/// Correlations [`pick_phase`] keeps alive at once (8 MiB of `f64`). Every
+/// Correlations [`pick_phase_streaming`] keeps alive at once (8 MiB of `f64`). Every
 /// payload up to 124 bytes fits in one pass.
 const PHASE_TABLE_ENTRIES: usize = 1 << 20;
 
@@ -45,19 +48,18 @@ pub(crate) const fn usable_min_samples(n_bits: usize) -> usize {
 
 pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
     let mut stft = ComplexStft::new(N_FFT, HOP);
-    let (mut spec, n_frames) = stft.analyze(samples);
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     let n_bits = bits.len().max(1);
     let n_ord = order.len();
     let chips = chips(key, n_bits, n_ord);
-    for f in 0..n_frames {
+    stft.map_overlap_add(samples, |f, spec| {
         let b = f % n_bits;
         let row = &chips[b * n_ord..(b + 1) * n_ord];
         // Bit 0 flips every chip; the chip itself picks the ±3 dB direction.
         let negate = bits[b] == 0;
         for (i, &bin) in order.iter().enumerate() {
-            let cell = &mut spec[f * nb + bin];
+            let cell = &mut spec[bin];
             let mag = modulus(*cell);
             if mag < 1e-7 {
                 continue;
@@ -70,8 +72,7 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
             let new_mag = (mag * gain).max(1e-7);
             *cell *= new_mag / mag;
         }
-    }
-    stft.synthesize(&spec, n_frames, samples.len())
+    })
 }
 
 /// Detect a payload: correlate against every bit phase, keep the strongest,
@@ -84,23 +85,23 @@ pub(crate) fn detect(samples: &[f32], payload_len: usize, n_bits: usize, key: &[
         return Detection::none();
     }
     let mut stft = ComplexStft::new(N_FFT, HOP);
-    let (spec, n_frames) = stft.analyze(samples);
+    let n_frames = stft.n_frames(samples.len());
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     if n_frames == 0 || order.is_empty() {
         return Detection::none();
     }
     let n_ord = order.len();
-    let mut db = vec![0.0f64; n_frames * n_ord];
-    for f in 0..n_frames {
-        for (i, &bin) in order.iter().enumerate() {
-            let mag = modulus(spec[f * nb + bin]).max(1e-7);
-            db[f * n_ord + i] = f64::from(20.0 * libm::log10f(mag));
-        }
-    }
-    drop(spec);
     let chips = chips(key, n_bits, n_ord);
-    pick_phase(&db, n_frames, n_bits, &chips, payload_len)
+    pick_phase_streaming(
+        &mut stft,
+        samples,
+        n_frames,
+        n_bits,
+        &order,
+        &chips,
+        payload_len,
+    )
 }
 
 /// One ±1 chip row per bit, drawn from that bit's domain-separated stream.
@@ -124,11 +125,130 @@ fn log_order(key: &[u8], nb: usize) -> Vec<usize> {
     keyed_bins(key, b"log-host-bins", BIN_LO, bin_hi, BINS_PER_FRAME)
 }
 
+/// Sliding host estimate backed by at most 18 spectral rows. The old
+/// detector retained the complete spectrogram, dB matrix and residual
+/// matrix, making memory grow by gigabytes on long recordings.
+struct StreamingLocalMean<'a> {
+    stft: &'a mut ComplexStft,
+    samples: &'a [f32],
+    order: &'a [usize],
+    n_frames: usize,
+    spectrum: Vec<Complex<f32>>,
+    rows: VecDeque<Vec<f64>>,
+    spare: Option<Vec<f64>>,
+    window: Vec<f64>,
+    lo: usize,
+    hi: usize,
+}
+
+impl<'a> StreamingLocalMean<'a> {
+    fn new(
+        stft: &'a mut ComplexStft,
+        samples: &'a [f32],
+        order: &'a [usize],
+        n_frames: usize,
+    ) -> Self {
+        let n_bins = stft.n_bins();
+        Self {
+            stft,
+            samples,
+            order,
+            n_frames,
+            spectrum: vec![Complex::new(0.0, 0.0); n_bins],
+            rows: VecDeque::with_capacity(2 * LOCAL_MEAN_RADIUS + 2),
+            spare: None,
+            window: vec![0.0; order.len()],
+            lo: 0,
+            hi: 0,
+        }
+    }
+
+    fn residual(&mut self, f: usize, out: &mut [f64]) {
+        let want_hi = (f + LOCAL_MEAN_RADIUS + 1).min(self.n_frames);
+        while self.hi < want_hi {
+            self.stft
+                .analyze_frame(self.samples, self.hi, &mut self.spectrum);
+            let mut row = self
+                .spare
+                .take()
+                .unwrap_or_else(|| vec![0.0; self.order.len()]);
+            for ((d, &bin), sum) in row.iter_mut().zip(self.order).zip(&mut self.window) {
+                let mag = modulus(self.spectrum[bin]).max(1e-7);
+                *d = f64::from(20.0 * libm::log10f(mag));
+                *sum += *d;
+            }
+            self.rows.push_back(row);
+            self.hi += 1;
+        }
+        let want_lo = f.saturating_sub(LOCAL_MEAN_RADIUS);
+        while self.lo < want_lo {
+            let row = self
+                .rows
+                .pop_front()
+                .expect("sliding window contains old row");
+            for (sum, &d) in self.window.iter_mut().zip(&row) {
+                *sum -= d;
+            }
+            self.spare = Some(row);
+            self.lo += 1;
+        }
+        let current = &self.rows[f - self.lo];
+        let count = (self.hi - self.lo) as f64;
+        for ((r, &d), &sum) in out.iter_mut().zip(current).zip(&self.window) {
+            *r = d - sum / count;
+        }
+    }
+}
+
+/// Correlate all phases in bounded blocks while producing host residuals
+/// from a reusable FFT and a short sliding spectral window.
+fn pick_phase_streaming(
+    stft: &mut ComplexStft,
+    samples: &[f32],
+    n_frames: usize,
+    n_bits: usize,
+    order: &[usize],
+    chips: &[f32],
+    payload_len: usize,
+) -> Detection {
+    let n_ord = order.len();
+    let block = (PHASE_TABLE_ENTRIES / n_bits).clamp(1, n_bits);
+    let mut table = vec![0.0f64; block * n_bits];
+    let mut residual = vec![0.0f64; n_ord];
+    let mut strongest = Strongest::new();
+    for first in (0..n_bits).step_by(block) {
+        let phases = first..(first + block).min(n_bits);
+        table.fill(0.0);
+        let mut host = StreamingLocalMean::new(stft, samples, order, n_frames);
+        for f in 0..n_frames {
+            host.residual(f, &mut residual);
+            if residual.iter().all(|&r| r == 0.0) {
+                continue;
+            }
+            for p in phases.clone() {
+                let b = (f + p) % n_bits;
+                let row = &chips[b * n_ord..(b + 1) * n_ord];
+                let c: f64 = residual
+                    .iter()
+                    .zip(row)
+                    .map(|(&r, &chip)| r * f64::from(chip))
+                    .sum();
+                table[(p - first) * n_bits + b] += c;
+            }
+        }
+        for p in phases {
+            strongest.offer(p, &table[(p - first) * n_bits..(p - first + 1) * n_bits]);
+        }
+    }
+    strongest.decode(payload_len)
+}
+
 /// Per-bin mean of the log-magnitudes over the frames within
 /// [`LOCAL_MEAN_RADIUS`] of the frame being read, frames clipped to the clip.
 ///
 /// The window slides: `residual` must be asked for frames in non-decreasing
 /// order, and each call only adds and drops the frames that moved in or out.
+#[cfg(test)]
 struct LocalMean<'a> {
     /// `(n_frames, n_ord)`, row-major.
     db: &'a [f64],
@@ -140,6 +260,7 @@ struct LocalMean<'a> {
     hi: usize,
 }
 
+#[cfg(test)]
 impl<'a> LocalMean<'a> {
     fn new(db: &'a [f64], n_frames: usize, n_ord: usize) -> Self {
         Self {
@@ -187,6 +308,7 @@ impl<'a> LocalMean<'a> {
 /// A frame carries a different bit from its neighbours, so the mark largely
 /// averages out of the local mean while the host's own spectral drift stays
 /// in it.
+#[cfg(test)]
 fn pick_phase(
     db: &[f64],
     n_frames: usize,
@@ -211,6 +333,7 @@ fn pick_phase(
 /// numbers, which is nothing for a few bytes of payload and gigabytes for a
 /// few kilobytes, so the phases are taken in blocks that fit. The work is the
 /// same: each (frame, phase) pair is correlated once, whatever the blocks.
+#[cfg(test)]
 fn pick_phase_in_blocks(
     db: &[f64],
     n_frames: usize,
@@ -327,6 +450,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn streaming_spectrum_and_host_residual_match_materialized_path() {
+        let samples = noise(N_FFT + 40 * HOP);
+        let mut stft = ComplexStft::new(N_FFT, HOP);
+        let n_frames = stft.n_frames(samples.len());
+        let order = log_order(KEY, stft.n_bins());
+        let mut spectrum = vec![Complex::new(0.0, 0.0); stft.n_bins()];
+        let mut db = vec![0.0f64; n_frames * order.len()];
+        for (f, row) in db.chunks_exact_mut(order.len()).enumerate() {
+            stft.analyze_frame(&samples, f, &mut spectrum);
+            for (d, &bin) in row.iter_mut().zip(&order) {
+                *d = f64::from(20.0 * libm::log10f(modulus(spectrum[bin]).max(1e-7)));
+            }
+        }
+        let mut old = LocalMean::new(&db, n_frames, order.len());
+        let mut streaming = StreamingLocalMean::new(&mut stft, &samples, &order, n_frames);
+        let mut expected = vec![0.0; order.len()];
+        let mut actual = vec![0.0; order.len()];
+        for f in 0..n_frames {
+            old.residual(f, &mut expected);
+            streaming.residual(f, &mut actual);
+            assert_eq!(actual, expected, "frame {f}");
+            assert!(streaming.rows.len() <= 2 * LOCAL_MEAN_RADIUS + 2);
+        }
     }
 
     #[test]

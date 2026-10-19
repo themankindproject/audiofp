@@ -126,6 +126,27 @@ impl StreamingNeuralEmbedder {
         Ok(out)
     }
 
+    /// Feed the whole chunk or reject it before modifying stream state.
+    /// This checks `max_push_samples` and nonfinite PCM before inference;
+    /// the legacy [`try_push`](Self::try_push) retains its truncation and
+    /// sanitization behavior for existing callers.
+    pub fn try_push_checked(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>> {
+        crate::pcm::reject_oversized_push(samples, self.core.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.try_push(samples)
+    }
+
+    /// Callback variant of [`try_push_checked`](Self::try_push_checked).
+    pub fn try_push_with_checked<F: FnMut(TimestampMs, &[f32])>(
+        &mut self,
+        samples: &[f32],
+        callback: F,
+    ) -> Result<usize> {
+        crate::pcm::reject_oversized_push(samples, self.core.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.try_push_with(samples, callback)
+    }
+
     /// Zero-allocation streaming variant: feed PCM and invoke
     /// `callback(t_start, &embedding)` for each embedding that becomes
     /// available. The embedding slice borrows the embedder's internal
@@ -137,8 +158,7 @@ impl StreamingNeuralEmbedder {
     /// runtime still allocates per inference call (input tensor and tract
     /// `run` internals), so this is **not** a whole-path zero-allocation
     /// guarantee — see [`ZeroAllocStreaming`](crate::ZeroAllocStreaming). The sample carry
-    /// grows only when a push larger than one analysis window arrives
-    /// (amortised `O(1)` per sample).
+    /// is bounded to a few analysis windows even for a very large push.
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -155,40 +175,40 @@ impl StreamingNeuralEmbedder {
         mut callback: F,
     ) -> Result<usize> {
         let samples = crate::pcm::truncate_push(samples, self.core.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let sr = self.core.cfg.sample_rate as u64;
         let mut emitted = 0usize;
 
-        while self.sample_carry.len() - self.carry_read >= window_samples {
-            // Disjoint borrow: `sample_carry` (immutable), `core` (mutable),
-            // and `embedding_scratch` (mutable) are different fields of
-            // `self`, so this is sound under Rust 2024's borrow rules.
-            let embed_result = {
-                let window = &self.sample_carry[self.carry_read..self.carry_read + window_samples];
-                self.core
-                    .embed_window_into(window, &mut self.embedding_scratch)
-            };
-            if let Err(e) = embed_result {
-                // Preserve the "committed samples are drained" contract:
-                // compact past everything the successful iterations took.
-                self.compact_carry();
-                return Err(e);
+        // Bound the carry even when a caller pushes a very large buffer.
+        // Chunk boundaries do not affect window positions or timestamps.
+        for chunk in samples.chunks(window_samples.saturating_mul(4).max(1)) {
+            crate::pcm::extend_sanitized(&mut self.sample_carry, chunk);
+            while self.sample_carry.len() - self.carry_read >= window_samples {
+                // Disjoint borrow: `sample_carry` (immutable), `core` (mutable),
+                // and `embedding_scratch` (mutable) are different fields of
+                // `self`, so this is sound under Rust 2024's borrow rules.
+                let embed_result = {
+                    let window =
+                        &self.sample_carry[self.carry_read..self.carry_read + window_samples];
+                    self.core
+                        .embed_window_into(window, &mut self.embedding_scratch)
+                };
+                if let Err(e) = embed_result {
+                    // Preserve the "committed samples are drained" contract:
+                    // compact past everything the successful iterations took.
+                    self.compact_carry();
+                    return Err(e);
+                }
+                let t_start = TimestampMs(self.samples_consumed * 1000 / sr);
+                callback(t_start, &self.embedding_scratch);
+                emitted += 1;
+
+                self.carry_read += hop_samples;
+                self.samples_consumed += hop_samples as u64;
             }
-            let t_start = TimestampMs(self.samples_consumed * 1000 / sr);
-            callback(t_start, &self.embedding_scratch);
-            emitted += 1;
-
-            // Advance the cursor past the hop we've now committed to; the
-            // remainder becomes the prefix of the next window. The carry
-            // stays strictly bounded — never larger than
-            // `window_samples + max_push - hop_samples` after compaction.
-            self.carry_read += hop_samples;
-            self.samples_consumed += hop_samples as u64;
+            self.compact_carry();
         }
-
-        self.compact_carry();
 
         Ok(emitted)
     }

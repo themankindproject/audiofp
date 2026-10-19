@@ -779,17 +779,17 @@ BER(δ) = hamming(query, reference aligned at δ) / (overlap(δ) · 32)
   `use_lut = false`.
 - **Sub-fingerprint LUT** — for larger references, build
   `frame_u32 → [positions]` over reference frames and probe each query
-  frame's exact value (plus optional 1–2 bit-flip neighbours). Haitsma's
-  key property: at BER < ~0.35 at least one query frame is bit-exact, so
-  the probes discover the true offset(s), which are then verified with the
-  exact BER path. `O(Q + candidates·overlap)` instead of `O(Q·R)`.
+  frame's exact value (plus optional 1–2 bit-flip neighbours). Discovered
+  offsets are verified with exact BER. A low overall BER alone does not
+  guarantee any bit-exact frame. The lookup costs
+  `O(Q + candidates·overlap)` instead of `O(Q·R)`.
 
 **Selection and pruning are BER-normalised.** The running best is compared
 by *rate*, not absolute Hamming totals, and the early-abort bound passed to
 each candidate is `best_BER × overlap × 32` — a short-overlap candidate with
 a small raw total but worse rate can no longer suppress a longer
-better-rate alignment. BER ties keep the first-found candidate; the exact
-path scans δ ascending, so ties resolve to the smallest offset.
+better-rate alignment. BER ties prefer more overlapping frames, then the
+offset closest to zero.
 
 **Decision:** `is_match = BER ≤ max_ber (0.35) && overlap ≥
 min_overlap_frames (256)`. `score = 1 − BER`. Prominence samples ~40 offsets
@@ -811,8 +811,9 @@ pub struct HaitsmaMatchConfig {
 > **Recall caveat for the LUT path.** With `probe_bit_flips = 0` the LUT only
 > discovers an alignment when at least one query frame is *bit-exactly*
 > present in the reference. Under codec noise this can miss a match the
-> exhaustive path would find. Raise `probe_bit_flips`, or set `use_lut =
-> false`, when matching noisy queries.
+> exhaustive path would find. Raise `probe_bit_flips`, set `use_lut =
+> false`, or call `match_one_with_fallback` when matching noisy queries. The
+> fallback retries a failed fast match with exhaustive BER search.
 
 ```rust
 use audiofp::classical::HaitsmaFingerprint;
@@ -1560,14 +1561,18 @@ offset  size  field
 18      …     payload     bytemuck-cast Pod hash structs, packed
 ```
 
-The payload is the raw `#[repr(C)]` little-endian representation of each
-hash struct (`WangHash` = 8 bytes, `PanakoHash` = 16 bytes, Haitsma frame =
-4 bytes). On little-endian hosts deserialisation is a single aligned copy.
+The v1 payload is the raw `#[repr(C)]` **native-endian** representation of
+each hash struct (`WangHash` = 8 bytes, `PanakoHash` = 16 bytes, Haitsma
+frame = 4 bytes). It is portable between little-endian hosts, but do not
+exchange v1 blobs between machines with different byte orders. The v2
+format below writes every payload field in little-endian order.
 
 **Validation on read:** wrong magic, unsupported version, algorithm-ID
 mismatch, truncated payload (`checked_mul` sizing — no 32-bit wrap), and
 non-finite / non-positive `fps` all return `AfpError::Deserialize`. Trailing
 bytes after the payload are ignored (forward compatibility).
+`from_bytes_strict` additionally requires the built-in algorithm's canonical
+frame rate; `from_bytes` keeps its existing permissive behavior.
 
 ### Usage
 
@@ -1607,6 +1612,30 @@ fn main() {
     assert_eq!(peeked.frames_per_sec, 62.5);
 }
 ```
+
+### Portable format with extractor provenance (v2)
+
+Use v2 when fingerprints cross machine boundaries or extraction settings
+must be checked before matching. It has a 40-byte little-endian header with
+the algorithm ID, frame rate, count, 128-bit configuration ID, and producer
+crate version. Payload fields are little-endian on every host. V1 readers and
+writers continue to use the original format.
+
+```rust
+use audiofp::classical::{WangConfig, WangFingerprint};
+
+let config = WangConfig::default();
+let fp = WangFingerprint { hashes: Vec::new(), frames_per_sec: 62.5 };
+let bytes = fp.to_bytes_with_config(&config).unwrap();
+let provenance = audiofp::serial_v2::FingerprintProvenance::peek(&bytes).unwrap();
+assert_eq!(provenance.config_id, config.compatibility_id());
+let restored = WangFingerprint::from_bytes_with_config(&bytes, &config).unwrap();
+assert!(restored.hashes.is_empty());
+```
+
+Pass the config used to create the extractor. Fingerprint values do not
+retain that config. The ID includes settings and caps that can change output;
+an input-size cap that only rejects a call does not change the ID.
 
 ### `FingerprintEnvelope`
 
@@ -2716,7 +2745,7 @@ Default = `[]` (no_std + alloc, no codecs):
 
 | Feature      | Brings in                                                                    |
 | ------------ | ---------------------------------------------------------------------------- |
-| `std`        | Symphonia itself, no codecs; also enables `audiofp::cache` (`.afp` fingerprint files). Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
+| `std`        | Standard-library cache and I/O error support, with no Symphonia dependency. `audiofp::io` is available when a `std-*` codec feature is enabled. |
 | `std-mp3`    | MP3 (`symphonia/mp3`)                                                        |
 | `std-aac`    | raw AAC (`symphonia/aac`)                                                    |
 | `std-flac`   | FLAC (`symphonia/flac`)                                                      |

@@ -32,7 +32,7 @@
 //! ```
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, WangFingerprint};
@@ -107,6 +107,29 @@ impl CachedFingerprint {
         }
     }
 
+    fn from_file(path: &Path, file: &mut File, cap: u64) -> Result<Self> {
+        checked_cache_len(path, file, cap)?;
+        let mut header = [0u8; crate::serial::HEADER_SIZE];
+        file.read_exact(&mut header).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                AfpError::Deserialize(format!("{}: short fingerprint header", path.display()))
+            } else {
+                AfpError::io_with_path(path, e)
+            }
+        })?;
+        let algorithm = crate::serial::FingerprintEnvelope::peek(&header)?.algorithm;
+        file.rewind().map_err(|e| AfpError::io_with_path(path, e))?;
+        match algorithm {
+            "wang-v1" => WangFingerprint::read_cache_from(path, file, cap).map(Self::Wang),
+            "panako-v2" => PanakoFingerprint::read_cache_from(path, file, cap).map(Self::Panako),
+            "haitsma-v1" => HaitsmaFingerprint::read_cache_from(path, file, cap).map(Self::Haitsma),
+            other => Err(AfpError::Deserialize(format!(
+                "{}: unknown algorithm tag: {other}",
+                path.display()
+            ))),
+        }
+    }
+
     /// The envelope of the cached fingerprint.
     #[must_use]
     pub fn envelope(&self) -> crate::serial::FingerprintEnvelope {
@@ -129,6 +152,19 @@ pub trait CacheableFingerprint: Sized {
     /// `AfpError::Deserialize` on any blob defect (inherited from
     /// `from_bytes`).
     fn from_cache_bytes(bytes: &[u8]) -> Result<Self>;
+
+    /// Write v1 bytes to a stream. Built-in fingerprints avoid a full blob
+    /// allocation; third-party implementations retain the existing default.
+    fn write_cache_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        writer.write_all(&self.to_cache_bytes())
+    }
+
+    /// Read from a checked file handle. Built-in fingerprints parse in
+    /// bounded blocks; third-party implementations retain the v1 default.
+    fn read_cache_from(path: &Path, file: &mut File, cap: u64) -> Result<Self> {
+        let bytes = read_handle_with_limit(path, file, cap)?;
+        Self::from_cache_bytes(&bytes)
+    }
 }
 
 impl CacheableFingerprint for WangFingerprint {
@@ -137,6 +173,21 @@ impl CacheableFingerprint for WangFingerprint {
     }
     fn from_cache_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_bytes(bytes)
+    }
+    fn write_cache_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        crate::serial::write_pod_blob(
+            writer,
+            &self.hashes,
+            crate::serial::ALG_WANG,
+            self.frames_per_sec,
+        )
+    }
+    fn read_cache_from(path: &Path, file: &mut File, cap: u64) -> Result<Self> {
+        let (hashes, frames_per_sec) = read_pod_cache(path, file, cap, crate::serial::ALG_WANG)?;
+        Ok(Self {
+            hashes,
+            frames_per_sec,
+        })
     }
 }
 
@@ -147,6 +198,21 @@ impl CacheableFingerprint for PanakoFingerprint {
     fn from_cache_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_bytes(bytes)
     }
+    fn write_cache_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        crate::serial::write_pod_blob(
+            writer,
+            &self.hashes,
+            crate::serial::ALG_PANAKO,
+            self.frames_per_sec,
+        )
+    }
+    fn read_cache_from(path: &Path, file: &mut File, cap: u64) -> Result<Self> {
+        let (hashes, frames_per_sec) = read_pod_cache(path, file, cap, crate::serial::ALG_PANAKO)?;
+        Ok(Self {
+            hashes,
+            frames_per_sec,
+        })
+    }
 }
 
 impl CacheableFingerprint for HaitsmaFingerprint {
@@ -156,18 +222,34 @@ impl CacheableFingerprint for HaitsmaFingerprint {
     fn from_cache_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_bytes(bytes)
     }
+    fn write_cache_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        crate::serial::write_pod_blob(
+            writer,
+            &self.frames,
+            crate::serial::ALG_HAITSMA,
+            self.frames_per_sec,
+        )
+    }
+    fn read_cache_from(path: &Path, file: &mut File, cap: u64) -> Result<Self> {
+        let (frames, frames_per_sec) = read_pod_cache(path, file, cap, crate::serial::ALG_HAITSMA)?;
+        Ok(Self {
+            frames,
+            frames_per_sec,
+        })
+    }
 }
 
 /// Optional aggregate limits for directory cache ingestion.
 ///
 /// Per-file size is always capped by [`MAX_CACHE_FILE_BYTES`]; these
-/// options bound how many files and how many total payload bytes a bulk
+/// options bound how many files and how many total on-disk bytes a bulk
 /// scan may retain in memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheLoadLimits {
     /// Stop after this many `.afp` files. `None` means no file-count cap.
     pub max_files: Option<usize>,
-    /// Stop after this many bytes of successfully loaded payload. `None`
+    /// Stop after this many bytes of successfully loaded cache files,
+    /// including headers and any trailing extension bytes. `None`
     /// means no aggregate byte cap.
     pub max_total_bytes: Option<u64>,
 }
@@ -252,16 +334,12 @@ fn open_cache_file_for_read(path: &Path) -> Result<File> {
     }
 }
 
-/// Read up to [`MAX_CACHE_FILE_BYTES`] from an already-opened regular file.
-///
-/// Metadata comes from the opened handle (not a separate path stat), and
-/// the read is capped to `MAX + 1` bytes so growth/substitution after
-/// open cannot force an unbounded allocation.
-fn read_bounded_from_handle(path: &Path, file: &mut File) -> Result<Vec<u8>> {
-    read_handle_with_limit(path, file, MAX_CACHE_FILE_BYTES)
+fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<u8>> {
+    checked_cache_len(path, file, cap)?;
+    read_limited(path, file, cap)
 }
 
-fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<u8>> {
+fn checked_cache_len(path: &Path, file: &File, cap: u64) -> Result<u64> {
     let meta = file
         .metadata()
         .map_err(|e| AfpError::io_with_path(path, e))?;
@@ -290,7 +368,67 @@ fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<
             provided: usize::try_from(meta.len()).unwrap_or(usize::MAX),
         });
     }
-    read_limited(path, file, cap)
+    Ok(meta.len())
+}
+
+/// Parse a built-in v1 payload into its final typed allocation in fixed
+/// blocks, avoiding a second allocation proportional to file size.
+fn read_pod_cache<T: bytemuck::Pod>(
+    path: &Path,
+    file: &mut File,
+    cap: u64,
+    alg_id: u8,
+) -> Result<(Vec<T>, f32)> {
+    let file_len = checked_cache_len(path, file, cap)?;
+    let mut header = [0u8; crate::serial::HEADER_SIZE];
+    file.read_exact(&mut header).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            AfpError::Deserialize(format!("{}: short fingerprint header", path.display()))
+        } else {
+            AfpError::io_with_path(path, e)
+        }
+    })?;
+    let (_, count, fps) = crate::serial::read_header(&header, Some(alg_id))?;
+    let elem_size = core::mem::size_of::<T>();
+    if elem_size == 0 || elem_size > 64 * 1024 {
+        return Err(AfpError::Deserialize(
+            "unsupported cache element size".into(),
+        ));
+    }
+    let payload_len = (count as usize)
+        .checked_mul(elem_size)
+        .ok_or_else(|| AfpError::Deserialize("fingerprint payload length overflow".into()))?;
+    let required_len = crate::serial::HEADER_SIZE
+        .checked_add(payload_len)
+        .ok_or_else(|| AfpError::Deserialize("fingerprint file length overflow".into()))?;
+    if required_len as u64 > file_len {
+        return Err(AfpError::Deserialize(format!(
+            "{}: payload too short: need {required_len} bytes, got {file_len}",
+            path.display()
+        )));
+    }
+    let mut values = Vec::with_capacity(count as usize);
+    let mut block = [0u8; 64 * 1024];
+    let per_block = block.len() / elem_size;
+    let mut remaining = count as usize;
+    while remaining > 0 {
+        let n = remaining.min(per_block);
+        let bytes = &mut block[..n * elem_size];
+        file.read_exact(bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                AfpError::Deserialize(format!("{}: fingerprint payload truncated", path.display()))
+            } else {
+                AfpError::io_with_path(path, e)
+            }
+        })?;
+        values.extend(
+            bytes
+                .chunks_exact(elem_size)
+                .map(bytemuck::pod_read_unaligned::<T>),
+        );
+        remaining -= n;
+    }
+    Ok((values, fps))
 }
 
 fn read_limited(path: &Path, reader: impl Read, cap: u64) -> Result<Vec<u8>> {
@@ -308,18 +446,6 @@ fn read_limited(path: &Path, reader: impl Read, cap: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read a regular `.afp` file with a size cap and no symlink following.
-///
-/// Shared by [`load_from_cache`], [`load_all_cached`], and
-/// [`iter_cached`]. Rejecting non-regular files (symlinks, FIFOs,
-/// devices) matters because entry points take caller-supplied paths: a
-/// `*.afp` symlink to `/dev/zero` would otherwise make `fs::read`
-/// allocate until the process dies.
-fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
-    let mut file = open_cache_file_for_read(path)?;
-    read_bounded_from_handle(path, &mut file)
-}
-
 /// Write a fingerprint to a `.afp` cache file (the v1 blob).
 ///
 /// Parent directories are **not** created (caller's job) — matching the
@@ -329,7 +455,9 @@ fn read_cache_file(path: &Path) -> Result<Vec<u8>> {
 ///
 /// `AfpError::Io` with the path attached on any filesystem failure.
 pub fn cache_to_file<T: CacheableFingerprint>(fp: &T, path: &Path) -> Result<()> {
-    fs::write(path, fp.to_cache_bytes()).map_err(|e| AfpError::io_with_path(path, e))
+    let mut file = File::create(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    fp.write_cache_to(&mut file)
+        .map_err(|e| AfpError::io_with_path(path, e))
 }
 
 /// RAII guard: removes the temp file on drop unless disarmed after a
@@ -373,7 +501,6 @@ pub fn cache_to_file_atomic<T: CacheableFingerprint>(fp: &T, path: &Path) -> Res
 }
 
 fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u64) -> Result<()> {
-    let bytes = fp.to_cache_bytes();
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -427,7 +554,7 @@ fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u
             .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
     }
 
-    file.write_all(&bytes)
+    fp.write_cache_to(&mut file)
         .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
     file.sync_all()
         .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
@@ -453,8 +580,8 @@ fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u
 /// - `AfpError::InputTooLarge` if the file exceeds [`MAX_CACHE_FILE_BYTES`].
 /// - `AfpError::Deserialize` if the contents are not a valid v1 blob for `T`.
 pub fn load_from_cache<T: CacheableFingerprint>(path: &Path) -> Result<T> {
-    let bytes = read_cache_file(path)?;
-    T::from_cache_bytes(&bytes)
+    let mut file = open_cache_file_for_read(path)?;
+    T::read_cache_from(path, &mut file, MAX_CACHE_FILE_BYTES)
 }
 
 /// Load every `*.afp` file in a directory (non-recursive).
@@ -584,8 +711,10 @@ impl Iterator for CacheDirIter {
             let remaining = max_total.saturating_sub(self.bytes_loaded);
             if remaining == 0 {
                 return Some(Err(AfpError::InputTooLarge {
-                    limit: max_total as usize,
-                    provided: self.bytes_loaded as usize + 1,
+                    limit: usize::try_from(max_total).unwrap_or(usize::MAX),
+                    provided: usize::try_from(self.bytes_loaded)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1),
                 }));
             }
             let meta = match fs::symlink_metadata(&path) {
@@ -594,8 +723,9 @@ impl Iterator for CacheDirIter {
             };
             if meta.is_file() && meta.len() > remaining {
                 return Some(Err(AfpError::InputTooLarge {
-                    limit: max_total as usize,
-                    provided: (self.bytes_loaded + meta.len()) as usize,
+                    limit: usize::try_from(max_total).unwrap_or(usize::MAX),
+                    provided: usize::try_from(self.bytes_loaded.saturating_add(meta.len()))
+                        .unwrap_or(usize::MAX),
                 }));
             }
         }
@@ -606,28 +736,26 @@ impl Iterator for CacheDirIter {
                 max.saturating_sub(self.bytes_loaded)
                     .min(MAX_CACHE_FILE_BYTES)
             });
-        let bytes = match open_cache_file_for_read(&path)
-            .and_then(|mut file| read_handle_with_limit(&path, &mut file, cap))
-        {
-            Ok(b) => b,
+        let (fp, file_len) = match open_cache_file_for_read(&path)
+            .and_then(|mut file| {
+                let file_len = checked_cache_len(&path, &file, cap)?;
+                let fp = CachedFingerprint::from_file(&path, &mut file, cap)?;
+                Ok((fp, file_len))
+            })
+            .map_err(|e| match e {
+                AfpError::Deserialize(msg) => {
+                    AfpError::Deserialize(format!("{}: {msg}", path.display()))
+                }
+                AfpError::InputTooLarge { limit, provided } => AfpError::Deserialize(format!(
+                    "{}: payload exceeds limit (limit {limit}, provided {provided})",
+                    path.display()
+                )),
+                other => other,
+            }) {
+            Ok(result) => result,
             Err(e) => return Some(Err(e)),
         };
-        // The actual read above is capped to the remaining total budget,
-        // even if the file grows after metadata is inspected.
-        let fp = match CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
-            AfpError::Deserialize(msg) => {
-                AfpError::Deserialize(format!("{}: {msg}", path.display()))
-            }
-            AfpError::InputTooLarge { limit, provided } => AfpError::Deserialize(format!(
-                "{}: payload exceeds limit (limit {limit}, provided {provided})",
-                path.display()
-            )),
-            other => other,
-        }) {
-            Ok(fp) => fp,
-            Err(e) => return Some(Err(e)),
-        };
-        self.bytes_loaded += bytes.len() as u64;
+        self.bytes_loaded = self.bytes_loaded.saturating_add(file_len);
         self.files_loaded += 1;
         Some(Ok((path, fp)))
     }
@@ -637,6 +765,33 @@ impl Iterator for CacheDirIter {
 mod tests {
     use super::*;
     use crate::classical::{WangFingerprint, WangHash};
+
+    #[test]
+    fn streamed_builtin_writes_are_byte_identical_to_v1_blobs() {
+        let wang = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0x1234_5678,
+                t_anchor: 42,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let panako = PanakoFingerprint {
+            hashes: vec![],
+            frames_per_sec: 62.5,
+        };
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![0xAABB_CCDD, 0x0123_4567],
+            frames_per_sec: 78.125,
+        };
+        fn assert_same<T: CacheableFingerprint>(fp: &T) {
+            let mut actual = Vec::new();
+            fp.write_cache_to(&mut actual).unwrap();
+            assert_eq!(actual, fp.to_cache_bytes());
+        }
+        assert_same(&wang);
+        assert_same(&panako);
+        assert_same(&haitsma);
+    }
 
     /// Unique temp dir per test, cleaned up on drop.
     struct TempDir(std::path::PathBuf);

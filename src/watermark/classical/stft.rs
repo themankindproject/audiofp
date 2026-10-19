@@ -62,71 +62,87 @@ impl ComplexStft {
         }
     }
 
-    /// Analyse into a flat `(n_frames, n_bins)` complex spectrogram.
-    pub(crate) fn analyze(&mut self, samples: &[f32]) -> (Vec<Complex<f32>>, usize) {
-        let n_frames = self.n_frames(samples.len());
-        let nb = self.n_bins();
-        let n = samples.len() as isize;
-        let center = (self.n_fft / 2) as isize;
-        let mut out = vec![Complex::new(0.0, 0.0); n_frames * nb];
-        for f in 0..n_frames {
-            let start = f as isize * self.hop as isize - center;
-            for k in 0..self.n_fft {
-                let idx = start + k as isize;
-                let s = if idx < 0 || idx >= n {
-                    0.0
-                } else {
-                    samples[idx as usize]
-                };
-                self.buf[k] = Complex::new(s * self.win[k], 0.0);
-            }
-            self.fwd
-                .process_with_scratch(&mut self.buf, &mut self.scratch);
-            out[f * nb..(f + 1) * nb].copy_from_slice(&self.buf[..nb]);
-        }
-        (out, n_frames)
+    /// Analyse one centred frame into caller-owned spectral scratch.
+    pub(crate) fn analyze_frame(
+        &mut self,
+        samples: &[f32],
+        frame: usize,
+        out: &mut [Complex<f32>],
+    ) {
+        debug_assert_eq!(out.len(), self.n_bins());
+        self.analyze_frame_in_place(samples, frame);
+        out.copy_from_slice(&self.buf[..self.n_bins()]);
     }
 
-    /// Reconstruct `n_samples` from a spectrogram produced by [`Self::analyze`].
-    pub(crate) fn synthesize(
+    fn analyze_frame_in_place(&mut self, samples: &[f32], frame: usize) {
+        let n = samples.len() as isize;
+        let start = frame as isize * self.hop as isize - (self.n_fft / 2) as isize;
+        for k in 0..self.n_fft {
+            let idx = start + k as isize;
+            let s = if idx < 0 || idx >= n {
+                0.0
+            } else {
+                samples[idx as usize]
+            };
+            self.buf[k] = Complex::new(s * self.win[k], 0.0);
+        }
+        self.fwd
+            .process_with_scratch(&mut self.buf, &mut self.scratch);
+    }
+
+    /// Map each half-spectrum and reconstruct with bounded overlap scratch.
+    /// Frame order and per-sample summation order follow the original
+    /// complete-spectrogram overlap-add path.
+    pub(crate) fn map_overlap_add(
         &mut self,
-        spec: &[Complex<f32>],
-        n_frames: usize,
-        n_samples: usize,
+        samples: &[f32],
+        mut map: impl FnMut(usize, &mut [Complex<f32>]),
     ) -> Vec<f32> {
+        let n_frames = self.n_frames(samples.len());
         let nb = self.n_bins();
-        let center = (self.n_fft / 2) as isize;
-        let total = n_samples as isize + 2 * center;
-        let mut acc = vec![0.0f64; total as usize];
-        let mut wsum = vec![0.0f64; total as usize];
+        let center = self.n_fft / 2;
+        let end = center + samples.len();
+        let mut acc = vec![0.0f64; self.n_fft];
+        let mut wsum = vec![0.0f64; self.n_fft];
+        let mut out = vec![0.0f32; samples.len()];
         let scale = 1.0 / self.n_fft as f32;
+        let mut finalized = 0usize;
 
         for f in 0..n_frames {
-            for k in 0..nb {
-                self.buf[k] = spec[f * nb + k];
-            }
+            self.analyze_frame_in_place(samples, f);
+            map(f, &mut self.buf[..nb]);
             for k in nb..self.n_fft {
-                self.buf[k] = spec[f * nb + (self.n_fft - k)].conj();
+                self.buf[k] = self.buf[self.n_fft - k].conj();
             }
             self.inv
                 .process_with_scratch(&mut self.buf, &mut self.scratch);
-            let start = f as isize * self.hop as isize;
+            let start = f * self.hop;
             for k in 0..self.n_fft {
-                let p = start + k as isize;
-                if p < 0 || p >= total {
-                    continue;
-                }
+                let p = start + k;
+                let slot = p % self.n_fft;
                 let w = f64::from(self.win[k]);
-                acc[p as usize] += f64::from(self.buf[k].re) * f64::from(scale) * w;
-                wsum[p as usize] += w * w;
+                acc[slot] += f64::from(self.buf[k].re) * f64::from(scale) * w;
+                wsum[slot] += w * w;
+            }
+            // The next frame starts at `(f + 1) * hop`; every earlier
+            // padded position has received its last contribution.
+            let ready = (start + self.hop).min(end);
+            while finalized < ready {
+                let slot = finalized % self.n_fft;
+                if finalized >= center && wsum[slot] > 1e-8 {
+                    out[finalized - center] = (acc[slot] / wsum[slot]) as f32;
+                }
+                acc[slot] = 0.0;
+                wsum[slot] = 0.0;
+                finalized += 1;
             }
         }
-        let mut out = vec![0.0f32; n_samples];
-        for (i, sample) in out.iter_mut().enumerate() {
-            let p = (i as isize + center) as usize;
-            if wsum[p] > 1e-8 {
-                *sample = (acc[p] / wsum[p]) as f32;
+        while finalized < end {
+            let slot = finalized % self.n_fft;
+            if finalized >= center && wsum[slot] > 1e-8 {
+                out[finalized - center] = (acc[slot] / wsum[slot]) as f32;
             }
+            finalized += 1;
         }
         out
     }

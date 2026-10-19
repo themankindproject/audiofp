@@ -208,6 +208,16 @@ impl Wang {
         );
         Self { cfg, frontend }
     }
+
+    /// Build a Wang extractor, rejecting nonfinite magnitude thresholds.
+    /// The infallible [`new`](Self::new) keeps its existing clamping API and
+    /// substitutes the default threshold when given NaN.
+    pub fn try_new(cfg: WangConfig) -> Result<Self> {
+        if !cfg.min_anchor_mag_db.is_finite() {
+            return Err(AfpError::Config("min_anchor_mag_db must be finite".into()));
+        }
+        Ok(Self::new(cfg))
+    }
 }
 
 /// Progress callback reporting interval for Wang/Panako (62.5 fps):
@@ -486,10 +496,38 @@ impl StreamingWang {
         }
     }
 
+    /// Build a streaming Wang extractor, rejecting nonfinite magnitude thresholds.
+    pub fn try_new(cfg: WangConfig) -> Result<Self> {
+        if !cfg.min_anchor_mag_db.is_finite() {
+            return Err(AfpError::Config("min_anchor_mag_db must be finite".into()));
+        }
+        Ok(Self::new(cfg))
+    }
+
     /// Borrow the configuration this stream was built with.
     #[must_use]
     pub fn config(&self) -> &WangConfig {
         &self.cfg
+    }
+
+    /// Feed a complete chunk or return an error before changing stream state.
+    /// Unlike the legacy [`push`](StreamingFingerprinter::push), this rejects
+    /// a chunk over `max_push_samples` and nonfinite PCM instead of dropping
+    /// or replacing samples.
+    pub fn push_checked(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, WangHash)>> {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push(samples)
+    }
+
+    /// Callback variant of [`push_checked`](Self::push_checked).
+    pub fn push_with_checked<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
+    where
+        F: FnMut(TimestampMs, &WangHash),
+    {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push_with(samples, callback)
     }
 
     /// Reset all internal state. The stream behaves as if freshly
@@ -665,6 +703,74 @@ mod tests {
     use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
+
+    #[test]
+    fn nan_peak_floor_is_safe_and_fallible_constructor_rejects_it() {
+        let bad = WangConfig {
+            min_anchor_mag_db: f32::NAN,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Wang::try_new(bad.clone()),
+            Err(AfpError::Config(_))
+        ));
+        assert!(matches!(
+            StreamingWang::try_new(bad.clone()),
+            Err(AfpError::Config(_))
+        ));
+        let audio = synthetic_audio(7, 40_000);
+        let mut safe = Wang::new(bad);
+        let mut default = Wang::default();
+        let expected = default.extract(&audio, SampleRate::HZ_8000).unwrap();
+        let actual = safe.extract(&audio, SampleRate::HZ_8000).unwrap();
+        assert!(!expected.hashes.is_empty());
+        assert_eq!(actual.hashes, expected.hashes);
+    }
+
+    #[test]
+    fn checked_push_rejects_bad_chunk_without_advancing_stream() {
+        let cfg = WangConfig {
+            max_push_samples: Some(512),
+            ..Default::default()
+        };
+        let mut checked = StreamingWang::new(cfg.clone());
+        let mut fresh = StreamingWang::new(cfg);
+        assert!(matches!(
+            checked.push_checked(&vec![0.0; 513]),
+            Err(AfpError::InputTooLarge { .. })
+        ));
+        assert!(matches!(
+            checked.push_checked(&[f32::NAN]),
+            Err(AfpError::NonFiniteSample { index: 0 })
+        ));
+        let audio = synthetic_audio(41, 8_000);
+        for chunk in audio.chunks(512) {
+            assert_eq!(
+                checked.push_checked(chunk).unwrap(),
+                fresh.push(chunk).unwrap()
+            );
+        }
+        assert_eq!(
+            checked.flush_complete().unwrap(),
+            fresh.flush_complete().unwrap()
+        );
+    }
+
+    #[test]
+    fn large_push_keeps_carry_bounded_and_matches_chunked_output() {
+        let audio = synthetic_audio(17, 100_000);
+        let mut whole = StreamingWang::default();
+        let mut chunked = StreamingWang::default();
+        let mut a = whole.push(&audio).unwrap();
+        a.extend(whole.flush_complete().unwrap());
+        let mut b = Vec::new();
+        for chunk in audio.chunks(2_113) {
+            b.extend(chunked.push(chunk).unwrap());
+        }
+        b.extend(chunked.flush_complete().unwrap());
+        assert_eq!(a, b);
+        assert!(whole.core.sample_carry.capacity() <= WANG_N_FFT * 8);
+    }
 
     fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
         // Two-tone with low-amplitude noise: stable across runs (no rng),

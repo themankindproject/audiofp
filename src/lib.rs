@@ -91,7 +91,7 @@
 //!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |         | Symphonia itself (no codecs). Also enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature for [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
+//! | `std`        |         | Enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature to pull Symphonia and enable [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
 //! | `std-wav`    |         | WAV + raw PCM decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                  |
 //! | `std-mp3`    |         | MP3 decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                            |
 //! | `std-flac`   |         | FLAC decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                           |
@@ -117,7 +117,7 @@
 // feature gate needed. The `docsrs` cfg is set by docs.rs and by our
 // `package.metadata.docs.rs` rustdoc-args.
 
-// The `std` feature is a bare dependency on Symphonia. Codec support is
+// The `std` feature enables cache and structured I/O errors. Symphonia is
 // opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, ...) or the
 // `all-codecs` feature, which is what gates `audiofp::io`. `std` on its
 // own is nonetheless a **valid** configuration: it enables `cache`
@@ -162,6 +162,7 @@ pub mod neural;
 /// [`prelude`] for details.
 pub mod prelude;
 pub mod serial;
+pub mod serial_v2;
 #[cfg(any(feature = "watermark", feature = "classical-watermark"))]
 pub mod watermark;
 

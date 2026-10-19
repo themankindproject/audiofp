@@ -48,5 +48,8 @@ pub mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use embedder::{NeuralEmbedder, NeuralEmbedderConfig, NeuralEmbedding, NeuralFingerprint};
+pub use embedder::{
+    IdentifiedNeuralFingerprint, NeuralEmbedder, NeuralEmbedderConfig, NeuralEmbedding,
+    NeuralFingerprint,
+};
 pub use streaming::StreamingNeuralEmbedder;

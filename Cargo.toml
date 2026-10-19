@@ -18,6 +18,7 @@ exclude      = [
     ".claude/",
     ".agents/",
     ".hermes/",
+    ".audit-notes/",
 
     # Stray scratch (untracked dev probe, not part of the crate).
     "bakeoff/tests/",
@@ -36,6 +37,8 @@ exclude      = [
     # system-lib dep) and classical watermarking (issue #153).
     "bakeoff/",
     "BENCHMARKS.md",
+    "BENCHMARKS-DRIFT.txt",
+    "bakeoff-check.log",
 
     # Benchmarks (users run their own; bench code references test helpers).
     "benches/",
@@ -49,6 +52,7 @@ exclude      = [
     # Contributor / governance docs.
     "CHANGELOG.md",
     "context.md",
+    "CONTEXT.md",
 
     # Personal scratch files.
     "prep.md",
@@ -76,7 +80,7 @@ default = []
 # module (`.afp` fingerprint files) and `IoError`, and just leaves
 # `audiofp::io` absent. It is never a compile error, so enabling `std`
 # through feature unification cannot break a downstream build.
-std = ["dep:symphonia", "dep:ahash", "dep:rustix"]
+std = ["dep:ahash", "dep:rustix"]
 std-mp3 = ["std", "symphonia/mp3"]
 std-aac = ["std", "symphonia/aac"]
 std-flac = ["std", "symphonia/flac"]

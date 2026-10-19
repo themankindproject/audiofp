@@ -570,6 +570,26 @@ impl StreamingHaitsma {
         &self.cfg
     }
 
+    /// Feed a complete chunk or return an error before changing stream state.
+    /// Unlike the legacy [`push`](StreamingFingerprinter::push), this rejects
+    /// a chunk over `max_push_samples` and nonfinite PCM instead of dropping
+    /// or replacing samples.
+    pub fn push_checked(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, u32)>> {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push(samples)
+    }
+
+    /// Callback variant of [`push_checked`](Self::push_checked).
+    pub fn push_with_checked<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
+    where
+        F: FnMut(TimestampMs, &u32),
+    {
+        crate::pcm::reject_oversized_push(samples, self.cfg.max_push_samples)?;
+        crate::pcm::reject_non_finite(samples)?;
+        self.push_with(samples, callback)
+    }
+
     /// Reset all internal state. The stream behaves as if freshly
     /// constructed: no buffered audio, no pending frames, frame
     /// counter restarted. Call between independent input streams
@@ -585,33 +605,33 @@ impl StreamingHaitsma {
     /// `self.pending`. Shared by `push()` and `push_with()`.
     fn process_push(&mut self, samples: &[f32]) {
         let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
+        for chunk in samples.chunks(HAITSMA_N_FFT * 4) {
+            crate::pcm::extend_sanitized(&mut self.sample_carry, chunk);
+            let mut off = 0usize;
+            while self.sample_carry.len() - off >= HAITSMA_N_FFT {
+                self.stft
+                    .process_frame_power(
+                        &self.sample_carry[off..off + HAITSMA_N_FFT],
+                        &mut self.frame_power,
+                    )
+                    .expect("frame_power is sized n_bins and frames are exactly n_fft");
+                let e = band_energies(&self.frame_power, &self.band_ranges);
 
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= HAITSMA_N_FFT {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + HAITSMA_N_FFT],
-                    &mut self.frame_power,
-                )
-                .expect("frame_power is sized n_bins and frames are exactly n_fft");
-            let e = band_energies(&self.frame_power, &self.band_ranges);
-
-            if self.has_prev {
-                let hash = pack_frame_bits(&e, &self.prev_energy);
-                let abs_frame = self.next_frame_idx;
-                let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
-                self.pending.push((TimestampMs(t_ms), hash));
-                self.next_frame_idx += 1;
-            } else {
-                self.has_prev = true;
+                if self.has_prev {
+                    let hash = pack_frame_bits(&e, &self.prev_energy);
+                    let abs_frame = self.next_frame_idx;
+                    let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
+                    self.pending.push((TimestampMs(t_ms), hash));
+                    self.next_frame_idx += 1;
+                } else {
+                    self.has_prev = true;
+                }
+                self.prev_energy = e;
+                off += HAITSMA_HOP;
             }
-            self.prev_energy = e;
-            off += HAITSMA_HOP;
-        }
-
-        if off > 0 {
-            self.sample_carry.drain(0..off);
+            if off > 0 {
+                self.sample_carry.drain(0..off);
+            }
         }
     }
 }

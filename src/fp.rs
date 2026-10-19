@@ -292,8 +292,10 @@ pub trait ZeroAllocStreaming: StreamingFingerprinter {}
 /// Fingerprint a batch of audio buffers in parallel using rayon.
 ///
 /// Each item is `(tag, samples, rate)` where `tag` is an opaque label
-/// passed through to the result. A fresh fingerprinter is constructed
-/// for each item via `make_fingerprinter`.
+/// passed through to the result. Rayon constructs a fingerprinter for each
+/// work partition and reuses it across that partition's items. The factory
+/// may therefore be called more than once per worker, but normally fewer
+/// times than there are items.
 ///
 /// Results are returned in the same order as the input items.
 ///
@@ -339,10 +341,10 @@ where
 {
     use rayon::prelude::*;
 
+    let factory = &make_fingerprinter;
     items
         .into_par_iter()
-        .map(|(tag, samples, rate)| {
-            let mut fp = make_fingerprinter();
+        .map_init(factory, |fp, (tag, samples, rate)| {
             (tag, fp.extract(&samples, rate))
         })
         .collect()

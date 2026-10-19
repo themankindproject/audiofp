@@ -25,6 +25,20 @@ pub(crate) fn truncate_push(samples: &[f32], max: Option<usize>) -> &[f32] {
     }
 }
 
+/// Reject a chunk before the legacy per-push truncation can discard samples.
+#[inline]
+pub(crate) fn reject_oversized_push(samples: &[f32], max: Option<usize>) -> Result<()> {
+    if let Some(limit) = max
+        && samples.len() > limit
+    {
+        return Err(AfpError::InputTooLarge {
+            limit,
+            provided: samples.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Append `samples` to `carry`, replacing any non-finite value with `0.0`.
 ///
 /// Streaming `push` is infallible, so sanitize rather than error. Clean

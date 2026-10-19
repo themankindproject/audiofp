@@ -129,13 +129,27 @@ impl PanakoRefIndex {
             return None;
         }
         let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = hashmap_new();
+        let mut stopped: HashMap<u32, ()> = hashmap_new();
+        let limit = cfg.max_postings_per_hash as usize;
         for h in &reference.hashes {
-            index
-                .entry(h.hash)
-                .or_default()
-                .push((h.t_anchor, h.t_b, h.t_c));
+            if stopped.contains_key(&h.hash) {
+                continue;
+            }
+            if let Some(postings) = index.get_mut(&h.hash) {
+                if postings.len() < limit {
+                    postings.push((h.t_anchor, h.t_b, h.t_c));
+                } else {
+                    // Free the over-limit list immediately; repeated audio
+                    // must not grow it to the full reference length.
+                    index.remove(&h.hash);
+                    stopped.insert(h.hash, ());
+                }
+            } else if limit > 0 {
+                index.insert(h.hash, vec![(h.t_anchor, h.t_b, h.t_c)]);
+            } else {
+                stopped.insert(h.hash, ());
+            }
         }
-        index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
         if index.is_empty() {
             return None;
         }
@@ -1106,6 +1120,36 @@ mod tests {
         };
         let cfg = PanakoMatchConfig::default();
         assert!(PanakoRefIndex::build(&empty, &cfg).is_none());
+    }
+
+    #[test]
+    fn prebuilt_discards_repetitive_hash_and_keeps_other_postings() {
+        let mut hashes = vec![
+            crate::classical::PanakoHash {
+                hash: 7,
+                t_anchor: 1,
+                t_b: 2,
+                t_c: 3,
+            };
+            10_000
+        ];
+        hashes.push(crate::classical::PanakoHash {
+            hash: 8,
+            t_anchor: 4,
+            t_b: 5,
+            t_c: 6,
+        });
+        let fp = PanakoFingerprint {
+            hashes,
+            frames_per_sec: 62.5,
+        };
+        let cfg = PanakoMatchConfig {
+            max_postings_per_hash: 100,
+            ..Default::default()
+        };
+        let index = PanakoRefIndex::build(&fp, &cfg).unwrap();
+        assert!(!index.index.contains_key(&7));
+        assert_eq!(index.index.get(&8).unwrap(), &vec![(4, 5, 6)]);
     }
 
     #[test]

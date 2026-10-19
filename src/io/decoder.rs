@@ -340,6 +340,20 @@ pub struct DecodeReport {
     pub stats: DecodeStats,
 }
 
+/// Decode report with an explicit end-of-file integrity signal.
+///
+/// The original [`DecodeReport`] shape remains available for source
+/// compatibility. Use [`decode_to_mono_diagnostics`] when a lenient decode
+/// must reveal that a container ended unexpectedly.
+#[derive(Clone, Debug)]
+pub struct DecodeDiagnostics {
+    /// PCM and packet counters from the decode pass.
+    pub report: DecodeReport,
+    /// `true` when the reader returned an unexpected EOF and lenient mode
+    /// returned the audio decoded before that point.
+    pub truncated_eof: bool,
+}
+
 /// Opened decode source: media stream + format hint + wall-clock deadline.
 /// Factored out of `open_source`'s signature so clippy's `type_complexity`
 /// lint stays quiet.
@@ -353,6 +367,8 @@ type OpenedSource = (
 /// format hint, and wall-clock deadline. Shared by [`decode_to_mono_limited`]
 /// and [`decode_to_mono_report`] so the two entry points cannot drift.
 fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
+    #[allow(clippy::disallowed_methods)]
+    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
     // Pre-check: don't even open files that are clearly too large.
     // Note: this is best-effort against TOCTOU (file can grow after the
     // stat); `max_samples` is the hard bound on decoded PCM.
@@ -380,9 +396,6 @@ fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
     // a testability concern — tests exercise the timeout via
     // `Duration::from_nanos(0)` which fires on the first packet regardless
     // of when the Instant was captured.
-    #[allow(clippy::disallowed_methods)]
-    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
-
     Ok((mss, hint, deadline))
 }
 
@@ -467,7 +480,7 @@ fn decode_inner(
     deadline: Option<(std::time::Instant, std::time::Duration)>,
 ) -> Result<(Vec<f32>, u32)> {
     decode_inner_report(mss, hint, max_samples, integrity_mode, deadline)
-        .map(|(samples, sr, _)| (samples, sr))
+        .map(|(samples, sr, _, _)| (samples, sr))
 }
 
 /// Decode with full observability: same output as
@@ -498,19 +511,33 @@ pub fn decode_to_mono_report<P: AsRef<Path>>(
     path: P,
     limits: DecodeLimits,
 ) -> Result<DecodeReport> {
+    decode_to_mono_diagnostics(path, limits).map(|d| d.report)
+}
+
+/// Decode to mono with packet counters and explicit truncated-EOF status.
+///
+/// This has the same accept/reject behavior as [`decode_to_mono_report`].
+/// In strict integrity mode, unexpected EOF remains an error.
+pub fn decode_to_mono_diagnostics<P: AsRef<Path>>(
+    path: P,
+    limits: DecodeLimits,
+) -> Result<DecodeDiagnostics> {
     let path = path.as_ref();
     let (mss, hint, deadline) = open_source(path, &limits)?;
-    let (samples, sample_rate, stats) = decode_inner_report(
+    let (samples, sample_rate, stats, truncated_eof) = decode_inner_report(
         mss,
         &hint,
         limits.max_samples,
         limits.integrity_mode,
         deadline,
     )?;
-    Ok(DecodeReport {
-        samples,
-        sample_rate,
-        stats,
+    Ok(DecodeDiagnostics {
+        report: DecodeReport {
+            samples,
+            sample_rate,
+            stats,
+        },
+        truncated_eof,
     })
 }
 
@@ -520,7 +547,7 @@ fn decode_inner_report(
     max_samples: Option<usize>,
     integrity_mode: bool,
     deadline: Option<(std::time::Instant, std::time::Duration)>,
-) -> Result<(Vec<f32>, u32, DecodeStats)> {
+) -> Result<(Vec<f32>, u32, DecodeStats, bool)> {
     let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
         .probe(
             hint,
@@ -722,15 +749,21 @@ fn decode_inner_report(
             }
         }
 
-        // Record the decoder's real output rate (once). A mid-stream rate
-        // change is a codec reset we do not model; adopt the first value
-        // and let the spec-change branch above handle the buffer.
-        if decoded_rate.is_none() {
-            let actual = decoded.spec().rate();
-            if actual == 0 {
-                stats.packets_skipped += 1;
-                continue;
+        // A single returned PCM buffer cannot represent multiple sample
+        // rates. Reject a mid-stream change instead of mislabelling samples.
+        let actual = decoded.spec().rate();
+        if actual == 0 {
+            stats.packets_skipped += 1;
+            continue;
+        }
+        if let Some(first) = decoded_rate {
+            if actual != first {
+                return Err(AfpError::Io(IoError::without_path(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decoded sample rate changed from {first} to {actual} Hz"),
+                ))));
             }
+        } else {
             decoded_rate = Some(actual);
         }
 
@@ -763,7 +796,7 @@ fn decode_inner_report(
     // the PCM and produce a duration and fingerprint pitch/speed error.
     // The real rate is what the samples are at, so it is authoritative.
     let sample_rate = decoded_rate.unwrap_or(sample_rate);
-    Ok((samples, sample_rate, stats))
+    Ok((samples, sample_rate, stats, truncated_eof))
 }
 
 #[cfg(test)]
@@ -1369,6 +1402,18 @@ mod tests {
         }
 
         #[test]
+        fn diagnostics_preserve_healthy_decode_and_report_complete_eof() {
+            let path = write_test_wav(1, 8_000, 8_000);
+            let diagnostics = decode_to_mono_diagnostics(&path, DecodeLimits::default()).unwrap();
+            let report = decode_to_mono_report(&path, DecodeLimits::default()).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert!(!diagnostics.truncated_eof);
+            assert_eq!(diagnostics.report.samples, report.samples);
+            assert_eq!(diagnostics.report.sample_rate, report.sample_rate);
+            assert_eq!(diagnostics.report.stats, report.stats);
+        }
+
+        #[test]
         fn stereo_sample_cap_counts_mono_output_frames() {
             let path = write_test_wav(2, 8_000, 16);
             let result = decode_to_mono_limited(&path, DecodeLimits::samples(16));
@@ -1677,5 +1722,23 @@ mod tests {
             report.stats
         );
         assert!(!report.samples.is_empty(), "partial audio must remain");
+    }
+
+    #[test]
+    #[cfg(feature = "std-ogg")]
+    fn diagnostics_mark_a_truncated_ogg_tail() {
+        let bytes = std::fs::read("tests/assets/speech.ogg").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "audiofp-decoder-truncated-ogg-{}.ogg",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes[..bytes.len() * 3 / 4 + 17]).unwrap();
+        let result = decode_to_mono_diagnostics(&path, DecodeLimits::default());
+        let strict = decode_to_mono_diagnostics(&path, DecodeLimits::default().strict());
+        std::fs::remove_file(&path).ok();
+        let diagnostics = result.unwrap();
+        assert!(!diagnostics.report.samples.is_empty());
+        assert!(diagnostics.truncated_eof);
+        assert!(matches!(strict, Err(AfpError::Io(_))));
     }
 }
