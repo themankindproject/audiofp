@@ -135,6 +135,8 @@ pub struct PanakoConfig {
     /// Per-second cap on peak count. Default 30.
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
+    /// Clamped to `[-200, 0]`; `NaN` is replaced by the default (a `NaN`
+    /// floor would otherwise drop every peak and still return `Ok`).
     pub min_anchor_mag_db: f32,
     /// Maximum input sample count accepted by [`extract`]. `None` disables
     /// the check. Default: 14_400_000 (30 minutes at 8 kHz).
@@ -795,6 +797,32 @@ mod tests {
     use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
+
+    #[test]
+    fn nan_peak_floor_falls_back_to_the_default_floor() {
+        let audio = synthetic_audio(7, 40_000);
+        let nan = PanakoConfig {
+            min_anchor_mag_db: f32::NAN,
+            ..Default::default()
+        };
+        let expected = Panako::default()
+            .extract(&audio, SampleRate::HZ_8000)
+            .unwrap();
+        assert!(!expected.hashes.is_empty(), "fixture must produce hashes");
+        let actual = Panako::new(nan.clone())
+            .extract(&audio, SampleRate::HZ_8000)
+            .unwrap();
+        assert_eq!(actual.hashes, expected.hashes);
+
+        let mut default_stream = StreamingPanako::default();
+        let mut nan_stream = StreamingPanako::new(nan);
+        let mut a = default_stream.push(&audio).unwrap();
+        a.extend(default_stream.flush_complete().unwrap());
+        let mut b = nan_stream.push(&audio).unwrap();
+        b.extend(nan_stream.flush_complete().unwrap());
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+    }
 
     fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(len);

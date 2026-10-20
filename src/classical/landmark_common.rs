@@ -148,6 +148,6 @@ impl FrontEnd {
             );
             self.picker.push_row(&self.frame);
         }
-        (n_frames, self.picker.finish(frames_per_sec))
+        (n_frames, self.picker.finish())
     }
 }

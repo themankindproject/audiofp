@@ -11,7 +11,7 @@
 //! size). Both are exact, so results are identical to a brute-force
 //! window max, and only `O(neighborhood_t · n_bins)` scratch is held.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BinaryHeap, VecDeque};
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
@@ -126,8 +126,56 @@ pub struct PeakPicker {
     /// Geometry of the in-progress `begin` … `finish` pass.
     n_bins: usize,
     rows_pushed: usize,
-    /// Pooled candidate buffer — avoids a per-call heap allocation.
+    /// Pooled candidate buffer — avoids a per-call heap allocation. With a
+    /// per-second cap this holds only the survivors of *finished* buckets.
     candidates: Vec<Peak>,
+    /// Candidates of the row being emitted (at most `n_bins`); only used
+    /// when the per-second cap is active.
+    row_candidates: Vec<Peak>,
+    /// Best `target_per_sec` peaks of the one-second bucket in progress,
+    /// worst on top. Candidates arrive in `(t_frame, f_bin)` order, so
+    /// buckets are contiguous and only one is ever open.
+    bucket_heap: BinaryHeap<BucketPeak>,
+    /// Bucket the heap currently belongs to.
+    bucket_id: Option<u32>,
+    /// `frames_per_sec` of the in-progress pass (bucket width in frames).
+    bucket_rate: f32,
+}
+
+/// Heap entry ordered **worst first**: lowest magnitude on top, and among
+/// equal magnitudes the *latest* `(t_frame, f_bin)`. This is exactly the
+/// reverse of the order [`adaptive_per_second`] sorts by (magnitude
+/// descending, position ascending — a total order, since positions are
+/// unique), so keeping the `K` smallest entries keeps the same `K` peaks.
+#[derive(Copy, Clone, Debug)]
+struct BucketPeak(Peak);
+
+impl PartialEq for BucketPeak {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for BucketPeak {}
+
+impl PartialOrd for BucketPeak {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BucketPeak {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Candidate magnitudes are never NaN (`emit_candidates` requires
+        // `mag > floor`), so `partial_cmp` is total here; the fallback
+        // mirrors `adaptive_per_second`.
+        other
+            .0
+            .mag
+            .partial_cmp(&self.0.mag)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| (self.0.t_frame, self.0.f_bin).cmp(&(other.0.t_frame, other.0.f_bin)))
+    }
 }
 
 impl PeakPicker {
@@ -143,6 +191,10 @@ impl PeakPicker {
             n_bins: 0,
             rows_pushed: 0,
             candidates: Vec::new(),
+            row_candidates: Vec::new(),
+            bucket_heap: BinaryHeap::new(),
+            bucket_id: None,
+            bucket_rate: 0.0,
         }
     }
 
@@ -189,7 +241,7 @@ impl PeakPicker {
         for row in spec.chunks_exact(n_bins) {
             self.push_row(row);
         }
-        self.finish(frames_per_sec)
+        self.finish()
     }
 
     /// Start a row-streaming pick over an `(n_frames, n_bins)`
@@ -211,6 +263,9 @@ impl PeakPicker {
         let kf = self.cfg.neighborhood_f;
         self.n_bins = n_bins;
         self.rows_pushed = 0;
+        self.bucket_heap.clear();
+        self.bucket_id = None;
+        self.bucket_rate = frames_per_sec;
         resize_scratch(&mut self.hpad, n_bins + 2 * kf);
         resize_scratch(&mut self.raw_ring, (kt + 1) * n_bins);
         resize_scratch(&mut self.vmax_row, n_bins);
@@ -277,22 +332,15 @@ impl PeakPicker {
 
     /// Drain the trailing edge and return the peaks sorted by
     /// `(t_frame, f_bin)`.
-    pub(crate) fn finish(&mut self, frames_per_sec: f32) -> Vec<Peak> {
+    pub(crate) fn finish(&mut self) -> Vec<Peak> {
         // Trailing edge: NaN rows reproduce the end-of-spectrogram clamp.
         for _ in 0..self.cfg.neighborhood_t {
             self.vert.next_slot().fill(f32::NAN);
             self.commit_and_emit();
         }
-        let target_per_sec = self.cfg.target_per_sec;
-
-        if target_per_sec > 0 && frames_per_sec > 0.0 && !self.candidates.is_empty() {
-            let capped = adaptive_per_second(
-                core::mem::take(&mut self.candidates),
-                frames_per_sec,
-                target_per_sec,
-            );
-            self.candidates = capped;
-        }
+        // The last bucket is still open.
+        self.flush_bucket();
+        self.bucket_id = None;
 
         self.candidates
             .sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
@@ -316,14 +364,68 @@ impl PeakPicker {
         let t = pos + 1 - w;
         let n_bins = self.n_bins;
         let slot = t % (self.cfg.neighborhood_t + 1);
-        emit_candidates(
-            &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
-            &self.vmax_row,
-            t as u32,
-            self.cfg.min_magnitude_db,
-            self.cfg.min_magnitude_linear,
-            &mut self.candidates,
-        );
+        if self.caps_per_second() {
+            // Bounded path: never let a dense row (a flat plateau makes
+            // every cell a candidate) accumulate across the whole clip.
+            self.row_candidates.clear();
+            emit_candidates(
+                &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
+                &self.vmax_row,
+                t as u32,
+                self.cfg.min_magnitude_db,
+                self.cfg.min_magnitude_linear,
+                &mut self.row_candidates,
+            );
+            for i in 0..self.row_candidates.len() {
+                let peak = self.row_candidates[i];
+                self.accept_bucket_peak(peak);
+            }
+        } else {
+            emit_candidates(
+                &self.raw_ring[slot * n_bins..(slot + 1) * n_bins],
+                &self.vmax_row,
+                t as u32,
+                self.cfg.min_magnitude_db,
+                self.cfg.min_magnitude_linear,
+                &mut self.candidates,
+            );
+        }
+    }
+
+    /// Whether the per-second cap applies to this pass (same condition the
+    /// old end-of-pass `adaptive_per_second` call used).
+    #[inline]
+    fn caps_per_second(&self) -> bool {
+        self.cfg.target_per_sec > 0 && self.bucket_rate > 0.0
+    }
+
+    /// Offer one candidate to its one-second bucket, keeping the best
+    /// `target_per_sec` by (magnitude desc, position asc).
+    #[inline]
+    fn accept_bucket_peak(&mut self, peak: Peak) {
+        // Same expression `adaptive_per_second` buckets with.
+        let bucket = (peak.t_frame as f32 / self.bucket_rate) as u32;
+        if self.bucket_id != Some(bucket) {
+            // Candidates arrive in increasing t_frame, and the bucket map
+            // is monotone in t_frame, so a finished bucket never reopens.
+            debug_assert!(self.bucket_id.is_none_or(|b| bucket > b));
+            self.flush_bucket();
+            self.bucket_id = Some(bucket);
+        }
+        let entry = BucketPeak(peak);
+        if self.bucket_heap.len() < self.cfg.target_per_sec {
+            self.bucket_heap.push(entry);
+        } else if self.bucket_heap.peek().is_some_and(|worst| entry < *worst) {
+            self.bucket_heap.pop();
+            self.bucket_heap.push(entry);
+        }
+    }
+
+    /// Move the open bucket's survivors into `candidates` (unordered —
+    /// `finish` sorts by position).
+    fn flush_bucket(&mut self) {
+        self.candidates
+            .extend(self.bucket_heap.drain().map(|entry| entry.0));
     }
 }
 
@@ -591,6 +693,11 @@ fn emit_candidates(
 }
 
 /// Keep the top `target` peaks per one-second bucket (by magnitude).
+///
+/// Reference implementation. [`PeakPicker`] now applies the same selection
+/// incrementally (`accept_bucket_peak`) so it never holds more than one
+/// bucket of candidates; the tests pin the two against each other.
+#[cfg(test)]
 fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize) -> Vec<Peak> {
     // Sort by (bucket asc, mag desc, position asc) so we can stream-select
     // per bucket. The `(t_frame, f_bin)` tiebreak is unique per peak, making
@@ -1673,6 +1780,152 @@ mod tests {
         }
         out.sort_unstable_by_key(|p| (p.t_frame, p.f_bin));
         out
+    }
+
+    /// Values drawn from a handful of levels, so exact magnitude ties and
+    /// flat plateaus (every cell a candidate) are the norm, not the exception.
+    fn tied_values(seed: u32, n: usize, levels: u32) -> Vec<f32> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                -40.0 + (x % levels) as f32 * 3.0
+            })
+            .collect()
+    }
+
+    /// The bounded per-bucket selection must equal the old "collect every
+    /// candidate, then `adaptive_per_second`" result bit for bit — including
+    /// plateaus, exact magnitude ties, fractional and degenerate frame rates.
+    #[test]
+    fn bounded_selection_equals_collect_then_cap_oracle() {
+        let mut x: u32 = 0xB0B5;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let rates = [
+            100.0_f32,
+            62.5,
+            78.125,
+            10.0,
+            7.3,
+            1.0,
+            0.3,
+            1e9,
+            0.0,
+            -5.0,
+            f32::NAN,
+            f32::INFINITY,
+        ];
+        for case in 0..600 {
+            let nf = (next() % 90 + 1) as usize;
+            let nb = (next() % 40 + 1) as usize;
+            let fps = rates[case % rates.len()];
+            let cfg = PeakPickerConfig {
+                neighborhood_t: (next() % 4) as usize,
+                neighborhood_f: (next() % 4) as usize,
+                min_magnitude_db: -55.0,
+                min_magnitude_linear: if case % 5 == 0 { Some(-37.0) } else { None },
+                target_per_sec: [1, 2, 3, 5, 30, 1000][case % 6],
+            };
+            // 1-3 levels => huge plateaus; 7 levels => ordinary ties.
+            let spec = tied_values(next(), nf * nb, [1, 2, 3, 7][case % 4]);
+            let mut picker = PeakPicker::new(cfg.clone());
+            // Twice with the same picker: pass 2 must not see pass 1's bucket.
+            for pass in 0..2 {
+                let got = picker.pick(&spec, nf, nb, fps);
+                let want = legacy_pick(&cfg, &spec, nf, nb, fps);
+                assert_eq!(
+                    got, want,
+                    "case {case} pass {pass}: {nf}x{nb} fps={fps} {cfg:?}"
+                );
+            }
+        }
+    }
+
+    /// Reusing one picker across passes with different frame rates must not
+    /// leak the previous pass's open bucket into the next.
+    #[test]
+    fn picker_reuse_across_frame_rates_matches_fresh_picker() {
+        let cfg = PeakPickerConfig {
+            neighborhood_t: 1,
+            neighborhood_f: 1,
+            min_magnitude_db: -55.0,
+            min_magnitude_linear: None,
+            target_per_sec: 2,
+        };
+        let spec = tied_values(11, 50 * 16, 3);
+        let mut reused = PeakPicker::new(cfg.clone());
+        for fps in [10.0_f32, 3.0, 0.0, 25.0, 10.0] {
+            let want = PeakPicker::new(cfg.clone()).pick(&spec, 50, 16, fps);
+            assert_eq!(reused.pick(&spec, 50, 16, fps), want, "fps={fps}");
+        }
+    }
+
+    /// A flat plateau makes every cell a candidate. The old code held all of
+    /// them until the end of the pass; the picker must now hold at most one
+    /// row, one bucket's worth, and the survivors of finished buckets.
+    #[test]
+    fn dense_plateau_keeps_only_bounded_bucket_candidates() {
+        let (k, n_bins, n_frames, fps) = (3usize, 64usize, 1_000usize, 100.0_f32);
+        let mut picker = PeakPicker::new(PeakPickerConfig {
+            neighborhood_t: 0,
+            neighborhood_f: 0,
+            min_magnitude_db: 0.0,
+            min_magnitude_linear: None,
+            target_per_sec: k,
+        });
+        let row = [1.0_f32; 64];
+        picker.begin(n_frames, n_bins, fps);
+        for t in 0..n_frames {
+            picker.push_row(&row);
+            let finished_buckets = t / 100 + 1;
+            assert!(picker.candidates.len() <= finished_buckets * k, "t={t}");
+            assert!(picker.bucket_heap.len() <= k, "t={t}");
+            assert!(picker.row_candidates.len() <= n_bins, "t={t}");
+        }
+        let peaks = picker.finish();
+        assert_eq!(peaks.len(), 10 * k);
+        // All magnitudes tie, so the position tie-break keeps the first K
+        // cells of each second.
+        for (bucket, kept) in peaks.chunks(k).enumerate() {
+            assert!(kept.iter().all(|p| p.t_frame == (bucket * 100) as u32));
+            assert_eq!(kept.iter().map(|p| p.f_bin).collect::<Vec<_>>(), [0, 1, 2]);
+        }
+        // Cross-check against the reference selection on the same input.
+        let cfg = PeakPickerConfig {
+            neighborhood_t: 0,
+            neighborhood_f: 0,
+            min_magnitude_db: 0.0,
+            min_magnitude_linear: None,
+            target_per_sec: k,
+        };
+        let spec = vec![1.0_f32; n_frames * n_bins];
+        assert_eq!(peaks, legacy_pick(&cfg, &spec, n_frames, n_bins, fps));
+    }
+
+    /// Same-magnitude peaks that straddle a bucket boundary belong to their
+    /// own bucket; selection must not carry over or drop across it.
+    #[test]
+    fn bucket_boundaries_are_respected() {
+        // fps = 4 => frames 0..3 are bucket 0, 4..7 bucket 1.
+        let cfg = PeakPickerConfig {
+            neighborhood_t: 0,
+            neighborhood_f: 0,
+            min_magnitude_db: 0.0,
+            min_magnitude_linear: None,
+            target_per_sec: 2,
+        };
+        let spec = vec![1.0_f32; 8 * 5];
+        let got = PeakPicker::new(cfg.clone()).pick(&spec, 8, 5, 4.0);
+        assert_eq!(got, legacy_pick(&cfg, &spec, 8, 5, 4.0));
+        let positions: Vec<(u32, u16)> = got.iter().map(|p| (p.t_frame, p.f_bin)).collect();
+        assert_eq!(positions, [(0, 0), (0, 1), (4, 0), (4, 1)]);
     }
 
     #[test]
