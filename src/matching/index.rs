@@ -1185,11 +1185,15 @@ impl HaitsmaIndex {
         query: &crate::classical::HaitsmaFingerprint,
         cfg: &crate::matching::HaitsmaMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use super::haitsma::{hamming_at_offset, overlap_at};
+        use super::haitsma::{
+            hamming_at_offset, informative_frames, informative_overlap, overlap_at,
+        };
 
         let q_frames = &query.frames;
         let q_len = q_frames.len();
-        if q_len == 0 || self.lut.is_empty() {
+        // A silent / constant / short-period query is not evidence of
+        // identity (see `HaitsmaMatcher`); stop before probing the LUT.
+        if q_len == 0 || self.lut.is_empty() || !informative_frames(q_frames) {
             return None;
         }
 
@@ -1283,7 +1287,9 @@ impl HaitsmaIndex {
                     continue;
                 }
                 let ber = h as f64 / (overlap as f64 * 32.0);
-                if ber < best_ber {
+                if ber < best_ber
+                    && informative_overlap(q_frames, &self.frames[*ref_id as usize], delta, overlap)
+                {
                     best_ber = ber;
                     best_hamming = h;
                     best_delta = delta;
@@ -2102,6 +2108,54 @@ mod tests {
             frames: frames.to_vec(),
             frames_per_sec: fps,
         }
+    }
+
+    #[test]
+    fn haitsma_index_rejects_silent_and_repeated_queries() {
+        // A posting limit far above the frame count keeps the stop-hash
+        // pruning from hiding the problem: only the guard can reject these.
+        let real: Vec<u32> = (0..600)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B1) ^ 0x1234_5678)
+            .collect();
+        let cases: Vec<(&str, Vec<u32>)> = vec![
+            ("silence", vec![0; 400]),
+            ("all ones", vec![u32::MAX; 400]),
+            ("alternating", (0..400).map(|i| i as u32 % 2).collect()),
+            (
+                "period 3",
+                (0..400)
+                    .map(|i| [0xAAAA_AAAA_u32, 0x5555_5555, 0][i % 3])
+                    .collect(),
+            ),
+        ];
+        let cfg = HaitsmaMatchConfig::default();
+        for (name, frames) in cases {
+            let degenerate = mk_haitsma_fp(&frames, 78.125);
+            // Catalogue holds the degenerate clip itself AND a real clip.
+            let index =
+                HaitsmaIndex::build(&[degenerate.clone(), mk_haitsma_fp(&real, 78.125)], 10_000);
+            assert!(
+                index.query(&degenerate, &cfg).is_none(),
+                "{name}: degenerate query must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn haitsma_index_still_finds_real_content_beside_a_silent_reference() {
+        let real: Vec<u32> = (0..600)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B1) ^ 0x1234_5678)
+            .collect();
+        let silent = mk_haitsma_fp(&vec![0; 600], 78.125);
+        let index = HaitsmaIndex::build(&[silent, mk_haitsma_fp(&real, 78.125)], 10_000);
+        let query = mk_haitsma_fp(&real[100..500], 78.125);
+        let (id, r) = index
+            .query(&query, &HaitsmaMatchConfig::default())
+            .expect("real excerpt must match");
+        assert_eq!(id, 1);
+        assert!(r.is_match);
+        assert_eq!(r.offset.frames, 100);
+        assert_eq!(r.score, 1.0);
     }
 
     #[test]

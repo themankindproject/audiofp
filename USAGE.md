@@ -446,11 +446,20 @@ db[t][f] >  -50.0                    (min_anchor_mag_db)
 db[t][f] >= rolling_max_31x31(t, f)  (>= so flat plateaus emit every cell)
 ```
 
+`min_anchor_mag_db` is clamped to `[-200, 0]` and a `NaN` value is replaced
+by the default `-50.0`. (`f32::clamp` passes `NaN` through, and every
+comparison against `NaN` is false, so an unsanitised `NaN` floor dropped
+every peak and still returned `Ok` with an empty fingerprint.)
+
 Then a **per-second adaptive cap** keeps only the top `30` peaks
 (`peaks_per_sec`) in each 1-second bucket. Bucket index =
 `floor(t_frame / 62.5)`. Ranking within a bucket is by magnitude descending,
 ties by `(t_frame, f_bin)` ascending — a total order, so the kept set is
-deterministic and identical offline vs streaming.
+deterministic and identical offline vs streaming. The offline picker applies
+the cap as peaks are found, so it holds at most one row of candidates, the
+current second's best 30, and the survivors of finished seconds — rather than
+every cell that clears the floor (a flat plateau makes *every* cell a
+candidate). The kept peaks are unchanged.
 
 ### Wang (landmark pairs)
 
@@ -628,6 +637,15 @@ pub struct TimeOffset {
 }
 ```
 
+`TimeOffset::from_frames(frames, frames_per_sec)` stores `frames` exactly.
+When `frames_per_sec` is not a finite, positive rate (zero, negative, `NaN`,
+infinite) there is no meaningful conversion and `ms` is `0`; previously a zero
+rate produced `i64::MAX` and a negative rate a sign-flipped value.
+`TimeOffset::try_from_frames` returns `None` instead, for an invalid rate or an
+offset that does not fit in `i64` milliseconds. Matchers never hit either case
+(a frame-rate mismatch returns `MatchResult::NONE` first); the guard matters
+when you build offsets yourself.
+
 Field semantics per matcher — **prominence is not comparable across matcher
 types**, do not threshold it with one global constant:
 
@@ -641,6 +659,34 @@ types**, do not threshold it with one global constant:
 `offset.frames` is positive when the query starts **later** in the reference
 (reference anchor at a larger frame index); `offset.ms` uses the *reference's*
 frame rate.
+
+#### Score helpers
+
+The helpers the matchers share are public, so a custom matcher built on the
+same histogram / accumulator can reuse them:
+
+- `clamp_score(s)` clamps into `[0, 1]`; `NaN` maps to `0.0`.
+- `compute_prominence(values, peak_idx)` is `peak / (mean_of_rest + 1)` and
+  **panics** if `peak_idx >= values.len()`.
+- `try_compute_prominence(values, peak_idx)` is the same value as
+  `Some(prominence)`, or `None` for an out-of-range index.
+
+```rust
+use audiofp::matching::{TimeOffset, clamp_score, try_compute_prominence};
+
+fn main() {
+    assert_eq!(clamp_score(f32::NAN), 0.0);
+    assert_eq!(clamp_score(1.5), 1.0);
+
+    let histogram = [1u32, 1, 1, 9, 1];
+    assert_eq!(try_compute_prominence(&histogram, 3), Some(9.0 / 2.0));
+    assert_eq!(try_compute_prominence(&histogram, 5), None);
+
+    assert_eq!(TimeOffset::try_from_frames(100, 62.5).unwrap().ms, 1600);
+    assert_eq!(TimeOffset::try_from_frames(100, 0.0), None);
+    assert_eq!(TimeOffset::from_frames(100, 0.0).ms, 0);
+}
+```
 
 ### WangMatcher
 
@@ -790,6 +836,21 @@ each candidate is `best_BER × overlap × 32` — a short-overlap candidate with
 a small raw total but worse rate can no longer suppress a longer
 better-rate alignment. BER ties keep the first-found candidate; the exact
 path scans δ ascending, so ties resolve to the smallest offset.
+
+**Low-information guard.** Digital silence, a steady tone or a short repeating
+pattern is bit-identical to itself at many alignments, so a BER near zero on
+such a region proves nothing — a clip of silence used to match itself (and any
+other silence) with `score = 1.0`. A fingerprint, and the region an alignment
+covers, must contain at least **4 distinct frames** and **4 bit positions that
+vary**; otherwise `match_one` returns `MatchResult::NONE` (and
+`HaitsmaIndex::query` returns `None`). Runs shorter than 32 frames are not
+screened, so an explicit small `min_overlap_frames` keeps its old behaviour.
+This rejects *degenerate* input; it is not a measure of how distinctive a
+recording is, and a track that is only partly silent is still compared on its
+non-silent part. Because a rejected silent alignment no longer sets the
+early-abort bound, the exact path (`use_lut = false`, or references of ≤ 512
+frames) does more work on inputs with long silent stretches; the default LUT
+path is unaffected.
 
 **Decision:** `is_match = BER ≤ max_ber (0.35) && overlap ≥
 min_overlap_frames (256)`. `score = 1 − BER`. Prominence samples ~40 offsets
@@ -2323,7 +2384,10 @@ fn main() {
   emit every cell (matches streaming semantics).
 - `target_per_sec > 0` keeps the top-K peaks per 1-second bucket
   (bucket = `floor(t_frame / frames_per_sec)`), ranked by magnitude
-  descending then `(t, f)` ascending — deterministic.
+  descending then `(t, f)` ascending — deterministic. The cap is applied
+  while rows are processed, so memory is bounded by one row of candidates
+  plus `K` per second even on a flat plateau (every cell a candidate); the
+  result is identical to capping the complete candidate list.
 - Output sorted by `(t_frame, f_bin)`. The picker is `&mut self` and pools
   all scratch — reuse one instance per producing thread or put it behind a
   `Mutex`.

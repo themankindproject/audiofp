@@ -16,6 +16,16 @@
 //! probes) → candidate offsets → run exact BER verification only there.
 //! Turns `O(Q·R)` into `O(Q + candidates·overlap)`.
 //!
+//! # Low-information guard
+//!
+//! Digital silence, a steady tone or a short repeating pattern is bit-identical
+//! to itself at many alignments, so a BER near zero on such a region proves
+//! nothing. A fingerprint — and the region an alignment covers — must hold at
+//! least four distinct frames and four varying bit positions, otherwise the
+//! result is [`MatchResult::NONE`](crate::matching::MatchResult::NONE). Runs
+//! shorter than 32 frames are not checked. This is a screen for degenerate
+//! input, not a measure of how distinctive a recording is.
+//!
 //! # Performance
 //!
 //! - Exact: `O(Q·R)` popcounts with aggressive early-abort.
@@ -95,6 +105,68 @@ pub(crate) fn overlap_at(q_len: usize, r_len: usize, delta: i64) -> usize {
     }
 }
 
+/// Shortest frame run the low-information check applies to. Below this there
+/// is too little evidence to call a region uninformative, so short overlaps
+/// (reachable only through an explicitly small `min_overlap_frames`) keep
+/// their historical behaviour.
+const INFORMATIVE_MIN_FRAMES: usize = 32;
+/// Distinct 32-bit frames a region needs to carry any information.
+const INFORMATIVE_DISTINCT_FRAMES: usize = 4;
+/// Bit positions that must vary somewhere in a region.
+const INFORMATIVE_VARYING_BITS: u32 = 4;
+
+/// `true` when `frames` holds enough variation to be evidence of identity.
+///
+/// Digital silence, a steady tone, or a short repeating pattern all produce
+/// a handful of distinct frames. Two such regions are bit-identical at many
+/// alignments, so their BER of ~0 proves nothing: without this check a clip
+/// of silence matched itself (and any other silence) with score 1.0.
+///
+/// A region is informative when it has at least four distinct frames and at
+/// least four bit positions that are not constant across it. Runs shorter
+/// than 32 frames are always accepted (see [`INFORMATIVE_MIN_FRAMES`]).
+/// The scan stops as soon as both conditions hold, so real audio costs a few
+/// frames; only genuinely uninformative regions are read to the end.
+#[inline]
+pub(crate) fn informative_frames(frames: &[u32]) -> bool {
+    if frames.len() < INFORMATIVE_MIN_FRAMES {
+        return true;
+    }
+    let mut seen = [0u32; INFORMATIVE_DISTINCT_FRAMES];
+    let mut distinct = 0usize;
+    let mut any = 0u32;
+    let mut all = u32::MAX;
+    for &frame in frames {
+        any |= frame;
+        all &= frame;
+        if distinct < INFORMATIVE_DISTINCT_FRAMES && !seen[..distinct].contains(&frame) {
+            seen[distinct] = frame;
+            distinct += 1;
+        }
+        if distinct == INFORMATIVE_DISTINCT_FRAMES
+            && (any ^ all).count_ones() >= INFORMATIVE_VARYING_BITS
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`informative_frames`] for both sides of the `overlap` frames aligned at
+/// `delta` (`delta = t_reference − t_query`, as in [`hamming_at_offset`]).
+#[inline]
+pub(crate) fn informative_overlap(
+    query: &[u32],
+    reference: &[u32],
+    delta: i64,
+    overlap: usize,
+) -> bool {
+    let q_start = if delta >= 0 { 0 } else { (-delta) as usize };
+    let r_start = if delta >= 0 { delta as usize } else { 0 };
+    informative_frames(&query[q_start..q_start + overlap])
+        && informative_frames(&reference[r_start..r_start + overlap])
+}
+
 /// Running best alignment across candidate offsets, compared by **BER**
 /// (hamming ÷ overlap-bits) — not by raw hamming.
 ///
@@ -129,8 +201,9 @@ impl BestAlignment {
     }
 
     /// Verify `delta` and update the incumbent if its BER is strictly
-    /// better. Ties keep the first-found candidate (the exact path
-    /// scans deltas in ascending order; the LUT path probes query
+    /// better and the aligned region carries information (see
+    /// [`informative_frames`]). Ties keep the first-found candidate (the
+    /// exact path scans deltas in ascending order; the LUT path probes query
     /// frames in order), so selection is deterministic.
     #[inline]
     fn consider(
@@ -154,7 +227,9 @@ impl BestAlignment {
             return; // aborted: rate cannot beat the incumbent
         }
         let ber = h as f64 / (overlap as f64 * 32.0);
-        if ber < self.ber {
+        // The informativeness scan runs only for a candidate that would
+        // become the new best, so it is off the hot path.
+        if ber < self.ber && informative_overlap(query, reference, delta, overlap) {
             self.ber = ber;
             self.hamming = h;
             self.delta = delta;
@@ -287,7 +362,13 @@ impl Matcher for HaitsmaMatcher {
         let q_len = q_frames.len();
         let r_len = r_frames.len();
 
-        if q_len == 0 || r_len == 0 {
+        // Silence, a steady tone or a short repeating pattern is not
+        // evidence of identity: it aligns with itself at BER ~0 everywhere.
+        if q_len == 0
+            || r_len == 0
+            || !informative_frames(q_frames)
+            || !informative_frames(r_frames)
+        {
             return MatchResult::NONE;
         }
 
@@ -442,6 +523,8 @@ impl Default for HaitsmaMatcher {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// Build a synthetic Haitsma fingerprint from known 32-bit frame values.
@@ -820,5 +903,133 @@ mod tests {
             self.0 ^= self.0 << 5;
             self.0
         }
+    }
+
+    // ── Low-information guard ──
+
+    /// Frame sequences that carry no evidence of identity.
+    fn degenerate_sequences(len: usize) -> Vec<(&'static str, Vec<u32>)> {
+        vec![
+            ("silence", vec![0; len]),
+            ("all ones", vec![u32::MAX; len]),
+            ("alternating 0/1", (0..len).map(|i| i as u32 % 2).collect()),
+            (
+                "period 3",
+                (0..len)
+                    .map(|i| [0xAAAA_AAAA_u32, 0x5555_5555, 0][i % 3])
+                    .collect(),
+            ),
+        ]
+    }
+
+    fn random_frames(seed: u32, len: usize) -> Vec<u32> {
+        let mut rng = XorShift(seed);
+        (0..len).map(|_| rng.next()).collect()
+    }
+
+    #[test]
+    fn silence_and_repeated_frames_are_not_evidence() {
+        // 400 frames exercises the exact path; 900 (> 512) the LUT path.
+        for len in [400, 900] {
+            for (name, frames) in degenerate_sequences(len) {
+                let fp = make_fp(&frames);
+                for use_lut in [true, false] {
+                    let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
+                        use_lut,
+                        ..Default::default()
+                    });
+                    assert_eq!(
+                        m.match_one(&fp, &fp),
+                        MatchResult::NONE,
+                        "{name} len={len} use_lut={use_lut}: self-match"
+                    );
+                    // Either side degenerate is enough to reject.
+                    let real = make_fp(&random_frames(0x1234_5678, 900));
+                    assert_eq!(
+                        m.match_one(&fp, &real),
+                        MatchResult::NONE,
+                        "{name} as query"
+                    );
+                    assert_eq!(
+                        m.match_one(&real, &fp),
+                        MatchResult::NONE,
+                        "{name} as reference"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_content_still_matches_and_is_unaffected_by_the_guard() {
+        let reference = random_frames(0xBEEF_0001, 900);
+        let excerpt = make_fp(&reference[200..600]);
+        let reference = make_fp(&reference);
+        for use_lut in [true, false] {
+            let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
+                use_lut,
+                ..Default::default()
+            });
+            let r = m.match_one(&excerpt, &reference);
+            assert!(r.is_match, "use_lut={use_lut}: {r:?}");
+            assert_eq!(r.offset.frames, 200);
+            assert_eq!(r.score, 1.0);
+        }
+    }
+
+    #[test]
+    fn informative_frames_thresholds() {
+        // < 32 frames are never judged.
+        assert!(informative_frames(&[]));
+        assert!(informative_frames(&[0; 31]));
+        // 32 identical frames are uninformative.
+        assert!(!informative_frames(&[0; 32]));
+        assert!(!informative_frames(&[0xDEAD_BEEF; 32]));
+        // Three distinct frames are not enough, even with many varying bits.
+        let three: Vec<u32> = (0..64)
+            .map(|i| [0u32, u32::MAX, 0x0F0F_0F0F][i % 3])
+            .collect();
+        assert!(!informative_frames(&three));
+        // Four distinct frames that differ in four bit positions are enough.
+        let four: Vec<u32> = (0..64).map(|i| (i % 4) as u32 | 0xF0).collect();
+        assert!(!informative_frames(&four), "only 2 varying bits");
+        let four_wide: Vec<u32> = (0..64)
+            .map(|i| [0u32, 0b0011, 0b1100, 0b1111][i % 4])
+            .collect();
+        assert!(informative_frames(&four_wide));
+        // Real audio is informative.
+        assert!(informative_frames(&random_frames(7, 64)));
+    }
+
+    #[test]
+    fn short_overlap_requests_keep_historical_behaviour() {
+        // With an explicit tiny `min_overlap_frames`, runs under 32 frames
+        // are not screened, so a 20-frame constant still self-matches.
+        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
+            min_overlap_frames: 16,
+            use_lut: false,
+            ..Default::default()
+        });
+        let fp = make_fp(&[7; 20]);
+        assert!(m.match_one(&fp, &fp).is_match);
+    }
+
+    #[test]
+    fn silent_alignment_does_not_beat_a_real_one() {
+        // The query is real content padded with silence; the reference holds
+        // the same real content. The true alignment must win.
+        let real = random_frames(0xC0FF_EE01, 500);
+        let mut query = real.clone();
+        query.extend(vec![0; 300]);
+        let mut reference = real;
+        reference.extend(vec![0; 300]);
+        let m = HaitsmaMatcher::new(HaitsmaMatchConfig {
+            use_lut: false,
+            ..Default::default()
+        });
+        let r = m.match_one(&make_fp(&query), &make_fp(&reference));
+        assert!(r.is_match, "{r:?}");
+        assert_eq!(r.offset.frames, 0);
+        assert_eq!(r.score, 1.0);
     }
 }

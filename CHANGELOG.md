@@ -33,7 +33,59 @@ and that audio that was never marked never decodes. It found the flat-spectrum
 false positive described under Fixed. The smoke script is now
 `scripts/fuzz_smoke.sh` and covers 12 targets.
 
+**`TimeOffset::try_from_frames` and `matching::try_compute_prominence`.**
+Checked counterparts of existing helpers. `try_from_frames(frames, fps)` returns
+`None` for a rate that is not finite and positive, or an offset that does not
+fit in `i64` milliseconds. `try_compute_prominence(values, peak_idx)` returns
+`None` where `compute_prominence` panics on an out-of-range index. Both are
+additive; no existing signature changed.
+
 ### Fixed
+
+**Degenerate inputs and non-finite values (salvaged from #155).** No public
+signature changed and no hash, wire format or threshold changed; the
+Wang/Panako/Haitsma goldens and the cross-platform determinism test are
+unchanged.
+
+- **A `NaN` `min_anchor_mag_db` no longer produces an empty fingerprint.**
+  `f32::clamp` passes `NaN` through and every peak comparison against it is
+  false, so `Wang`, `Panako` and their streaming forms dropped every peak and
+  still returned `Ok` (0 hashes on a clip that yields 1,177 with the default).
+  `NaN` is now replaced by the default `-50.0`; other values clamp to
+  `[-200, 0]` as before.
+- **Silence and repeated frames no longer match in `HaitsmaMatcher` and
+  `HaitsmaIndex`.** A clip of digital silence, an all-ones run, or a short
+  repeating pattern is bit-identical to itself at many alignments, so it matched
+  itself (and other silence) with `is_match = true, score = 1.0`. A fingerprint,
+  and the region an alignment covers, must now hold at least 4 distinct frames
+  and 4 varying bit positions, otherwise the result is `MatchResult::NONE`
+  (`HaitsmaIndex::query` returns `None`). Runs under 32 frames are not screened.
+  This rejects *degenerate* input only: a track that is merely partly silent is
+  still compared on its non-silent part, and two different partly-silent tracks
+  can still score above the threshold. Cost: with `use_lut = false` (or a
+  reference of ≤ 512 frames), input with a long silent stretch is slower
+  (+31% with a 5 s silent prefix on the query and 10 s on the reference), because the rejected silent alignment used to
+  set the early-abort bound to 0 and make every other offset abort at once. The
+  default LUT path is unaffected (silence against silence: 6.8 ms → 2.6 µs).
+- **`clamp_score(NaN)` returns `0.0`** instead of `NaN`, so a score is always
+  inside the documented `[0, 1]`.
+- **`TimeOffset::from_frames` with an invalid frame rate** (zero, negative,
+  `NaN`, infinite) returns `ms: 0` with `frames` intact. A zero rate used to give
+  `ms = i64::MAX` and a negative rate a sign-flipped value. Valid rates are
+  unchanged, and the matchers never reach this (a frame-rate mismatch already
+  returns `MatchResult::NONE`).
+
+**Offline peak picking no longer holds every candidate.** `PeakPicker` collected
+every cell that cleared the floor and applied the per-second cap at the end.
+A flat plateau makes every cell a candidate: a 10-minute 513-bin spectrogram
+held 354.5 MiB of candidates before reducing them to 18,000 peaks. The cap is
+now applied as rows arrive (a top-`K` heap per one-second bucket), so peak
+memory is one row plus `K` per second (0.4 MiB for the same input, 466 → 246 ms).
+The selected peaks are identical: same magnitude-descending, `(t_frame, f_bin)`-
+ascending order, same bucket expression. This is pinned by a 600-case
+differential test against the old collect-then-cap result (plateaus, exact
+ties, fractional and degenerate frame rates, reused pickers), and by the golden
+tests, where the hashes of a 60 s synthetic clip are byte-identical to before.
 
 **`watermark::classical` detectors (pre-release review of #154).** The embedded
 format and the public types are unchanged — `embed` output is bit-identical to

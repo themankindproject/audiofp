@@ -106,6 +106,8 @@ pub struct WangConfig {
     /// Per-second cap on peak count. Default 30.
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
+    /// Clamped to `[-200, 0]`; `NaN` is replaced by the default (a `NaN`
+    /// floor would otherwise drop every peak and still return `Ok`).
     pub min_anchor_mag_db: f32,
     /// Maximum input sample count accepted by [`extract`]. `None` disables
     /// the check (full backward compatibility). Default: 14_400_000
@@ -665,6 +667,58 @@ mod tests {
     use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
+
+    #[test]
+    fn nan_peak_floor_falls_back_to_the_default_floor() {
+        // `f32::clamp` leaves NaN alone and `x >= NaN` is false, so a NaN
+        // floor used to drop every peak and still return `Ok`.
+        let audio = synthetic_audio(7, 40_000);
+        let nan = WangConfig {
+            min_anchor_mag_db: f32::NAN,
+            ..Default::default()
+        };
+        let expected = Wang::default()
+            .extract(&audio, SampleRate::HZ_8000)
+            .unwrap();
+        assert!(!expected.hashes.is_empty(), "fixture must produce hashes");
+        let actual = Wang::new(nan.clone())
+            .extract(&audio, SampleRate::HZ_8000)
+            .unwrap();
+        assert_eq!(actual.hashes, expected.hashes);
+
+        // The streaming extractor shares the sanitiser.
+        let mut default_stream = StreamingWang::default();
+        let mut nan_stream = StreamingWang::new(nan);
+        let mut a = default_stream.push(&audio).unwrap();
+        a.extend(default_stream.flush_complete().unwrap());
+        let mut b = nan_stream.push(&audio).unwrap();
+        b.extend(nan_stream.flush_complete().unwrap());
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn infinite_peak_floors_still_clamp() {
+        let audio = synthetic_audio(7, 40_000);
+        let low = WangConfig {
+            min_anchor_mag_db: f32::NEG_INFINITY,
+            ..Default::default()
+        };
+        let clamped = WangConfig {
+            min_anchor_mag_db: -200.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            Wang::new(low)
+                .extract(&audio, SampleRate::HZ_8000)
+                .unwrap()
+                .hashes,
+            Wang::new(clamped)
+                .extract(&audio, SampleRate::HZ_8000)
+                .unwrap()
+                .hashes,
+        );
+    }
 
     fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
         // Two-tone with low-amplitude noise: stable across runs (no rng),
