@@ -89,6 +89,22 @@ tests, where the hashes of a 60 s synthetic clip are byte-identical to before.
 
 ### Performance
 
+**`Haitsma::pack_frame_bits` extracts sign bits with a mask, not a scalar
+loop.** The 32 band-difference signs were packed with a 32-iteration scalar
+loop over `diff.to_array()`; the sign test is now `f32x8::simd_gt` +
+`to_bitmask`, reversed and shifted into place per 8-lane chunk. The
+`f32x8` difference computation is unchanged, so hashes are **bit-identical**
+— pinned by the `haitsma-v1` synthetic and real-audio goldens, the
+`pack_frame_bits` bit-layout unit tests, and the cross-platform determinism
+suite, all unchanged. `simd_gt` uses `GreaterThanOrdered` (NaN and signed
+zero compare false, matching the old `d > 0.0`), `> 0.0` is an exact IEEE
+comparison, and `to_bitmask`'s lane→bit order is the same on AVX and the
+SSE/scalar fallback, so the result is identical on every target. Internal
+only: no public API, hash, or score change. Measured effect is small —
+extraction is a tiny fraction of FFT-bound `extract` — so a back-to-back A/B
+shows it neutral-to-slightly-faster (no significant change at 2 s / 30 s;
+~8 % on the 5 s bench), not a headline speedup.
+
 **`watermark::classical` allocation and FFT cost.** LogHost detect rebuilt a
 ChaCha keystream per (phase, frame) — 90,167 allocations and 705 ms for 30 s of
 audio. One chip row per bit is now drawn once and shared by embed and detect,

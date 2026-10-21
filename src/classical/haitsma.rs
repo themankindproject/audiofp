@@ -365,7 +365,9 @@ fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS])
     // Each iteration reads curr[off..off+8] and curr[off+1..off+9] to
     // compute 8 adjacent-band differences from the 33-band array.
     use crate::dsp::simd::load8;
+    use wide::f32x8;
 
+    let zero = f32x8::ZERO;
     for chunk in 0..4 {
         let off = chunk * 8;
         let curr_lo = load8(curr, off);
@@ -375,12 +377,19 @@ fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS])
 
         // diff[i] = (curr[i] - curr[i+1]) - (prev[i] - prev[i+1])
         let diff = (curr_lo - curr_hi) - (prev_lo - prev_hi);
-        let arr = diff.to_array();
 
-        // Pack sign bits: band at offset+i maps to bit (31 - offset - i).
-        for (i, &d) in arr.iter().enumerate() {
-            hash |= ((d > 0.0) as u32) << (31 - off - i);
-        }
+        // `simd_gt` uses GreaterThanOrdered (NaN and signed zero compare
+        // false), matching the previous scalar `d > 0.0` exactly, and
+        // `> 0.0` is an exact IEEE comparison, so the mask is bit-identical
+        // on every target. `to_bitmask` sets bit `i` iff lane `i` is
+        // positive, with the same lane->bit convention on AVX and the
+        // scalar/SSE fallback — so this is cross-platform deterministic.
+        let bm = diff.simd_gt(zero).to_bitmask() as u8;
+
+        // Band at offset+i maps to hash bit (31 - off - i). Reversing the
+        // 8-bit lane mask (lane i -> bit 7-i) places lane i at bit
+        // (24 - off) + (7 - i) = 31 - off - i after the shift.
+        hash |= (bm.reverse_bits() as u32) << (24 - off);
     }
 
     hash
