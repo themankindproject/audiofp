@@ -2968,15 +2968,7 @@ mod tests {
 
     #[test]
     fn haitsma_index_verifies_beyond_the_most_hit_delta() {
-        struct XorShift(u32);
-        impl XorShift {
-            fn next(&mut self) -> u32 {
-                self.0 ^= self.0 << 13;
-                self.0 ^= self.0 >> 17;
-                self.0 ^= self.0 << 5;
-                self.0
-            }
-        }
+        use crate::matching::XorShift;
 
         let mut rng = XorShift(0x1D3A_5EED);
         let r: alloc::vec::Vec<u32> = (0..900).map(|_| rng.next() | 1).collect();

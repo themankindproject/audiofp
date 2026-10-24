@@ -2,11 +2,29 @@
 //!
 //! If any of these fail after a code change, it means hash output has
 //! drifted — the algorithm version suffix must be bumped.
+//!
+//! To regenerate the goldens after an *intentional* output change:
+//!
+//! ```bash
+//! UPDATE_GOLDENS=1 cargo test --features std-ogg --test real_audio_golden
+//! ```
+//!
+//! Each test then rewrites its golden file from the freshly extracted
+//! bytes before comparing, so a regenerating run passes. The PR description
+//! must justify the regeneration.
 #![cfg(feature = "std-ogg")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
+
+/// With `UPDATE_GOLDENS` set, (re)write the golden file from `actual`
+/// first; the comparison below then runs against what was just written.
+fn update_golden_if_requested(golden_path: &str, actual: &[u8]) {
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        std::fs::write(golden_path, actual).unwrap();
+    }
+}
 
 fn assert_golden_wang(asset: &str, golden_path: &str) {
     let samples = decode_to_mono_at(asset, 8_000).unwrap();
@@ -17,8 +35,12 @@ fn assert_golden_wang(asset: &str, golden_path: &str) {
         .iter()
         .flat_map(|h| h.hash.to_le_bytes())
         .collect();
-    let expected = std::fs::read(golden_path)
-        .unwrap_or_else(|_| panic!("golden file missing: {golden_path}. Run: cargo test --test generate_real_goldens --all-features -- --ignored"));
+    update_golden_if_requested(golden_path, &actual);
+    let expected = std::fs::read(golden_path).unwrap_or_else(|_| {
+        panic!(
+            "golden file missing: {golden_path}. Run: UPDATE_GOLDENS=1 cargo test --features std-ogg --test real_audio_golden"
+        )
+    });
     assert_eq!(
         actual,
         expected,
@@ -37,6 +59,7 @@ fn assert_golden_panako(asset: &str, golden_path: &str) {
         .iter()
         .flat_map(|h| h.hash.to_le_bytes())
         .collect();
+    update_golden_if_requested(golden_path, &actual);
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}."));
     assert_eq!(actual, expected, "Panako hash drift detected on {asset}!");
@@ -47,6 +70,7 @@ fn assert_golden_haitsma(asset: &str, golden_path: &str) {
     let mut haitsma = Haitsma::default();
     let fp = haitsma.extract(&samples, SampleRate::HZ_5000).unwrap();
     let actual: Vec<u8> = fp.frames.iter().flat_map(|f| f.to_le_bytes()).collect();
+    update_golden_if_requested(golden_path, &actual);
     let expected = std::fs::read(golden_path)
         .unwrap_or_else(|_| panic!("golden file missing: {golden_path}."));
     assert_eq!(actual, expected, "Haitsma hash drift detected on {asset}!");

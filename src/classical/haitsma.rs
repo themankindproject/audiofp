@@ -666,41 +666,8 @@ mod tests {
     use super::*;
     use crate::AfpError;
     use crate::SampleRate;
+    use crate::classical::testing::{chunk_sizes, synthetic_audio_5k as synthetic_audio};
     use alloc::vec;
-    use core::f32::consts::PI;
-
-    fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity(len);
-        let mut x: u32 = seed.max(1);
-        for n in 0..len {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let noise = ((x as i32 as f32) / (i32::MAX as f32)) * 0.05;
-            let t = n as f32 / 5_000.0;
-            // Use frequencies in the 300-2000 Hz band so they hit our bands.
-            let s = 0.5 * libm::sinf(2.0 * PI * 600.0 * t)
-                + 0.3 * libm::sinf(2.0 * PI * 1200.0 * t)
-                + noise;
-            out.push(s);
-        }
-        out
-    }
-
-    fn chunk_sizes(seed: u32, total: usize, max_chunk: usize) -> Vec<usize> {
-        let mut x = seed.max(1);
-        let mut out = Vec::new();
-        let mut remaining = total;
-        while remaining > 0 {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let n = ((x as usize) % max_chunk).max(1).min(remaining);
-            out.push(n);
-            remaining -= n;
-        }
-        out
-    }
 
     #[test]
     fn rejects_wrong_sample_rate() {

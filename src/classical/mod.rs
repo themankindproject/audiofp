@@ -27,6 +27,8 @@ pub mod haitsma;
 pub(crate) mod landmark_common;
 pub mod panako;
 pub(crate) mod stream;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod wang;
 
 pub use haitsma::{Haitsma, HaitsmaConfig, HaitsmaFingerprint, StreamingHaitsma};

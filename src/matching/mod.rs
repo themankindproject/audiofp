@@ -330,6 +330,20 @@ pub fn try_compute_prominence(values: &[u32], peak_idx: usize) -> Option<f32> {
     (peak_idx < values.len()).then(|| compute_prominence(values, peak_idx))
 }
 
+/// Deterministic xorshift32 shared by the matching unit tests.
+#[cfg(test)]
+pub(crate) struct XorShift(pub(crate) u32);
+
+#[cfg(test)]
+impl XorShift {
+    pub(crate) fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -422,14 +422,11 @@ mod tests {
 
     #[test]
     fn sparse_peak_matches_dense_randomized_oracle() {
-        let mut seed = 17u32;
+        let mut rng = crate::matching::XorShift(17);
         for _ in 0..200 {
             let bins: Vec<_> = (-20i64..=20)
                 .filter_map(|d| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    let c = seed % 7;
+                    let c = rng.next() % 7;
                     (c > 3).then_some((d, c))
                 })
                 .collect();

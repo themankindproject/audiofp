@@ -604,16 +604,7 @@ mod tests {
     // (2 458 bits) evaluated first would abort 300 frames @ 28 % BER
     // (2 688 bits) mid-scan and win with the wrong offset.
 
-    /// Deterministic xorshift32.
-    struct XorShift(u32);
-    impl XorShift {
-        fn next(&mut self) -> u32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 17;
-            self.0 ^= self.0 << 5;
-            self.0
-        }
-    }
+    use crate::matching::XorShift;
 
     /// Copy `src`, flipping each bit independently with probability
     /// `pct`% (deterministic given the seed).
@@ -939,7 +930,7 @@ mod tests {
         );
 
         // Random data → low prominence
-        let mut rng = Xor32(42);
+        let mut rng = XorShift(42);
         let q_rand: Vec<u32> = (0..400).map(|_| rng.next()).collect();
         let r_rand: Vec<u32> = (0..400).map(|_| rng.next()).collect();
         let rand_result = m.match_one(&make_fp(&q_rand), &make_fp(&r_rand));
@@ -951,17 +942,6 @@ mod tests {
                 rand_result.prominence,
                 true_result.prominence
             );
-        }
-    }
-
-    /// Trivial xorshift32 for test reproducibility (no dependency, no_std safe).
-    struct Xor32(u32);
-    impl Xor32 {
-        fn next(&mut self) -> u32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 17;
-            self.0 ^= self.0 << 5;
-            self.0
         }
     }
 

@@ -729,8 +729,10 @@ impl crate::ZeroAllocStreaming for StreamingPanako {}
 mod tests {
     use super::*;
     use crate::SampleRate;
+    use crate::classical::testing::{chunk_sizes, landmark_shared_tests, synthetic_audio};
     use alloc::vec;
-    use core::f32::consts::PI;
+
+    landmark_shared_tests!(Panako, StreamingPanako, PanakoConfig);
 
     #[test]
     fn nan_peak_floor_falls_back_to_the_default_floor() {
@@ -756,38 +758,6 @@ mod tests {
         b.extend(nan_stream.flush_complete().unwrap());
         assert!(!a.is_empty());
         assert_eq!(a, b);
-    }
-
-    fn synthetic_audio(seed: u32, len: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity(len);
-        let mut x: u32 = seed.max(1);
-        for n in 0..len {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let noise = ((x as i32 as f32) / (i32::MAX as f32)) * 0.05;
-            let t = n as f32 / 8_000.0;
-            let s = 0.5 * libm::sinf(2.0 * PI * 880.0 * t)
-                + 0.3 * libm::sinf(2.0 * PI * 1320.0 * t)
-                + noise;
-            out.push(s);
-        }
-        out
-    }
-
-    fn chunk_sizes(seed: u32, total: usize, max_chunk: usize) -> Vec<usize> {
-        let mut x = seed.max(1);
-        let mut out = Vec::new();
-        let mut remaining = total;
-        while remaining > 0 {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let n = ((x as usize) % max_chunk).max(1).min(remaining);
-            out.push(n);
-            remaining -= n;
-        }
-        out
     }
 
     #[test]
@@ -848,21 +818,6 @@ mod tests {
         for w in fpr.hashes.windows(2) {
             assert!((w[0].t_anchor, w[0].t_b, w[0].t_c) <= (w[1].t_anchor, w[1].t_b, w[1].t_c));
         }
-    }
-
-    #[test]
-    fn synthetic_signal_is_deterministic() {
-        // Two separate extractors on identical input must produce the
-        // same hash multiset (the regression goldens pin byte-exact
-        // output; this smoke test pins the count + multiset count for a
-        // second seed at a different length to catch algorithm drift
-        // the goldens would miss if the seed/input changes).
-        let samples = synthetic_audio(0xBEEF, 8_000 * 3);
-        let mut a = Panako::default();
-        let mut b = Panako::default();
-        let fa = a.extract(&samples, SampleRate::HZ_8000).unwrap();
-        let fb = b.extract(&samples, SampleRate::HZ_8000).unwrap();
-        assert_eq!(fa.hashes, fb.hashes);
     }
 
     #[test]
@@ -1396,55 +1351,12 @@ mod tests {
     }
 
     #[test]
-    fn extreme_config_is_clamped_within_safe_bounds() {
-        let cfg = PanakoConfig {
-            fan_out: u16::MAX,
-            target_zone_t: u16::MAX,
-            peaks_per_sec: u16::MAX,
-            ..PanakoConfig::default()
-        };
-        let fp = Panako::new(cfg);
-        assert_eq!(fp.config().fan_out, 64);
-        assert_eq!(fp.config().target_zone_t, 512);
-        assert_eq!(fp.config().peaks_per_sec, 500);
-    }
-
-    #[test]
-    fn clamped_config_still_produces_valid_hashes() {
-        let cfg = PanakoConfig {
-            fan_out: u16::MAX,
-            target_zone_t: u16::MAX,
-            peaks_per_sec: u16::MAX,
-            ..PanakoConfig::default()
-        };
-        let mut fp = Panako::new(cfg);
-        let samples = synthetic_audio(0xCAFE, 8_000 * 3);
-
-        let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
-        assert!(!fpr.hashes.is_empty());
-    }
-
-    #[test]
     fn streaming_default_config_is_unchanged_by_guard_clamps() {
         let s = StreamingPanako::default();
         let cfg = s.config();
         assert_eq!(cfg.fan_out, 5);
         assert_eq!(cfg.target_zone_t, 96);
         assert_eq!(cfg.peaks_per_sec, 30);
-    }
-
-    #[test]
-    fn streaming_extreme_config_is_clamped_within_safe_bounds() {
-        let cfg = PanakoConfig {
-            fan_out: u16::MAX,
-            target_zone_t: u16::MAX,
-            peaks_per_sec: u16::MAX,
-            ..PanakoConfig::default()
-        };
-        let s = StreamingPanako::new(cfg);
-        assert_eq!(s.config().fan_out, 64);
-        assert_eq!(s.config().target_zone_t, 512);
-        assert_eq!(s.config().peaks_per_sec, 500);
     }
 
     #[test]
@@ -1550,115 +1462,7 @@ mod tests {
         assert!(matches!(err, AfpError::InputTooLarge { .. }));
     }
 
-    #[test]
-    fn none_disables_max_input_check() {
-        let cfg = PanakoConfig {
-            max_input_samples: None,
-            ..PanakoConfig::default()
-        };
-        let mut fp = Panako::new(cfg);
-        let samples = vec![0.0_f32; 16_000];
-
-        fp.extract(&samples, SampleRate::HZ_8000).unwrap();
-    }
-
-    #[test]
-    fn max_hashes_enforced_rejects_too_many() {
-        let cfg = PanakoConfig {
-            max_hashes: Some(10),
-            ..PanakoConfig::default()
-        };
-        let mut fp = Panako::new(cfg);
-        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-
-        let err = fp.extract(&samples, SampleRate::HZ_8000).unwrap_err();
-        assert!(matches!(err, AfpError::InputTooLarge { .. }));
-    }
-
-    #[test]
-    fn max_pending_anchors_evicts_oldest() {
-        let cfg = PanakoConfig {
-            max_pending_anchors: Some(100),
-            ..PanakoConfig::default()
-        };
-        let mut s = StreamingPanako::new(cfg);
-        let samples = synthetic_audio(0xCAFE, 8_000 * 20);
-        let mut hashes = s.push(&samples).unwrap();
-        hashes.extend(s.flush().unwrap());
-        assert!(s.config().max_pending_anchors.is_some());
-        assert!(!hashes.is_empty(), "should produce hashes with cap=100");
-    }
-
-    #[test]
-    fn max_push_samples_truncates_hostile_chunk() {
-        let cfg = PanakoConfig {
-            max_push_samples: Some(512),
-            ..PanakoConfig::default()
-        };
-        let mut s = StreamingPanako::new(cfg);
-        // One huge push must not panic; only the first 512 samples are kept.
-        let samples = synthetic_audio(0xBEEF, 8_000 * 5);
-        let _ = s.push(&samples).unwrap();
-        let _ = s.flush().unwrap();
-        assert_eq!(s.config().max_push_samples, Some(512));
-    }
-
     // ── Progress callback tests ──
-
-    #[test]
-    fn extract_with_progress_is_called_and_monotonic() {
-        let mut fp = Panako::default();
-        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-
-        let mut values: Vec<f32> = Vec::new();
-        let result = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
-        assert!(result.is_ok());
-        // Must be called at least a few times.
-        assert!(
-            values.len() >= 3,
-            "expected at least 3 progress calls, got {}",
-            values.len()
-        );
-        // First value must be 0.0.
-        assert_eq!(values[0], 0.0);
-        // Last value must be 1.0.
-        assert_eq!(*values.last().unwrap(), 1.0);
-        // Must be monotonically non-decreasing.
-        for w in values.windows(2) {
-            assert!(w[1] >= w[0], "progress went backwards: {} → {}", w[0], w[1]);
-        }
-        // All values must be in [0, 1].
-        for &v in &values {
-            assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
-        }
-    }
-
-    #[test]
-    fn extract_with_progress_matches_extract_output() {
-        let samples = synthetic_audio(0xDEAD, 8_000 * 4);
-
-        let mut fp1 = Panako::default();
-        let result1 = fp1.extract(&samples, SampleRate::HZ_8000).unwrap();
-
-        let mut fp2 = Panako::default();
-        let result2 = fp2
-            .extract_with_progress(&samples, SampleRate::HZ_8000, |_| {})
-            .unwrap();
-
-        assert_eq!(result1.hashes, result2.hashes);
-        assert_eq!(result1.frames_per_sec, result2.frames_per_sec);
-    }
-
-    #[test]
-    fn extract_with_progress_short_audio_still_reports_0_and_1() {
-        let mut fp = Panako::default();
-        let samples = synthetic_audio(0xFACE, 8_000 * 2);
-
-        let mut values: Vec<f32> = Vec::new();
-        let _ = fp.extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v));
-        assert_eq!(values[0], 0.0);
-        assert_eq!(*values.last().unwrap(), 1.0);
-    }
 
     #[test]
     fn legacy_flush_fewer_hashes_than_offline_at_18000_samples() {
