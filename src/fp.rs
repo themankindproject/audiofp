@@ -10,8 +10,7 @@
 //!
 //! Concrete implementations live in the algorithm modules
 //! ([`classical::Wang`](crate::classical::Wang), [`classical::Panako`](crate::classical::Panako),
-//! [`classical::Haitsma`](crate::classical::Haitsma), and — behind the
-//! `neural` feature — [`neural::NeuralEmbedder`](crate::neural::NeuralEmbedder)).
+//! [`classical::Haitsma`](crate::classical::Haitsma)).
 
 use alloc::vec::Vec;
 
@@ -143,7 +142,7 @@ pub trait StreamingFingerprinter {
     ///
     /// Must not block and must not allocate beyond the per-instance
     /// budget set at construction. Returns `Err` if the stream cannot
-    /// process the samples (e.g. neural inference failure).
+    /// process the samples.
     ///
     /// # Edge cases
     ///
@@ -280,13 +279,8 @@ pub trait StreamingFingerprinter {
 /// In-crate impls: [`StreamingWang`](crate::StreamingWang),
 /// [`StreamingPanako`](crate::StreamingPanako), and
 /// [`StreamingHaitsma`](crate::StreamingHaitsma) (all drain a pre-allocated
-/// `emitted` buffer; pinned by allocation-counting tests).
-/// [`neural::StreamingNeuralEmbedder`](https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html)
-/// (feature `neural`) deliberately does **not** implement this trait: even
-/// [`try_push_with`](https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.try_push_with)
-/// reuses only the embedding scratch buffer — tract still allocates an input
-/// tensor and runtime workspace on every inference. Use classical streaming
-/// extractors when you need a whole-path zero-allocation contract.
+/// `emitted` buffer; pinned by allocation-counting tests). Use these
+/// streaming extractors when you need a whole-path zero-allocation contract.
 pub trait ZeroAllocStreaming: StreamingFingerprinter {}
 
 /// Fingerprint a batch of audio buffers in parallel using rayon.

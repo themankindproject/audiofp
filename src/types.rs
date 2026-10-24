@@ -29,7 +29,7 @@ impl SampleRate {
     /// 11.025 kHz.
     pub const HZ_11025: SampleRate = SampleRate(NonZeroU32::new(11_025).unwrap());
 
-    /// 16 kHz — typical speech rate; AudioSeal watermark default.
+    /// 16 kHz — typical speech rate.
     pub const HZ_16000: SampleRate = SampleRate(NonZeroU32::new(16_000).unwrap());
 
     /// 22.05 kHz — common for music workflows.
