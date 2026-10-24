@@ -405,7 +405,7 @@ impl PanakoMatcher {
         let denom = query.hashes.len().max(1) as f32;
         let score = clamp_score(votes as f32 / denom);
 
-        if super::below_threshold(score, cfg.min_score) || votes < cfg.min_votes {
+        if super::below_threshold(score, cfg.min_score) {
             return MatchResult::NONE;
         }
 

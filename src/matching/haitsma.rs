@@ -179,15 +179,15 @@ pub(crate) fn informative_overlap(
 /// `best_ber × overlap × 32` as the abort bound keeps the prune
 /// rate-normalized: a candidate is only aborted when its *rate* can no
 /// longer beat the incumbent.
-struct BestAlignment {
-    ber: f64,
-    hamming: u64,
-    delta: i64,
-    overlap: usize,
+pub(crate) struct BestAlignment {
+    pub(crate) ber: f64,
+    pub(crate) hamming: u64,
+    pub(crate) delta: i64,
+    pub(crate) overlap: usize,
 }
 
 impl BestAlignment {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ber: f64::INFINITY,
             hamming: u64::MAX,
@@ -196,7 +196,7 @@ impl BestAlignment {
         }
     }
 
-    fn found(&self) -> bool {
+    pub(crate) fn found(&self) -> bool {
         self.ber < f64::INFINITY
     }
 
@@ -206,7 +206,7 @@ impl BestAlignment {
     /// exact path scans deltas in ascending order; the LUT path probes query
     /// frames in order), so selection is deterministic.
     #[inline]
-    fn consider(
+    pub(crate) fn consider(
         &mut self,
         query: &[u32],
         reference: &[u32],
@@ -506,6 +506,18 @@ impl Matcher for HaitsmaMatcher {
     }
 }
 
+/// BER, score and match verdict of an alignment already accepted by
+/// [`BestAlignment::consider`], which enforces `min_overlap_frames`.
+pub(crate) fn ber_score_match(hamming: u64, overlap: usize, max_ber: f32) -> (f32, f32, bool) {
+    let total_bit_pairs = (overlap * 32) as u64;
+    let ber = if total_bit_pairs > 0 {
+        hamming as f32 / total_bit_pairs as f32
+    } else {
+        1.0
+    };
+    (ber, clamp_score(1.0 - ber), ber <= max_ber)
+}
+
 fn build_result(
     best_hamming: u64,
     best_delta: i64,
@@ -515,15 +527,7 @@ fn build_result(
     frames_per_sec: f32,
     cfg: &HaitsmaMatchConfig,
 ) -> MatchResult {
-    let total_bit_pairs = (overlap * 32) as u64;
-    let ber = if total_bit_pairs > 0 {
-        best_hamming as f32 / total_bit_pairs as f32
-    } else {
-        1.0
-    };
-
-    let score = clamp_score(1.0 - ber);
-    let is_match = ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
+    let (ber, score, is_match) = ber_score_match(best_hamming, overlap, cfg.max_ber);
 
     // Prominence: sample offsets across the range to estimate typical
     // (median) BER, then compute median / best.

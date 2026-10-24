@@ -70,15 +70,7 @@ pub fn match_best<M: Matcher>(
         if !result.is_match {
             continue;
         }
-        let better = match &best {
-            None => true,
-            Some((_, b)) => {
-                crate::matching::match_result_compare_desc(&result, b) == core::cmp::Ordering::Less
-            }
-        };
-        if better {
-            best = Some((i, result));
-        }
+        track_best(&mut best, i, result);
     }
     best
 }
@@ -1188,9 +1180,7 @@ impl HaitsmaIndex {
         query: &crate::classical::HaitsmaFingerprint,
         cfg: &crate::matching::HaitsmaMatchConfig,
     ) -> Option<(usize, MatchResult)> {
-        use super::haitsma::{
-            hamming_at_offset, informative_frames, informative_overlap, overlap_at,
-        };
+        use super::haitsma::{BestAlignment, informative_frames, overlap_at};
 
         let q_frames = &query.frames;
         let q_len = q_frames.len();
@@ -1293,50 +1283,26 @@ impl HaitsmaIndex {
             // Best-BER tracking with a rate-normalized early-abort bound
             // (same rationale as `HaitsmaMatcher`): a short-overlap
             // candidate must not suppress a longer better-rate one.
-            let mut best_ber = f64::INFINITY;
-            let mut best_hamming = u64::MAX;
-            let mut best_delta: i64 = 0;
-            let mut best_overlap: usize = 0;
-
+            let mut alignment = BestAlignment::new();
             for &(delta, _hits) in &deltas {
-                let overlap = overlap_at(q_len, r_len, delta);
-                if overlap < min_overlap {
-                    continue;
-                }
-                let bound = (best_ber * overlap as f64 * 32.0) as u64;
-                let h = hamming_at_offset(
+                alignment.consider(
                     q_frames,
                     &self.frames[ref_id as usize],
+                    q_len,
+                    r_len,
                     delta,
-                    overlap,
-                    bound,
+                    min_overlap,
                 );
-                if h == u64::MAX {
-                    continue;
-                }
-                let ber = h as f64 / (overlap as f64 * 32.0);
-                if ber < best_ber
-                    && informative_overlap(q_frames, &self.frames[ref_id as usize], delta, overlap)
-                {
-                    best_ber = ber;
-                    best_hamming = h;
-                    best_delta = delta;
-                    best_overlap = overlap;
-                }
             }
 
-            if best_hamming == u64::MAX {
+            if !alignment.found() {
                 continue;
             }
 
-            let delta = best_delta;
-            let overlap = best_overlap;
-
-            let total_bits = (overlap * 32) as u64;
-            let ber = best_hamming as f32 / total_bits as f32;
-
-            let score = crate::matching::clamp_score(1.0 - ber);
-            let is_match = ber <= cfg.max_ber && (overlap as u32) >= cfg.min_overlap_frames;
+            let delta = alignment.delta;
+            let overlap = alignment.overlap;
+            let (ber, score, is_match) =
+                super::haitsma::ber_score_match(alignment.hamming, overlap, cfg.max_ber);
 
             // Prominence: approximate — compare the winning BER against
             // what you'd expect from random alignment (~0.5).
