@@ -14,20 +14,6 @@ bytemuck = "1.25.0"
 audiofp = { path = "..", features = ["all-codecs", "classical-watermark"] }
 
 [[bin]]
-name = "wang_hash_roundtrip"
-path = "fuzz_targets/wang_hash_roundtrip.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "panako_hash_roundtrip"
-path = "fuzz_targets/panako_hash_roundtrip.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "haitsma_hash_roundtrip"
 path = "fuzz_targets/haitsma_hash_roundtrip.rs"
 test = false

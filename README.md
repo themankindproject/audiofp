@@ -67,6 +67,7 @@ once (the pre-0.4.0 `std` behavior).
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `std` | No | The codec-free `audiofp::cache` module (`.afp` fingerprint files) and `IoError`; no Symphonia. Combine with a `std-*` feature for `audiofp::io` |
 | `std-wav` | No | WAV + raw PCM decoding via Symphonia (`audiofp::io`) |
 | `std-mp3` | No | MP3 decoding via Symphonia |
 | `std-flac` | No | FLAC decoding via Symphonia |
@@ -75,7 +76,7 @@ once (the pre-0.4.0 `std` behavior).
 | `std-mp4` | No | AAC-in-MP4 / ISO-BMFF decoding via Symphonia |
 | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
 | `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
-| `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` (implies `std`) |
+| `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` and parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies `std`) |
 | `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`). **Deprecated — removed in 0.5.0**; migrate to `classical-watermark` |
 | `classical-watermark` | No | Keyed classical watermark embed + blind detect (`audiofp::watermark::classical`). FFT + `alloc` only — does not imply `std` |
 | `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |

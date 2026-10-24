@@ -14,15 +14,10 @@ FUZZ_TOML = REPO / "fuzz" / "Cargo.toml"
 
 
 class FuzzSmokeTests(unittest.TestCase):
-    def test_script_lists_exactly_twelve_targets(self) -> None:
+    def test_script_has_no_hard_coded_target_count(self) -> None:
         text = SCRIPT.read_text()
-        names = re.findall(r'^\s+([a-z0-9_]+)\s*$', text, re.M)
-        # Only entries inside the TARGETS=( ... ) array.
-        start = text.index("TARGETS=(")
-        end = text.index(")", start)
-        block = text[start:end]
-        targets = re.findall(r'^\s+([a-z0-9_]+)\s*$', block, re.M)
-        self.assertEqual(len(targets), 12)
+        self.assertNotRegex(text, r"-ne\s+\d+")
+        self.assertIn("fuzz/Cargo.toml", text)
 
     def test_script_targets_match_cargo_fuzz_bins(self) -> None:
         text = SCRIPT.read_text()
@@ -47,28 +42,23 @@ class FuzzSmokeTests(unittest.TestCase):
         self.assertIn("-max_len=", text)
 
     def test_script_fails_when_target_count_wrong(self) -> None:
+        import shutil
         import tempfile
-        import textwrap
 
         with tempfile.TemporaryDirectory() as tmp:
-            bad = pathlib.Path(tmp) / "fuzz_smoke_bad.sh"
-            bad.write_text(
-                textwrap.dedent(
-                    """\
-                    #!/usr/bin/env bash
-                    set -euo pipefail
-                    TARGETS=(only_one)
-                    if [[ "${#TARGETS[@]}" -ne 12 ]]; then
-                      echo "expected 12 fuzz targets, found ${#TARGETS[@]}" >&2
-                      exit 1
-                    fi
-                    """
-                )
+            root = pathlib.Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "fuzz").mkdir()
+            script = root / "scripts" / "fuzz_smoke.sh"
+            shutil.copy(SCRIPT, script)
+            (root / "fuzz" / "Cargo.toml").write_text(
+                '[[bin]]\nname = "only_one"\n'
             )
-            bad.chmod(0o755)
-            proc = subprocess.run([str(bad)], capture_output=True, text=True)
+            proc = subprocess.run(
+                ["bash", str(script)], capture_output=True, text=True
+            )
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("expected 12 fuzz targets", proc.stderr)
+            self.assertIn("expected 1 fuzz targets", proc.stderr)
 
 
 if __name__ == "__main__":

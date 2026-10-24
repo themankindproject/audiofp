@@ -353,5 +353,5 @@ jobs:
           pr-comment: false
       - name: install cargo-fuzz
         run: cargo +nightly install cargo-fuzz
-      - name: fuzz smoke test (all 12 targets, bounded runs)
+      - name: fuzz smoke test (all targets, bounded runs)
         run: bash scripts/fuzz_smoke.sh

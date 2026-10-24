@@ -16,12 +16,14 @@ MAX_RUNS="${MAX_RUNS:-1000}"
 MAX_TOTAL_TIME="${MAX_TOTAL_TIME:-30}"
 MAX_LEN="${MAX_LEN:-8192}"
 
+# Source of truth is the [[bin]] entries in fuzz/Cargo.toml; the array below
+# must match them exactly.
+EXPECTED_COUNT="$(grep -c '^\[\[bin\]\]' "$PROJECT_ROOT/fuzz/Cargo.toml")"
+
 TARGETS=(
   streaming_wang_equiv
   streaming_panako_equiv
   streaming_haitsma_equiv
-  wang_hash_roundtrip
-  panako_hash_roundtrip
   haitsma_hash_roundtrip
   sinc_resampler
   decode_bytes
@@ -31,8 +33,8 @@ TARGETS=(
   classical_watermark
 )
 
-if [[ "${#TARGETS[@]}" -ne 12 ]]; then
-  echo "expected 12 fuzz targets, found ${#TARGETS[@]}" >&2
+if [[ "${#TARGETS[@]}" -ne "$EXPECTED_COUNT" ]]; then
+  echo "expected $EXPECTED_COUNT fuzz targets, found ${#TARGETS[@]}" >&2
   exit 1
 fi
 

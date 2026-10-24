@@ -100,7 +100,7 @@
 //! | `std-mp4`    |         | AAC-in-MP4 / ISO-BMFF decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                          |
 //! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
 //! | `all-codecs` |         | Every format/codec above at once → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html) (the pre-0.4.0 `std`). |
-//! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] (implies `std`). |
+//! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] and parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies `std`). |
 //! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html) (implies `std`). **Deprecated** — removed in 0.5.0; migrate to `classical-watermark`. |
 //! | `classical-watermark` | | Keyed classical embed and detect ([`watermark::classical`](https://docs.rs/audiofp/latest/audiofp/watermark/classical/index.html)). Does not imply `std`. |
 //! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`](https://docs.rs/audiofp/latest/audiofp/neural/index.html)); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
