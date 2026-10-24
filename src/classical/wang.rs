@@ -38,7 +38,10 @@
 
 use alloc::vec::Vec;
 
-use crate::classical::landmark_common::FrontEnd;
+use crate::classical::landmark_common::{
+    FRAMES_PER_SEC, FrontEnd, HOP, LOG_FLOOR_POWER, MIN_SAMPLES, N_FFT, PEAK_NEIGHBOURHOOD, SR,
+    lookahead_frames, peak_cfg,
+};
 use crate::classical::stream;
 use crate::dsp::peaks::Peak;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
@@ -149,7 +152,7 @@ impl Default for WangConfig {
             target_zone_f: 64,
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
-            max_input_samples: Some(30 * 60 * WANG_SR as usize),
+            max_input_samples: Some(30 * 60 * SR as usize),
             max_hashes: Some(500_000),
             max_pending_anchors: None,
             max_push_samples: None,
@@ -157,19 +160,8 @@ impl Default for WangConfig {
     }
 }
 
-const WANG_N_FFT: usize = 1024;
-const WANG_HOP: usize = 128;
-const WANG_SR: u32 = 8_000;
-const WANG_FRAMES_PER_SEC: f32 = WANG_SR as f32 / WANG_HOP as f32;
-
 /// Quantisation buckets for the 9-bit frequency field.
 const WANG_FREQ_BUCKETS: u32 = 512;
-const WANG_PEAK_NEIGHBOURHOOD: usize = 15;
-const WANG_LOG_FLOOR: f32 = 1e-6;
-/// Squared form of the magnitude floor — fed to `log10(power)` instead of
-/// `log10(magnitude)`, which lets us skip the per-bin `sqrt` in STFT.
-/// Equivalent to `WANG_LOG_FLOOR.powi(2)`.
-const WANG_LOG_FLOOR_POWER: f32 = WANG_LOG_FLOOR * WANG_LOG_FLOOR;
 
 /// Wang offline fingerprinter.
 ///
@@ -209,19 +201,15 @@ impl Wang {
     pub fn new(mut cfg: WangConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
         let frontend = FrontEnd::new(
-            WANG_N_FFT,
-            WANG_HOP,
-            WANG_PEAK_NEIGHBOURHOOD,
+            N_FFT,
+            HOP,
+            PEAK_NEIGHBOURHOOD,
             cfg.min_anchor_mag_db,
             cfg.peaks_per_sec as usize,
         );
         Self { cfg, frontend }
     }
 }
-
-/// Progress callback reporting interval for Wang/Panako (62.5 fps):
-/// every 32 frames ≈ 500 ms of audio.
-const WANG_PROGRESS_INTERVAL: usize = 32;
 
 impl Wang {
     /// Extract fingerprint with a progress callback.
@@ -238,51 +226,20 @@ impl Wang {
         &mut self,
         samples: &[f32],
         rate: SampleRate,
-        mut progress: F,
+        progress: F,
     ) -> Result<WangFingerprint> {
-        crate::classical::landmark_common::check_extract_preamble(
+        let cfg = &self.cfg;
+        let hashes = self.frontend.extract_hashes(
             samples,
             rate,
-            WANG_SR,
-            self.min_samples(),
-            self.cfg.max_input_samples,
+            cfg.max_input_samples,
+            progress,
+            |peaks| build_hashes(peaks, cfg),
+            |h| (h.t_anchor, h.hash),
         )?;
-
-        progress(0.0);
-
-        // Compute power (|X|2) directly from the FFT — skips a per-bin
-        // sqrt that the dB conversion would immediately undo.
-        // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
-        // The STFT → dB → peak-pick phase is ~70 % of the work; it reports
-        // its own progress as frames are processed.
-        let (n_frames, peaks) = self.frontend.pick_peaks(
-            samples,
-            WANG_FRAMES_PER_SEC,
-            WANG_LOG_FLOOR_POWER,
-            0.7,
-            WANG_PROGRESS_INTERVAL,
-            &mut progress,
-        );
-        if n_frames == 0 {
-            progress(1.0);
-            return Ok(WangFingerprint {
-                hashes: Vec::new(),
-                frames_per_sec: WANG_FRAMES_PER_SEC,
-            });
-        }
-
-        progress(0.80);
-        progress(0.90);
-
-        let mut hashes = build_hashes(&peaks, &self.cfg)?;
-        // Stable, deterministic ordering for round-trip and golden tests.
-        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
-
-        progress(1.0);
-
         Ok(WangFingerprint {
             hashes,
-            frames_per_sec: WANG_FRAMES_PER_SEC,
+            frames_per_sec: FRAMES_PER_SEC,
         })
     }
 }
@@ -300,12 +257,12 @@ impl Fingerprinter for Wang {
     }
 
     fn required_sample_rate(&self) -> SampleRate {
-        // WANG_SR is a compile-time constant; unwrap is trivially safe.
-        SampleRate::new(WANG_SR).expect("WANG_SR is non-zero")
+        // SR is a compile-time constant; unwrap is trivially safe.
+        SampleRate::new(SR).expect("SR is non-zero")
     }
 
     fn min_samples(&self) -> usize {
-        WANG_SR as usize * 2
+        MIN_SAMPLES
     }
 
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
@@ -478,11 +435,11 @@ impl StreamingWang {
         Self {
             cfg: cfg.clone(),
             core: stream::StreamCore::new(
-                WANG_N_FFT,
-                WANG_HOP,
-                WANG_SR,
-                WANG_PEAK_NEIGHBOURHOOD,
-                WANG_LOG_FLOOR_POWER,
+                N_FFT,
+                HOP,
+                SR,
+                PEAK_NEIGHBOURHOOD,
+                LOG_FLOOR_POWER,
                 stream::Zone::Inclusive,
                 // Pool buffers pre-reserved at the pop-time size
                 // (`2·fan_out + 2`, see `StreamCore::new`) so they never
@@ -508,33 +465,33 @@ impl StreamingWang {
         self.core.reset();
     }
 
-    /// Frames an anchor must have *after* it before all of its targets
-    /// are observed. Used only for [`latency_ms`] — emission timing in
-    /// the incremental implementation is driven by anchor finalisation.
-    ///
-    /// [`latency_ms`]: StreamingWang::latency_ms
-    fn lookahead_frames(&self) -> u32 {
-        self.cfg.target_zone_t as u32
-            + WANG_PEAK_NEIGHBOURHOOD as u32
-            + WANG_FRAMES_PER_SEC.ceil() as u32
+    fn peak_cfg(&self) -> stream::PeakCfg {
+        peak_cfg!(self.cfg)
     }
 
-    fn peak_cfg(&self) -> stream::PeakCfg {
-        stream::PeakCfg {
-            min_anchor_mag_db: self.cfg.min_anchor_mag_db,
-            target_zone_t: self.cfg.target_zone_t as i32,
-            target_zone_f: self.cfg.target_zone_f as i32,
-            fan_out: self.cfg.fan_out as usize,
-            peaks_per_sec: self.cfg.peaks_per_sec as usize,
-            max_pending_anchors: self.cfg.max_pending_anchors,
-            max_push_samples: self.cfg.max_push_samples,
-        }
+    /// Run `step` through the shared core, collecting the emitted hashes.
+    fn run_collect(&mut self, step: stream::Step<'_>) -> Vec<(TimestampMs, WangHash)> {
+        let cfg = self.peak_cfg();
+        self.core
+            .run_collect(step, cfg, Self::add_target, Self::emit_anchor)
+    }
+
+    /// Run `step` through the shared core, passing each emitted hash to
+    /// `callback`.
+    fn run_with(
+        &mut self,
+        step: stream::Step<'_>,
+        callback: impl FnMut(TimestampMs, &WangHash),
+    ) -> usize {
+        let cfg = self.peak_cfg();
+        self.core
+            .run_with(step, cfg, Self::add_target, Self::emit_anchor, callback)
     }
 
     /// Wang target maintenance: keep the top-K targets by
     /// `(mag desc, position asc)`.
-    fn add_target(targets: &mut Vec<Peak>, target: Peak, _dt: i32, _df: i32, cfg: stream::PeakCfg) {
-        crate::classical::wang::insert_top_target(targets, target, cfg.fan_out);
+    fn add_target(targets: &mut Vec<Peak>, target: Peak, cfg: stream::PeakCfg) {
+        insert_top_target(targets, target, cfg.fan_out);
     }
 
     /// Emit Wang hashes for a finalised anchor: linear walk over its
@@ -551,7 +508,7 @@ impl StreamingWang {
             let f_b_q = quantise_freq(target.f_bin);
             let dt = (target.t_frame - anchor.peak.t_frame).clamp(1, 0x3FFF);
             let hash = ((f_a_q & 0x1FF) << 23) | ((f_b_q & 0x1FF) << 14) | dt;
-            let t_ms = (anchor.peak.t_frame as u64 * WANG_HOP as u64 * 1000) / WANG_SR as u64;
+            let t_ms = (anchor.peak.t_frame as u64 * HOP as u64 * 1000) / SR as u64;
             out.push((
                 TimestampMs(t_ms),
                 WangHash {
@@ -577,28 +534,15 @@ impl StreamingWang {
     /// intervening `push` returns nothing. Safe after `push` following an
     /// earlier `flush_complete` (pending anchors/targets are empty).
     pub fn flush_complete(&mut self) -> Result<alloc::vec::Vec<(TimestampMs, WangHash)>> {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_flush_complete(cfg, Self::add_target, Self::emit_anchor);
-        Ok(core::mem::take(&mut self.core.emitted))
+        Ok(self.run_collect(stream::Step::FlushComplete))
     }
 
     /// Callback variant of [`flush_complete`](Self::flush_complete).
-    pub fn flush_complete_with<F>(&mut self, mut callback: F) -> Result<usize>
+    pub fn flush_complete_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &WangHash),
     {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_flush_complete(cfg, Self::add_target, Self::emit_anchor);
-        let mut n = 0usize;
-        for (t, frame) in self.core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::FlushComplete, callback))
     }
 }
 
@@ -606,59 +550,33 @@ impl StreamingFingerprinter for StreamingWang {
     type Frame = WangHash;
 
     fn required_sample_rate(&self) -> u32 {
-        WANG_SR
+        SR
     }
 
     fn push(&mut self, samples: &[f32]) -> Result<alloc::vec::Vec<(TimestampMs, Self::Frame)>> {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
-        Ok(core::mem::take(&mut self.core.emitted))
+        Ok(self.run_collect(stream::Step::Push(samples)))
     }
 
-    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
+    fn push_with<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_push_samples(samples, cfg, Self::add_target, Self::emit_anchor);
-        let mut n = 0usize;
-        for (t, frame) in self.core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::Push(samples), callback))
     }
 
     fn flush(&mut self) -> Result<alloc::vec::Vec<(TimestampMs, Self::Frame)>> {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_flush(cfg, Self::add_target, Self::emit_anchor);
-        Ok(core::mem::take(&mut self.core.emitted))
+        Ok(self.run_collect(stream::Step::Flush))
     }
 
-    fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
+    fn flush_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        self.core.emitted.clear();
-        let cfg = self.peak_cfg();
-        self.core
-            .process_flush(cfg, Self::add_target, Self::emit_anchor);
-        let mut n = 0usize;
-        for (t, frame) in self.core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::Flush, callback))
     }
 
     fn latency_ms(&self) -> u32 {
-        (self.lookahead_frames() * WANG_HOP as u32 * 1000) / WANG_SR
+        (lookahead_frames(self.cfg.target_zone_t) * HOP as u32 * 1000) / SR
     }
 }
 
@@ -670,6 +588,7 @@ impl crate::ZeroAllocStreaming for StreamingWang {}
 mod tests {
     use super::*;
     use crate::SampleRate;
+    use crate::classical::landmark_common::PROGRESS_INTERVAL;
     use alloc::vec;
     use core::f32::consts::PI;
 
@@ -958,7 +877,7 @@ mod tests {
         let mut after: Vec<(TimestampMs, WangHash)> = s.push(&b).unwrap();
         after.extend(s.flush().unwrap());
         assert!(!after.is_empty(), "continuation should emit hashes");
-        let first_new_frame = 1 + (a.len().saturating_sub(WANG_N_FFT)) / WANG_HOP;
+        let first_new_frame = 1 + (a.len().saturating_sub(N_FFT)) / HOP;
         for (t, h) in &after {
             assert!(
                 h.t_anchor as usize >= first_new_frame,
@@ -1121,11 +1040,11 @@ mod tests {
         // ceilings document the actual steady-state and catch future
         // regressions that would inflate any of them.
         let secs = 30usize;
-        let samples = synthetic_audio(7, WANG_SR as usize * secs);
+        let samples = synthetic_audio(7, SR as usize * secs);
         let chunk = 256usize;
 
         let mut s = StreamingWang::default();
-        let max_spec_rows = 2 * WANG_PEAK_NEIGHBOURHOOD + 1;
+        let max_spec_rows = 2 * PEAK_NEIGHBOURHOOD + 1;
 
         let mut peak_carry = 0usize;
         let mut peak_spec_rows = 0usize;
@@ -1142,7 +1061,7 @@ mod tests {
             peak_anchors = peak_anchors.max(s.core.pending_anchors.len());
 
             // Hard structural invariants — must hold every push.
-            assert!(s.core.sample_carry.len() < WANG_N_FFT);
+            assert!(s.core.sample_carry.len() < N_FFT);
             assert!(s.core.spec_n_rows <= max_spec_rows);
             start = end;
         }
@@ -1154,7 +1073,7 @@ mod tests {
             peak_spec_rows, max_spec_rows,
             "spec window should fill once the stream is long enough",
         );
-        assert!(peak_carry < WANG_N_FFT, "peak_carry {peak_carry}");
+        assert!(peak_carry < N_FFT, "peak_carry {peak_carry}");
         assert!(
             peak_bucket_pending <= 3,
             "bucket_pending peaked at {peak_bucket_pending} (steady state should be ≤ 2)",
@@ -1268,9 +1187,9 @@ mod tests {
     }
 
     /// Bucket index for a frame at the Wang default rate
-    /// (`WANG_FRAMES_PER_SEC = 62.5`).
+    /// (`FRAMES_PER_SEC = 62.5`).
     fn wang_bucket_of(t_frame: u32) -> i64 {
-        (t_frame as f32 / WANG_FRAMES_PER_SEC) as i64
+        (t_frame as f32 / FRAMES_PER_SEC) as i64
     }
 
     #[test]
@@ -1683,12 +1602,12 @@ mod tests {
     #[test]
     fn extract_with_progress_reports_the_documented_sequence() {
         let samples = synthetic_audio(0xCAFE, 8_000 * 5);
-        let n_frames = (samples.len() - WANG_N_FFT) / WANG_HOP + 1;
+        let n_frames = (samples.len() - N_FFT) / HOP + 1;
         let mut expected = alloc::vec![0.0_f32];
-        let mut done = WANG_PROGRESS_INTERVAL;
+        let mut done = PROGRESS_INTERVAL;
         while done < n_frames {
             expected.push(0.7 * (done as f32 / n_frames as f32));
-            done += WANG_PROGRESS_INTERVAL;
+            done += PROGRESS_INTERVAL;
         }
         expected.extend([0.7, 0.8, 0.9, 1.0]);
         let mut values = Vec::new();
@@ -1885,7 +1804,7 @@ mod tests {
         let mut after: Vec<(TimestampMs, WangHash)> = s.push(&b).unwrap();
         after.extend(s.flush_complete().unwrap());
         assert!(!after.is_empty());
-        let first_new_frame = 1 + (a.len().saturating_sub(WANG_N_FFT)) / WANG_HOP;
+        let first_new_frame = 1 + (a.len().saturating_sub(N_FFT)) / HOP;
         for (t, h) in &after {
             assert!(
                 h.t_anchor as usize >= first_new_frame,

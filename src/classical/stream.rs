@@ -160,6 +160,44 @@ pub(crate) struct StreamCore<F> {
     pub(crate) pool_misses: u64,
 }
 
+/// Which pipeline phase [`StreamCore::run_collect`] / [`StreamCore::run_with`]
+/// should drive.
+#[derive(Clone, Copy)]
+pub(crate) enum Step<'a> {
+    /// Feed samples (`push` / `push_with`).
+    Push(&'a [f32]),
+    /// Legacy end-of-stream drain (`flush` / `flush_with`).
+    Flush,
+    /// Corrected end-of-stream drain (`flush_complete` / `flush_complete_with`).
+    FlushComplete,
+}
+
+/// Scan one detected spectrogram row and push every peak that clears
+/// `min_mag` and its neighbourhood maximum (`row_max`) into the bucket
+/// map. Shared by the steady-state scan and the flush drain so both apply
+/// the identical peak criterion.
+fn scan_row(
+    spec_row: &[f32],
+    row_max: &[f32],
+    abs_f: u32,
+    bucket: u32,
+    min_mag: f32,
+    bucket_pending: &mut Vec<(u32, Vec<Peak>)>,
+    bucket_pool: &mut Vec<Vec<Peak>>,
+) {
+    for (bin, (&v, &max)) in spec_row.iter().zip(row_max).enumerate() {
+        if v > min_mag && v >= max {
+            let peak = Peak {
+                t_frame: abs_f,
+                f_bin: bin as u16,
+                _pad: 0,
+                mag: v,
+            };
+            push_peak(bucket_pending, bucket_pool, bucket, peak);
+        }
+    }
+}
+
 /// Push `peak` into the per-second bucket map, creating the bucket entry
 /// if absent. Shared by the steady-state peak scan and the flush drain
 /// so the bucket-insertion order stays identical on both paths.
@@ -339,45 +377,28 @@ impl<F> StreamCore<F> {
         self.spec[dst_start..dst_start + n_bins].copy_from_slice(&self.frame_scratch);
     }
 
-    /// Peak-detect rows `[from_row, to_row]` (spec-relative) and push
-    /// survivors into `bucket_pending`.
-    fn detect_rows_range(&mut self, cfg: PeakCfg, from_row: usize, to_row: usize) {
-        if self.spec_n_rows == 0 || from_row > to_row {
+    /// Peak-detect row `row` (spec-relative) and push survivors into
+    /// `bucket_pending`.
+    fn detect_row(&mut self, cfg: PeakCfg, row: usize) {
+        if row >= self.spec_n_rows {
             return;
         }
         let n_bins = self.spec_n_bins;
-        let spec_tail = self.spec_tail;
-        let spec_cap = self.spec_capacity();
-        for row in from_row..=to_row {
-            if row >= self.spec_n_rows {
-                break;
-            }
-            let abs_f = self.spec_first_frame + row as u32;
-            let bucket = (abs_f as f32 / self.frames_per_sec) as u32;
-            // Ring addressing: logical row → slot offset (audit C2).
-            let row_start = (spec_tail + row) % spec_cap * n_bins;
-            let spec_row = &self.spec[row_start..row_start + n_bins];
-            let peak_max = &self.peak_row_max[..n_bins];
-            for bin in 0..n_bins {
-                let v = spec_row[bin];
-                if v > cfg.min_anchor_mag_db && v >= peak_max[bin] {
-                    let peak = Peak {
-                        t_frame: abs_f,
-                        f_bin: bin as u16,
-                        _pad: 0,
-                        mag: v,
-                    };
-                    // Disjoint field borrows (`bucket_pending` vs
-                    // `bucket_pool`) — no conflict.
-                    push_peak(
-                        &mut self.bucket_pending,
-                        &mut self.bucket_pool,
-                        bucket,
-                        peak,
-                    );
-                }
-            }
-        }
+        let abs_f = self.spec_first_frame + row as u32;
+        let bucket = (abs_f as f32 / self.frames_per_sec) as u32;
+        // Ring addressing: logical row → slot offset (audit C2).
+        let row_start = self.spec_row_base(row);
+        // Disjoint field borrows (`spec`, `peak_row_max`, `bucket_pending`,
+        // `bucket_pool`) — no conflict.
+        scan_row(
+            &self.spec[row_start..row_start + n_bins],
+            &self.peak_row_max[..n_bins],
+            abs_f,
+            bucket,
+            cfg.min_anchor_mag_db,
+            &mut self.bucket_pending,
+            &mut self.bucket_pool,
+        );
     }
 
     /// Finalise one bucket: apply per-second adaptive threshold (top
@@ -388,7 +409,7 @@ impl<F> StreamCore<F> {
         &mut self,
         cfg: PeakCfg,
         bucket: u32,
-        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
     ) {
         let mut peaks = match self.bucket_pending.binary_search_by_key(&bucket, |e| e.0) {
             Ok(idx) => self.bucket_pending.remove(idx).1,
@@ -434,7 +455,7 @@ impl<F> StreamCore<F> {
                 if !in_freq {
                     continue;
                 }
-                add_target(&mut anchor.targets, peak, dt, df, cfg);
+                add_target(&mut anchor.targets, peak, cfg);
             }
             // Register this peak as a new ANCHOR, reusing a pooled target
             // buffer when one is available (steady-state zero-alloc).
@@ -507,7 +528,7 @@ impl<F> StreamCore<F> {
     fn finalize_buckets(
         &mut self,
         cfg: PeakCfg,
-        add_target: &mut impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        add_target: &mut impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
         emit_anchor: &mut impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         if self.last_pd_frame < 0 {
@@ -593,14 +614,67 @@ impl<F> StreamCore<F> {
         self.emitted = emitted;
     }
 
+    /// Run one `step` of the pipeline and return everything it emitted.
+    ///
+    /// Clears `self.emitted` first, so the result holds only this step's
+    /// hashes. The buffer is handed to the caller (the per-call `Vec` the
+    /// [`StreamingFingerprinter`](crate::StreamingFingerprinter) contract
+    /// returns) and regrown by the next step.
+    pub(crate) fn run_collect(
+        &mut self,
+        step: Step<'_>,
+        cfg: PeakCfg,
+        add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) -> Vec<(TimestampMs, F)> {
+        self.run(step, cfg, add_target, emit_anchor);
+        core::mem::take(&mut self.emitted)
+    }
+
+    /// Run one `step` of the pipeline, handing each emitted hash to
+    /// `callback` and returning how many there were. Drains the pooled
+    /// `emitted` buffer in place, so it stays allocation-free after warmup.
+    pub(crate) fn run_with(
+        &mut self,
+        step: Step<'_>,
+        cfg: PeakCfg,
+        add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+        mut callback: impl FnMut(TimestampMs, &F),
+    ) -> usize {
+        self.run(step, cfg, add_target, emit_anchor);
+        let mut n = 0usize;
+        for (t, frame) in self.emitted.drain(..) {
+            callback(t, &frame);
+            n += 1;
+        }
+        n
+    }
+
+    /// Clear `self.emitted` and run one `step` into it.
+    fn run(
+        &mut self,
+        step: Step<'_>,
+        cfg: PeakCfg,
+        add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        self.emitted.clear();
+        match step {
+            Step::Push(samples) => self.process_push_samples(samples, cfg, add_target, emit_anchor),
+            Step::Flush => self.process_flush(cfg, add_target, emit_anchor),
+            Step::FlushComplete => self.process_flush_complete(cfg, add_target, emit_anchor),
+        }
+    }
+
     /// Common processing for `push` and `push_with`: advance the STFT,
     /// detect peaks, finalise buckets, emit ready anchors into
     /// `self.emitted`.
-    pub(crate) fn process_push_samples(
+    fn process_push_samples(
         &mut self,
         samples: &[f32],
         cfg: PeakCfg,
-        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
         mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
@@ -635,7 +709,7 @@ impl<F> StreamCore<F> {
                 .push_row(&self.frame_scratch, &mut self.peak_row_max)
             {
                 let row_idx = (ripe_abs - self.spec_first_frame) as usize;
-                self.detect_rows_range(cfg, row_idx, row_idx);
+                self.detect_row(cfg, row_idx);
                 self.last_pd_frame = i64::from(ripe_abs);
             }
         }
@@ -647,50 +721,79 @@ impl<F> StreamCore<F> {
         self.finalize_buckets(cfg, &mut add_target, &mut emit_anchor);
     }
 
-    /// Common processing for `flush` and `flush_with`: drain remaining
-    /// peaks from the incremental detector, finalise all buckets, emit
-    /// all anchors into `self.emitted`.
-    pub(crate) fn process_flush(
-        &mut self,
-        cfg: PeakCfg,
-        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
-    ) {
+    /// Drain the incremental peak detector's un-ripe tail rows into
+    /// `bucket_pending` and advance `last_pd_frame` past them. Shared by
+    /// both flush flavours.
+    fn drain_peak_detector(&mut self, min_mag: f32) {
         let n_bins = self.spec_n_bins;
         let spec = &self.spec;
         let spec_tail = self.spec_tail;
-        let spec_cap = 2 * self.neighborhood + 1;
+        let spec_cap = self.spec_capacity();
         let spec_first_frame = self.spec_first_frame;
         let bucket_pending = &mut self.bucket_pending;
         let bucket_pool = &mut self.bucket_pool;
         let last_pd = &mut self.last_pd_frame;
-        let min_mag = cfg.min_anchor_mag_db;
         let frames_per_sec = self.frames_per_sec;
 
         self.peak_det
             .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
                 let row_idx = (ripe_abs - spec_first_frame) as usize;
                 let bucket = (ripe_abs as f32 / frames_per_sec) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate() {
-                    let idx = (spec_tail + row_idx) % spec_cap * n_bins + bin;
-                    let v = spec[idx];
-                    if v > min_mag && v >= row_max {
-                        let peak = Peak {
-                            t_frame: ripe_abs,
-                            f_bin: bin as u16,
-                            _pad: 0,
-                            mag: v,
-                        };
-                        push_peak(bucket_pending, bucket_pool, bucket, peak);
-                    }
-                }
+                let row_start = (spec_tail + row_idx) % spec_cap * n_bins;
+                scan_row(
+                    &spec[row_start..row_start + n_bins],
+                    max_row,
+                    ripe_abs,
+                    bucket,
+                    min_mag,
+                    bucket_pending,
+                    bucket_pool,
+                );
                 *last_pd = i64::from(ripe_abs);
             });
+    }
 
+    /// Stage every pending bucket in `to_finalize` (ascending) and return
+    /// how many there are. Shared by both flush flavours.
+    fn stage_all_buckets(&mut self) -> usize {
         self.to_finalize.clear();
         self.to_finalize
             .extend(self.bucket_pending.iter().map(|e| e.0));
-        let n = self.to_finalize.len();
+        self.to_finalize.len()
+    }
+
+    /// Emit every pending anchor unconditionally, recycling each consumed
+    /// target buffer into the pool.
+    fn emit_all_pending(
+        &mut self,
+        cfg: PeakCfg,
+        emit_anchor: &mut impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        // Temporarily take `emitted` to split the borrow (as in
+        // `emit_finalized_anchors`).
+        let mut emitted = core::mem::take(&mut self.emitted);
+        while let Some(anchor) = self.pending_anchors.pop_front() {
+            let freed = emit_anchor(anchor, cfg, &mut emitted);
+            // Capped (see TARGETS_POOL_MAX): excess is dropped.
+            if self.targets_pool.len() < TARGETS_POOL_MAX {
+                self.targets_pool.push(freed);
+            }
+        }
+        self.emitted = emitted;
+    }
+
+    /// Common processing for `flush` and `flush_with`: drain remaining
+    /// peaks from the incremental detector, finalise all buckets, emit
+    /// all anchors into `self.emitted`.
+    fn process_flush(
+        &mut self,
+        cfg: PeakCfg,
+        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
+        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        self.drain_peak_detector(cfg.min_anchor_mag_db);
+
+        let n = self.stage_all_buckets();
         // Finalize + emit INTERLEAVED per bucket (not finalize-all then
         // emit-all): each bucket's anchors are emitted — returning their
         // target buffers to the pool — before the next bucket allocates new
@@ -708,20 +811,12 @@ impl<F> StreamCore<F> {
         // check is a liveness optimization for steady-state `push`, but at
         // end-of-stream every anchor's full lookahead has been observed, so
         // the remaining ones must emit (and the queue must empty).
-        let mut emitted = core::mem::take(&mut self.emitted);
         for i in 0..n {
             let bucket = self.to_finalize[i];
             self.finalize_bucket(cfg, bucket, &mut add_target);
-            while let Some(anchor) = self.pending_anchors.pop_front() {
-                let freed = emit_anchor(anchor, cfg, &mut emitted);
-                // Capped (see TARGETS_POOL_MAX): excess is dropped.
-                if self.targets_pool.len() < TARGETS_POOL_MAX {
-                    self.targets_pool.push(freed);
-                }
-            }
+            self.emit_all_pending(cfg, &mut emit_anchor);
         }
         self.to_finalize.clear();
-        self.emitted = emitted;
     }
 
     /// Corrected end-of-stream finalisation: finalize every remaining bucket
@@ -730,63 +825,23 @@ impl<F> StreamCore<F> {
     /// tail anchors at EOF. Matches offline [`Wang::extract`] /
     /// [`Panako::extract`] hash multisets; the legacy [`process_flush`] path
     /// is retained for byte-compatible streaming output.
-    pub(crate) fn process_flush_complete(
+    fn process_flush_complete(
         &mut self,
         cfg: PeakCfg,
-        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        mut add_target: impl FnMut(&mut Vec<Peak>, Peak, PeakCfg),
         mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
-        let n_bins = self.spec_n_bins;
-        let spec = &self.spec;
-        let spec_tail = self.spec_tail;
-        let spec_cap = 2 * self.neighborhood + 1;
-        let spec_first_frame = self.spec_first_frame;
-        let bucket_pending = &mut self.bucket_pending;
-        let bucket_pool = &mut self.bucket_pool;
-        let last_pd = &mut self.last_pd_frame;
-        let min_mag = cfg.min_anchor_mag_db;
-        let frames_per_sec = self.frames_per_sec;
+        self.drain_peak_detector(cfg.min_anchor_mag_db);
 
-        self.peak_det
-            .flush(&mut self.peak_row_max, |ripe_abs, max_row| {
-                let row_idx = (ripe_abs - spec_first_frame) as usize;
-                let bucket = (ripe_abs as f32 / frames_per_sec) as u32;
-                for (bin, &row_max) in max_row.iter().enumerate() {
-                    let idx = (spec_tail + row_idx) % spec_cap * n_bins + bin;
-                    let v = spec[idx];
-                    if v > min_mag && v >= row_max {
-                        let peak = Peak {
-                            t_frame: ripe_abs,
-                            f_bin: bin as u16,
-                            _pad: 0,
-                            mag: v,
-                        };
-                        push_peak(bucket_pending, bucket_pool, bucket, peak);
-                    }
-                }
-                *last_pd = i64::from(ripe_abs);
-            });
-
-        self.to_finalize.clear();
-        self.to_finalize
-            .extend(self.bucket_pending.iter().map(|e| e.0));
-        let n = self.to_finalize.len();
+        let n = self.stage_all_buckets();
         for i in 0..n {
             let bucket = self.to_finalize[i];
             self.finalize_bucket(cfg, bucket, &mut add_target);
         }
 
         self.emit_finalized_anchors(cfg, &mut emit_anchor);
-
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            let freed = emit_anchor(anchor, cfg, &mut emitted);
-            if self.targets_pool.len() < TARGETS_POOL_MAX {
-                self.targets_pool.push(freed);
-            }
-        }
+        self.emit_all_pending(cfg, &mut emit_anchor);
         self.to_finalize.clear();
-        self.emitted = emitted;
     }
 }
 

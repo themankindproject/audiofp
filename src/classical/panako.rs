@@ -65,7 +65,10 @@
 
 use alloc::vec::Vec;
 
-use crate::classical::landmark_common::FrontEnd;
+use crate::classical::landmark_common::{
+    FRAMES_PER_SEC, FrontEnd, HOP, LOG_FLOOR_POWER, MIN_SAMPLES, N_FFT, PEAK_NEIGHBOURHOOD, SR,
+    lookahead_frames, peak_cfg,
+};
 use crate::classical::stream;
 use crate::dsp::peaks::Peak;
 use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
@@ -176,23 +179,13 @@ impl Default for PanakoConfig {
             target_zone_f: 96,
             peaks_per_sec: 30,
             min_anchor_mag_db: -50.0,
-            max_input_samples: Some(30 * 60 * PANAKO_SR as usize),
+            max_input_samples: Some(30 * 60 * SR as usize),
             max_hashes: Some(500_000),
             max_pending_anchors: None,
             max_push_samples: None,
         }
     }
 }
-
-const PANAKO_N_FFT: usize = 1024;
-const PANAKO_HOP: usize = 128;
-const PANAKO_SR: u32 = 8_000;
-const PANAKO_FRAMES_PER_SEC: f32 = PANAKO_SR as f32 / PANAKO_HOP as f32;
-
-const PANAKO_PEAK_NEIGHBOURHOOD: usize = 15;
-const PANAKO_LOG_FLOOR: f32 = 1e-6;
-/// Squared form of the magnitude floor — see Wang for rationale.
-const PANAKO_LOG_FLOOR_POWER: f32 = PANAKO_LOG_FLOOR * PANAKO_LOG_FLOOR;
 
 /// Panako offline fingerprinter.
 ///
@@ -231,19 +224,15 @@ impl Panako {
     pub fn new(mut cfg: PanakoConfig) -> Self {
         crate::classical::sanitize_cfg!(cfg);
         let frontend = FrontEnd::new(
-            PANAKO_N_FFT,
-            PANAKO_HOP,
-            PANAKO_PEAK_NEIGHBOURHOOD,
+            N_FFT,
+            HOP,
+            PEAK_NEIGHBOURHOOD,
             cfg.min_anchor_mag_db,
             cfg.peaks_per_sec as usize,
         );
         Self { cfg, frontend }
     }
 }
-
-/// Progress callback reporting interval for Panako (62.5 fps):
-/// every 32 frames ≈ 500 ms of audio.
-const PANAKO_PROGRESS_INTERVAL: usize = 32;
 
 impl Panako {
     /// Extract fingerprint with a progress callback.
@@ -260,47 +249,20 @@ impl Panako {
         &mut self,
         samples: &[f32],
         rate: SampleRate,
-        mut progress: F,
+        progress: F,
     ) -> Result<PanakoFingerprint> {
-        crate::classical::landmark_common::check_extract_preamble(
+        let cfg = &self.cfg;
+        let hashes = self.frontend.extract_hashes(
             samples,
             rate,
-            PANAKO_SR,
-            self.min_samples(),
-            self.cfg.max_input_samples,
+            cfg.max_input_samples,
+            progress,
+            |peaks| build_triplet_hashes(peaks, cfg),
+            |h| (h.t_anchor, h.t_b, h.t_c, h.hash),
         )?;
-
-        progress(0.0);
-
-        // The STFT → dB → peak-pick phase is ~70 % of the work; it reports
-        // its own progress as frames are processed.
-        let (n_frames, peaks) = self.frontend.pick_peaks(
-            samples,
-            PANAKO_FRAMES_PER_SEC,
-            PANAKO_LOG_FLOOR_POWER,
-            0.7,
-            PANAKO_PROGRESS_INTERVAL,
-            &mut progress,
-        );
-        if n_frames == 0 {
-            progress(1.0);
-            return Ok(PanakoFingerprint {
-                hashes: Vec::new(),
-                frames_per_sec: PANAKO_FRAMES_PER_SEC,
-            });
-        }
-
-        progress(0.80);
-        progress(0.90);
-
-        let mut hashes = build_triplet_hashes(&peaks, &self.cfg)?;
-        hashes.sort_unstable_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
-
-        progress(1.0);
-
         Ok(PanakoFingerprint {
             hashes,
-            frames_per_sec: PANAKO_FRAMES_PER_SEC,
+            frames_per_sec: FRAMES_PER_SEC,
         })
     }
 }
@@ -318,12 +280,12 @@ impl Fingerprinter for Panako {
     }
 
     fn required_sample_rate(&self) -> SampleRate {
-        // PANAKO_SR is a compile-time constant; unwrap is trivially safe.
-        SampleRate::new(PANAKO_SR).expect("PANAKO_SR is non-zero")
+        // SR is a compile-time constant; unwrap is trivially safe.
+        SampleRate::new(SR).expect("SR is non-zero")
     }
 
     fn min_samples(&self) -> usize {
-        PANAKO_SR as usize * 2
+        MIN_SAMPLES
     }
 
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {
@@ -567,11 +529,11 @@ impl StreamingPanako {
         Self {
             cfg: cfg.clone(),
             core: stream::StreamCore::new(
-                PANAKO_N_FFT,
-                PANAKO_HOP,
-                PANAKO_SR,
-                PANAKO_PEAK_NEIGHBOURHOOD,
-                PANAKO_LOG_FLOOR_POWER,
+                N_FFT,
+                HOP,
+                SR,
+                PEAK_NEIGHBOURHOOD,
+                LOG_FLOOR_POWER,
                 stream::Zone::Strict,
                 // Pool buffers pre-reserved at the pop-time size
                 // (`2·fan_out + 2`, see `StreamCore::new`) so they never
@@ -598,27 +560,42 @@ impl StreamingPanako {
         self.core.reset();
     }
 
-    fn lookahead_frames(&self) -> u32 {
-        self.cfg.target_zone_t as u32
-            + PANAKO_PEAK_NEIGHBOURHOOD as u32
-            + PANAKO_FRAMES_PER_SEC.ceil() as u32
+    fn peak_cfg(&self) -> stream::PeakCfg {
+        peak_cfg!(self.cfg)
     }
 
-    fn peak_cfg(&self) -> stream::PeakCfg {
-        stream::PeakCfg {
-            min_anchor_mag_db: self.cfg.min_anchor_mag_db,
-            target_zone_t: self.cfg.target_zone_t as i32,
-            target_zone_f: self.cfg.target_zone_f as i32,
-            fan_out: self.cfg.fan_out as usize,
-            peaks_per_sec: self.cfg.peaks_per_sec as usize,
-            max_pending_anchors: self.cfg.max_pending_anchors,
-            max_push_samples: self.cfg.max_push_samples,
-        }
+    /// Run `step` through the shared core, collecting the emitted hashes.
+    fn run_collect(&mut self, step: stream::Step<'_>) -> Vec<(TimestampMs, PanakoHash)> {
+        let cfg = self.peak_cfg();
+        // Disjoint field borrows: `core` (receiver) vs `emit_heap` /
+        // `emit_scratch` (captured by the closure) — no conflict.
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.run_collect(step, cfg, Self::add_target, |a, c, o| {
+            Self::emit_anchor(a, c, o, heap, scratch)
+        })
+    }
+
+    /// Run `step` through the shared core, passing each emitted hash to
+    /// `callback`.
+    fn run_with(
+        &mut self,
+        step: stream::Step<'_>,
+        callback: impl FnMut(TimestampMs, &PanakoHash),
+    ) -> usize {
+        let cfg = self.peak_cfg();
+        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
+        core.run_with(
+            step,
+            cfg,
+            Self::add_target,
+            |a, c, o| Self::emit_anchor(a, c, o, heap, scratch),
+            callback,
+        )
     }
 
     /// Panako target maintenance: keep all in-cone targets, capped at
     /// `2·fan_out` with weakest-magnitude eviction.
-    fn add_target(targets: &mut Vec<Peak>, target: Peak, _dt: i32, _df: i32, cfg: stream::PeakCfg) {
+    fn add_target(targets: &mut Vec<Peak>, target: Peak, cfg: stream::PeakCfg) {
         let target_cap = 2 * cfg.fan_out;
         targets.push(target);
         if targets.len() > target_cap {
@@ -678,7 +655,7 @@ impl StreamingPanako {
         scratch.sort_unstable_by_key(|x| (x.0.t_frame, x.0.f_bin, x.1.t_frame, x.1.f_bin));
         for (b, c, _) in &*scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
-            let t_ms = (anchor.peak.t_frame as u64 * PANAKO_HOP as u64 * 1000) / PANAKO_SR as u64;
+            let t_ms = (anchor.peak.t_frame as u64 * HOP as u64 * 1000) / SR as u64;
             out.push((
                 TimestampMs(t_ms),
                 PanakoHash {
@@ -698,32 +675,15 @@ impl StreamingPanako {
     /// See [`StreamingWang::flush_complete`](super::StreamingWang::flush_complete) for the legacy-vs-corrected
     /// flush contract and when to opt in.
     pub fn flush_complete(&mut self) -> Result<Vec<(TimestampMs, PanakoHash)>> {
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_flush_complete(cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        Ok(core::mem::take(&mut core.emitted))
+        Ok(self.run_collect(stream::Step::FlushComplete))
     }
 
     /// Callback variant of [`flush_complete`](Self::flush_complete).
-    pub fn flush_complete_with<F>(&mut self, mut callback: F) -> Result<usize>
+    pub fn flush_complete_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &PanakoHash),
     {
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_flush_complete(cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        let mut n = 0usize;
-        for (t, frame) in core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::FlushComplete, callback))
     }
 }
 
@@ -731,69 +691,33 @@ impl StreamingFingerprinter for StreamingPanako {
     type Frame = PanakoHash;
 
     fn required_sample_rate(&self) -> u32 {
-        PANAKO_SR
+        SR
     }
 
     fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        // Disjoint field borrows: `core` (receiver) vs `emit_heap` /
-        // `emit_scratch` (captured by the closure) — no conflict.
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_push_samples(samples, cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        Ok(core::mem::take(&mut core.emitted))
+        Ok(self.run_collect(stream::Step::Push(samples)))
     }
 
-    fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
+    fn push_with<F>(&mut self, samples: &[f32], callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_push_samples(samples, cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        let mut n = 0usize;
-        for (t, frame) in core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::Push(samples), callback))
     }
 
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_flush(cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        Ok(core::mem::take(&mut core.emitted))
+        Ok(self.run_collect(stream::Step::Flush))
     }
 
-    fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
+    fn flush_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
     {
-        let cfg = self.peak_cfg();
-        let (core, heap, scratch) = (&mut self.core, &mut self.emit_heap, &mut self.emit_scratch);
-        core.emitted.clear();
-        core.process_flush(cfg, Self::add_target, |a, c, o| {
-            Self::emit_anchor(a, c, o, heap, scratch)
-        });
-        let mut n = 0usize;
-        for (t, frame) in core.emitted.drain(..) {
-            callback(t, &frame);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.run_with(stream::Step::Flush, callback))
     }
 
     fn latency_ms(&self) -> u32 {
-        (self.lookahead_frames() * PANAKO_HOP as u32 * 1000) / PANAKO_SR
+        (lookahead_frames(self.cfg.target_zone_t) * HOP as u32 * 1000) / SR
     }
 }
 
@@ -1268,11 +1192,11 @@ mod tests {
         // Same shape as the Wang invariant test: 30 s of audio in
         // 256-sample chunks, peak-tracked ceilings on every buffer.
         let secs = 30usize;
-        let samples = synthetic_audio(11, PANAKO_SR as usize * secs);
+        let samples = synthetic_audio(11, SR as usize * secs);
         let chunk = 256usize;
 
         let mut s = StreamingPanako::default();
-        let max_spec_rows = 2 * PANAKO_PEAK_NEIGHBOURHOOD + 1;
+        let max_spec_rows = 2 * PEAK_NEIGHBOURHOOD + 1;
 
         let mut peak_carry = 0usize;
         let mut peak_spec_rows = 0usize;
@@ -1288,7 +1212,7 @@ mod tests {
             peak_bucket_pending = peak_bucket_pending.max(s.core.bucket_pending.len());
             peak_anchors = peak_anchors.max(s.core.pending_anchors.len());
 
-            assert!(s.core.sample_carry.len() < PANAKO_N_FFT);
+            assert!(s.core.sample_carry.len() < N_FFT);
             assert!(s.core.spec_n_rows <= max_spec_rows);
             start = end;
         }
@@ -1296,7 +1220,7 @@ mod tests {
         // target_zone_t=96 frames ≈ 1.54 s of bucket coverage at 62.5
         // fps; peaks_per_sec=30 → ~46 anchors at peak.
         assert_eq!(peak_spec_rows, max_spec_rows);
-        assert!(peak_carry < PANAKO_N_FFT, "peak_carry {peak_carry}");
+        assert!(peak_carry < N_FFT, "peak_carry {peak_carry}");
         assert!(
             peak_bucket_pending <= 3,
             "bucket_pending peaked at {peak_bucket_pending} (steady state should be ≤ 2)",
@@ -1351,9 +1275,9 @@ mod tests {
     }
 
     /// Bucket index for a frame at the Panako default rate
-    /// (`PANAKO_FRAMES_PER_SEC = 62.5`).
+    /// (`FRAMES_PER_SEC = 62.5`).
     fn panako_bucket_of(t_frame: u32) -> i64 {
-        (t_frame as f32 / PANAKO_FRAMES_PER_SEC) as i64
+        (t_frame as f32 / FRAMES_PER_SEC) as i64
     }
 
     #[test]
