@@ -1,0 +1,10 @@
+# Codecov status targets. Both the whole-project and the per-change (patch)
+# checks must reach 80% coverage for CI to pass.
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+    patch:
+      default:
+        target: 80%
