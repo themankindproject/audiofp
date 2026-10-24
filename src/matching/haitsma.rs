@@ -6,11 +6,11 @@
 //! # Two tiers
 //!
 //! **Exact BER** — slide query over reference at every offset `δ`,
-//! compute Hamming via hardware `POPCNT` with per-frame early-abort.
-//! Most offsets die in the first few frames.
+//! compute Hamming via hardware `POPCNT`, checking a rate-normalised
+//! early-abort bound every 64 frames once a good candidate exists.
 //!
 //! **Sub-fingerprint LUT** — when `reference.len() > 512`, build a
-//! hash map `u32 → Vec<pos>` over reference frames. Haitsma's key
+//! sorted `(u32, pos)` table over reference frames. Haitsma's key
 //! property: when `BER < ~0.35`, at least one query frame is bit-exact,
 //! so probe each query frame's exact `u32` (plus optional 1–2 bit-flip
 //! probes) → candidate offsets → run exact BER verification only there.
@@ -30,14 +30,14 @@
 //!
 //! - Exact: `O(Q·R)` popcounts with aggressive early-abort.
 //! - LUT: `O(Q + candidates·overlap)` — sub-millisecond for song-length.
-//! - Memory: transient hash map ≈ `r_len*12` bytes (`HashMap` under `std`).
+//! - Memory: transient sorted LUT of `r_len` `(frame, position)` pairs
+//!   (16 bytes each) plus a `q_len + r_len`-bit seen-offset set.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
 use crate::classical::HaitsmaFingerprint;
-use crate::matching::maps::HashMap;
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 /// Hamming distance over `overlap` frames at offset `delta`.
@@ -238,46 +238,96 @@ impl BestAlignment {
     }
 }
 
-/// Build a LUT: `u32` sub-fingerprint → list of reference frame indices.
-fn build_lut(reference: &[u32]) -> HashMap<u32, Vec<usize>> {
-    let mut lut: HashMap<u32, Vec<usize>> = super::maps::hashmap_with_capacity(reference.len() / 2);
-    for (pos, &frame) in reference.iter().enumerate() {
-        lut.entry(frame).or_default().push(pos);
+/// Sub-fingerprint LUT: `(frame, position)` pairs sorted by frame, then
+/// position.
+///
+/// One allocation and one sort. The previous `HashMap<u32, Vec<usize>>`
+/// paid one `Vec` per distinct frame — nearly every frame of a real
+/// reference — and since `match_one` rebuilds the LUT on every call, that
+/// build was most of its cost (≈ 5 ms of 5.6 ms on a 4-minute reference).
+/// Each frame's positions come back ascending, as the map's insertion
+/// order gave them, so candidates are considered in the same order.
+///
+/// Bit-flip probing does up to 529 lookups per query frame, nearly all
+/// misses, so a one-bit-per-slot membership filter (≥ 16 slots per
+/// reference frame, ~3–6 % false positives) answers most of them before
+/// the binary search.
+struct Lut {
+    pairs: Vec<(u32, usize)>,
+    filter: Vec<u64>,
+    /// `32 − log2(filter bits)`: a slot is the top bits of a
+    /// multiplicative hash of the frame.
+    shift: u32,
+}
+
+impl Lut {
+    fn build(reference: &[u32]) -> Self {
+        let mut pairs: Vec<(u32, usize)> = reference
+            .iter()
+            .enumerate()
+            .map(|(pos, &frame)| (frame, pos))
+            .collect();
+        pairs.sort_unstable();
+        let bits = (reference.len() * 16)
+            .next_power_of_two()
+            .clamp(64, 1 << 24);
+        let shift = 32 - bits.trailing_zeros();
+        let mut filter = alloc::vec![0_u64; bits / 64];
+        for &frame in reference {
+            let slot = Self::slot(frame, shift);
+            filter[slot / 64] |= 1 << (slot % 64);
+        }
+        Self {
+            pairs,
+            filter,
+            shift,
+        }
     }
-    lut
+
+    #[inline]
+    fn slot(frame: u32, shift: u32) -> usize {
+        (frame.wrapping_mul(0x9E37_79B1) >> shift) as usize
+    }
+
+    /// Every `(frame, position)` entry for `frame`, positions ascending.
+    #[inline]
+    fn get(&self, frame: u32) -> &[(u32, usize)] {
+        let slot = Self::slot(frame, self.shift);
+        if self.filter[slot / 64] & (1 << (slot % 64)) == 0 {
+            return &[];
+        }
+        let start = self.pairs.partition_point(|&(f, _)| f < frame);
+        let len = self.pairs[start..].partition_point(|&(f, _)| f == frame);
+        &self.pairs[start..start + len]
+    }
 }
 
 /// Probe all 1-bit-flip variants of `frame` (32 variants).
 #[inline]
-fn probe_1flip(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
-    if let Some(v) = lut.get(&frame) {
-        f(v);
-    }
+fn probe_1flip(frame: u32, lut: &Lut, f: &mut impl FnMut(&[(u32, usize)])) {
+    probe_exact(frame, lut, f);
     for bit in 0..32 {
-        if let Some(v) = lut.get(&(frame ^ (1u32 << bit))) {
-            f(v);
-        }
+        probe_exact(frame ^ (1u32 << bit), lut, f);
     }
 }
 
 /// Probe exact + 1-bit + 2-bit-flip variants (1 + 32 + 496 = 529 probes).
 #[inline]
-fn probe_2flip(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
+fn probe_2flip(frame: u32, lut: &Lut, f: &mut impl FnMut(&[(u32, usize)])) {
     probe_1flip(frame, lut, f);
     for b1 in 0..32 {
         for b2 in (b1 + 1)..32 {
-            if let Some(v) = lut.get(&(frame ^ (1u32 << b1) ^ (1u32 << b2))) {
-                f(v);
-            }
+            probe_exact(frame ^ (1u32 << b1) ^ (1u32 << b2), lut, f);
         }
     }
 }
 
 /// Probe exact only (no bit flips).
 #[inline]
-fn probe_exact(frame: u32, lut: &HashMap<u32, Vec<usize>>, f: &mut impl FnMut(&Vec<usize>)) {
-    if let Some(v) = lut.get(&frame) {
-        f(v);
+fn probe_exact(frame: u32, lut: &Lut, f: &mut impl FnMut(&[(u32, usize)])) {
+    let hits = lut.get(frame);
+    if !hits.is_empty() {
+        f(hits);
     }
 }
 
@@ -377,7 +427,7 @@ impl Matcher for HaitsmaMatcher {
         // LUT path
         let use_lut = self.cfg.use_lut && r_len > 512;
         if use_lut {
-            let lut = build_lut(r_frames);
+            let lut = Lut::build(r_frames);
             let mut best = BestAlignment::new();
 
             // Deduplicated body across the three probe modes: verify
@@ -386,15 +436,21 @@ impl Matcher for HaitsmaMatcher {
             // A repeated exact frame hit can identify the same alignment
             // hundreds of times. Remember deltas for this entire query;
             // consideration still occurs in first-seen order for stable ties.
-            let mut seen_deltas = alloc::collections::BTreeSet::new();
+            // Deltas span `[-(q_len - 1), r_len - 1]`, so a bitset over that
+            // range replaces a `BTreeSet` (one node per candidate).
+            let d_min = -(q_len as i64 - 1);
+            let mut seen_deltas = alloc::vec![0_u64; (q_len + r_len).div_ceil(64)];
 
             for (q_pos, &q_frame) in q_frames.iter().enumerate() {
-                let mut consider = |positions: &Vec<usize>| {
-                    for &r_pos in positions {
+                let mut consider = |hits: &[(u32, usize)]| {
+                    for &(_, r_pos) in hits {
                         let delta = r_pos as i64 - q_pos as i64;
-                        if !seen_deltas.insert(delta) {
+                        let bit = (delta - d_min) as usize;
+                        let (word, mask) = (bit / 64, 1_u64 << (bit % 64));
+                        if seen_deltas[word] & mask != 0 {
                             continue;
                         }
+                        seen_deltas[word] |= mask;
                         best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
                     }
                 };
@@ -418,7 +474,7 @@ impl Matcher for HaitsmaMatcher {
                 best.overlap,
                 q_frames,
                 r_frames,
-                query.frames_per_sec,
+                reference.frames_per_sec,
                 &self.cfg,
             );
         }
@@ -444,7 +500,7 @@ impl Matcher for HaitsmaMatcher {
             best.overlap,
             q_frames,
             r_frames,
-            query.frames_per_sec,
+            reference.frames_per_sec,
             &self.cfg,
         )
     }

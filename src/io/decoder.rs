@@ -15,7 +15,7 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::dsp::resample::SincResampler;
 use crate::error::IoError;
-use crate::io::riff_preflight::preflight_wav_from_file;
+use crate::io::riff_preflight::preflight_header_from_file;
 use crate::{AfpError, Result};
 
 /// Maximum channel count `audiofp` will decode.
@@ -28,9 +28,9 @@ use crate::{AfpError, Result};
 /// 65535). 64 comfortably covers 7.1, ambisonics, and stem files.
 const MAX_DECODE_CHANNELS: usize = 64;
 
-/// Default ceiling on the mono buffer produced by an upsampling
+/// Floor of the ceiling on the mono buffer produced by an upsampling
 /// [`decode_to_mono_at_limited`] call when the caller set no
-/// `max_samples`.
+/// `max_samples` (see [`MAX_UNCAPPED_UPSAMPLE_GROWTH`] for the rest).
 ///
 /// `max_samples` bounds the buffer at the *native* rate; a resample to a
 /// higher `target_sr` can legally multiply it. The source rate is
@@ -40,6 +40,16 @@ const MAX_DECODE_CHANNELS: usize = 64;
 /// provide no protection at all. 10 minutes at 48 kHz is far beyond any
 /// fingerprinting window.
 const DEFAULT_MAX_RESAMPLED_SAMPLES: usize = 48_000 * 60 * 10;
+
+/// Largest growth factor an uncapped resample may apply to the decoded
+/// native buffer before [`DEFAULT_MAX_RESAMPLED_SAMPLES`] becomes the
+/// binding limit.
+///
+/// Real upsampling ratios are small (8 kHz → 48 kHz is 6×); a crafted
+/// 1 Hz header asks for 48 000×. Bounding the *ratio* keeps the second
+/// out while letting a long file go through any ordinary rate change,
+/// including every downsample (growth < 1).
+const MAX_UNCAPPED_UPSAMPLE_GROWTH: usize = 8;
 
 /// Resource limits for untrusted-upload decoding.
 ///
@@ -277,10 +287,14 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
         // 1 Hz can demand gigabytes and minutes of CPU. Bound the
         // projection *before* resampling regardless of whether the caller
         // set `max_samples`: when they did, that is the cap; when they did
-        // not, use a hard default so `DecodeLimits::bytes(..)` (byte-only)
-        // is not a false sense of security.
+        // not, the output may grow to `MAX_UNCAPPED_UPSAMPLE_GROWTH` × the
+        // already-decoded native buffer, or to the fixed default floor if
+        // that is larger. So `DecodeLimits::bytes(..)` (byte-only) is not a
+        // false sense of security, yet a downsample (which never grows the
+        // buffer) or a modest upsample of a long file is never rejected for
+        // its length alone.
         let projected = (samples.len() as u64 * target_sr as u64).div_ceil(sr as u64);
-        let cap = limits.max_samples.unwrap_or(DEFAULT_MAX_RESAMPLED_SAMPLES);
+        let cap = resample_cap(samples.len(), limits.max_samples);
         if projected > cap as u64 {
             return Err(AfpError::InputTooLarge {
                 limit: cap,
@@ -300,6 +314,14 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     }
 }
 
+/// Ceiling on the resampled output length for a `native_len`-sample decode
+/// (see the comment at the call site in [`decode_to_mono_at_limited`]).
+fn resample_cap(native_len: usize, max_samples: Option<usize>) -> usize {
+    max_samples.unwrap_or_else(|| {
+        DEFAULT_MAX_RESAMPLED_SAMPLES.max(native_len.saturating_mul(MAX_UNCAPPED_UPSAMPLE_GROWTH))
+    })
+}
+
 /// Observability counters for one decode pass. Returned as part of
 /// [`DecodeReport`]; see [`decode_to_mono_report`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -308,8 +330,9 @@ pub struct DecodeStats {
     /// files are excluded — they are not part of this stream).
     pub packets_total: u64,
     /// Packets skipped without failing the decode: recoverable per-packet
-    /// decode failures (`integrity_mode: false`, the default) plus
-    /// malformed 0-channel packets. A large count relative to
+    /// decode failures (`integrity_mode: false`, the default), malformed
+    /// 0-channel packets, and one for a stream that ends mid-packet (a
+    /// truncated file). A large count relative to
     /// `packets_total` means the fingerprint was built from partial audio
     /// and may fail to match for that reason — not because the recording
     /// differs. Route on this number (enroll / enroll+flag / quarantine)
@@ -353,11 +376,34 @@ type OpenedSource = (
 /// format hint, and wall-clock deadline. Shared by [`decode_to_mono_limited`]
 /// and [`decode_to_mono_report`] so the two entry points cannot drift.
 fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
-    // Pre-check: don't even open files that are clearly too large.
-    // Note: this is best-effort against TOCTOU (file can grow after the
-    // stat); `max_samples` is the hard bound on decoded PCM.
+    // `Instant::now` is the correct choice here: the decode timeout
+    // measures wall-clock time from the caller's perspective, so it starts
+    // before the header preflight and the probe rather than after them.
+    // This is not a testability concern — tests exercise the timeout via
+    // `Duration::from_nanos(0)` which fires on the first packet regardless
+    // of when the Instant was captured.
+    #[allow(clippy::disallowed_methods)]
+    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
+
+    let mut file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
+    // Byte cap, checked on the opened handle (not a second path lookup) so
+    // the size belongs to the file actually decoded. A non-regular file
+    // (FIFO, character device) has no meaningful length to check, so it is
+    // rejected when a byte cap is requested. The file can still grow after
+    // this check; `max_samples` is the hard bound on decoded PCM.
     if limits.max_bytes > 0 {
-        let meta = std::fs::metadata(path).map_err(|e| AfpError::io_with_path(path, e))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| AfpError::io_with_path(path, e))?;
+        if !meta.is_file() {
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "max_bytes requires a regular file",
+                ),
+            ));
+        }
         let len = meta.len();
         if len > limits.max_bytes {
             return Err(AfpError::InputTooLarge {
@@ -366,22 +412,13 @@ fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
             });
         }
     }
-    let mut file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
-    preflight_wav_from_file(&mut file, path)?;
+    preflight_header_from_file(&mut file, path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-
-    // `Instant::now` is the correct choice here: the decode timeout
-    // measures wall-clock time from the caller's perspective. This is not
-    // a testability concern — tests exercise the timeout via
-    // `Duration::from_nanos(0)` which fires on the first packet regardless
-    // of when the Instant was captured.
-    #[allow(clippy::disallowed_methods)]
-    let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
 
     Ok((mss, hint, deadline))
 }
@@ -405,6 +442,42 @@ fn downmix_planes_to_mono<S: Sample + IntoSample<f32>>(
         return;
     }
     let overflow_threshold = f32::MAX / n_chans as f32;
+
+    // Fast path: accumulate plane by plane — contiguous reads and one plane
+    // lookup per channel instead of one per sample (~10× on the downmix
+    // itself, ~13 % on a stereo FLAC decode end to end). The sum runs in the
+    // same channel order from the
+    // same `0.0` start as the per-frame loop below, then divides the same
+    // way, so the output is bit-identical. A packet holding any value that
+    // loop routes through f64 (non-finite, or large enough that the f32 sum
+    // could overflow) is redone with it instead.
+    let start = samples.len();
+    samples.resize(start + n_frames, 0.0);
+    let mut needs_f64 = false;
+    {
+        let out = &mut samples[start..];
+        for c in 0..n_chans {
+            let plane = &buf
+                .plane(c)
+                .expect("decoded buffer must have plane for each channel")[..n_frames];
+            for (acc, &v) in out.iter_mut().zip(plane) {
+                let v: f32 = v.into_sample();
+                // Same test as the per-frame loop's `!v.is_finite() ||
+                // v.abs() > overflow_threshold` (NaN and ±Inf included).
+                needs_f64 |= !v.is_finite() || v.abs() > overflow_threshold;
+                *acc += v;
+            }
+        }
+        if !needs_f64 {
+            let n = n_chans as f32;
+            for acc in out.iter_mut() {
+                *acc /= n;
+            }
+            return;
+        }
+    }
+    samples.truncate(start);
+
     for i in 0..n_frames {
         let mut use_f64 = false;
         let mut sum = 0.0_f32;
@@ -457,6 +530,12 @@ fn append_decoded_mono(decoded: GenericAudioBufferRef<'_>, samples: &mut Vec<f32
         GenericAudioBufferRef::F32(buf) => downmix!(buf),
         GenericAudioBufferRef::F64(buf) => downmix!(buf),
     }
+}
+
+/// `UnsupportedChannels` carries a `u16`; saturate rather than wrap so a
+/// layout with more than 65535 channels does not report a small count.
+fn channel_count_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 fn decode_inner(
@@ -567,6 +646,19 @@ fn decode_inner_report(
         ))));
     }
 
+    // Reject an absurd declared channel count before building the decoder:
+    // Symphonia's PCM decoder sizes its packet buffer as
+    // `max_frames × channels` at construction, so a header claiming 65535
+    // channels (AIFF, Matroska) costs hundreds of MB before a single packet
+    // reaches the per-packet check below.
+    if let Some(channels) = audio_params.channels.as_ref()
+        && channels.count() > MAX_DECODE_CHANNELS
+    {
+        return Err(AfpError::UnsupportedChannels(channel_count_u16(
+            channels.count(),
+        )));
+    }
+
     let codecs = symphonia::default::get_codecs();
     let decoder_factory = codecs
         .get_audio_decoder(audio_params.codec)
@@ -623,7 +715,12 @@ fn decode_inner_report(
             Ok(Some(p)) => p,
             Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // The container ended mid-packet: the file is truncated. In
+                // lenient mode that is audio lost without an error, so count
+                // it as a skipped packet; a report on a file missing most of
+                // its data used to look perfectly healthy.
                 truncated_eof = true;
+                stats.packets_skipped += 1;
                 break;
             }
             // ResetRequired means the reader re-synced (e.g. after a seek
@@ -705,7 +802,7 @@ fn decode_inner_report(
             continue;
         }
         if n_chans > MAX_DECODE_CHANNELS {
-            return Err(AfpError::UnsupportedChannels(n_chans as u16));
+            return Err(AfpError::UnsupportedChannels(channel_count_u16(n_chans)));
         }
 
         // Bound decoded **mono** PCM growth before allocating conversion
@@ -769,6 +866,61 @@ fn decode_inner_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference downmix: the per-frame loop the plane-wise fast path must
+    /// reproduce bit for bit.
+    fn downmix_reference(planes: &[Vec<f32>]) -> Vec<f32> {
+        let n = planes.len();
+        let threshold = f32::MAX / n as f32;
+        (0..planes[0].len())
+            .map(|i| {
+                let values: Vec<f32> = planes.iter().map(|p| p[i]).collect();
+                if values.iter().any(|v| !v.is_finite() || v.abs() > threshold) {
+                    (values.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64) as f32
+                } else {
+                    values.iter().fold(0.0_f32, |acc, &v| acc + v) / n as f32
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plane_wise_downmix_matches_the_per_frame_reference() {
+        use symphonia::core::audio::{AudioMut, AudioSpec, Channels};
+        let mut x: u32 = 7;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as i32 as f32) / (i32::MAX as f32)
+        };
+        let ordinary: Vec<Vec<f32>> = (0..6).map(|_| (0..500).map(|_| next()).collect()).collect();
+        let mut signed_zero = ordinary.clone();
+        signed_zero[0][0] = -0.0;
+        signed_zero[1][0] = -0.0;
+        let mut huge = ordinary.clone();
+        huge[1][7] = f32::MAX;
+        huge[0][9] = f32::NAN;
+        for planes in [
+            &ordinary[..2],
+            &ordinary[..6],
+            &signed_zero[..2],
+            &huge[..2],
+            &huge[..6],
+        ] {
+            let spec = AudioSpec::new(8000, Channels::Discrete(planes.len() as u16));
+            let mut buffer = AudioBuffer::<f32>::new(spec, 1024);
+            buffer.resize(planes[0].len(), &vec![0.0; planes.len()]);
+            for (c, plane) in planes.iter().enumerate() {
+                buffer.plane_mut(c).unwrap().copy_from_slice(plane);
+            }
+            let mut actual = vec![0.25];
+            append_decoded_mono(GenericAudioBufferRef::F32(&buffer), &mut actual);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(actual[0], 0.25, "prior samples must survive");
+            assert_eq!(bits(&actual[1..]), bits(&downmix_reference(planes)));
+        }
+    }
 
     #[test]
     fn every_decoded_sample_format_preserves_mono_values_and_frame_count() {
@@ -1106,80 +1258,41 @@ mod tests {
             assert_eq!(limits2.max_samples, Some(480_000));
         }
 
+        /// Raw PCM carries no checksum, so damaged sample bytes are
+        /// undetectable: both the lenient and the strict mode decode them as
+        /// (garbage) audio of the full length. (These two tests used to accept
+        /// every outcome; the per-packet integrity path is exercised with a
+        /// damaged MP3 by `integrity_mode_fails_on_a_damaged_mp3`.)
         #[test]
-        fn default_mode_skips_corrupt_packets() {
-            // With default (non-strict) limits, corrupted WAV data packets
-            // should be skipped and decoding should succeed (possibly with
-            // fewer samples, but no error).
+        fn damaged_pcm_bytes_decode_in_both_modes() {
             let path = write_corrupt_wav(8_000, 8_000);
-            let result = decode_to_mono_limited(&path, DecodeLimits::default());
+            let lenient = decode_to_mono_report(&path, DecodeLimits::default());
+            let strict = decode_to_mono_limited(&path, DecodeLimits::default().strict());
             std::fs::remove_file(&path).ok();
-            // WAV is a simple container: symphonia may or may not report a
-            // per-packet decode error for corrupted PCM (it might just decode
-            // the bytes as garbage audio). Either outcome (Ok or recoverable
-            // skip) is acceptable for the default mode — the key invariant is
-            // that it does NOT return an Io error with "decode integrity".
-            match result {
-                Ok(_) => {} // fine — corrupt PCM was decoded as-is or skipped
-                Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
-                    panic!("default mode should NOT fail with integrity error: {e}");
-                }
-                Err(_) => {} // other errors (probe failure, etc.) are acceptable
-            }
+            let lenient = lenient.expect("lenient decode");
+            assert_eq!(lenient.samples.len(), 8_000);
+            assert_eq!(lenient.stats.packets_skipped, 0);
+            assert_eq!(strict.expect("strict decode").0.len(), 8_000);
         }
 
+        /// A `fmt ` chunk with 0 bits per sample cannot initialise the codec,
+        /// in either mode.
         #[test]
-        fn integrity_mode_fails_on_corrupt_packets() {
-            // With integrity_mode=true, if Symphonia reports a per-packet
-            // decode/IO error, the decode should fail.
-            let path = write_corrupt_wav(8_000, 8_000);
-            let limits = DecodeLimits::default().strict();
-            let result = decode_to_mono_limited(&path, limits);
-            std::fs::remove_file(&path).ok();
-            // WAV PCM corruption may not always trigger a Symphonia DecodeError
-            // (symphonia might just decode the garbage bytes). So this test
-            // verifies the contract: IF an error is returned, it must be the
-            // integrity error. If it succeeds, that's also fine (means
-            // symphonia didn't detect corruption in the PCM stream).
-            match result {
-                Ok(_) => {
-                    // Symphonia decoded garbage as valid PCM — acceptable for
-                    // raw PCM WAV since there's no checksum. The integrity
-                    // check only fires when Symphonia itself raises an error.
-                }
-                Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {
-                    // This is exactly what we want when corruption IS detected.
-                }
-                Err(other) => {
-                    // Other errors (e.g. probe failure if header was hit) are ok.
-                    let _ = other;
-                }
-            }
-        }
-
-        /// A more reliable test: corrupt the WAV header's format chunk to
-        /// trigger a guaranteed codec-level error.
-        #[test]
-        fn integrity_mode_rejects_mangled_format() {
+        fn mangled_format_is_rejected_in_both_modes() {
             let path = write_test_wav(1, 8_000, 8_000);
-            // Mangle the "fmt " chunk by changing bits_per_sample (offset 34-35
-            // in a standard WAV) to an absurd value.
             let mut bytes = std::fs::read(&path).unwrap();
             // Verify this is a RIFF WAV with "fmt " at offset 12.
             assert_eq!(&bytes[0..4], b"RIFF");
             assert_eq!(&bytes[8..12], b"WAVE");
             // bits_per_sample is at byte 34 in a standard 16-byte fmt chunk.
-            // Set it to 0 to trigger a codec init failure.
             bytes[34] = 0;
             bytes[35] = 0;
             std::fs::write(&path, &bytes).unwrap();
-
-            // With default mode — should fail with a codec/probe error, not
-            // "decode integrity" since the codec can't even initialize.
-            let result = decode_to_mono_limited(&path, DecodeLimits::default());
-            assert!(result.is_err(), "mangled format should fail");
-
+            let lenient = decode_to_mono_limited(&path, DecodeLimits::default());
+            let strict = decode_to_mono_limited(&path, DecodeLimits::default().strict());
             std::fs::remove_file(&path).ok();
+            assert!(lenient.is_err(), "mangled format should fail: {lenient:?}");
+            assert!(strict.is_err(), "mangled format should fail: {strict:?}");
         }
 
         #[test]
@@ -1345,7 +1458,43 @@ mod tests {
             }
         }
 
+        /// Without `max_samples`, a long file must survive any ordinary
+        /// rate change: a one-hour 8001 Hz → 8000 Hz decode used to fail
+        /// against the fixed 10-minute-at-48-kHz ceiling even though a
+        /// downsample cannot grow the buffer.
+        #[test]
+        fn resample_cap_scales_with_the_native_decode() {
+            let one_hour_8k = 8_000 * 3_600;
+            // Downsample / mild upsample of a long file: the cap tracks the
+            // native length, so the projection always fits.
+            assert!(resample_cap(one_hour_8k, None) >= one_hour_8k);
+            assert!(resample_cap(one_hour_8k, None) >= one_hour_8k * 6);
+            // Short files keep the fixed floor.
+            assert_eq!(resample_cap(1_000, None), DEFAULT_MAX_RESAMPLED_SAMPLES);
+            // A crafted 1 Hz header asks for 48 000× growth and stays bounded.
+            assert!(1_000 * 48_000 > resample_cap(1_000, None));
+            // An explicit cap always wins.
+            assert_eq!(resample_cap(one_hour_8k, Some(1_500)), 1_500);
+        }
+
         // -- DecodeReport observability --
+
+        /// A WAV whose `data` chunk claims more bytes than the file holds:
+        /// the lenient decode keeps what is there, and the report says audio
+        /// is missing (it used to read `packets_skipped: 0`).
+        #[test]
+        fn report_flags_a_truncated_file() {
+            let path = write_test_wav(1, 8_000, 32_000);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, &bytes[..bytes.len() / 4]).unwrap();
+            let report = decode_to_mono_report(&path, DecodeLimits::default());
+            let strict = decode_to_mono_limited(&path, DecodeLimits::default().strict());
+            std::fs::remove_file(&path).ok();
+            let report = report.expect("lenient decode keeps the audio that is there");
+            assert!(!report.samples.is_empty() && report.samples.len() < 32_000);
+            assert!(report.stats.packets_skipped > 0, "{:?}", report.stats);
+            assert!(strict.is_err(), "integrity mode rejects a truncated file");
+        }
 
         #[test]
         fn report_matches_limited_on_healthy_file() {
@@ -1656,6 +1805,20 @@ mod tests {
         path
     }
 
+    /// Integrity mode turns the per-packet decode errors the lenient path
+    /// skips into a failure.
+    #[test]
+    #[cfg(feature = "std-mp3")]
+    fn integrity_mode_fails_on_a_damaged_mp3() {
+        let path = write_corrupt_mp3();
+        let result = decode_to_mono_limited(&path, DecodeLimits::default().strict());
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(AfpError::Io(ref e)) if e.source.to_string().contains("decode integrity") => {}
+            other => panic!("expected a decode-integrity error, got {other:?}"),
+        }
+    }
+
     #[test]
     #[cfg(feature = "std-mp3")]
     fn report_counts_skipped_packets_on_damaged_mp3() {
@@ -1677,5 +1840,43 @@ mod tests {
             report.stats
         );
         assert!(!report.samples.is_empty(), "partial audio must remain");
+    }
+
+    /// A 70-byte AIFF declaring 65535 channels: debug Symphonia panicked
+    /// inside `probe` (u16 block-align overflow) and release Symphonia
+    /// built a ~300 MB PCM decoder before any packet was checked. Both
+    /// public entry points must return an error instead.
+    #[test]
+    #[cfg(feature = "std-aiff")]
+    fn aiff_with_absurd_channel_count_errors_without_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FORM");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"AIFF");
+        bytes.extend_from_slice(b"COMM");
+        bytes.extend_from_slice(&18u32.to_be_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&16u16.to_be_bytes());
+        bytes.extend_from_slice(&[0x40, 0x0B, 0xFA, 0, 0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(b"SSND");
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        let form_size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&form_size.to_be_bytes());
+        let path = std::env::temp_dir().join(format!(
+            "audiofp-decoder-aiff-65535ch-{}.aiff",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let plain = std::panic::catch_unwind(|| decode_to_mono(&path));
+        let report =
+            std::panic::catch_unwind(|| decode_to_mono_report(&path, DecodeLimits::default()));
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(plain, Ok(Err(_))), "decode_to_mono: {plain:?}");
+        assert!(
+            matches!(report, Ok(Err(_))),
+            "decode_to_mono_report: {report:?}"
+        );
     }
 }

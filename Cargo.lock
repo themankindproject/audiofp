@@ -99,7 +99,6 @@ dependencies = [
  "libm",
  "mimalloc",
  "num-complex",
- "num-traits",
  "proptest",
  "prost",
  "rayon",

@@ -22,13 +22,13 @@
 //! The PR description must justify the regeneration — these files protect
 //! against unintentional numeric drift.
 
+mod common;
+
 use std::path::Path;
 
 use audiofp::classical::{Haitsma, Panako, PanakoHash, Wang, WangHash};
 use audiofp::{Fingerprinter, SampleRate};
 
-const TONE_LO: f32 = 880.0;
-const TONE_HI: f32 = 1320.0;
 const SECS: f32 = 6.0;
 const GOLDEN_DIR: &str = "tests/goldens";
 
@@ -36,23 +36,9 @@ const MAGIC_WANG: &[u8; 8] = b"AFPWANG\0";
 const MAGIC_PANAKO: &[u8; 8] = b"AFPPANK\0";
 const MAGIC_HAITSMA: &[u8; 8] = b"AFPHAIT\0";
 
-/// Deterministic xorshift32-driven two-tone-with-noise synthesiser.
+/// The shared two-tone signal (880 + 1320 Hz), [`SECS`] long.
 fn synth(seed: u32, sr: u32) -> Vec<f32> {
-    let n = (sr as f32 * SECS) as usize;
-    let mut out = Vec::with_capacity(n);
-    let mut x = seed.max(1);
-    for i in 0..n {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        let noise = (x as i32 as f32) / (i32::MAX as f32) * 0.05;
-        let t = i as f32 / sr as f32;
-        let s = 0.5 * (2.0 * std::f32::consts::PI * TONE_LO * t).sin()
-            + 0.3 * (2.0 * std::f32::consts::PI * TONE_HI * t).sin()
-            + noise;
-        out.push(s);
-    }
-    out
+    common::audio_gen::two_tone(seed, sr, (sr as f32 * SECS) as usize)
 }
 
 /// Build a `<magic> <bytes>` golden file payload.

@@ -32,14 +32,14 @@ const SLANEY_MIN_LOG_HZ: f32 = 1000.0;
 /// log(6.4) / 27 ≈ 0.068751965 — precomputed once instead of calling
 /// `libm::logf` + division every time `hz_to_mel` / `mel_to_hz` is called.
 const SLANEY_LOGSTEP: f32 = 0.068_751_97_f32;
-// log2 is cheaper than log10 on libm softfloat, so we multiply
-// `core::f32::consts::LOG10_2 * log2f(x)` instead of calling `log10f`.
 const SLANEY_MIN_LOG_MEL: f32 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
 
 impl MelScale {
     #[inline]
     fn hz_to_mel(self, hz: f32) -> f32 {
         match self {
+            // `LOG10_2 · log2f(x)` instead of `log10f(x)`: log2 is cheaper
+            // on libm's software float path.
             MelScale::Htk => 2595.0 * core::f32::consts::LOG10_2 * log2f(1.0 + hz / 700.0),
             MelScale::Slaney => {
                 if hz < SLANEY_MIN_LOG_HZ {
@@ -87,6 +87,11 @@ struct MelBand {
 /// assert_eq!(fb.n_mels, 128);
 /// assert_eq!(fb.n_bins(), 1025);
 /// ```
+///
+/// The public fields describe the filterbank as built and are
+/// informational: changing one afterwards does **not** rebuild the filters,
+/// and `log_mel` / `log_mel_from_power` then panic on the mismatch (e.g.
+/// after raising `n_mels`). Build a new filterbank instead.
 #[derive(Clone, Debug)]
 pub struct MelFilterBank {
     /// Number of mel bands (rows of the matrix).
@@ -108,6 +113,10 @@ pub struct MelFilterBank {
     /// hot-path representation; the dense matrix is reconstructed
     /// on-demand via the `matrix()` getter.
     sparse: Vec<MelBand>,
+    /// Spectrum length the bands were built for (`n_fft / 2 + 1` at
+    /// construction). The `log_mel` length checks use this and
+    /// `sparse.len()`, not the public fields, which can be changed later.
+    built_bins: usize,
 }
 
 impl MelFilterBank {
@@ -291,6 +300,7 @@ impl MelFilterBank {
             fmax,
             scale,
             sparse,
+            built_bins: n_fft / 2 + 1,
         })
     }
 
@@ -319,9 +329,11 @@ impl MelFilterBank {
 
     /// Compute one log-mel frame from a magnitude spectrum.
     ///
-    /// Computes `log10(M · |X|² + 1e-10)` per librosa: the magnitude is
-    /// squared to power before the matrix-vector product, and a small
-    /// floor avoids `log10(0)`.
+    /// Computes `log10(M · |X|² + 1e-10)`: the magnitude is squared to
+    /// power before the matrix-vector product, and a small additive floor
+    /// avoids `log10(0)`. (librosa's `power_to_db` clamps with
+    /// `max(S, amin)` and scales to dB instead, so the two are not
+    /// numerically identical near silence.)
     ///
     /// # Output range
     ///
@@ -331,15 +343,9 @@ impl MelFilterBank {
     ///
     /// # Panics
     ///
-    /// Panics if `magnitude.len() != n_bins()` or `out.len() != n_mels`.
+    /// Panics if `magnitude.len()` or `out.len()` differs from the
+    /// `n_bins()` / `n_mels` the filterbank was built with.
     pub fn log_mel(&self, magnitude: &[f32], out: &mut [f32]) {
-        assert_eq!(
-            magnitude.len(),
-            self.n_bins(),
-            "magnitude length must equal n_bins"
-        );
-        assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
-
         // Square magnitude to power inline while accumulating via SIMD.
         self.log_mel_core(magnitude, out, super::dot_sq_wide);
     }
@@ -357,21 +363,35 @@ impl MelFilterBank {
     ///
     /// # Panics
     ///
-    /// Panics if `power.len() != n_bins()` or `out.len() != n_mels`.
+    /// Panics if `power.len()` or `out.len()` differs from the `n_bins()` /
+    /// `n_mels` the filterbank was built with.
     pub fn log_mel_from_power(&self, power: &[f32], out: &mut [f32]) {
-        assert_eq!(power.len(), self.n_bins(), "power length must equal n_bins");
-        assert_eq!(out.len(), self.n_mels, "out length must equal n_mels");
-
         self.log_mel_core(power, out, super::dot_wide);
     }
 
     /// Shared sparse band accumulation: `out[k] = log10(dot(band, spec) +
-    /// 1e-10)` per librosa. The `dot` param selects the accumulation —
+    /// 1e-10)`. The `dot` param selects the accumulation —
     /// [`super::dot_sq_wide`] (squares magnitude to power inline) for
     /// [`log_mel`](Self::log_mel), [`super::dot_wide`] for
     /// [`log_mel_from_power`](Self::log_mel_from_power) where the input
     /// is already power.
+    ///
+    /// The lengths are checked against the bands as built, so a public field
+    /// changed after construction fails here with a clear message rather
+    /// than an index out of bounds partway through.
     fn log_mel_core(&self, spec: &[f32], out: &mut [f32], dot: fn(&[f32], &[f32]) -> f32) {
+        assert_eq!(
+            spec.len(),
+            self.built_bins,
+            "spectrum length must equal n_bins ({}) as built (fields changed after construction?)",
+            self.built_bins
+        );
+        assert_eq!(
+            out.len(),
+            self.sparse.len(),
+            "out length must equal n_mels ({}) as built (fields changed after construction?)",
+            self.sparse.len()
+        );
         // Use the sparse representation: only iterate non-zero bins per band.
         // Each triangular filter spans ~20-40 bins instead of all n_bins.
         // The dot product is vectorized 8-wide via `wide::f32x8`.
@@ -390,6 +410,31 @@ impl MelFilterBank {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The public fields are informational; changing one after construction
+    /// used to end in an index-out-of-bounds panic deep in the band loop.
+    /// The length checks follow the bands as built instead.
+    #[test]
+    #[should_panic(expected = "as built (fields changed after construction?)")]
+    fn mutated_fields_fail_with_a_clear_message() {
+        let mut fb = MelFilterBank::new(8, 64, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+        fb.n_mels = 16;
+        let spec = alloc::vec![1.0_f32; fb.n_bins()];
+        let mut out = alloc::vec![0.0_f32; fb.n_mels];
+        fb.log_mel(&spec, &mut out);
+    }
+
+    #[test]
+    fn mutated_n_fft_still_uses_the_built_bins() {
+        let mut fb = MelFilterBank::new(8, 64, 16_000, 0.0, 8_000.0, MelScale::Slaney);
+        let spec = alloc::vec![1.0_f32; fb.n_bins()];
+        let mut before = [0.0_f32; 8];
+        fb.log_mel(&spec, &mut before);
+        fb.n_fft = 32;
+        let mut after = [0.0_f32; 8];
+        fb.log_mel(&spec, &mut after);
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn htk_round_trip() {

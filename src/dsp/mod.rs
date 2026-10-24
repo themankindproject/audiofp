@@ -31,29 +31,6 @@ pub mod windows;
 /// than `log10` on the supported targets).
 pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
 
-/// Convert a power spectrum slice to dB in-place using SIMD via `wide`.
-///
-/// Equivalent to:
-/// ```ignore
-/// for v in buf.iter_mut() {
-///     *v = DB_LOG2_FACTOR * libm::log2f(v.max(floor));
-/// }
-/// ```
-///
-/// Uses `wide::f32x8` to process 8 elements at a time with vectorized
-/// `max` and [`simd::log2_lanes`].
-///
-/// **Not bit-identical to the scalar loop.** The vector `log2` is a
-/// polynomial approximation that can differ from `libm::log2f` by 1 ULP
-/// on some inputs, so the 8-wide body and the scalar tail of the same row
-/// can disagree in the last bit. The difference is far below any
-/// fingerprinting threshold, but do not rely on exact equality against a
-/// scalar reference. Each path is bit-identical across targets.
-#[inline]
-pub(crate) fn power_to_db_wide(buf: &mut [f32], floor: f32) {
-    simd::db_into(buf, floor, DB_LOG2_FACTOR);
-}
-
 /// SIMD-accelerated dot product: `sum(a[i] * b[i])` via `wide::f32x8`.
 ///
 /// Processes 8 elements at a time (multiply and add rounded separately),

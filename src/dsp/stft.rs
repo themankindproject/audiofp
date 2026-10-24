@@ -6,7 +6,8 @@
 //!
 //! When [`StftConfig::center`] is `true` (the default), the input is
 //! reflect-padded by `n_fft / 2` samples on each side before framing —
-//! matching the behaviour of `librosa.stft(..., center=True)`.
+//! matching `librosa.stft(..., center=True, pad_mode="reflect")`. (Current
+//! librosa defaults to `pad_mode="constant"`, i.e. zero padding.)
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -146,8 +147,8 @@ pub struct StftConfig {
     /// Window function applied to each frame before transformation.
     pub window: WindowKind,
     /// When `true`, reflect-pad the input so frame `i` is centred at
-    /// sample `i * hop` (librosa default). When `false`, frame `i`
-    /// starts at sample `i * hop`.
+    /// sample `i * hop` (librosa `center=True, pad_mode="reflect"`). When
+    /// `false`, frame `i` starts at sample `i * hop`.
     pub center: bool,
 }
 

@@ -231,15 +231,13 @@ fn wang_match_mismatched_frames_per_sec_is_none() {
 }
 
 #[test]
-fn extract_then_match_adversarial_pcm_no_panic() {
+fn adversarial_pcm_is_rejected_and_silence_never_matches() {
     use audiofp::matching::{
         Matcher, PanakoMatchConfig, PanakoMatcher, WangMatchConfig, WangMatcher,
     };
 
-    // Hostile PCM: NaNs and Infs — must not panic. Offline extract may
-    // return Err(NonFiniteSample) (base-branch PCM policy) or succeed
-    // with a sparse fingerprint; either path is acceptable so long as
-    // matching on a successful extract is also panic-free.
+    // Hostile PCM: offline extract rejects it, naming the first non-finite
+    // sample (`src/pcm.rs` policy), so nothing reaches the matchers.
     let mut pcm = vec![0.0f32; 8000 * 2];
     pcm[100] = f32::NAN;
     pcm[200] = f32::INFINITY;
@@ -250,19 +248,22 @@ fn extract_then_match_adversarial_pcm_no_panic() {
     let wang = WangMatcher::new(WangMatchConfig::default());
     let panako = PanakoMatcher::new(PanakoMatchConfig::default());
 
-    if let Ok(wang_fp) = w.extract(&pcm, SampleRate::HZ_8000) {
-        let _ = wang.match_one(&wang_fp, &wang_fp);
-    }
-    if let Ok(panako_fp) = p.extract(&pcm, SampleRate::HZ_8000) {
-        let _ = panako.match_one(&panako_fp, &panako_fp);
-    }
+    assert!(matches!(
+        w.extract(&pcm, SampleRate::HZ_8000),
+        Err(audiofp::AfpError::NonFiniteSample { index: 100 })
+    ));
+    assert!(matches!(
+        p.extract(&pcm, SampleRate::HZ_8000),
+        Err(audiofp::AfpError::NonFiniteSample { index: 100 })
+    ));
 
-    // Finite path: matching empty/sparse fingerprints must stay well-formed.
+    // Silence extracts to an empty fingerprint, and matching it against
+    // itself is a well-formed non-match.
     let silence = vec![0.0f32; 8000 * 2];
-    if let Ok(wang_fp) = w.extract(&silence, SampleRate::HZ_8000) {
-        let _ = wang.match_one(&wang_fp, &wang_fp);
-    }
-    if let Ok(panako_fp) = p.extract(&silence, SampleRate::HZ_8000) {
-        let _ = panako.match_one(&panako_fp, &panako_fp);
-    }
+    let wang_fp = w.extract(&silence, SampleRate::HZ_8000).unwrap();
+    assert!(wang_fp.hashes.is_empty());
+    assert!(!wang.match_one(&wang_fp, &wang_fp).is_match);
+    let panako_fp = p.extract(&silence, SampleRate::HZ_8000).unwrap();
+    assert!(panako_fp.hashes.is_empty());
+    assert!(!panako.match_one(&panako_fp, &panako_fp).is_match);
 }

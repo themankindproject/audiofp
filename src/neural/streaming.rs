@@ -15,7 +15,11 @@ use super::embedder::{EmbedderCore, NeuralEmbedderConfig};
 ///
 /// Output is bit-exactly equivalent to
 /// [`NeuralEmbedder::extract`](super::NeuralEmbedder) for the same
-/// total input, regardless of how the input is chunked across calls.
+/// total input, regardless of how the input is chunked across calls,
+/// with `batch_size == 1` and finite input. (Offline `extract` rejects
+/// NaN/±Inf while streaming zeroes it; a `batch_size > 1` offline run uses
+/// a separately optimised batch plan; and a push cut short by
+/// `max_push_samples` drops samples streaming never sees.)
 /// Both paths share the same `embed_window_into` routine, all scratch
 /// is reset per call, and non-centred framing means no STFT state
 /// crosses window boundaries. Verified end-to-end by the
@@ -42,7 +46,8 @@ use super::embedder::{EmbedderCore, NeuralEmbedderConfig};
 /// ```
 pub struct StreamingNeuralEmbedder {
     core: EmbedderCore,
-    /// Ring buffer of unconsumed input samples. Bounded by
+    /// Linear buffer of unconsumed input samples (compacted with
+    /// `copy_within`, see `carry_read`). Bounded by
     /// `window_samples - 1 + max push size`.
     sample_carry: Vec<f32>,
     /// Read cursor into `sample_carry`: index of the first sample not yet
@@ -72,12 +77,22 @@ impl StreamingNeuralEmbedder {
     ///
     /// Performs the same work as [`super::NeuralEmbedder::new`] —
     /// validation, ONNX load, optimisation, runnable plan construction,
-    /// and a probe inference — and shares the same error contract.
+    /// and a probe inference — and shares the same error contract, except
+    /// that no batched plan is built: streaming always runs one window per
+    /// call, so a `batch_size > 1` plan would only double model memory and
+    /// construction time (and fail on fixed-batch models streaming can
+    /// run). [`config`](Self::config) still reports the `batch_size` given.
     pub fn new(cfg: NeuralEmbedderConfig) -> Result<Self> {
-        let inner = super::embedder::NeuralEmbedder::new(cfg)?;
-        let embedding_dim = inner.core.embedding_dim;
+        let batch_size = cfg.batch_size;
+        let inner = super::embedder::NeuralEmbedder::new(NeuralEmbedderConfig {
+            batch_size: 1,
+            ..cfg
+        })?;
+        let mut core = inner.core;
+        core.cfg.batch_size = batch_size;
+        let embedding_dim = core.embedding_dim;
         Ok(Self {
-            core: inner.core,
+            core,
             sample_carry: Vec::new(),
             carry_read: 0,
             samples_consumed: 0,
@@ -126,7 +141,7 @@ impl StreamingNeuralEmbedder {
         Ok(out)
     }
 
-    /// Zero-allocation streaming variant: feed PCM and invoke
+    /// Callback streaming variant: feed PCM and invoke
     /// `callback(t_start, &embedding)` for each embedding that becomes
     /// available. The embedding slice borrows the embedder's internal
     /// buffer and is overwritten on the next emit — copy out before
@@ -154,8 +169,9 @@ impl StreamingNeuralEmbedder {
         samples: &[f32],
         mut callback: F,
     ) -> Result<usize> {
-        let samples = crate::pcm::truncate_push(samples, self.core.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
+        let kept = crate::pcm::truncate_push(samples, self.core.cfg.max_push_samples);
+        let dropped = samples.len() - kept.len();
+        crate::pcm::extend_sanitized(&mut self.sample_carry, kept);
         let window_samples = self.core.window_samples;
         let hop_samples = self.core.hop_samples;
         let sr = self.core.cfg.sample_rate as u64;
@@ -189,6 +205,21 @@ impl StreamingNeuralEmbedder {
         }
 
         self.compact_carry();
+
+        if dropped > 0 {
+            // `max_push_samples` cut this push short, so the next push does
+            // not continue where the kept samples ended. Treat the cut like
+            // `flush`: drop the partial window and advance the timeline past
+            // it and the discarded samples. Splicing the next push onto the
+            // carry made one window straddle the gap and left every later
+            // `t_start` early by `dropped`.
+            let partial = self.sample_carry.len() - self.carry_read;
+            self.samples_consumed = self
+                .samples_consumed
+                .saturating_add((partial + dropped) as u64);
+            self.sample_carry.clear();
+            self.carry_read = 0;
+        }
 
         Ok(emitted)
     }
@@ -484,6 +515,25 @@ mod tests {
             assert_eq!(e.t_start.0, t.0);
             assert_eq!(&e.vector, v);
         }
+    }
+
+    /// A push cut short by `max_push_samples` is a discontinuity: the next
+    /// push must start a fresh window on the input timeline. It used to be
+    /// spliced onto the leftover carry, so one window straddled the gap and
+    /// every later `t_start` was early by the dropped count.
+    #[test]
+    fn truncated_push_keeps_the_input_timeline() {
+        let mut cfg = small_cfg(); // 4 000-sample window and hop at 16 kHz
+        cfg.max_push_samples = Some(6_000);
+        let audio = synth_audio(5, 14_000, cfg.sample_rate);
+        let mut s = passthrough_streaming(cfg).unwrap();
+        // 10 000 offered, 6 000 kept: one window at 0 ms, 2 000 left over,
+        // 4 000 dropped.
+        let first = s.push(&audio[..10_000]).unwrap();
+        assert_eq!(first.iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [0]);
+        // The next window starts at input sample 10 000 = 625 ms.
+        let second = s.push(&audio[10_000..]).unwrap();
+        assert_eq!(second.iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [625]);
     }
 
     #[test]

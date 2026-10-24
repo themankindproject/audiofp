@@ -91,7 +91,7 @@
 //!
 //! | Feature      | Default | Description                                                       |
 //! | ------------ | :-----: | ----------------------------------------------------------------- |
-//! | `std`        |         | Symphonia itself (no codecs). Also enables the codec-free `cache` module (`.afp` fingerprint files) and `IoError`. Combine with a `std-*` feature for [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
+//! | `std`        |         | The codec-free `cache` module (`.afp` fingerprint files) and `IoError`; no Symphonia. Combine with a `std-*` feature for [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
 //! | `std-wav`    |         | WAV + raw PCM decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                  |
 //! | `std-mp3`    |         | MP3 decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                            |
 //! | `std-flac`   |         | FLAC decoding → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html).                                           |
@@ -112,14 +112,15 @@
 //! for the complete API guide.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // doc_auto_cfg is stable since Rust 1.92 (merged into doc_cfg) — no
 // feature gate needed. The `docsrs` cfg is set by docs.rs and by our
 // `package.metadata.docs.rs` rustdoc-args.
 
-// The `std` feature is a bare dependency on Symphonia. Codec support is
-// opt-in via the per-codec sub-features (`std-wav`, `std-mp3`, ...) or the
-// `all-codecs` feature, which is what gates `audiofp::io`. `std` on its
+// The `std` feature enables std-only modules but not Symphonia. Codec
+// support (and the Symphonia dependency with it) is opt-in via the
+// per-codec sub-features (`std-wav`, `std-mp3`, ...) or the `all-codecs`
+// feature, which is what gates `audiofp::io`. `std` on its
 // own is nonetheless a **valid** configuration: it enables `cache`
 // (plain `std::fs`, no Symphonia) and `IoError`, and simply leaves `io`
 // absent. Features that imply `std` (`neural`, `watermark`, `rayon`,

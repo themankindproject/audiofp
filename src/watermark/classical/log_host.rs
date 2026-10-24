@@ -11,6 +11,8 @@ use alloc::vec::Vec;
 
 use super::coding::{hard_bits, unframe};
 use super::keying::{ChaCha, derive_key, keyed_bins};
+use num_complex::Complex;
+
 use super::stft::{ComplexStft, modulus};
 use super::{Detection, HOP, N_FFT};
 
@@ -27,9 +29,6 @@ const BINS_PER_FRAME: usize = 300;
 /// ten tracks, which are also the tracks the recovery figures in the
 /// changelog come from.
 const LOCAL_MEAN_RADIUS: usize = 8;
-/// Correlations [`pick_phase`] keeps alive at once (8 MiB of `f64`). Every
-/// payload up to 124 bytes fits in one pass.
-const PHASE_TABLE_ENTRIES: usize = 1 << 20;
 
 /// STFT frames per framed bit a clip needs before recovery stops depending
 /// on how loud the host is next to the mark. See [`usable_min_samples`].
@@ -43,21 +42,27 @@ pub(crate) const fn usable_min_samples(n_bits: usize) -> usize {
         .saturating_mul(HOP)
 }
 
+/// Embed `bits`, one STFT frame at a time: analyse, scale the keyed bins,
+/// inverse-transform and overlap-add, so the whole complex spectrogram is
+/// never held (see [`ComplexStft::synthesize_frame`]).
 pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
     let mut stft = ComplexStft::new(N_FFT, HOP);
-    let (mut spec, n_frames) = stft.analyze(samples);
+    let n_frames = stft.n_frames(samples.len());
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     let n_bits = bits.len().max(1);
     let n_ord = order.len();
     let chips = chips(key, n_bits, n_ord);
+    let mut ola = stft.overlap_add(samples.len());
+    let mut frame = vec![Complex::new(0.0f32, 0.0); nb];
     for f in 0..n_frames {
+        frame.copy_from_slice(stft.analyze_frame(samples, f));
         let b = f % n_bits;
         let row = &chips[b * n_ord..(b + 1) * n_ord];
         // Bit 0 flips every chip; the chip itself picks the ±3 dB direction.
         let negate = bits[b] == 0;
         for (i, &bin) in order.iter().enumerate() {
-            let cell = &mut spec[f * nb + bin];
+            let cell = &mut frame[bin];
             let mag = modulus(*cell);
             if mag < 1e-7 {
                 continue;
@@ -70,8 +75,9 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
             let new_mag = (mag * gain).max(1e-7);
             *cell *= new_mag / mag;
         }
+        stft.synthesize_frame(&frame, f, &mut ola);
     }
-    stft.synthesize(&spec, n_frames, samples.len())
+    ola.finish(N_FFT)
 }
 
 /// Detect a payload: correlate against every bit phase, keep the strongest,
@@ -84,21 +90,23 @@ pub(crate) fn detect(samples: &[f32], payload_len: usize, n_bits: usize, key: &[
         return Detection::none();
     }
     let mut stft = ComplexStft::new(N_FFT, HOP);
-    let (spec, n_frames) = stft.analyze(samples);
+    let n_frames = stft.n_frames(samples.len());
     let nb = stft.n_bins();
     let order = log_order(key, nb);
     if n_frames == 0 || order.is_empty() {
         return Detection::none();
     }
+    // Only the keyed bins' dB levels are kept, frame by frame (300 per
+    // frame instead of the 1025-bin complex spectrogram).
     let n_ord = order.len();
     let mut db = vec![0.0f64; n_frames * n_ord];
     for f in 0..n_frames {
+        let bins = stft.analyze_frame(samples, f);
         for (i, &bin) in order.iter().enumerate() {
-            let mag = modulus(spec[f * nb + bin]).max(1e-7);
+            let mag = modulus(bins[bin]).max(1e-7);
             db[f * n_ord + i] = f64::from(20.0 * libm::log10f(mag));
         }
     }
-    drop(spec);
     let chips = chips(key, n_bits, n_ord);
     pick_phase(&db, n_frames, n_bits, &chips, payload_len)
 }
@@ -187,6 +195,15 @@ impl<'a> LocalMean<'a> {
 /// A frame carries a different bit from its neighbours, so the mark largely
 /// averages out of the local mean while the host's own spectral drift stays
 /// in it.
+///
+/// Phase `p` reads frame `f` as bit `(f + p) % n_bits`, so frames congruent
+/// modulo `n_bits` always carry the same bit. They are summed first
+/// (`folded[g] = Σ_{f ≡ g} residual_f`), and the correlation of bit `b`
+/// under phase `p` is then one dot product, `folded[(b − p) mod n_bits] ·
+/// chip_b`: `n_bits²` dot products instead of `n_frames · n_bits` (a clip
+/// holds at least one frame per bit), ≈ 60× faster at typical lengths. Only
+/// the folded rows and one phase's `n_bits` correlations are alive, never
+/// the per-frame residual matrix or an `n_bits²` phase table.
 fn pick_phase(
     db: &[f64],
     n_frames: usize,
@@ -194,73 +211,42 @@ fn pick_phase(
     chips: &[f32],
     payload_len: usize,
 ) -> Detection {
-    pick_phase_in_blocks(
-        db,
-        n_frames,
-        n_bits,
-        chips,
-        payload_len,
-        PHASE_TABLE_ENTRIES,
-    )
-}
-
-/// [`pick_phase`] with at most `table_entries` correlations alive at once.
-///
-/// Phase `p` reads frame `f` as bit `(f + p) % n_bits`, so every phase needs
-/// its own row of `n_bits` correlations. All of them at once is `n_bits^2`
-/// numbers, which is nothing for a few bytes of payload and gigabytes for a
-/// few kilobytes, so the phases are taken in blocks that fit. The work is the
-/// same: each (frame, phase) pair is correlated once, whatever the blocks.
-fn pick_phase_in_blocks(
-    db: &[f64],
-    n_frames: usize,
-    n_bits: usize,
-    chips: &[f32],
-    payload_len: usize,
-    table_entries: usize,
-) -> Detection {
     let n_ord = chips.len() / n_bits;
     let mut host = LocalMean::new(db, n_frames, n_ord);
-    let mut residual = vec![0.0f64; n_frames * n_ord];
-    for (f, row) in residual.chunks_exact_mut(n_ord).enumerate() {
-        host.residual(f, row);
+    let mut row = vec![0.0f64; n_ord];
+    let mut folded = vec![0.0f64; n_bits * n_ord];
+    let mut any_live = false;
+    for f in 0..n_frames {
+        host.residual(f, &mut row);
+        // A frame that equals its neighbours adds exactly nothing.
+        if row.iter().any(|&r| r != 0.0) {
+            any_live = true;
+            let g = f % n_bits;
+            for (acc, &r) in folded[g * n_ord..(g + 1) * n_ord].iter_mut().zip(&row) {
+                *acc += r;
+            }
+        }
     }
-    // A frame that equals its neighbours adds exactly nothing.
-    let live: Vec<bool> = residual
-        .chunks_exact(n_ord)
-        .map(|row| row.iter().any(|&r| r != 0.0))
-        .collect();
-    if !live.contains(&true) {
+    if !any_live {
         // Every frame equals its neighbours (digital silence, or a constant
         // host): there is nothing to correlate, so no bit has a vote.
         return Detection::none();
     }
 
-    let block = (table_entries / n_bits).clamp(1, n_bits);
-    // `table[(p - first) * n_bits + b]`: correlation of bit `b` under phase `p`.
-    let mut table = vec![0.0f64; block * n_bits];
+    let mut corr = vec![0.0f64; n_bits];
     let mut strongest = Strongest::new();
-    for first in (0..n_bits).step_by(block) {
-        let phases = first..(first + block).min(n_bits);
-        table.fill(0.0);
-        for (f, frame) in residual.chunks_exact(n_ord).enumerate() {
-            if !live[f] {
-                continue;
-            }
-            for p in phases.clone() {
-                let b = (f + p) % n_bits;
-                let row = &chips[b * n_ord..(b + 1) * n_ord];
-                let c: f64 = frame
-                    .iter()
-                    .zip(row)
-                    .map(|(&r, &chip)| r * f64::from(chip))
-                    .sum();
-                table[(p - first) * n_bits + b] += c;
-            }
+    for p in 0..n_bits {
+        for (b, c) in corr.iter_mut().enumerate() {
+            let g = (b + n_bits - p) % n_bits;
+            let frames = &folded[g * n_ord..(g + 1) * n_ord];
+            let chip = &chips[b * n_ord..(b + 1) * n_ord];
+            *c = frames
+                .iter()
+                .zip(chip)
+                .map(|(&r, &chip)| r * f64::from(chip))
+                .sum();
         }
-        for p in phases {
-            strongest.offer(p, &table[(p - first) * n_bits..(p - first + 1) * n_bits]);
-        }
+        strongest.offer(p, &corr);
     }
     strongest.decode(payload_len)
 }
@@ -548,26 +534,66 @@ mod tests {
         assert_eq!(c.decode(PAYLOAD.len()).sync_offset, 2);
     }
 
+    /// The pre-folding detector: correlate each frame with its bit's chip
+    /// under every phase and accumulate. `pick_phase` must agree with it.
+    fn pick_phase_per_frame(
+        db: &[f64],
+        n_frames: usize,
+        n_bits: usize,
+        chips: &[f32],
+        payload_len: usize,
+    ) -> Detection {
+        let n_ord = chips.len() / n_bits;
+        let mut host = LocalMean::new(db, n_frames, n_ord);
+        let mut frame = vec![0.0f64; n_ord];
+        let mut table = vec![0.0f64; n_bits * n_bits];
+        for f in 0..n_frames {
+            host.residual(f, &mut frame);
+            for p in 0..n_bits {
+                let b = (f + p) % n_bits;
+                let row = &chips[b * n_ord..(b + 1) * n_ord];
+                let c: f64 = frame
+                    .iter()
+                    .zip(row)
+                    .map(|(&r, &ch)| r * f64::from(ch))
+                    .sum();
+                table[p * n_bits + b] += c;
+            }
+        }
+        let mut strongest = Strongest::new();
+        for p in 0..n_bits {
+            strongest.offer(p, &table[p * n_bits..(p + 1) * n_bits]);
+        }
+        strongest.decode(payload_len)
+    }
+
     #[test]
-    fn taking_the_phases_in_blocks_changes_nothing() {
-        let n_frames = 96 * 3;
-        let (db, chips) = marked_analysis(n_frames);
-        let whole = pick_phase(&db, n_frames, 96, &chips, PAYLOAD.len());
-        assert_eq!(whole.payload.as_deref(), Some(&PAYLOAD[..]));
-        // Blocks of 96, 17, 7 and 1 phases: a table of 96 * block entries.
-        for block in [96, 17, 7, 1] {
-            let found = pick_phase_in_blocks(&db, n_frames, 96, &chips, PAYLOAD.len(), 96 * block);
-            assert_eq!(found.payload, whole.payload, "block {block}");
-            assert_eq!(found.sync_offset, whole.sync_offset, "block {block}");
+    fn folded_correlation_matches_the_per_frame_sum() {
+        for n_frames in [96, 96 * 3, 96 * 3 + 41] {
+            let (db, chips) = marked_analysis(n_frames);
+            let folded = pick_phase(&db, n_frames, 96, &chips, PAYLOAD.len());
+            let reference = pick_phase_per_frame(&db, n_frames, 96, &chips, PAYLOAD.len());
+            assert_eq!(folded.payload, reference.payload, "{n_frames} frames");
             assert_eq!(
-                found.score.to_bits(),
-                whole.score.to_bits(),
-                "block {block}"
+                folded.sync_offset, reference.sync_offset,
+                "{n_frames} frames"
+            );
+            // Only the summation order differs.
+            let rel = (folded.score - reference.score).abs() / reference.score.abs().max(1e-300);
+            assert!(
+                rel < 1e-9,
+                "{n_frames} frames: {} vs {}",
+                folded.score,
+                reference.score
             );
         }
-        // A table too small for even one phase is one phase at a time.
-        let tiny = pick_phase_in_blocks(&db, n_frames, 96, &chips, PAYLOAD.len(), 1);
-        assert_eq!(tiny.payload, whole.payload);
+        let (db, chips) = marked_analysis(96 * 3);
+        assert_eq!(
+            pick_phase(&db, 96 * 3, 96, &chips, PAYLOAD.len())
+                .payload
+                .as_deref(),
+            Some(&PAYLOAD[..])
+        );
     }
 
     #[test]

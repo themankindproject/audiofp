@@ -4,7 +4,7 @@ version      = "0.4.5"
 edition      = "2024"
 rust-version = "1.93.0"
 license      = "MIT"
-description  = "Pure-Rust audio fingerprinting: Wang, Panako, Haitsma–Kalker with streaming, in-memory matching, ONNX neural/watermark, no_std + alloc, Pod hash types."
+description  = "Pure-Rust audio fingerprinting: Wang, Panako, Haitsma–Kalker with streaming, in-memory matching, keyed classical watermarking, ONNX neural embeddings, no_std + alloc, Pod hash types."
 repository   = "https://github.com/themankindproject/audiofp"
 homepage     = "https://github.com/themankindproject/audiofp"
 documentation = "https://docs.rs/audiofp"
@@ -12,56 +12,13 @@ authors      = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
 keywords     = ["audio", "fingerprint", "no-std", "shazam", "acoustid"]
 categories   = ["multimedia::audio", "algorithms"]
 readme       = "README.md"
-exclude      = [
-    # Dev-only: CI, tooling, and repo metadata not needed by downstream.
-    ".github/",
-    ".claude/",
-    ".agents/",
-    ".hermes/",
-
-    # Stray scratch (untracked dev probe, not part of the crate).
-    "bakeoff/tests/",
-
-    # Test audio corpus (~8 MB) and golden snapshots.
-    "tests/assets/",
-    "tests/goldens/",
-
-    # Integration / property / E2E test sources (unit tests are in src/).
-    "tests/",
-
-    # Fuzz harnesses.
-    "fuzz/",
-
-    # Bakeoff harnesses (dev-only) + their reports: chromaprint (issue #88,
-    # system-lib dep) and classical watermarking (issue #153).
-    "bakeoff/",
-    "BENCHMARKS.md",
-
-    # Benchmarks (users run their own; bench code references test helpers).
-    "benches/",
-
-    # Dev config files — not needed to compile the library.
-    "clippy.toml",
-    "deny.toml",
-    "rustfmt.toml",
-    "rust-toolchain.toml",
-
-    # Contributor / governance docs.
-    "CHANGELOG.md",
-    "context.md",
-
-    # Personal scratch files.
-    "prep.md",
-    "dsp.md",
-
-    # Long-form docs — available on GitHub, not needed to compile.
-    "USAGE.md",
-    "ROBUSTNESS.md",
-    "scripts/",
-
-    # Examples — available on GitHub; not needed for library usage.
-    "examples/",
-]
+# Allowlist, not denylist: the 0.4.5 package shipped `CONTEXT.md`,
+# `BENCHMARKS-DRIFT.txt` and `bakeoff-check.log` because the old `exclude`
+# list named `context.md` (case mismatch) and could not anticipate new
+# scratch files. Only what building and documenting the library needs is
+# published; tests, benches, examples, fuzz, bakeoff and long-form docs
+# stay on GitHub.
+include      = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [features]
 default = []
@@ -75,8 +32,11 @@ default = []
 # Bare `std` is a VALID configuration: it enables the codec-free `cache`
 # module (`.afp` fingerprint files) and `IoError`, and just leaves
 # `audiofp::io` absent. It is never a compile error, so enabling `std`
-# through feature unification cannot break a downstream build.
-std = ["dep:symphonia", "dep:ahash", "dep:rustix"]
+# through feature unification cannot break a downstream build. It does not
+# pull in Symphonia: each `std-*` codec feature's `symphonia/<codec>` entry
+# enables the dependency, so `std`-only builds (and `rayon`, `neural`,
+# `watermark`, `mimalloc`) skip compiling a decoder they never use.
+std = ["dep:ahash", "dep:rustix"]
 std-mp3 = ["std", "symphonia/mp3"]
 std-aac = ["std", "symphonia/aac"]
 std-flac = ["std", "symphonia/flac"]
@@ -150,7 +110,6 @@ mimalloc = ["std", "dep:mimalloc"]
 thiserror   = { version = "2.0.18", default-features = false }
 mimalloc    = { version = "0.1.50", default-features = false, optional = true }
 libm        = "0.2.16"
-num-traits  = { version = "0.2.19", default-features = false }
 # `bytemuck`: lets the real FFT view its sample buffer as packed complex
 # values without a copy or `unsafe`.
 num-complex = { version = "0.4.6", default-features = false, features = ["bytemuck"] }

@@ -106,8 +106,10 @@ pub struct WangConfig {
     /// Per-second cap on peak count. Default 30.
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
-    /// Clamped to `[-200, 0]`; `NaN` is replaced by the default (a `NaN`
-    /// floor would otherwise drop every peak and still return `Ok`).
+    /// Clamped to `[-119, 0]` (lower floors would turn digital silence,
+    /// which sits on the −120 dB log floor, into peaks); `NaN` is replaced
+    /// by the default (a `NaN` floor would otherwise drop every peak and
+    /// still return `Ok`).
     pub min_anchor_mag_db: f32,
     /// Maximum input sample count accepted by [`extract`]. `None` disables
     /// the check (full backward compatibility). Default: 14_400_000
@@ -115,8 +117,13 @@ pub struct WangConfig {
     ///
     /// [`extract`]: Wang::extract
     pub max_input_samples: Option<usize>,
-    /// Maximum number of hashes allowed. `None` disables. Default: 500_000
-    /// — enough for ~2 hours of rich music at default fan_out=10.
+    /// Maximum number of hashes offline [`extract`](Wang::extract) may
+    /// produce before returning [`AfpError::InputTooLarge`]. `None`
+    /// disables. Default: 500_000 — about 35–45 minutes of rich music at
+    /// the measured 175–230 hashes/s (the hard ceiling is 300/s, so a
+    /// 30-minute input at the default `max_input_samples` can exceed it).
+    /// Streaming does not enforce it; bound a stream with
+    /// `max_pending_anchors` / `max_push_samples` instead.
     pub max_hashes: Option<usize>,
     /// Maximum number of pending anchors in the streaming pipeline.
     /// `None` disables (default, unbounded). When set, anchors exceeding
@@ -246,9 +253,16 @@ impl Wang {
         // Compute power (|X|2) directly from the FFT — skips a per-bin
         // sqrt that the dB conversion would immediately undo.
         // 20 · log10(sqrt(p)) ≡ 10 · log10(p).
-        let (n_frames, peaks) =
-            self.frontend
-                .pick_peaks(samples, WANG_FRAMES_PER_SEC, WANG_LOG_FLOOR_POWER);
+        // The STFT → dB → peak-pick phase is ~70 % of the work; it reports
+        // its own progress as frames are processed.
+        let (n_frames, peaks) = self.frontend.pick_peaks(
+            samples,
+            WANG_FRAMES_PER_SEC,
+            WANG_LOG_FLOOR_POWER,
+            0.7,
+            WANG_PROGRESS_INTERVAL,
+            &mut progress,
+        );
         if n_frames == 0 {
             progress(1.0);
             return Ok(WangFingerprint {
@@ -257,15 +271,6 @@ impl Wang {
             });
         }
 
-        // Report progress through the STFT phase (~70% of total work).
-        // Since power_flat_into is a bulk operation, report proportional
-        // progress at intervals based on frame count.
-        crate::classical::landmark_common::report_stft_progress(
-            n_frames,
-            0.7,
-            WANG_PROGRESS_INTERVAL,
-            &mut progress,
-        );
         progress(0.80);
         progress(0.90);
 
@@ -705,7 +710,7 @@ mod tests {
             ..Default::default()
         };
         let clamped = WangConfig {
-            min_anchor_mag_db: -200.0,
+            min_anchor_mag_db: crate::classical::MIN_ANCHOR_MAG_DB_FLOOR,
             ..Default::default()
         };
         assert_eq!(
@@ -1264,8 +1269,8 @@ mod tests {
 
     /// Bucket index for a frame at the Wang default rate
     /// (`WANG_FRAMES_PER_SEC = 62.5`).
-    fn wang_bucket_of(t_frame: u32) -> i32 {
-        (t_frame as f32 / WANG_FRAMES_PER_SEC) as i32
+    fn wang_bucket_of(t_frame: u32) -> i64 {
+        (t_frame as f32 / WANG_FRAMES_PER_SEC) as i64
     }
 
     #[test]
@@ -1669,6 +1674,28 @@ mod tests {
         for &v in &values {
             assert!((0.0..=1.0).contains(&v), "progress out of range: {v}");
         }
+    }
+
+    /// The front-end now reports from inside its frame loop (it used to
+    /// replay the values after the whole phase had finished); the sequence a
+    /// caller sees is unchanged: 0, `0.7 · k·32 / n_frames` for every
+    /// 32-frame step short of the end, 0.7, 0.8, 0.9, 1.
+    #[test]
+    fn extract_with_progress_reports_the_documented_sequence() {
+        let samples = synthetic_audio(0xCAFE, 8_000 * 5);
+        let n_frames = (samples.len() - WANG_N_FFT) / WANG_HOP + 1;
+        let mut expected = alloc::vec![0.0_f32];
+        let mut done = WANG_PROGRESS_INTERVAL;
+        while done < n_frames {
+            expected.push(0.7 * (done as f32 / n_frames as f32));
+            done += WANG_PROGRESS_INTERVAL;
+        }
+        expected.extend([0.7, 0.8, 0.9, 1.0]);
+        let mut values = Vec::new();
+        Wang::default()
+            .extract_with_progress(&samples, SampleRate::HZ_8000, |v| values.push(v))
+            .unwrap();
+        assert_eq!(values, expected);
     }
 
     #[test]

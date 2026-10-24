@@ -353,7 +353,10 @@ impl WatermarkDetector {
         let confidence = if localization.is_empty() {
             0.0
         } else {
-            localization.iter().sum::<f32>() / localization.len() as f32
+            // f64: an f32 running sum stalls at 2^24 (an hour of per-sample
+            // scores at 0.9 averaged to 0.29), so long inputs never detected.
+            (localization.iter().map(|&v| f64::from(v)).sum::<f64>() / localization.len() as f64)
+                as f32
         };
         let detected = confidence > self.cfg.threshold;
 

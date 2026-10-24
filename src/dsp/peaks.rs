@@ -984,7 +984,8 @@ pub struct IncrementalPeakDetector {
     kt: usize,
     kf: usize,
     n_bins: usize,
-    // Number of rows pushed so far (saturates at u32::MAX in practice).
+    // Number of rows pushed so far. Overflows after 2^32 rows (a debug
+    // panic, a wrap in release); long-running streams call `reset()`.
     n_pushed: u32,
     // Absolute index of the last row whose 2-D max was emitted, via
     // either `push_row` or `flush`. Rows at or below it are never
@@ -1110,7 +1111,6 @@ impl IncrementalPeakDetector {
     /// independent input streams sharing one detector instance so stale
     /// data from a previous stream doesn't bleed into the first emitted
     /// row.
-    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.n_pushed = 0;
         self.last_emitted = -1;

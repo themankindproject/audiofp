@@ -122,7 +122,7 @@ impl Matcher for NeuralMatcher {
         let fps = reference.frames_per_sec;
 
         match self.cfg.aggregation {
-            Aggregation::Global => self.match_global(q, r, dim, assume_norm),
+            Aggregation::Global => self.match_global(q, r, dim),
             Aggregation::SlidingMax => self.match_sliding(q, r, assume_norm, fps),
             Aggregation::Dtw => self.match_dtw(q, r, assume_norm),
         }
@@ -138,7 +138,6 @@ impl NeuralMatcher {
         q: &[NeuralEmbedding],
         r: &[NeuralEmbedding],
         dim: usize,
-        _assume_norm: bool,
     ) -> MatchResult {
         let qc = normalized_centroid(q, dim);
         let rc = normalized_centroid(r, dim);
@@ -170,11 +169,16 @@ impl NeuralMatcher {
         let mut best_j = 0usize;
         let mut sum_means = 0.0_f32;
         let mut count = 0u32;
+        let (short_norms, long_norms) = (norms(short, assume_norm), norms(long, assume_norm));
 
         for j in 0..=(n - m) {
             let mut acc = 0.0_f32;
             for i in 0..m {
-                acc += cosine(&short[i].vector, &long[j + i].vector, assume_norm);
+                acc += cosine(
+                    &short[i].vector,
+                    &long[j + i].vector,
+                    norm_pair(&short_norms, i, &long_norms, j + i),
+                );
             }
             let mean = acc / m as f32;
             sum_means += mean;
@@ -222,6 +226,7 @@ impl NeuralMatcher {
     ) -> MatchResult {
         let m = q.len();
         let n = r.len();
+        let (q_norms, r_norms) = (norms(q, assume_norm), norms(r, assume_norm));
 
         // Rolling two-row DP. cost = 1 − cosine ∈ [0, 2].
         let mut prev = vec![f32::INFINITY; n + 1];
@@ -231,7 +236,12 @@ impl NeuralMatcher {
         for i in 1..=m {
             curr[0] = f32::INFINITY;
             for j in 1..=n {
-                let dist = 1.0 - cosine(&q[i - 1].vector, &r[j - 1].vector, assume_norm);
+                let dist = 1.0
+                    - cosine(
+                        &q[i - 1].vector,
+                        &r[j - 1].vector,
+                        norm_pair(&q_norms, i - 1, &r_norms, j - 1),
+                    );
                 let best_prev = prev[j].min(curr[j - 1]).min(prev[j - 1]);
                 curr[j] = dist + best_prev;
             }
@@ -244,12 +254,9 @@ impl NeuralMatcher {
         // effective cosine. (The longest warp path would be
         // `m + n − 1`; using the shortest keeps the normaliser tight
         // and the score in a sensible range — audit 67-4.)
+        // `m, n ≥ 1` here (empty sequences return early in `match_one`).
         let path_len = m.max(n) as f32;
-        let mean_dist = if path_len > 0.0 {
-            total_cost / path_len
-        } else {
-            2.0
-        };
+        let mean_dist = total_cost / path_len;
         let equiv_cos = 1.0 - mean_dist;
 
         // DTW is the one mode with a tempo model: report the
@@ -262,13 +269,20 @@ impl NeuralMatcher {
 
     /// Assemble a [`MatchResult`] from a cosine score.
     ///
-    /// Both `cos` and `prominence` are sanitised to finite values so the
-    /// public API can never leak Inf/NaN (audit 67-3). `prominence` is
-    /// floored at 0 — negative prominence has no useful meaning and a
-    /// degenerate `mean_others == -1` could otherwise produce Inf.
+    /// The public API never leaks Inf/NaN (audit 67-3). A non-finite
+    /// cosine (NaN embeddings) is no evidence and returns
+    /// [`MatchResult::NONE`]: mapping it to `0.0` let it pass a
+    /// `min_cosine <= 0` gate. `prominence` is floored at 0 (negative
+    /// prominence has no useful meaning); `+Inf` — every other lag at
+    /// cosine −1, i.e. the strongest possible peak — saturates to
+    /// `f32::MAX` rather than collapsing to 0.
     fn build(&self, cos: f32, prominence: f32, offset: TimeOffset, votes: u32) -> MatchResult {
-        let cos = if cos.is_finite() { cos } else { 0.0 };
-        let prominence = if prominence.is_finite() && prominence >= 0.0 {
+        if !cos.is_finite() {
+            return MatchResult::NONE;
+        }
+        let prominence = if prominence == f32::INFINITY {
+            f32::MAX
+        } else if prominence.is_finite() && prominence >= 0.0 {
             prominence
         } else {
             0.0
@@ -294,21 +308,34 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     crate::dsp::simd::dot_core(a, b)
 }
 
-/// Cosine similarity. When `assume_norm` is `true` the inputs are taken
-/// to be unit vectors and the dot product is returned directly.
+/// Cosine similarity of `a` and `b`, given their L2 norms; `None` takes
+/// both as unit vectors and returns the dot product directly.
 #[inline]
-fn cosine(a: &[f32], b: &[f32], assume_norm: bool) -> f32 {
+fn cosine(a: &[f32], b: &[f32], norms: Option<(f32, f32)>) -> f32 {
     let d = dot(a, b);
-    if assume_norm {
-        return d;
+    match norms {
+        None => d,
+        Some((na, nb)) if na < 1e-12 || nb < 1e-12 => 0.0,
+        Some((na, nb)) => d / (na * nb),
     }
-    let na = crate::neural::embedder::sumsq_wide(a).sqrt();
-    let nb = crate::neural::embedder::sumsq_wide(b).sqrt();
-    if na < 1e-12 || nb < 1e-12 {
-        0.0
-    } else {
-        d / (na * nb)
-    }
+}
+
+/// Each embedding's L2 norm, computed once per sequence — SlidingMax and
+/// DTW compare every vector against many others, and recomputing both norms
+/// per pair tripled their work. `None` when `assume_norm` takes the vectors
+/// as unit length.
+fn norms(embs: &[NeuralEmbedding], assume_norm: bool) -> Option<Vec<f32>> {
+    (!assume_norm).then(|| {
+        embs.iter()
+            .map(|e| crate::neural::embedder::sumsq_wide(&e.vector).sqrt())
+            .collect()
+    })
+}
+
+/// The `(a, b)` norm pair for [`cosine`] from two [`norms`] results.
+#[inline]
+fn norm_pair(a: &Option<Vec<f32>>, i: usize, b: &Option<Vec<f32>>, j: usize) -> Option<(f32, f32)> {
+    Some((a.as_ref()?[i], b.as_ref()?[j]))
 }
 
 /// Mean of all embedding vectors, L2-normalised. Returns a zero vector
@@ -488,6 +515,27 @@ mod tests {
             res.score
         );
         assert!(res.score > 0.999, "DTW self-match score ~1: {}", res.score);
+    }
+
+    /// NaN embeddings are no evidence: their cosine used to be mapped to
+    /// `0.0`, which passed a `min_cosine <= 0` gate in every mode.
+    #[test]
+    fn nan_embeddings_never_match() {
+        let bad = fp(vec![emb(&[f32::NAN, 0.0, 0.0], 0)], 3);
+        let good = fp(vec![emb(&[1.0, 0.0, 0.0], 0)], 3);
+        for aggregation in [
+            Aggregation::Global,
+            Aggregation::SlidingMax,
+            Aggregation::Dtw,
+        ] {
+            let m = NeuralMatcher::new(NeuralMatchConfig {
+                min_cosine: 0.0,
+                aggregation,
+                ..Default::default()
+            });
+            assert!(!m.match_one(&bad, &good).is_match, "{aggregation:?}");
+            assert!(!m.match_one(&good, &bad).is_match, "{aggregation:?}");
+        }
     }
 
     #[test]

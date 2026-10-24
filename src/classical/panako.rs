@@ -79,8 +79,9 @@ use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter,
 ///
 /// # Frame index invariants
 ///
-/// `t_anchor < t_b < t_c` — the anchor is always the earliest peak,
-/// `t_b` is the nearer target, and `t_c` is the farther one. The hash
+/// `t_anchor < t_b <= t_c` — the anchor is always the earliest peak,
+/// `t_b` is the nearer target, and `t_c` is the farther one (two targets
+/// can share a frame, so `t_b == t_c` occurs). The hash
 /// field encodes a tempo-invariant ratio `β = (t_c − t_b) / (t_c − t_a)`
 /// so matching survives ±5 % speed changes.
 ///
@@ -92,9 +93,9 @@ pub struct PanakoHash {
     pub hash: u32,
     /// STFT frame index of the anchor peak (earliest of the three).
     pub t_anchor: u32,
-    /// STFT frame index of the nearer target (`t_anchor < t_b < t_c`).
+    /// STFT frame index of the nearer target (`t_anchor < t_b <= t_c`).
     pub t_b: u32,
-    /// STFT frame index of the farther target (`t_b < t_c`).
+    /// STFT frame index of the farther target (`t_b <= t_c`).
     pub t_c: u32,
 }
 
@@ -135,15 +136,20 @@ pub struct PanakoConfig {
     /// Per-second cap on peak count. Default 30.
     pub peaks_per_sec: u16,
     /// Magnitude floor (dB) below which peaks are ignored. Default −50.
-    /// Clamped to `[-200, 0]`; `NaN` is replaced by the default (a `NaN`
-    /// floor would otherwise drop every peak and still return `Ok`).
+    /// Clamped to `[-119, 0]` (lower floors would turn digital silence,
+    /// which sits on the −120 dB log floor, into peaks); `NaN` is replaced
+    /// by the default (a `NaN` floor would otherwise drop every peak and
+    /// still return `Ok`).
     pub min_anchor_mag_db: f32,
     /// Maximum input sample count accepted by [`extract`]. `None` disables
     /// the check. Default: 14_400_000 (30 minutes at 8 kHz).
     ///
     /// [`extract`]: Panako::extract
     pub max_input_samples: Option<usize>,
-    /// Maximum number of hashes allowed. `None` disables. Default: 500_000.
+    /// Maximum number of hashes offline [`extract`](Panako::extract) may
+    /// produce before returning [`AfpError::InputTooLarge`]. `None`
+    /// disables. Default: 500_000. Streaming does not enforce it; bound a
+    /// stream with `max_pending_anchors` / `max_push_samples` instead.
     pub max_hashes: Option<usize>,
     /// Maximum number of pending anchors in the streaming pipeline.
     /// `None` disables (default, unbounded). When set, anchors exceeding
@@ -266,9 +272,16 @@ impl Panako {
 
         progress(0.0);
 
-        let (n_frames, peaks) =
-            self.frontend
-                .pick_peaks(samples, PANAKO_FRAMES_PER_SEC, PANAKO_LOG_FLOOR_POWER);
+        // The STFT → dB → peak-pick phase is ~70 % of the work; it reports
+        // its own progress as frames are processed.
+        let (n_frames, peaks) = self.frontend.pick_peaks(
+            samples,
+            PANAKO_FRAMES_PER_SEC,
+            PANAKO_LOG_FLOOR_POWER,
+            0.7,
+            PANAKO_PROGRESS_INTERVAL,
+            &mut progress,
+        );
         if n_frames == 0 {
             progress(1.0);
             return Ok(PanakoFingerprint {
@@ -277,13 +290,6 @@ impl Panako {
             });
         }
 
-        // Report progress through the STFT phase (~70% of total work).
-        crate::classical::landmark_common::report_stft_progress(
-            n_frames,
-            0.7,
-            PANAKO_PROGRESS_INTERVAL,
-            &mut progress,
-        );
         progress(0.80);
         progress(0.90);
 
@@ -520,8 +526,11 @@ fn pack_triplet(a: &Peak, b: &Peak, c: &Peak) -> u32 {
 /// Streaming Panako fingerprinter.
 ///
 /// Same deferred-emission strategy as [`super::StreamingWang`]: hashes are
-/// emitted only once their anchor has accrued the full lookahead, so the
-/// output multiset matches [`Panako::extract`] for the same total input.
+/// emitted only once their anchor has accrued the full lookahead. Ending
+/// the stream with [`flush_complete`](Self::flush_complete) makes the
+/// output multiset match [`Panako::extract`] for the same total input;
+/// the legacy `flush` can drop hashes near a fractional-second end of
+/// stream (audit F01).
 ///
 /// Latency is higher than Wang because the triplet zone is wider
 /// (`target_zone_t = 96` vs Wang's 63).
@@ -659,12 +668,13 @@ impl StreamingPanako {
         scratch.extend(heap.drain().map(|w| (w.b, w.c, w.score)));
         // Select the top `fan_out` triplets by score (the heap above
         // already capped the set), then re-sort the selected triplets in
-        // place by `(t_b, t_c)` so the streamed sequence is ordered by
-        // `(t_anchor, t_b, t_c)` — the `PanakoFingerprint` ordering
-        // invariant the offline `extract` establishes. `(t_b, t_c)` is a
-        // unique key per anchor (b and c are distinct peaks), so no hash
-        // tiebreak is needed. The emitted set is unchanged, so
-        // streaming↔offline multiset parity holds.
+        // place by `(t_b, f_b, t_c, f_c)` — a unique key per anchor (b and
+        // c are distinct peaks), so the emission order is deterministic.
+        // This is a stable per-anchor order, **not** the global
+        // `(t_anchor, t_b, t_c)` order of `PanakoFingerprint` (anchors in
+        // one frame interleave): sort the collected stream if you need
+        // that. The emitted set is unchanged, so streaming↔offline
+        // multiset parity holds.
         scratch.sort_unstable_by_key(|x| (x.0.t_frame, x.0.f_bin, x.1.t_frame, x.1.f_bin));
         for (b, c, _) in &*scratch {
             let hash = pack_triplet(&anchor.peak, b, c);
@@ -1342,8 +1352,8 @@ mod tests {
 
     /// Bucket index for a frame at the Panako default rate
     /// (`PANAKO_FRAMES_PER_SEC = 62.5`).
-    fn panako_bucket_of(t_frame: u32) -> i32 {
-        (t_frame as f32 / PANAKO_FRAMES_PER_SEC) as i32
+    fn panako_bucket_of(t_frame: u32) -> i64 {
+        (t_frame as f32 / PANAKO_FRAMES_PER_SEC) as i64
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Shared offline-extract helpers for the landmark fingerprinters.
+//! Shared offline-extract helpers for the classical fingerprinters.
 //!
 //! [`Wang`](super::Wang) and [`Panako`](super::Panako) run the same
 //! front-end (8 kHz, 1024-pt Hann STFT, dB peak picking) and differ only
@@ -41,22 +41,6 @@ pub(crate) fn check_extract_preamble(
         });
     }
     Ok(())
-}
-
-/// Report proportional progress through the bulk-STFT phase (which holds
-/// `weight` of total work), then report `weight` itself on completion.
-pub(crate) fn report_stft_progress(
-    total_frames: usize,
-    weight: f32,
-    interval: usize,
-    progress: &mut impl FnMut(f32),
-) {
-    let mut reported = 0usize;
-    while reported + interval < total_frames {
-        reported += interval;
-        progress(weight * (reported as f32 / total_frames as f32));
-    }
-    progress(weight);
 }
 
 /// Shared offline front-end for the landmark fingerprinters: Hann STFT,
@@ -114,11 +98,20 @@ impl FrontEnd {
     /// Run STFT → dB → peak pick. Picker config is fixed at construction
     /// (the extractor config is immutable after `new`), so this just
     /// reuses the pooled scratch on every call.
+    ///
+    /// This phase is `weight` of the extractor's work: every `interval`
+    /// frames it reports `weight · done / total`, then `weight` once the
+    /// peaks are picked — as the frames are processed, not after (the
+    /// values used to be replayed once the whole phase had finished).
+    /// Nothing is reported for an input shorter than one frame.
     pub(crate) fn pick_peaks(
         &mut self,
         samples: &[f32],
         frames_per_sec: f32,
         log_floor_power: f32,
+        weight: f32,
+        interval: usize,
+        progress: &mut impl FnMut(f32),
     ) -> (usize, alloc::vec::Vec<Peak>) {
         let n_frames = self.stft.n_frames(samples.len());
         let n_bins = self.stft.n_bins();
@@ -147,7 +140,13 @@ impl FrontEnd {
                 scalar_from,
             );
             self.picker.push_row(&self.frame);
+            let done = f + 1;
+            if done % interval == 0 && done < n_frames {
+                progress(weight * (done as f32 / n_frames as f32));
+            }
         }
-        (n_frames, self.picker.finish())
+        let peaks = self.picker.finish();
+        progress(weight);
+        (n_frames, peaks)
     }
 }

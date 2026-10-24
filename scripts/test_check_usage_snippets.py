@@ -145,6 +145,15 @@ class CheckUsageSnippetsTests(unittest.TestCase):
         self.assertEqual(compiled, 0)
         self.assertEqual(ran, 0)
 
+    def test_classical_watermark_block_does_not_need_onnx_watermark(self) -> None:
+        checker = load_checker()
+        block = "use audiofp::watermark::classical::ClassicalConfig;"
+        self.assertTrue(checker.block_needs_features(block, {"classical-watermark"}))
+        self.assertFalse(checker.block_needs_features(block, {"watermark"}))
+        onnx = "use audiofp::watermark::WatermarkDetector;"
+        self.assertFalse(checker.block_needs_features(onnx, {"classical-watermark"}))
+        self.assertTrue(checker.block_needs_features(onnx, {"watermark"}))
+
 
 if __name__ == "__main__":
     unittest.main()

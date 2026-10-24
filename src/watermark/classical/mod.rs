@@ -525,6 +525,27 @@ mod tests {
         }
     }
 
+    /// Extreme but finite samples: a bin's `re² + im²` used to overflow
+    /// `f32`, so embedding noise at amplitude 1e18 returned mostly
+    /// non-finite samples (QIM 63 488 of 64 000, LogHost all of them).
+    #[test]
+    fn extreme_finite_amplitude_embeds_stay_finite() {
+        let host: Vec<f32> = noise(64_000).iter().map(|&s| s * 5e18).collect();
+        let payload = [1, 2, 3, 4];
+        for algorithm in [Algorithm::QimBlock, Algorithm::LogHost] {
+            let config = ClassicalConfig::new(payload.len()).with_algorithm(algorithm);
+            let embedder = ClassicalEmbedder::try_new(config, b"key", &payload).unwrap();
+            let marked = embedder.embed(&host, SampleRate::HZ_16000).unwrap();
+            assert!(marked.iter().all(|s| s.is_finite()), "{algorithm:?}");
+            let detector = ClassicalDetector::try_new(config, b"key").unwrap();
+            let result = detector.detect(&marked, SampleRate::HZ_16000).unwrap();
+            assert!(result.score.is_finite(), "{algorithm:?}: {result:?}");
+            if algorithm == Algorithm::QimBlock {
+                assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+            }
+        }
+    }
+
     #[test]
     fn wrong_key_and_unwatermarked_audio_return_no_payload() {
         let samples = noise(16_000 * 8);

@@ -1,8 +1,4 @@
 //! Generic ONNX log-mel embedder (offline / whole-buffer).
-//!
-//! This module uses limited `unsafe` for zero-copy Tract tensor
-//! initialization — the only path in the crate that requires it.
-#![allow(unsafe_code)]
 
 use crate::SampleRate;
 use alloc::format;
@@ -30,15 +26,45 @@ pub(crate) fn sumsq_wide(v: &[f32]) -> f32 {
 /// In-place L2 normalisation: scales `v` so its Euclidean norm is 1.
 /// Leaves the vector unchanged if its norm is below `1e-12` (effectively
 /// zero).
+///
+/// The f32 sum of squares overflows once finite components pass
+/// ~1.8e19/√dim, which made `1/norm` zero and wiped the vector; such
+/// vectors are normalised in f64 instead. Ordinary vectors never take
+/// that path, so their result is unchanged.
 #[inline]
 fn l2_normalize_inplace(v: &mut [f32]) {
-    let sumsq = sumsq_wide(v);
-    let norm = sumsq.sqrt();
-    if norm > 1e-12 {
-        let inv = 1.0 / norm;
-        for x in v.iter_mut() {
-            *x *= inv;
+    let norm = sumsq_wide(v).sqrt();
+    if norm.is_finite() {
+        if norm > 1e-12 {
+            let inv = 1.0 / norm;
+            for x in v.iter_mut() {
+                *x *= inv;
+            }
         }
+        return;
+    }
+    let norm = v
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt();
+    if norm.is_finite() {
+        for x in v.iter_mut() {
+            *x = (f64::from(*x) / norm) as f32;
+        }
+    }
+}
+
+/// A NaN / ±Inf model output is an inference failure, not an embedding:
+/// passed through, it would match nothing (or, before the matcher guarded
+/// it, everything) without any error signal.
+fn reject_non_finite_embedding(v: &[f32]) -> Result<()> {
+    if v.iter().all(|x| x.is_finite()) {
+        Ok(())
+    } else {
+        Err(AfpError::Inference(
+            "model produced a non-finite embedding".to_string(),
+        ))
     }
 }
 
@@ -85,7 +111,9 @@ pub struct NeuralEmbedderConfig {
     /// [`extract`]: NeuralEmbedder::extract
     pub max_input_samples: Option<usize>,
     /// Maximum samples accepted in a single streaming `push`. `None`
-    /// disables (default). Excess samples are dropped (push is infallible).
+    /// disables (default). Excess samples are dropped (push is infallible);
+    /// the cut is treated as a discontinuity, like `flush`: the partial
+    /// window is discarded and later timestamps stay on the input timeline.
     pub max_push_samples: Option<usize>,
     /// Number of analysis windows to batch into a single model call
     /// during offline [`extract`](NeuralEmbedder::extract). Default 1
@@ -211,26 +239,26 @@ impl EmbedderCore {
         // into its `[1, n_mels, n_frames]` row-major buffer with strided
         // writes — no intermediate `Vec` and no transpose.
         //
-        // NOTE: tract 0.22.1's `Tensor::clone()` is a deep copy
-        // (`self.deep_clone()`), not a refcount bump, so caching the
-        // tensor and cloning per call would not save the allocation.
-        // A genuine zero-alloc path requires a tract API change
-        // (`from_raw_vec` or similar); tracked in issue #7.
+        // NOTE: tract's `Tensor::clone()` is a deep copy, not a refcount
+        // bump, so caching the tensor and cloning per call would not save
+        // the allocation. A genuine zero-alloc path requires a tract API
+        // change (`from_raw_vec` or similar); tracked in issue #7.
         //
-        // SAFETY: `Tensor::uninitialized` returns a tensor whose backing
-        // buffer is uninitialised; we must overwrite every element before
-        // `run()` reads it. The for_each_frame callback fires exactly
-        // `n_frames` times, and for each `f` we write every
-        // `m in 0..n_mels` index — covering all `n_mels * n_frames`
-        // positions in the tensor.
-        let mut tensor = unsafe {
-            Tensor::uninitialized::<f32>(&[1, n_mels, n_frames])
-                .map_err(|e| AfpError::Inference(format!("input alloc: {e}")))?
-        };
+        // Zero-initialised rather than `Tensor::uninitialized`: the fill
+        // is one memset (microseconds against a model run), and it keeps
+        // this path free of `unsafe` — a front-end whose frame count ever
+        // disagreed with `n_frames` would otherwise feed uninitialised
+        // heap memory to the model.
+        let mut tensor = Tensor::zero::<f32>(&[1, n_mels, n_frames])
+            .map_err(|e| AfpError::Inference(format!("input alloc: {e}")))?;
 
         {
-            // SAFETY: we just allocated `tensor` as f32 with the correct shape above.
-            let dst = unsafe { tensor.as_slice_mut_unchecked::<f32>() };
+            let mut view = tensor
+                .try_as_plain_mut()
+                .map_err(|e| AfpError::Inference(format!("input view: {e}")))?;
+            let dst = view
+                .as_slice_mut::<f32>()
+                .map_err(|e| AfpError::Inference(format!("input view: {e}")))?;
             self.frontend.for_each_frame(window, |f, mel_row| {
                 // Strided write: position (m, f) in the `[n_mels, n_frames]`
                 // matrix lives at `m * n_frames + f`.
@@ -262,6 +290,7 @@ impl EmbedderCore {
         out.clear();
         out.reserve(self.embedding_dim);
         out.extend(view.iter().copied());
+        reject_non_finite_embedding(out)?;
 
         if self.cfg.l2_normalize {
             l2_normalize_inplace(out);
@@ -310,15 +339,18 @@ impl EmbedderCore {
         let embedding_dim = self.embedding_dim;
         let window_stride = n_mels * n_frames; // elements per batch item
 
-        // Allocate input tensor [batch, n_mels, n_frames].
-        // SAFETY: we will fill every element before run() reads it.
-        let mut tensor = unsafe {
-            Tensor::uninitialized::<f32>(&[batch, n_mels, n_frames])
-                .map_err(|e| AfpError::Inference(format!("batch input alloc: {e}")))?
-        };
+        // Allocate input tensor [batch, n_mels, n_frames], zero-initialised
+        // for the same reason as `embed_window_into`.
+        let mut tensor = Tensor::zero::<f32>(&[batch, n_mels, n_frames])
+            .map_err(|e| AfpError::Inference(format!("batch input alloc: {e}")))?;
 
         {
-            let dst = unsafe { tensor.as_slice_mut_unchecked::<f32>() };
+            let mut view = tensor
+                .try_as_plain_mut()
+                .map_err(|e| AfpError::Inference(format!("batch input view: {e}")))?;
+            let dst = view
+                .as_slice_mut::<f32>()
+                .map_err(|e| AfpError::Inference(format!("batch input view: {e}")))?;
             for (b, window) in windows.iter().enumerate() {
                 assert_eq!(
                     window.len(),
@@ -357,21 +389,20 @@ impl EmbedderCore {
             )));
         }
 
-        let mut scratch = Vec::with_capacity(embedding_dim);
         for (b, ts) in timestamps.iter().enumerate().take(batch) {
             let slice = &view
                 .as_slice()
                 .expect("output tensor must be contiguous f32")
                 [b * embedding_dim..(b + 1) * embedding_dim];
-            scratch.clear();
-            scratch.extend_from_slice(slice);
+            let mut vector = slice.to_vec();
+            reject_non_finite_embedding(&vector)?;
 
             if self.cfg.l2_normalize {
-                l2_normalize_inplace(&mut scratch);
+                l2_normalize_inplace(&mut vector);
             }
 
             out.push(NeuralEmbedding {
-                vector: scratch.clone(),
+                vector,
                 t_start: *ts,
             });
         }

@@ -23,14 +23,18 @@
 
 #![cfg(all(feature = "std", not(feature = "mimalloc")))]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use audiofp::Fingerprinter;
 use audiofp::SampleRate;
 use audiofp::classical::HaitsmaFingerprint;
-use audiofp::classical::{Haitsma, Wang, WangFingerprint};
-use audiofp::matching::{HaitsmaIndex, WangIndex, WangMatchConfig};
+use audiofp::classical::{Haitsma, Panako, PanakoFingerprint, Wang, WangFingerprint};
+use audiofp::matching::{
+    HaitsmaIndex, HaitsmaMatchConfig, PanakoIndex, PanakoMatchConfig, WangIndex, WangMatchConfig,
+};
 
 /// Counting wrapper around [`System`]. Thread-local so parallel tests in this
 /// binary never contaminate each other's deltas.
@@ -83,23 +87,9 @@ fn live_bytes() -> i64 {
     LIVE_BYTES.with(Cell::get)
 }
 
+/// The shared two-tone signal, `secs` seconds long.
 fn synth(seed: u32, sr: u32, secs: usize) -> Vec<f32> {
-    let n = sr as usize * secs;
-    let mut out = Vec::with_capacity(n);
-    let mut x = seed.max(1);
-    for i in 0..n {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        let noise = (x as i32 as f32) / (i32::MAX as f32) * 0.05;
-        let t = i as f32 / sr as f32;
-        out.push(
-            0.5 * (2.0 * std::f32::consts::PI * 880.0 * t).sin()
-                + 0.3 * (2.0 * std::f32::consts::PI * 1320.0 * t).sin()
-                + noise,
-        );
-    }
-    out
+    common::audio_gen::two_tone(seed, sr, sr as usize * secs)
 }
 
 fn wang_fp(seed: u32, secs: usize) -> WangFingerprint {
@@ -176,21 +166,23 @@ fn haitsma_index_estimated_bytes_tracks_real_heap() {
 
     assert!(real > 0, "index should hold heap: {real}");
 
-    // `estimated_bytes` is documented as an approximation (allocator rounding,
-    // table overhead), so this is a sanity band, not an equality: it catches a
-    // gross over/under-report such as the #10 double count.
+    // `estimated_bytes` reconstructs the SwissTable layout, so on this
+    // workload it lands within rounding of the real heap (it used to overstate
+    // it 1.6–2.2× with a flat per-slot overhead). The ±10 % band leaves room
+    // for allocator rounding and catches any accounting drift, such as the #10
+    // double count.
     let ratio = reported as f64 / real as f64;
     assert!(
-        (0.5..=2.0).contains(&ratio),
+        (0.9..=1.1).contains(&ratio),
         "estimated_bytes {reported} vs real {real} (ratio {ratio:.2}) — accounting drift"
     );
 }
 
 /// `WangIndex::estimated_bytes` must track the heap the index actually holds.
 ///
-/// `estimated_bytes` is documented as an approximation (allocator rounding,
-/// table overhead), so the bound is a sanity band rather than an equality — it
-/// catches a gross over/under-report such as the §4.2 #10 double count.
+/// Same ±10 % band as the Haitsma test: the estimate follows the real table
+/// layout, so anything wider is accounting drift (the §4.2 #10 double count,
+/// or the 1.6–2.2× flat-overhead overstatement it replaced).
 #[test]
 fn wang_index_estimated_bytes_tracks_real_heap() {
     let refs: Vec<WangFingerprint> = (0..64u32).map(|i| wang_fp(200 + i, 3)).collect();
@@ -203,7 +195,7 @@ fn wang_index_estimated_bytes_tracks_real_heap() {
     assert!(real > 0, "index should hold heap: {real}");
     let ratio = reported as f64 / real as f64;
     assert!(
-        (0.5..=2.0).contains(&ratio),
+        (0.9..=1.1).contains(&ratio),
         "WangIndex::estimated_bytes {reported} vs real {real} (ratio {ratio:.2})"
     );
 }
@@ -288,4 +280,95 @@ fn haitsma_frame_count_follows_the_floor_formula() {
             "{secs}s ({n} samples) should yield floor(({n} - {n_fft})/{hop}) = {expect} frames"
         );
     }
+}
+
+fn panako_fp(seed: u32, secs: usize) -> PanakoFingerprint {
+    let samples = synth(seed, 8_000, secs);
+    Panako::default()
+        .extract(&samples, SampleRate::HZ_8000)
+        .expect("panako extract")
+}
+
+/// Warm allocations per query, averaged over 50 queries.
+fn allocs_per_query(mut query: impl FnMut()) -> usize {
+    for _ in 0..4 {
+        query();
+    }
+    const REPS: usize = 50;
+    let before = allocs();
+    for _ in 0..REPS {
+        query();
+    }
+    (allocs() - before) / REPS
+}
+
+/// `PanakoIndex::query` and `HaitsmaIndex::query` must not allocate per
+/// candidate reference either. Both used to: a nested map of per-reference
+/// accumulators plus fresh consolidation vectors per candidate (Panako,
+/// ≈ 5 per candidate), and a `ref → Vec<delta>` map (Haitsma, 1 per
+/// candidate). They now gather one flat vote list and reuse their scratch,
+/// so the count stays a small constant as the candidate set grows.
+///
+/// Measured on this workload (100 candidate references, warm):
+///
+/// | Revision | Panako | Haitsma |
+/// |---|---|---|
+/// | before (0.4.5) | **295** | **113** |
+/// | after | **11** | **12** |
+#[test]
+fn panako_and_haitsma_index_queries_do_not_allocate_per_candidate() {
+    let query = panako_fp(7, 3);
+    let mut catalog: Vec<PanakoFingerprint> = (0..100u32).map(|i| panako_fp(10 + i, 3)).collect();
+    catalog[50] = query.clone();
+    let index = PanakoIndex::build(&catalog, 100);
+    let cfg = PanakoMatchConfig::default();
+    let panako = allocs_per_query(|| {
+        std::hint::black_box(index.query(&query, &cfg));
+    });
+
+    // Every reference shares a 64-frame run with the query, so all 100 are
+    // candidates (extracted fingerprints of different noise seeds rarely
+    // share an exact frame).
+    let mut x: u32 = 0x1234_5678;
+    let mut frames = |n: usize| -> Vec<u32> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x
+            })
+            .collect()
+    };
+    let q_frames = frames(600);
+    let catalog: Vec<HaitsmaFingerprint> = (0..100)
+        .map(|i| {
+            let mut f = frames(600);
+            let at = (i * 5) % 500;
+            f[at..at + 64].copy_from_slice(&q_frames[at..at + 64]);
+            HaitsmaFingerprint {
+                frames: f,
+                frames_per_sec: 78.125,
+            }
+        })
+        .collect();
+    let query = HaitsmaFingerprint {
+        frames: q_frames,
+        frames_per_sec: 78.125,
+    };
+    let index = HaitsmaIndex::build(&catalog, 100);
+    let cfg = HaitsmaMatchConfig::default();
+    let haitsma = allocs_per_query(|| {
+        std::hint::black_box(index.query(&query, &cfg));
+    });
+
+    eprintln!("allocations per warm query: panako {panako}, haitsma {haitsma}");
+    assert!(
+        panako <= 50,
+        "PanakoIndex::query allocated {panako} times per query"
+    );
+    assert!(
+        haitsma <= 50,
+        "HaitsmaIndex::query allocated {haitsma} times per query"
+    );
 }

@@ -422,6 +422,29 @@ fn resonator(x: f32, state: &mut [f32; 2], r: f32, theta: f32) -> f32 {
     y * (1.0 - r * r) // normalize gain
 }
 
+/// Deterministic two-tone test signal: 880 Hz at 0.5 plus 1320 Hz at 0.3,
+/// with ±0.05 xorshift noise, `n` samples at `sr`. Rich enough for every
+/// fingerprinter to emit hashes, and fully reproducible.
+///
+/// `tests/regression.rs` fingerprints this signal for its bit-exact goldens,
+/// so the arithmetic must not change.
+pub fn two_tone(seed: u32, sr: u32, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    let mut x = seed.max(1);
+    for i in 0..n {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let noise = (x as i32 as f32) / (i32::MAX as f32) * 0.05;
+        let t = i as f32 / sr as f32;
+        let s = 0.5 * (2.0 * std::f32::consts::PI * 880.0 * t).sin()
+            + 0.3 * (2.0 * std::f32::consts::PI * 1320.0 * t).sin()
+            + noise;
+        out.push(s);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::Rng;

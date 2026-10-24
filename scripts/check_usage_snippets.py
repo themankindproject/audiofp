@@ -18,7 +18,8 @@ Usage:
     --keep       keep the scratch crate under target/usage-check for inspection
     --features   comma-separated Cargo features for the audiofp dependency
                  (default: all-codecs,neural,watermark,classical-watermark,rayon)
-    --docs       comma-separated doc basenames to check (default: all three)
+    --docs       comma-separated doc basenames to check (default: USAGE.md and
+                 README.md)
 
 Exit status 0 = all snippets compile and all runnable tests pass.
 """
@@ -93,8 +94,13 @@ def block_needs_features(block: str, enabled: set[str]) -> bool:
     codec_ok = "all-codecs" in enabled or any(
         f.startswith("std-") for f in enabled
     )
+    # `watermark::classical` contains the deprecated module's `watermark::`
+    # needle; strip it first so a classical-only block does not also demand
+    # the ONNX `watermark` feature (and silently drop out once it is gone).
+    generic = block.replace("watermark::classical", "")
     for needle, feature in FEATURE_GATES:
-        if needle not in block:
+        haystack = generic if feature == "watermark" else block
+        if needle not in haystack:
             continue
         if feature.startswith("std-") and codec_ok:
             continue

@@ -156,7 +156,8 @@ impl SincResampler {
     ///
     /// # Panics
     ///
-    /// Panics if `from_sr == 0`, `to_sr == 0`, or `quality.half_taps == 0`.
+    /// Panics on any config [`try_with_quality`](Self::try_with_quality)
+    /// rejects.
     #[must_use]
     pub fn with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> Self {
         Self::try_with_quality(from_sr, to_sr, quality).expect("invalid SincResampler config")
@@ -167,14 +168,23 @@ impl SincResampler {
     ///
     /// # Errors
     ///
-    /// - `from_sr` or `to_sr` is zero
-    /// - `quality.half_taps` is zero
-    /// - `quality.polyphase_steps` is zero
+    /// `from_sr` or `to_sr` is zero (the default quality is always valid).
     pub fn try_new(from_sr: u32, to_sr: u32) -> crate::Result<Self> {
         Self::try_with_quality(from_sr, to_sr, SincQuality::default())
     }
 
     /// Fallible version of [`with_quality`](Self::with_quality).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AfpError::Config`](crate::AfpError::Config) when:
+    ///
+    /// - `from_sr` or `to_sr` is zero
+    /// - `quality.half_taps` is zero or above 65 536
+    /// - `quality.polyphase_steps` is zero
+    /// - `quality.kaiser_beta` is non-finite or outside ±50
+    /// - the kernel table (`polyphase_steps × (2·half_taps + 1)`) exceeds
+    ///   256 MiB
     pub fn try_with_quality(from_sr: u32, to_sr: u32, quality: SincQuality) -> crate::Result<Self> {
         if from_sr == 0 || to_sr == 0 {
             return Err(crate::AfpError::Config(
@@ -285,8 +295,8 @@ impl SincResampler {
     ///
     /// # Performance
     ///
-    /// Cost is `O(n_output × taps)` where `taps` = `quality * 2`
-    /// (default quality 64 → 128 multiply-adds per output sample).
+    /// Cost is `O(n_output × taps)` where `taps = 2 · half_taps + 1`
+    /// (default `half_taps = 32` → 65 multiply-adds per output sample).
     /// For repeated calls, prefer [`process_into`](Self::process_into)
     /// to reuse the output allocation.
     #[must_use]
@@ -328,7 +338,17 @@ impl SincResampler {
         // the filter width the raw bounds can cross (`n_safe_start > n_out`
         // or `n_safe_end < n_safe_start`), which used to make the boundary
         // loops double-emit samples — clamp so that can't happen.
-        let n_safe_start = (((half as f64) / ratio).ceil() as usize).min(n_out);
+        //
+        // `ceil(half / ratio)` is the exact-arithmetic bound, but the middle
+        // loop floors `n as f64 * ratio`, and that product can round one
+        // ULP below `half` (e.g. 1920 → 44 100: `147 * ratio` evaluates to
+        // 5.999…). Step forward until the f64 product the loop will
+        // actually compute clears `half`; the product is monotone in `n`,
+        // so this runs at most a couple of iterations.
+        let mut n_safe_start = (((half as f64) / ratio).ceil() as usize).min(n_out);
+        while n_safe_start < n_out && ((n_safe_start as f64 * ratio).floor() as usize) < half {
+            n_safe_start += 1;
+        }
         let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
         let n_safe_end = n_safe_end.min(n_out).max(n_safe_start);
 
@@ -349,9 +369,10 @@ impl SincResampler {
             let step = ((frac * steps as f32) as usize).min(steps - 1);
             let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
 
-            // Safe: in the middle region `n ≥ n_safe_start` guarantees
-            // `i_centre ≥ half`, so this cannot wrap.
-            let base = i_centre.wrapping_sub(half);
+            // `n_safe_start` was chosen so the f64 product above floors to
+            // at least `half`, so this cannot wrap.
+            debug_assert!(i_centre >= half);
+            let base = i_centre - half;
             let acc = super::dot_wide(&input[base..base + taps], kernel);
             out.push(acc);
         }
@@ -416,13 +437,18 @@ fn kaiser_window_input(x: f32, half: f32, beta: f32, inv_i0_beta: f32) -> f32 {
 }
 
 /// Modified Bessel function of the first kind, order 0, via series
-/// expansion. Converges fast for `|x| ≤ 30` (well past audio Kaiser β).
+/// expansion, run until the relative term size drops below `1e-12`.
+///
+/// The term count needed grows with `|x|` (about 19 at the default
+/// β = 8.6, 30 at β = 20, 54 at the ±50 bound `try_with_quality` accepts), so the
+/// cap only guards against a runaway loop; it is never the stopping
+/// condition for an accepted β.
 #[inline]
 fn modified_bessel_i0(x: f32) -> f32 {
     let mut sum = 1.0_f64;
     let mut term = 1.0_f64;
     let half_x_sq = (x as f64 * x as f64) / 4.0;
-    for k in 1..=30 {
+    for k in 1..=200 {
         let kf = k as f64;
         term *= half_x_sq / (kf * kf);
         sum += term;
@@ -749,5 +775,31 @@ mod tests {
         assert!(matches!(result, Err(crate::AfpError::Config(ref message))
             if message.contains("polyphase kernel table")
                 && (message.contains("exceeds") || message.contains("too large"))));
+    }
+
+    /// `ceil(half / ratio)` alone is not a safe middle-region start: the
+    /// f64 product `n * ratio` the loop floors can land one ULP below
+    /// `half`, which wrapped `i_centre - half` and panicked on slicing
+    /// (1920 → 44 100 was one of 63 such pairs among common rates).
+    #[test]
+    fn rate_pairs_whose_safe_start_rounds_below_half_do_not_panic() {
+        let x = vec![0.1_f32; 4096];
+        let rates = [
+            15_u32, 960, 1_800, 1_920, 3_840, 5_000, 8_000, 11_025, 16_000, 22_050, 32_000, 44_100,
+            48_000, 88_200, 96_000,
+        ];
+        for &from in &rates {
+            for &to in &rates {
+                for half_taps in [6, 32] {
+                    let q = SincQuality {
+                        half_taps,
+                        ..SincQuality::default()
+                    };
+                    let y = SincResampler::with_quality(from, to, q).process(&x);
+                    let expected = (x.len() as u64 * to as u64).div_ceil(from as u64) as usize;
+                    assert_eq!(y.len(), expected, "{from} -> {to}, half_taps {half_taps}");
+                }
+            }
+        }
     }
 }

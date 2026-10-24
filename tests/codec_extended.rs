@@ -16,30 +16,19 @@
     feature = "std-aiff"
 ))]
 
+mod common;
+
 use std::collections::HashSet;
 
 use audiofp::classical::{Panako, Wang};
 use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
+use common::degrade::jaccard;
 
 fn wang_hashes(path: &str) -> HashSet<u32> {
     let samples =
         decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
-    let mut wang = Wang::default();
-    wang.extract(&samples, SampleRate::HZ_8000)
-        .unwrap()
-        .hashes
-        .into_iter()
-        .map(|h| h.hash)
-        .collect()
-}
-
-fn jaccard(a: &HashSet<u32>, b: &HashSet<u32>) -> f32 {
-    let union = a.union(b).count();
-    if union == 0 {
-        return 0.0;
-    }
-    a.intersection(b).count() as f32 / union as f32
+    common::degrade::wang_hash_set(&samples, 8_000)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

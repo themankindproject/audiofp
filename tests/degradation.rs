@@ -13,12 +13,7 @@
 //!
 //! Fixtures cover two genres (contemporary `galway`, jazz-funk
 //! `acidjazz`) so the gates are not tuned to one recording.
-#![cfg(all(
-    feature = "std-wav",
-    feature = "std-mp3",
-    feature = "std-flac",
-    feature = "std-ogg"
-))]
+#![cfg(feature = "std-wav")]
 
 use audiofp::classical::{Haitsma, Panako, Wang};
 use audiofp::io::decode_to_mono_at;

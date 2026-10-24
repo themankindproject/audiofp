@@ -14,7 +14,12 @@
 //! The real-audio snapshot tests require the `std` feature (file decoding).
 //! The adversarial/stress tests work under `no_std + alloc`.
 
-#![cfg(all(feature = "std-mp3", feature = "std-flac", feature = "std-ogg"))]
+#![cfg(all(
+    feature = "std-wav",
+    feature = "std-mp3",
+    feature = "std-flac",
+    feature = "std-ogg"
+))]
 
 use audiofp::classical::{Haitsma, HaitsmaConfig, Panako, PanakoConfig, Wang, WangConfig};
 use audiofp::{AfpError, Fingerprinter, SampleRate};
@@ -498,52 +503,7 @@ mod real_audio_snapshots {
         }
     }
 
-    // ─── Cross-format consistency ────────────────────────────────────
-
-    #[test]
-    fn wang_galway_mp3_vs_flac_substantial_overlap() {
-        let flac = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
-        let mp3 = decode_to_mono_at(asset("galway.mp3"), 8_000).unwrap();
-
-        let mut w = Wang::default();
-        let fp_flac = w.extract(&flac, SampleRate::HZ_8000).unwrap();
-        let fp_mp3 = w.extract(&mp3, SampleRate::HZ_8000).unwrap();
-
-        // Compute hash overlap (Jaccard-style)
-        use std::collections::HashSet;
-        let set_flac: HashSet<u32> = fp_flac.hashes.iter().map(|h| h.hash).collect();
-        let set_mp3: HashSet<u32> = fp_mp3.hashes.iter().map(|h| h.hash).collect();
-        let intersection = set_flac.intersection(&set_mp3).count();
-        let union = set_flac.union(&set_mp3).count();
-        let jaccard = intersection as f64 / union.max(1) as f64;
-
-        // MP3 128kbps vs FLAC should share ≥25% of hashes
-        assert!(
-            jaccard >= 0.20,
-            "galway MP3 vs FLAC Jaccard too low: {jaccard:.3} (expected ≥ 0.20)"
-        );
-    }
-
-    #[test]
-    fn wang_different_tracks_minimal_overlap() {
-        let galway = decode_to_mono_at(asset("galway.flac"), 8_000).unwrap();
-        let freak = decode_to_mono_at(asset("freak.flac"), 8_000).unwrap();
-
-        let mut w = Wang::default();
-        let fp_galway = w.extract(&galway, SampleRate::HZ_8000).unwrap();
-        let fp_freak = w.extract(&freak, SampleRate::HZ_8000).unwrap();
-
-        use std::collections::HashSet;
-        let set_a: HashSet<u32> = fp_galway.hashes.iter().map(|h| h.hash).collect();
-        let set_b: HashSet<u32> = fp_freak.hashes.iter().map(|h| h.hash).collect();
-        let intersection = set_a.intersection(&set_b).count();
-        let union = set_a.union(&set_b).count();
-        let jaccard = intersection as f64 / union.max(1) as f64;
-
-        // Different songs should have < 5% overlap (random collision floor)
-        assert!(
-            jaccard < 0.05,
-            "different tracks Jaccard too high: {jaccard:.3} (expected < 0.05)"
-        );
-    }
+    // Cross-format consistency (Galway MP3 vs FLAC, Galway vs Freak) is
+    // covered by `codec_roundtrip::wang_mp3_vs_flac` (with a stricter
+    // ≥ 0.25 bound) and `codec_extended::different_tracks_near_zero_overlap`.
 }

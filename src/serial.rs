@@ -10,15 +10,17 @@
 //!
 //! ```text
 //! [magic: 8 bytes "AUDIOFP\0"] [version: u8 = 1] [algorithm_id: u8]
-//! [hash_count: u32 LE] [fps: f32 LE] [hashes: Pod bytes]
+//! [hash_count: u32 LE] [fps: f32 LE] [hashes: u32 LE words]
 //! ```
 //!
-//! The hash payload is the raw native-endian `bytemuck::cast_slice`
-//! representation of each algorithm's Pod hash type. The header fields
-//! are explicitly little-endian; the payload is **not** byte-swapped, so
-//! a blob written on a different-endian host parses with a valid header
-//! and silently swapped hashes. The format is therefore effectively
-//! little-endian-only in practice (all supported targets are LE).
+//! Every hash type is plain `u32` fields in declaration order (`WangHash`:
+//! `hash, t_anchor`; `PanakoHash`: `hash, t_anchor, t_b, t_c`; Haitsma: one
+//! `u32` per frame), and the payload stores each field little-endian, like
+//! the header. On little-endian hosts that is byte-for-byte the in-memory
+//! `bytemuck` layout (so blobs written by earlier releases read unchanged);
+//! a big-endian host converts each word, so blobs move between hosts of
+//! either byte order. (Earlier releases wrote the payload in host order,
+//! which made a big-endian blob read back with silently swapped hashes.)
 //!
 //! [`to_bytes`]: crate::classical::WangFingerprint::to_bytes
 //! [`from_bytes`]: crate::classical::WangFingerprint::from_bytes
@@ -187,18 +189,23 @@ fn read_header(bytes: &[u8], expected_alg: Option<u8>) -> Result<(u8, u32, f32)>
     Ok((alg_id, hash_count, fps))
 }
 
-/// Read a byte slice into a `Vec<T>` where `T: Pod`.
+/// Read little-endian `u32` words into a `Vec<T>`, where `T` is plain
+/// `u32` fields (see the module docs).
 ///
-/// This handles potentially-unaligned input by allocating a properly
-/// aligned `Vec<T>` and copying the raw bytes into it. `src` must be an
-/// exact multiple of `size_of::<T>()`.
+/// Handles unaligned input by copying into a properly aligned `Vec<T>`.
+/// `src` must be an exact multiple of `size_of::<T>()`.
 fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     let elem_size = core::mem::size_of::<T>();
     if elem_size == 0 || src.is_empty() {
         return Vec::new();
     }
     debug_assert_eq!(src.len() % elem_size, 0);
-    bytemuck::allocation::pod_collect_to_vec(src)
+    let mut values: Vec<T> = bytemuck::allocation::pod_collect_to_vec(src);
+    // A no-op on little-endian hosts (`from_le` is the identity).
+    for word in bytemuck::cast_slice_mut::<T, u32>(&mut values) {
+        *word = u32::from_le(*word);
+    }
+    values
 }
 
 /// Serialize a Pod hash slice with the standard header into a `Vec<u8>`.
@@ -210,12 +217,16 @@ fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
 /// truncating the count would produce a corrupt blob. This is unreachable
 /// in practice (billions of hashes) but must fail loudly if it ever occurs.
 fn pod_blob<T: bytemuck::Pod>(values: &[T], alg_id: u8, fps: f32) -> Vec<u8> {
-    let value_bytes: &[u8] = cast_slice(values);
+    // `T` is plain `u32` fields, so its words are the payload (written
+    // little-endian; on little-endian hosts this is a straight copy).
+    let words: &[u32] = cast_slice(values);
     let count = u32::try_from(values.len())
         .expect("fingerprint hash count exceeds u32::MAX and cannot be serialized");
-    let mut buf = Vec::with_capacity(HEADER_SIZE + value_bytes.len());
+    let mut buf = Vec::with_capacity(HEADER_SIZE + 4 * words.len());
     write_header(&mut buf, alg_id, count, fps);
-    buf.extend_from_slice(value_bytes);
+    for word in words {
+        buf.extend_from_slice(&word.to_le_bytes());
+    }
     buf
 }
 
@@ -497,6 +508,53 @@ mod tests {
         assert_eq!(env.algorithm, "haitsma-v1");
         assert_eq!(env.sample_rate, 5_000);
         assert_eq!(env.hash_count, 100);
+    }
+
+    /// The payload is little-endian `u32` words in field order on every host
+    /// (this pins the bytes, so it also guards a big-endian build), and an
+    /// unaligned blob reads back intact.
+    #[test]
+    fn payload_is_little_endian_words_in_field_order() {
+        let fp = PanakoFingerprint {
+            hashes: vec![PanakoHash {
+                hash: 0x0102_0304,
+                t_anchor: 0x0506_0708,
+                t_b: 0x090A_0B0C,
+                t_c: 0x0D0E_0F10,
+            }],
+            frames_per_sec: 62.5,
+        };
+        let blob = fp.to_bytes();
+        assert_eq!(
+            &blob[HEADER_SIZE..],
+            &[
+                4, 3, 2, 1, 8, 7, 6, 5, 0xC, 0xB, 0xA, 9, 0x10, 0xF, 0xE, 0xD
+            ]
+        );
+        let mut shifted = vec![0u8];
+        shifted.extend_from_slice(&blob);
+        let back = PanakoFingerprint::from_bytes(&shifted[1..]).unwrap();
+        assert_eq!(back.hashes, fp.hashes);
+
+        let wang = WangFingerprint {
+            hashes: vec![WangHash {
+                hash: 0xAABB_CCDD,
+                t_anchor: 7,
+            }],
+            frames_per_sec: 62.5,
+        };
+        assert_eq!(
+            &wang.to_bytes()[HEADER_SIZE..],
+            &[0xDD, 0xCC, 0xBB, 0xAA, 7, 0, 0, 0]
+        );
+        let haitsma = HaitsmaFingerprint {
+            frames: vec![0x1122_3344],
+            frames_per_sec: 78.125,
+        };
+        assert_eq!(
+            &haitsma.to_bytes()[HEADER_SIZE..],
+            &[0x44, 0x33, 0x22, 0x11]
+        );
     }
 
     #[test]

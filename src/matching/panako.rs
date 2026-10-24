@@ -15,16 +15,17 @@
 //!    `s ∈ [scale_min, scale_max]`.
 //! 3. **Peak** — find the accumulator bin with the most votes. This is
 //!    the coarse `(s*, b*, votes)`. Peak finding consolidates each bin's
-//!    ±(1 scale-bin, ±tol offset-bin) neighbourhood — `O(bins²)`, fine
-//!    for the typical few-hundred-bin accumulators of song-length inputs.
-//! 4. **RANSAC refine** (if `ransac_refine`): from the `(t_q, t_r)`
-//!    anchor pairs collected during voting, iteratively sample 2 pairs,
-//!    fit `t_ref = s·t_query + b`, keep the largest inlier set.
+//!    ±(1 scale-bin, ±tol offset-bin) neighbourhood with a sorted sweep
+//!    and prefix sums — `O(B log B)` for `B` occupied bins.
+//! 4. **RANSAC refine** (if `ransac_refine`): iteratively sample 2 of the
+//!    `(t_q, t_r)` anchor pairs that voted into the peak's neighbourhood,
+//!    fit `t_ref = s·t_query + b`, count inliers over all pairs, and keep
+//!    the largest inlier set (no least-squares refit).
 //! 5. **Score** — normalised vote count + prominence + decision.
 //!
 //! # Performance
 //!
-//! - Time: `O(R + matched_pairs + bins²)`. Heavier than Wang (2-D grid
+//! - Time: `O(R + matched_pairs + B log B)`. Heavier than Wang (2-D grid
 //!   + RANSAC) but still fast for song-length inputs.
 //! - Memory: sparse accumulator, transient per-match.
 //!
@@ -33,14 +34,11 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::classical::PanakoFingerprint;
 use crate::matching::maps::{HashMap, hashmap_new};
-use crate::matching::{
-    MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence, frames_per_sec_compatible,
-};
+use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 /// Configuration for [`PanakoMatcher`].
 ///
@@ -245,10 +243,16 @@ impl PanakoMatcher {
         // boundary bin.
         let eps_scale = scale_per_bin * 0.5;
 
-        // Accumulator: (scale_bin, offset_bin) → vote count
-        let mut acc: HashMap<(u32, i64), u32> = hashmap_new();
-        // Candidate anchor pairs for RANSAC: (t_query_anchor, t_ref_anchor).
+        // Votes as a flat `(scale_bin, offset_bin)` list, counted after one
+        // sort below — cheaper than a map entry per vote (≈ 4× on a
+        // 100k-vote accumulator with the no_std `BTreeMap`), and the sort
+        // yields the key order consolidation needs anyway.
+        let mut votes: Vec<(u32, i64)> = Vec::new();
+        // Candidate anchor pairs for RANSAC: (t_query_anchor, t_ref_anchor),
+        // with the accumulator key each one voted into (same order), so
+        // refinement can sample from the Hough peak's own pairs.
         let mut pairs: Vec<(f64, f64)> = Vec::new();
+        let mut pair_keys: Vec<(u32, i64)> = Vec::new();
         let tol = cfg.offset_tolerance_frames as i64;
 
         for h in &query.hashes {
@@ -257,7 +261,7 @@ impl PanakoMatcher {
             let q_tc = h.t_c;
             if let Some(list) = index.get(&hash) {
                 for &(tr_a, _tr_b, tr_c) in list {
-                    // `PanakoHash` documents `t_anchor < t_b < t_c`, but the
+                    // `PanakoHash` documents `t_anchor < t_b <= t_c`, but the
                     // fields are `pub` and the type is `Pod`, so a malformed
                     // triplet is constructible in safe Rust and reachable
                     // verbatim from `from_bytes` (mmap / flat-file path).
@@ -289,17 +293,18 @@ impl PanakoMatcher {
                     // exactly, matching `WangMatcher`'s semantics.
                     let off_key = b.round() as i64;
 
-                    *acc.entry((s_bin, off_key)).or_insert(0) += 1;
+                    votes.push((s_bin, off_key));
                     // Only the refinement pass reads `pairs`; skip the push
                     // (and the per-pair growth) when refinement is disabled.
                     if cfg.ransac_refine {
                         pairs.push((q_ta as f64, tr_a as f64));
+                        pair_keys.push((s_bin, off_key));
                     }
                 }
             }
         }
 
-        if acc.is_empty() {
+        if votes.is_empty() {
             return MatchResult::NONE;
         }
 
@@ -316,28 +321,18 @@ impl PanakoMatcher {
         // neighbourhood-aware peak selection and the Wang gold standard
         // (audit B5).
         let tol_i64 = tol;
-        let mut acc_vec: Vec<((u32, i64), u32)> = acc.iter().map(|(&k, &v)| (k, v)).collect();
-        // Sort by (s_bin, off_key) so we can use a sliding window on
-        // the offset dimension within each scale-bin neighbourhood.
-        acc_vec.sort_unstable_by_key(|&((s, o), _)| (s, o));
+        // Sorted by (s_bin, off_key) so consolidation can binary-search the
+        // offset dimension within each scale-bin neighbourhood.
+        votes.sort_unstable();
+        let mut acc_vec: Vec<((u32, i64), u32)> = Vec::new();
+        super::consolidate::count_sorted(&votes, &mut acc_vec);
+        drop(votes);
 
-        let rows = super::consolidate::panako_scale_rows(&acc_vec);
-        let prefix = super::consolidate::panako_vote_prefix(&acc_vec);
-        let mut consolidated: Vec<u32> = vec![0u32; acc_vec.len()];
-        let mut peak_votes = 0u32;
-        let mut peak_linear_idx = 0usize;
+        let mut scratch = super::consolidate::HoughScratch::default();
+        let (peak_votes, peak_linear_idx) =
+            super::consolidate::panako_hough_peak(&acc_vec, tol_i64, &mut scratch);
 
-        for (i, slot) in consolidated.iter_mut().enumerate() {
-            let neigh_votes =
-                super::consolidate::panako_neighborhood_sum(&acc_vec, &rows, &prefix, i, tol_i64);
-            *slot = neigh_votes;
-            if neigh_votes > peak_votes {
-                peak_votes = neigh_votes;
-                peak_linear_idx = i;
-            }
-        }
-
-        if peak_votes < cfg.min_votes {
+        if peak_votes == 0 || peak_votes < cfg.min_votes {
             return MatchResult::NONE;
         }
 
@@ -347,22 +342,50 @@ impl PanakoMatcher {
         // not understated relative to its background. `peak_linear_idx`
         // indexes both `acc_vec` and `consolidated` consistently.
         let (peak_s_bin, peak_off_key) = acc_vec[peak_linear_idx].0;
-        let prominence = compute_prominence(&consolidated, peak_linear_idx);
-        if prominence < cfg.min_prominence {
+        let prominence = super::consolidate::panako_prominence(
+            &acc_vec,
+            &scratch.consolidated,
+            peak_linear_idx,
+            tol_i64,
+        );
+        if super::below_threshold(prominence, cfg.min_prominence) {
             return MatchResult::NONE;
         }
 
-        // Coarse scale from the peak bin centre; offset straight from
-        // the 1-frame-granularity peak key.
+        // Coarse scale from the peak bin centre; offset from the most-voted
+        // offset in the peak's neighbourhood (`consolidate::mode_offset`) —
+        // the first consolidated maximum in `(scale, offset)` order leans
+        // toward lower offsets when background votes border the peak.
         let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
-        let coarse_b = peak_off_key as f64;
+        let coarse_b = super::consolidate::panako_peak_offset(
+            &acc_vec,
+            peak_linear_idx,
+            tol_i64,
+            &mut scratch,
+        ) as f64;
 
         // --- 5. RANSAC refinement ---
         // Reuses the (t_q, t_r) pairs gathered during voting — no second
-        // scan over the index. When RANSAC finds no inliers (degenerate
-        // input), fall back to the coarse Hough result.
+        // scan over the index. Candidate lines are fitted only from pairs
+        // that voted into the peak's consolidation neighbourhood (±1 scale
+        // bin, ±tol offset): sampling from *all* pairs let a line through
+        // two noise pairs replace a strong Hough peak whenever true pairs
+        // were a small fraction of the votes, reporting a wrong offset and
+        // scale. Inliers are still counted over all pairs, so a true line
+        // whose votes straddle bins is not undercounted. When RANSAC finds
+        // no inliers (degenerate input), fall back to the coarse Hough
+        // result.
         let (final_scale, final_offset, votes) = if cfg.ransac_refine {
-            let (s, b, n) = ransac_refine(&pairs, coarse_s as f32, coarse_b, tol_i64, cfg);
+            let peak_pairs: Vec<(f64, f64)> = pairs
+                .iter()
+                .zip(&pair_keys)
+                .filter(|&(_, &(s_bin, off_key))| {
+                    s_bin.abs_diff(peak_s_bin) <= 1 && (off_key - peak_off_key).abs() <= tol_i64
+                })
+                .map(|(&pair, _)| pair)
+                .collect();
+            let (s, b, n) =
+                ransac_refine(&peak_pairs, &pairs, coarse_s as f32, coarse_b, tol_i64, cfg);
             // Refinement fits a SINGLE line, so a consolidated coarse peak
             // spread over ±1 scale bins can yield fewer inliers than the
             // neighbourhood count. Falling back only on `n == 0` used to turn
@@ -382,7 +405,7 @@ impl PanakoMatcher {
         let denom = query.hashes.len().max(1) as f32;
         let score = clamp_score(votes as f32 / denom);
 
-        if score < cfg.min_score || votes < cfg.min_votes {
+        if super::below_threshold(score, cfg.min_score) || votes < cfg.min_votes {
             return MatchResult::NONE;
         }
 
@@ -435,12 +458,6 @@ pub(crate) fn normalize_config(mut cfg: PanakoMatchConfig) -> PanakoMatchConfig 
     cfg
 }
 
-/// Iterative RANSAC over the `(t_query, t_ref)` anchor pairs collected
-/// during Hough voting. Samples 2 pairs, fits `t_ref = s·t_query + b`,
-/// counts inliers within `tol_frames`, and keeps the best fit.
-///
-/// Returns `(scale, offset, inlier_count)`. When fewer than 2 pairs are
-/// available or no valid model is found, returns `(coarse_s, coarse_b, 0)`
 /// Count inliers for a candidate line `t_ref = s * t_query + b`.
 /// Written as a tight loop without per-element branching so LLVM can
 /// auto-vectorize the abs-diff + compare into SIMD instructions.
@@ -455,18 +472,26 @@ fn count_inliers_wide(pairs: &[(f64, f64)], s: f64, b: f64, tol: f64) -> u32 {
     count
 }
 
+/// Iterative RANSAC over the `(t_query, t_ref)` anchor pairs collected
+/// during Hough voting. Samples 2 pairs from `samples` (the Hough peak's
+/// own pairs), fits `t_ref = s·t_query + b`, counts inliers over all
+/// `pairs` within `tol_frames`, and keeps the best fit.
+///
+/// Returns `(scale, offset, inlier_count)`. When fewer than 2 samples are
+/// available or no valid model is found, returns `(coarse_s, coarse_b, 0)`
 /// so the caller can fall back to the Hough peak geometry without mixing
 /// the RANSAC score with the Hough vote count (audit B4).
 ///
 /// The pairs are reused from voting — no second scan over the index.
 fn ransac_refine(
+    samples: &[(f64, f64)],
     pairs: &[(f64, f64)],
     coarse_s: f32,
     coarse_b: f64,
     tol_frames: i64,
     cfg: &PanakoMatchConfig,
 ) -> (f32, f64, u32) {
-    if pairs.len() < 2 {
+    if samples.len() < 2 {
         return (coarse_s, coarse_b, 0);
     }
 
@@ -475,12 +500,12 @@ fn ransac_refine(
     // single-frame jitter still admits real inliers.
     let inlier_tol = (tol_frames.max(2)) as f64;
 
-    // Budget: at least 4 samples per pair, capped at 128 — more iterations
+    // Budget: at least 4 draws per sample, capped at 128 — more iterations
     // cost time, fewer hurt the inlier estimate on noisy data.
-    let n_iter = 128usize.min(pairs.len() * 4);
+    let n_iter = 128usize.min(samples.len() * 4);
     // Deterministic seed derived from the data so repeated runs on the
     // same input produce identical results (no_std has no system RNG).
-    let seed = pairs.len().wrapping_mul(2_654_435_761) as u64;
+    let seed = samples.len().wrapping_mul(2_654_435_761) as u64;
     let mut rng = XorShift64(seed.max(1));
 
     let mut best_inliers = 0u32;
@@ -488,14 +513,14 @@ fn ransac_refine(
     let mut best_b = coarse_b;
 
     for _ in 0..n_iter {
-        let i = (rng.next() % pairs.len() as u64) as usize;
-        let j = (rng.next() % pairs.len() as u64) as usize;
+        let i = (rng.next() % samples.len() as u64) as usize;
+        let j = (rng.next() % samples.len() as u64) as usize;
         if i == j {
             continue;
         }
 
-        let (tq1, tr1) = pairs[i];
-        let (tq2, tr2) = pairs[j];
+        let (tq1, tr1) = samples[i];
+        let (tq2, tr2) = samples[j];
 
         let dq = tq2 - tq1;
         if dq.abs() < 1.0 {
@@ -535,6 +560,7 @@ mod tests {
     use super::*;
     use crate::classical::PanakoHash;
     use crate::matching::PanakoIndex;
+    use alloc::vec;
 
     /// Build a synthetic Panako fingerprint.
     fn make_fp(triples: &[(u32, u32, u32)], hash_offset: u32) -> PanakoFingerprint {
@@ -905,6 +931,202 @@ mod tests {
         let fp = make_fp(&[(10, 20, 30), (50, 60, 70)], 0);
         let res = m.match_one(&fp, &fp);
         assert!(!res.is_match);
+    }
+
+    /// 20 matching triplets, alternately jittered by one frame, and no noise:
+    /// the generic prominence averaged the peak's own neighbour bins as
+    /// "background" (20 / (20 + 1) ≈ 0.95), so this clean match failed the
+    /// default `min_prominence` of 5 in the matcher and the index.
+    #[test]
+    fn a_clean_jittered_match_is_prominent() {
+        let mut q = Vec::new();
+        let mut r = Vec::new();
+        for i in 0..20_u32 {
+            let ta = 30 * i;
+            let jitter = i % 2;
+            q.push(PanakoHash {
+                hash: i,
+                t_anchor: ta,
+                t_b: ta + 5,
+                t_c: ta + 10,
+            });
+            r.push(PanakoHash {
+                hash: i,
+                t_anchor: ta + 500 + jitter,
+                t_b: ta + 505 + jitter,
+                t_c: ta + 510 + jitter,
+            });
+        }
+        let q = PanakoFingerprint {
+            hashes: q,
+            frames_per_sec: 62.5,
+        };
+        let r = PanakoFingerprint {
+            hashes: r,
+            frames_per_sec: 62.5,
+        };
+        for ransac_refine in [false, true] {
+            let cfg = PanakoMatchConfig {
+                ransac_refine,
+                ..Default::default()
+            };
+            let m = PanakoMatcher::new(cfg.clone()).match_one(&q, &r);
+            assert!(m.is_match, "ransac {ransac_refine}: {m:?}");
+            assert!((m.offset.frames - 500).abs() <= 1, "{m:?}");
+            let ix = PanakoIndex::build(core::slice::from_ref(&r), 100).query(&q, &cfg);
+            assert!(ix.is_some(), "index, ransac {ransac_refine}");
+        }
+    }
+
+    /// A background vote one frame below the true offset gives both bins the
+    /// same consolidated sum, and the first maximum in `(scale, offset)`
+    /// order won: the offset leaned one frame low. The coarse offset now
+    /// comes from the most-voted offset in the peak's neighbourhood.
+    #[test]
+    fn background_vote_does_not_pull_the_coarse_offset_low() {
+        let mut q = Vec::new();
+        let mut r = Vec::new();
+        for i in 0..40_u32 {
+            let ta = 20 * i;
+            q.push(PanakoHash {
+                hash: i,
+                t_anchor: ta,
+                t_b: ta + 4,
+                t_c: ta + 8,
+            });
+            r.push(PanakoHash {
+                hash: i,
+                t_anchor: ta + 1_000,
+                t_b: ta + 1_004,
+                t_c: ta + 1_008,
+            });
+        }
+        q.push(PanakoHash {
+            hash: 500,
+            t_anchor: 900,
+            t_b: 904,
+            t_c: 908,
+        });
+        // Scattered background votes far from the peak, so prominence has a
+        // background to measure against.
+        for k in 0..12_u32 {
+            let (ta, tr) = (100 + 30 * k, 4_000 + 300 * k);
+            q.push(PanakoHash {
+                hash: 600 + k,
+                t_anchor: ta,
+                t_b: ta + 4,
+                t_c: ta + 8,
+            });
+            r.push(PanakoHash {
+                hash: 600 + k,
+                t_anchor: tr,
+                t_b: tr + 4,
+                t_c: tr + 8,
+            });
+        }
+        // b = 1 899 − 900 = 999: one frame below the true offset, which
+        // ties the two bins' consolidated sums.
+        r.push(PanakoHash {
+            hash: 500,
+            t_anchor: 1_899,
+            t_b: 1_903,
+            t_c: 1_907,
+        });
+        let mk = |mut hashes: Vec<PanakoHash>| {
+            hashes.sort_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+            PanakoFingerprint {
+                hashes,
+                frames_per_sec: 62.5,
+            }
+        };
+        let (q, r) = (mk(q), mk(r));
+        let cfg = PanakoMatchConfig {
+            ransac_refine: false,
+            ..Default::default()
+        };
+        let m = PanakoMatcher::new(cfg.clone()).match_one(&q, &r);
+        assert!(m.is_match, "{m:?}");
+        assert_eq!(m.offset.frames, 1_000);
+        let (_, ix) = PanakoIndex::build(core::slice::from_ref(&r), 100)
+            .query(&q, &cfg)
+            .expect("index match");
+        assert_eq!(ix.offset.frames, 1_000);
+    }
+
+    /// 40 true triplets at `s = 1, b = 1000` hidden among 50 noise hashes
+    /// with 100 reference postings each: the Hough peak is clear, but
+    /// RANSAC used to sample candidate lines from every pair, so with true
+    /// pairs a small fraction of the votes it usually kept a line through
+    /// noise (wrong offset and scale) or dropped the match. Sampling from
+    /// the peak's own pairs must recover the true alignment on every seed.
+    #[test]
+    fn ransac_keeps_a_strong_hough_peak_among_noise_pairs() {
+        let mut x: u32 = 0x9E37_79B9;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for trial in 0..20_u32 {
+            let mut q = Vec::new();
+            let mut r = Vec::new();
+            for i in 0..40_u32 {
+                let ta = 10 * i + trial;
+                let span = 6 + i % 5;
+                q.push(PanakoHash {
+                    hash: i,
+                    t_anchor: ta,
+                    t_b: ta + span / 2,
+                    t_c: ta + span,
+                });
+                r.push(PanakoHash {
+                    hash: i,
+                    t_anchor: ta + 1000,
+                    t_b: ta + 1000 + span / 2,
+                    t_c: ta + 1000 + span,
+                });
+            }
+            for j in 0..50_u32 {
+                let hash = 10_000 + j;
+                let ta = rng() % 400;
+                q.push(PanakoHash {
+                    hash,
+                    t_anchor: ta,
+                    t_b: ta + 4,
+                    t_c: ta + 8,
+                });
+                for _ in 0..100 {
+                    let ta = rng() % 5_000;
+                    let span = 7 + rng() % 3;
+                    r.push(PanakoHash {
+                        hash,
+                        t_anchor: ta,
+                        t_b: ta + span / 2,
+                        t_c: ta + span,
+                    });
+                }
+            }
+            let mk = |mut hashes: Vec<PanakoHash>| {
+                hashes.sort_by_key(|h| (h.t_anchor, h.t_b, h.t_c, h.hash));
+                PanakoFingerprint {
+                    hashes,
+                    frames_per_sec: 62.5,
+                }
+            };
+            let m = PanakoMatcher::new(PanakoMatchConfig::default()).match_one(&mk(q), &mk(r));
+            assert!(m.is_match, "trial {trial}: {m:?}");
+            assert!(
+                (m.offset.frames - 1000).abs() <= 2,
+                "trial {trial}: offset {} (expected 1000)",
+                m.offset.frames
+            );
+            assert!(
+                (m.time_scale - 1.0).abs() < 0.05,
+                "trial {trial}: time_scale {}",
+                m.time_scale
+            );
+        }
     }
 
     #[test]

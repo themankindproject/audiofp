@@ -5,8 +5,7 @@
 //! (landmark contrib ratio, `1 − BER`, cosine), and `prominence` has a
 //! different formula per matcher — even the two Haitsma paths disagree.
 //! Thresholds therefore do not transfer, and fusing matchers (cascades,
-//! ensembles, [`similarity`](crate::matching)-style APIs) needs a common
-//! scale. This module provides it: one closed-form logistic map per
+//! ensembles, similarity-style APIs) needs a common scale. This module provides it: one closed-form logistic map per
 //! algorithm, each anchored at the measured score gap on the calibration
 //! corpus (see `ROBUSTNESS.md`, "Calibrated confidence").
 //!

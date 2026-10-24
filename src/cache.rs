@@ -350,8 +350,12 @@ impl Drop for AtomicTempGuard {
     }
 }
 
-/// Write a fingerprint atomically: create a private temporary sibling,
-/// write the full v1 blob, then rename into place.
+/// Write a fingerprint atomically: create a uniquely named temporary
+/// sibling, write the full v1 blob, then rename into place.
+///
+/// The final file gets the same permissions [`cache_to_file`] would give
+/// it: an existing file's mode is preserved on Unix, and a new file gets
+/// the process default.
 ///
 /// On failure the previous file at `path` (if any) is preserved. The
 /// temporary file is removed when possible. Parent directories are **not**
@@ -394,11 +398,6 @@ fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u
         ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
         match options.open(&candidate) {
             Ok(f) => {
                 temp_path = candidate;
@@ -420,10 +419,14 @@ fn cache_to_file_atomic_at<T: CacheableFingerprint>(fp: &T, path: &Path, base: u
     })?;
     let mut guard = AtomicTempGuard(temp_path.clone());
 
+    // The renamed file should end up with the same mode `cache_to_file`
+    // gives it: the existing file's mode when overwriting, else the
+    // process default (`0o666` minus umask, which `create_new` already
+    // applied). A fixed 0600 here made every atomically written cache
+    // unreadable to group / other readers.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    if let Ok(existing) = fs::metadata(path) {
+        file.set_permissions(existing.permissions())
             .map_err(|e| AfpError::io_with_path(&temp_path, e))?;
     }
 
@@ -509,6 +512,7 @@ pub fn load_all_cached_limited(
 pub fn iter_cached(dir: &Path, limits: CacheLoadLimits) -> Result<CacheDirIter> {
     let entries = fs::read_dir(dir).map_err(|e| AfpError::io_with_path(dir.to_path_buf(), e))?;
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut kept: std::collections::BinaryHeap<PathBuf> = std::collections::BinaryHeap::new();
     let mut afp_count = 0usize;
     for entry in entries {
         let entry = entry.map_err(|e| AfpError::io_with_path(dir.to_path_buf(), e))?;
@@ -524,16 +528,26 @@ pub fn iter_cached(dir: &Path, limits: CacheLoadLimits) -> Result<CacheDirIter> 
             .is_some_and(|ext| ext.eq_ignore_ascii_case(AFP_EXT));
         if is_afp {
             afp_count += 1;
-            if let Some(max_files) = limits.max_files {
-                if paths.len() < max_files {
-                    paths.push(path);
+            match limits.max_files {
+                // Keep the `max_files` smallest paths (a bounded max-heap),
+                // so the retained set is the first N in sorted order rather
+                // than whichever N `read_dir` happened to return first, and
+                // memory stays O(max_files) on huge directories.
+                Some(max_files) => {
+                    kept.push(path);
+                    if kept.len() > max_files {
+                        kept.pop();
+                    }
                 }
-            } else {
-                paths.push(path);
+                None => paths.push(path),
             }
         }
     }
-    paths.sort();
+    if limits.max_files.is_some() {
+        paths = kept.into_sorted_vec();
+    } else {
+        paths.sort();
+    }
     let excess_files = limits
         .max_files
         .is_some_and(|max_files| afp_count > max_files);
@@ -545,6 +559,7 @@ pub fn iter_cached(dir: &Path, limits: CacheLoadLimits) -> Result<CacheDirIter> 
         files_loaded: 0,
         excess_files,
         afp_count,
+        done: false,
     })
 }
 
@@ -557,12 +572,19 @@ pub struct CacheDirIter {
     files_loaded: usize,
     excess_files: bool,
     afp_count: usize,
+    /// Set once an aggregate limit has been reported: the scan is over, so
+    /// a consumer that skips `Err` items cannot keep loading later files
+    /// past the budget.
+    done: bool,
 }
 
 impl Iterator for CacheDirIter {
     type Item = Result<(PathBuf, CachedFingerprint)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         let path = match self.paths.get(self.index) {
             Some(p) => {
                 self.index += 1;
@@ -571,6 +593,7 @@ impl Iterator for CacheDirIter {
             None => {
                 if self.excess_files {
                     self.excess_files = false;
+                    self.done = true;
                     let max_files = self.limits.max_files.unwrap_or(0);
                     return Some(Err(AfpError::InputTooLarge {
                         limit: max_files,
@@ -583,6 +606,7 @@ impl Iterator for CacheDirIter {
         if let Some(max_total) = self.limits.max_total_bytes {
             let remaining = max_total.saturating_sub(self.bytes_loaded);
             if remaining == 0 {
+                self.done = true;
                 return Some(Err(AfpError::InputTooLarge {
                     limit: max_total as usize,
                     provided: self.bytes_loaded as usize + 1,
@@ -593,6 +617,7 @@ impl Iterator for CacheDirIter {
                 Err(e) => return Some(Err(AfpError::io_with_path(&path, e))),
             };
             if meta.is_file() && meta.len() > remaining {
+                self.done = true;
                 return Some(Err(AfpError::InputTooLarge {
                     limit: max_total as usize,
                     provided: (self.bytes_loaded + meta.len()) as usize,
@@ -610,7 +635,15 @@ impl Iterator for CacheDirIter {
             .and_then(|mut file| read_handle_with_limit(&path, &mut file, cap))
         {
             Ok(b) => b,
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                // A read capped below the per-file maximum was capped by
+                // the remaining total budget (the file grew after the
+                // metadata check above): that is the aggregate limit.
+                if cap < MAX_CACHE_FILE_BYTES && matches!(e, AfpError::InputTooLarge { .. }) {
+                    self.done = true;
+                }
+                return Some(Err(e));
+            }
         };
         // The actual read above is capped to the remaining total budget,
         // even if the file grows after metadata is inspected.
@@ -1041,6 +1074,85 @@ mod tests {
             matches!(err, AfpError::InputTooLarge { .. }),
             "byte budget exhaustion must error, got {err:?}"
         );
+    }
+
+    fn one_hash_fp(n: u32) -> WangFingerprint {
+        WangFingerprint {
+            hashes: (0..n)
+                .map(|i| WangHash {
+                    hash: i,
+                    t_anchor: i,
+                })
+                .collect(),
+            frames_per_sec: 62.5,
+        }
+    }
+
+    /// `max_files` must keep the first N paths in sorted order. It used to
+    /// keep whichever N `read_dir` returned first and sort only those.
+    #[test]
+    fn max_files_keeps_the_sorted_prefix() {
+        let dir = TempDir::new("max_files_sorted");
+        for name in ["h", "c", "f", "a", "g", "b", "e", "d"] {
+            cache_to_file(&one_hash_fp(1), &dir.0.join(format!("{name}.afp"))).unwrap();
+        }
+        let limits = CacheLoadLimits {
+            max_files: Some(2),
+            max_total_bytes: None,
+        };
+        let items: Vec<_> = iter_cached(&dir.0, limits).unwrap().collect();
+        let names: Vec<_> = items
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.afp", "b.afp"]);
+        assert!(matches!(
+            items.last(),
+            Some(Err(AfpError::InputTooLarge {
+                limit: 2,
+                provided: 8
+            }))
+        ));
+    }
+
+    /// After the byte budget is reported, the scan is over: a consumer that
+    /// skips `Err` items must not go on to load a later, smaller file.
+    #[test]
+    fn byte_budget_error_ends_the_iteration() {
+        let dir = TempDir::new("budget_fused");
+        cache_to_file(&one_hash_fp(1), &dir.0.join("a.afp")).unwrap();
+        cache_to_file(&one_hash_fp(100), &dir.0.join("b.afp")).unwrap();
+        cache_to_file(&one_hash_fp(1), &dir.0.join("c.afp")).unwrap();
+        let small = one_hash_fp(1).to_cache_bytes().len() as u64;
+        let limits = CacheLoadLimits {
+            max_files: None,
+            max_total_bytes: Some(small * 2),
+        };
+        let mut iter = iter_cached(&dir.0, limits).unwrap();
+        assert!(iter.next().unwrap().is_ok(), "a.afp fits");
+        assert!(
+            matches!(iter.next(), Some(Err(AfpError::InputTooLarge { .. }))),
+            "b.afp exceeds the remaining budget"
+        );
+        assert!(iter.next().is_none(), "c.afp must not load past the budget");
+    }
+
+    /// The atomic write must not leave the final file 0600: it keeps an
+    /// existing file's mode, as `cache_to_file` does.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_the_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("atomic_mode");
+        let path = dir.0.join("a.afp");
+        cache_to_file(&one_hash_fp(1), &path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        cache_to_file_atomic(&one_hash_fp(2), &path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let loaded: WangFingerprint = load_from_cache(&path).unwrap();
+        assert_eq!(loaded.hashes.len(), 2);
     }
 
     #[test]

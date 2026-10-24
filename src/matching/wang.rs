@@ -15,8 +15,9 @@
 //!    framing-jitter votes coalesce into a single peak.
 //! 4. **Prominence** — `peak ÷ (mean of non-peak bins + 1)` — the
 //!    discriminator between a true spike and flat random collisions.
-//! 5. **Score** — normalised to `[0, 1]` by dividing peak votes by the
-//!    number of query hashes that landed in the winning offset span.
+//! 5. **Score** — normalised to `[0, 1]`: the number of distinct query
+//!    hashes with at least one posting inside the winning offset window,
+//!    divided by the number of query hashes.
 //!
 //! # Performance
 //!
@@ -266,15 +267,32 @@ impl WangMatcher {
         // --- 4. Find peak (use consolidated for robustness, but pick
         //     the plateau centre to avoid jitter bias) ---
         let peak_val = *consolidated.iter().max().unwrap_or(&0);
-        if peak_val < cfg.min_votes {
+        // `peak_val == 0` is no evidence at all: with `min_votes: 0` it used
+        // to "match" at offset `-q_max` with zero votes.
+        if peak_val == 0 || peak_val < cfg.min_votes {
             return MatchResult::NONE;
         }
 
-        let peak_idx = super::consolidate::first_connected_plateau_center(&consolidated, peak_val);
+        let (plateau_start, plateau_end) =
+            super::consolidate::first_connected_plateau(&consolidated, peak_val);
+        let peak_idx = (plateau_start + plateau_end) / 2;
+        // Reported offset: the most-voted raw offset near the plateau (see
+        // `consolidate::mode_offset`). With zero tolerance the histogram is
+        // the consolidated view and the plateau centre already is that.
+        let mode_idx = if tol > 0 {
+            super::consolidate::dense_mode_offset(
+                &hist,
+                plateau_start.saturating_sub(tol),
+                plateau_end.saturating_add(tol),
+            )
+            .unwrap_or(peak_idx)
+        } else {
+            peak_idx
+        };
 
         // --- 5. Prominence (on consolidated histogram) ---
         let prominence = compute_prominence(&consolidated, peak_idx);
-        if prominence < cfg.min_prominence {
+        if super::below_threshold(prominence, cfg.min_prominence) {
             return MatchResult::NONE;
         }
 
@@ -304,11 +322,11 @@ impl WangMatcher {
         let denom = query.hashes.len().max(1) as f32;
         let score = clamp_score(contrib_count as f32 / denom);
 
-        if score < cfg.min_score {
+        if super::below_threshold(score, cfg.min_score) {
             return MatchResult::NONE;
         }
 
-        let offset = TimeOffset::from_frames(delta_star, reference.frames_per_sec);
+        let offset = TimeOffset::from_frames(mode_idx as i64 + dmin, reference.frames_per_sec);
 
         MatchResult {
             is_match: true,
@@ -447,6 +465,73 @@ mod tests {
         let fp = make_fp(&[10, 20, 30], 0);
         let result = matcher.match_one(&fp, &fp);
         assert!(!result.is_match);
+    }
+
+    /// One background vote two frames below a 40-vote spike collapsed the
+    /// consolidated plateau to `δ* − 1`, so the reported offset leaned one
+    /// frame low. Both the matcher and the index now report the spike.
+    #[test]
+    fn background_vote_does_not_pull_the_offset_low() {
+        let anchors: Vec<u32> = (0..40).map(|i| 50 * i + 5).collect();
+        let mut query = make_fp(&anchors, 0);
+        let mut reference = make_fp(&anchors.iter().map(|t| t + 1_000).collect::<Vec<_>>(), 0);
+        query.hashes.push(WangHash {
+            hash: 9_999,
+            t_anchor: 3_000,
+        });
+        reference.hashes.push(WangHash {
+            hash: 9_999,
+            t_anchor: 3_998,
+        });
+        reference.hashes.sort_by_key(|h| (h.t_anchor, h.hash));
+        let cfg = WangMatchConfig::default();
+        let m = WangMatcher::new(cfg.clone()).match_one(&query, &reference);
+        assert!(m.is_match);
+        assert_eq!(m.offset.frames, 1_000);
+        let idx = crate::matching::WangIndex::build(core::slice::from_ref(&reference), 100);
+        let (_, r) = idx.query(&query, &cfg).expect("index match");
+        assert_eq!(r, m, "index and matcher must agree");
+    }
+
+    /// Every gate set to zero must still require *some* evidence: with no
+    /// shared hash the matcher used to report a match with zero votes.
+    #[test]
+    fn zero_thresholds_still_need_a_vote() {
+        let matcher = WangMatcher::new(WangMatchConfig {
+            min_votes: 0,
+            min_score: 0.0,
+            min_prominence: 0.0,
+            ..Default::default()
+        });
+        let r = make_fp(&[10, 20, 30, 40], 0);
+        let q = make_fp(&[10, 20, 30, 40], 1_000);
+        assert_eq!(matcher.match_one(&q, &r), MatchResult::NONE);
+    }
+
+    /// A `NaN` threshold fails the gate instead of disabling it: `x < NaN`
+    /// is false, so a 3-hash self-match (prominence ≈ 1.2) used to pass a
+    /// `NaN` `min_prominence` / `min_score`.
+    #[test]
+    fn nan_thresholds_fail_closed() {
+        let fp = make_fp(&[10, 20, 30], 0);
+        for cfg in [
+            WangMatchConfig {
+                min_votes: 3,
+                min_prominence: f32::NAN,
+                ..Default::default()
+            },
+            WangMatchConfig {
+                min_votes: 3,
+                min_prominence: 0.0,
+                min_score: f32::NAN,
+                ..Default::default()
+            },
+        ] {
+            let m = WangMatcher::new(cfg.clone()).match_one(&fp, &fp);
+            assert!(!m.is_match, "{cfg:?} -> {m:?}");
+            let idx = crate::matching::WangIndex::build(core::slice::from_ref(&fp), 100);
+            assert!(idx.query(&fp, &cfg).is_none(), "index, {cfg:?}");
+        }
     }
 
     #[test]

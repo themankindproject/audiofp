@@ -14,65 +14,31 @@
     feature = "std-mp4"
 ))]
 
+mod common;
+
 use std::collections::HashSet;
 
-use audiofp::classical::{Haitsma, Panako, Wang};
+use audiofp::classical::Wang;
 use audiofp::io::decode_to_mono_at;
 use audiofp::{Fingerprinter, SampleRate};
+use common::degrade::{haitsma_similarity as haitsma_bit_similarity, jaccard};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+fn decode(path: &str, sr: u32) -> Vec<f32> {
+    decode_to_mono_at(path, sr).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"))
+}
+
 fn wang_hashes(path: &str) -> HashSet<u32> {
-    let samples =
-        decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
-    let mut wang = Wang::default();
-    wang.extract(&samples, SampleRate::HZ_8000)
-        .unwrap()
-        .hashes
-        .into_iter()
-        .map(|h| h.hash)
-        .collect()
+    common::degrade::wang_hash_set(&decode(path, 8_000), 8_000)
 }
 
 fn panako_hashes(path: &str) -> HashSet<u32> {
-    let samples =
-        decode_to_mono_at(path, 8_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
-    let mut panako = Panako::default();
-    panako
-        .extract(&samples, SampleRate::HZ_8000)
-        .unwrap()
-        .hashes
-        .into_iter()
-        .map(|h| h.hash)
-        .collect()
+    common::degrade::panako_hash_set(&decode(path, 8_000), 8_000)
 }
 
 fn haitsma_frames(path: &str) -> Vec<u32> {
-    let samples =
-        decode_to_mono_at(path, 5_000).unwrap_or_else(|e| panic!("failed to decode {path}: {e}"));
-    let mut h = Haitsma::default();
-    h.extract(&samples, SampleRate::HZ_5000).unwrap().frames
-}
-
-fn jaccard(a: &HashSet<u32>, b: &HashSet<u32>) -> f32 {
-    let union = a.union(b).count();
-    if union == 0 {
-        return 0.0;
-    }
-    a.intersection(b).count() as f32 / union as f32
-}
-
-fn haitsma_bit_similarity(a: &[u32], b: &[u32]) -> f32 {
-    let n = a.len().min(b.len());
-    if n == 0 {
-        return 0.0;
-    }
-    let matching: u32 = a[..n]
-        .iter()
-        .zip(b[..n].iter())
-        .map(|(x, y)| 32 - (x ^ y).count_ones())
-        .sum();
-    matching as f32 / (n as u32 * 32) as f32
+    common::degrade::haitsma_frames(&decode(path, 5_000), 5_000)
 }
 
 // ── Reference: FLAC (lossless) ───────────────────────────────────────────

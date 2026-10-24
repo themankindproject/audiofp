@@ -21,7 +21,6 @@ allow = [
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "MPL-2.0",
     "ISC",
     "Unicode-DFS-2016",
     "Unicode-3.0",
@@ -30,9 +29,27 @@ allow = [
     "BSL-1.0",
 ]
 
-# MPL-2.0 is the only weak-copyleft permitted; symphonia is the justification.
+# MPL-2.0 (weak copyleft) is allowed only for the crates below, not
+# globally: the Symphonia family (the `std-*` decoders) and `dyn-eq` (pulled
+# in by tract for `neural` / `watermark`). A new MPL dependency fails
+# `cargo deny check` until it is listed here on purpose.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "symphonia" },
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-flac" },
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-mp3" },
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-aac" },
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-adpcm" },
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-alac" },
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-pcm" },
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-vorbis" },
+    { allow = ["MPL-2.0"], crate = "symphonia-common" },
+    { allow = ["MPL-2.0"], crate = "symphonia-core" },
+    { allow = ["MPL-2.0"], crate = "symphonia-format-isomp4" },
+    { allow = ["MPL-2.0"], crate = "symphonia-format-mkv" },
+    { allow = ["MPL-2.0"], crate = "symphonia-format-ogg" },
+    { allow = ["MPL-2.0"], crate = "symphonia-format-riff" },
+    { allow = ["MPL-2.0"], crate = "symphonia-metadata" },
+    { allow = ["MPL-2.0"], crate = "dyn-eq" },
 ]
 
 [bans]

@@ -21,6 +21,12 @@ cobertura.xml
 future.md
 audio.md
 context.md
+CONTEXT.md
 prep.md
 dsp.md
 PONYTAIL-DEBT.md
+
+# Bakeoff CI artifacts and Python bytecode
+BENCHMARKS-DRIFT.txt
+bakeoff-check.log
+__pycache__/

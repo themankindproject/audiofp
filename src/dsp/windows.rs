@@ -62,8 +62,10 @@ pub fn make_window(kind: WindowKind, n: usize) -> Vec<f32> {
         let v = match kind {
             WindowKind::Hann => 0.5 - 0.5 * cosf(two_pi * kf / n_f),
             WindowKind::Hamming => 0.54 - 0.46 * cosf(two_pi * kf / n_f),
+            // `0.42 − 0.5 + 0.08` rounds to −1.5e-8 in f32 at k = 0; clamp so
+            // the documented non-negative contract holds.
             WindowKind::Blackman => {
-                0.42 - 0.5 * cosf(two_pi * kf / n_f) + 0.08 * cosf(four_pi * kf / n_f)
+                (0.42 - 0.5 * cosf(two_pi * kf / n_f) + 0.08 * cosf(four_pi * kf / n_f)).max(0.0)
             }
         };
         w.push(v);
@@ -73,6 +75,16 @@ pub fn make_window(kind: WindowKind, n: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_window_is_non_negative() {
+        for kind in [WindowKind::Hann, WindowKind::Hamming, WindowKind::Blackman] {
+            for n in [2, 3, 64, 255, 1024, 2048] {
+                let w = make_window(kind, n);
+                assert!(w.iter().all(|&v| v >= 0.0), "{kind:?} n={n}: {:?}", w[0]);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

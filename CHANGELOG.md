@@ -7,6 +7,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+No hash layout, wire format, frame rate or default threshold changed; the
+offline Wang/Panako/Haitsma goldens and the cross-platform determinism test are
+unchanged.
+
+**Crashes and resource bounds on untrusted input**
+
+- **`SincResampler` no longer panics on ordinary rate pairs.** The middle-region
+  start `ceil(half_taps / ratio)` could land on an `n` whose f64 product
+  `n · ratio` floors one below `half_taps`, wrapping an index (1920 → 44 100 and
+  62 other common pairs at default quality). Reachable through
+  `io::decode_to_mono_at` with a crafted file rate.
+- **AIFF / AIFC headers with an absurd channel count are rejected before
+  Symphonia sees them.** A 70-byte AIFF declaring 65 535 channels panicked
+  inside `probe` in debug builds (`u16` block-align overflow) and made the PCM
+  decoder allocate ~300 MB in release. The header preflight now covers `COMM`
+  as well as WAVE `fmt `, and the decoder also checks the declared channel
+  count before it is built (covering Matroska). `UnsupportedChannels` saturates
+  instead of wrapping counts above 65 535.
+- **The header preflight stops at the format chunk and reads through a
+  buffer**, so a flood of tiny chunks no longer costs two syscalls each, and
+  the decode `timeout` now starts before the preflight and probe.
+- **`max_bytes` is checked on the opened handle**, not a second path lookup;
+  a non-regular file is rejected when a byte cap is requested.
+
+**Decoding and cache**
+
+- **`decode_to_mono_at` accepts long files.** Without `max_samples`, any
+  resample was capped at 10 minutes at 48 kHz — including downsampling, which
+  cannot grow the buffer — so a one-hour 8001 Hz → 8000 Hz decode failed. The
+  uncapped limit is now the larger of that floor and 8× the decoded native
+  length, which still bounds a crafted 1 Hz header.
+- **`iter_cached` / `load_all_cached_limited` with `max_files` keep the first N
+  files in sorted order** (they kept whichever N `read_dir` returned first).
+- **An aggregate cache limit ends the scan.** After a byte-budget or file-count
+  error the iterator returns `None`; a consumer that skipped errors could keep
+  loading later files past the budget.
+- **Fingerprint blobs are little-endian on every host.** The v1 header was
+  little-endian but the hash payload was written in host byte order, so a blob
+  written on a big-endian host read back with byte-swapped hashes (and vice
+  versa). The payload is now little-endian `u32` words in field order, which
+  is byte-for-byte what little-endian hosts always wrote: existing blobs and
+  `.afp` files are unchanged. Verified on a big-endian target under Miri.
+- **`decode_to_mono_report` flags truncated files.** A stream ending mid-packet
+  now counts as a skipped packet; a WAV missing three quarters of its declared
+  data reported `packets_skipped: 0`.
+- **`cache_to_file_atomic` no longer leaves files at mode 0600.** It keeps an
+  existing file's mode, and a new file gets the process default, as
+  `cache_to_file` does.
+
+**Streaming extraction**
+
+- **`max_pending_anchors` no longer depends on push size.** One large push
+  finalised every ripe second before emitting, so the cap evicted anchors that
+  small pushes keep (749 vs 3 674 hashes on 20 s at `Some(100)`). Anchors are
+  now emitted after each second is finalised; without a cap the output is
+  unchanged.
+- **Pushing after a `flush` that ended mid-second keeps emitting that second.**
+  Its remaining peaks were stranded until the next flush.
+- **Streaming Wang/Panako converts every bin on the same dB path as offline.**
+  Bin 512 took the scalar `log2` tail, which can differ by 1 ULP and flip a
+  peak tie (1 530 vs 1 536 hashes on a signal with equal DC and Nyquist power).
+  Offline output is unchanged.
+- **The frame budget really is the `u32` range.** Internal counters were `i32`
+  and silently stopped finalisation at 2³¹ frames (~398 days at 62.5 fps).
+- **`reset()` returns in-flight buffers to the pools**, so the first segment
+  after it is allocation-free (it cost 32 / 52 allocations for Wang / Panako).
+- **`min_anchor_mag_db` is clamped to `[-119, 0]`** (was `[-200, 0]`). The dB
+  spectrogram is floored at −120 dB, so a lower peak floor turned digital
+  silence into a plateau of peaks and silence matched silence.
+- **Haitsma bumps `Some(0)` limits to `Some(1)`** like Wang and Panako; a zero
+  `max_push_samples` made every push yield nothing.
+- **`Wang` / `Panako` `extract_with_progress` report progress while working.**
+  Every intermediate value used to be replayed after the STFT and peak-picking
+  phase had finished (on 600 s of audio the first value above 0 arrived at
+  442.6 ms of a 455.9 ms run). The sequence of values is unchanged.
+
+**Matching**
+
+- **Panako RANSAC no longer replaces a strong Hough peak with a line through
+  noise.** It sampled candidate lines from every vote pair, so when true pairs
+  were a small fraction of the votes it often reported a wrong offset and
+  scale, or dropped the match. It now samples from the pairs that voted into
+  the peak's neighbourhood (inliers are still counted over all pairs). The
+  real-audio matching and threshold-calibration suites are unchanged.
+- **`NaN` thresholds fail closed.** A `NaN` `min_score` or `min_prominence`
+  disabled the gate in `WangMatcher`, `PanakoMatcher`, `WangIndex` and
+  `PanakoIndex` (`x < NaN` is false). With every gate at zero, Wang and Panako
+  also required no votes and "matched" with none.
+- **`NeuralMatcher` treats a non-finite cosine as no evidence** (it was mapped
+  to `0.0`, passing a `min_cosine <= 0` gate), and reports `f32::MAX` rather
+  than `0.0` for an infinitely sharp peak.
+- **Wang and Panako offsets no longer lean one frame low.** The reported offset
+  was the consolidated plateau's floored midpoint (Wang) or the first
+  consolidated maximum in `(scale, offset)` order (Panako), so a single
+  background vote next to the peak shifted it by a frame. Both matchers and
+  both indexes now report the most-voted raw offset inside the peak's ±tol
+  window (votes split evenly still report the midpoint). Scores and
+  prominence are unchanged; offsets move by at most `offset_tolerance_frames`.
+- **Panako prominence measures the background, not the peak's own spread.**
+  It averaged every occupied accumulator bin, and in a sparse accumulator
+  most of those are the peak's neighbours, which share its votes: 20 clean,
+  jittered triplets scored 0.95 against the default `min_prominence` of 5 (the
+  same evidence passes `WangMatcher`). The background is now the bins beyond
+  the peak's reach (more than 2 scale bins or `2·tol` frames away), in
+  `PanakoMatcher` and `PanakoIndex`. The real-audio matching, cross-track
+  rejection and threshold-calibration suites are unchanged.
+- **`HaitsmaMatcher` converts offsets with the reference frame rate**, like
+  every other matcher and `HaitsmaIndex`.
+- **`HaitsmaIndex` rejects uninformative references** as `HaitsmaMatcher`
+  does; a 20-frame query against 1 000 identical frames matched with score 1.0.
+- **Index `estimated_bytes` follows the real hash-table layout.** A flat
+  per-slot overhead overstated an index by 1.6–2.2×, and the Haitsma and
+  Panako estimates left out the stop-hash tombstones; the estimate now lands
+  within allocator rounding of the measured heap on `std`.
+- **Index `remove` / `remove_many` drop the keys they empty.** Enroll/erase
+  churn grew the map without bound (200 cycles with one live track left ~400 k
+  keys, ~31 MB). `len()` now counts keys with a live posting, and
+  `is_empty()` is `true` once every reference is removed.
+
+**Neural and watermark**
+
+- **Non-finite model output is an `Inference` error** instead of an embedding,
+  and L2 normalisation no longer zeroes huge-but-finite vectors.
+- **`StreamingNeuralEmbedder`: a push cut short by `max_push_samples` keeps the
+  input timeline.** The next push was spliced onto the cut, so later
+  timestamps were early by the dropped count. `new` also no longer builds an
+  unused batch plan when `batch_size > 1`.
+- **Classical watermark: extreme but finite samples stay finite.** A bin's
+  `re² + im²` overflowed `f32`, so embedding at amplitude 1e18 returned mostly
+  non-finite samples.
+- **`WatermarkDetector` (deprecated) averages scores in f64.** The f32 running
+  sum stalled at 2²⁴, so an hour of per-sample scores at 0.9 averaged to 0.29.
+
+**Smaller fixes**
+
+- The Kaiser `I0` series runs to convergence for every accepted β (it was cut
+  at 30 terms, 5 % off at β = 50; output for β ≤ 20 is unchanged).
+- Blackman windows are non-negative at index 0 (was −1.5e-8).
+- `MelFilterBank::log_mel` / `log_mel_from_power` check lengths against the
+  filterbank as built, so changing a public field after construction fails
+  with a clear message instead of an index out of bounds inside the band loop.
+
+### Changed
+
+- **`std` no longer pulls in Symphonia.** Each `std-*` codec feature enables it;
+  `std`-only, `rayon`, `neural`, `watermark` and `mimalloc` builds skip it.
+- **The published package is an allowlist** (`src/`, `Cargo.toml`, `README.md`,
+  `LICENSE`). 0.4.5 shipped `CONTEXT.md`, `BENCHMARKS-DRIFT.txt` and
+  `bakeoff-check.log` because the old `exclude` list named `context.md`.
+- Removed the unused `num-traits` dependency.
+- The three index types share their stop-hash pruning, insert and removal
+  bookkeeping, and Panako's matcher and index share one Hough peak routine,
+  instead of carrying copies.
+- Tests: the NaN/Inf property and adversarial tests now assert the
+  `NonFiniteSample` contract (they discarded the result, so they could not
+  fail), the corrupt-packet decoder tests assert what each mode does (the
+  integrity path is exercised with a damaged MP3), and two `stress` tests that
+  duplicated the codec suites are gone.
+- `deny.toml` allows MPL-2.0 only for the crates that need it (the Symphonia
+  family and tract's `dyn-eq`) instead of globally; the per-crate exception it
+  had was a no-op.
+- CI: the golden job runs `regression` and `real_audio_golden` on Linux, macOS
+  and Windows (`--skip golden` in the test matrix also skipped the real-audio
+  goldens); the `cargo audit` job, which duplicated `cargo deny`'s advisories
+  check, and the matrix's duplicate doc-test step are gone. Two test files now
+  require the `std-wav` feature they use; `degradation` needs only `std-wav`.
+- `neural/embedder.rs` no longer uses `unsafe`: model inputs are
+  zero-initialised (one memset per inference). The crate is now
+  `#![forbid(unsafe_code)]`.
+
+### Performance
+
+- `HaitsmaMatcher::match_one` builds its per-call LUT as one sorted table with
+  a membership filter instead of a map with one `Vec` per frame: 6.1 → 1.1 ms
+  (default build) and 2.7 → 1.1 ms (`std`) on a 4-minute reference, and
+  29 → 4.5 ms with two-bit-flip probing. Results are identical.
+- `HaitsmaIndex::remove` / `remove_many` visit only the removed references' own
+  keys instead of the whole LUT.
+- `NeuralMatcher` with `assume_normalized: false` computes each embedding's
+  norm once per sequence instead of twice per compared pair (SlidingMax, DTW);
+  results are bit-identical.
+- `PanakoIndex::query` and `HaitsmaIndex::query` no longer allocate per
+  candidate reference: one flat vote list, sorted once, replaces their nested
+  maps (295 → 11 and 113 → 12 allocations per warm query with 100 candidates).
+  `PanakoMatcher` counts votes the same way, and both share one Hough peak
+  routine instead of two copies. `PanakoIndex::query` now has the same
+  10 M-vote cap as `WangIndex::query`. Results are identical.
+- `WangIndex::query` sorts votes by `(reference, offset)` in place, so per-offset
+  counts and the contributor window need no per-candidate map, and the stable
+  sort's `n/2` scratch buffer is gone. The per-reference vote cap, which could
+  never bind, was removed.
+- Multichannel decode downmixes plane by plane (bit-identical); about 13 %
+  faster stereo FLAC decode end to end.
+- Classical watermark LogHost detection folds frames by bit phase before
+  correlating (`n_bits²` dot products instead of `n_frames · n_bits`) and no
+  longer keeps the per-frame residual matrix or a phase table: 382 → 169 ms on
+  a 120 s clip, same payload and score.
+- LogHost embed and detect process one STFT frame at a time instead of holding
+  the whole complex spectrogram, and embed overlap-adds into an `n_fft`-long
+  ring instead of two clip-length f64 accumulators. Peak memory on a 600 s
+  clip: embed 379 → 79 MB, detect 235 → 85 MB (≈ 2.3 → 0.5 GB per hour of
+  audio). Embed output is bit-identical (pinned by the PR #154 hashes).
+
 ## [0.4.5] - 2026-10-21
 
 ### Added

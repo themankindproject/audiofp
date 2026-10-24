@@ -9,31 +9,13 @@
 //! PROPTEST_CASES=2000 cargo test --test property
 //! ```
 
+mod common;
+
 use audiofp::classical::{Haitsma, Panako, StreamingHaitsma, StreamingPanako, StreamingWang, Wang};
-use audiofp::{Fingerprinter, SampleRate, StreamingFingerprinter};
+use audiofp::{AfpError, Fingerprinter, SampleRate, StreamingFingerprinter};
 use proptest::prelude::*;
 
-const TONE_LO: f32 = 880.0;
-const TONE_HI: f32 = 1320.0;
-
-/// Deterministic xorshift32 + two-tone synthesiser. Same generator as
-/// every other test in the suite, so failing inputs reproduce easily.
-fn synth(seed: u32, sr: u32, n_samples: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n_samples);
-    let mut x = seed.max(1);
-    for i in 0..n_samples {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        let noise = (x as i32 as f32) / (i32::MAX as f32) * 0.05;
-        let t = i as f32 / sr as f32;
-        let s = 0.5 * (2.0 * std::f32::consts::PI * TONE_LO * t).sin()
-            + 0.3 * (2.0 * std::f32::consts::PI * TONE_HI * t).sin()
-            + noise;
-        out.push(s);
-    }
-    out
-}
+use common::audio_gen::two_tone as synth;
 
 /// Strategy: a random sequence of chunk sizes in `1..=max_chunk` whose
 /// sum is `total_samples`.
@@ -172,11 +154,11 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// NaN / inf robustness: none of these may panic; behaviour is contractually
-// "graceful degradation" — NaN/inf propagates through the DSP chain, so
-// no valid peaks are detected and the fingerprint is empty or sparse.
-// A future version may return an error for NaN inputs; for now, the
-// contract is "never panic, always produce some output".
+// NaN / inf robustness. The PCM policy (`src/pcm.rs`): offline `extract`
+// rejects non-finite input with `NonFiniteSample { index }` naming the first
+// bad sample; streaming `push` sanitises it to 0.0 and keeps going. (These
+// tests used to discard the result, so they passed whatever happened — and
+// since `extract` rejects up front, they never reached the DSP chain.)
 // ---------------------------------------------------------------------------
 
 /// Inject `n_spikes` NaN or infinity values at random positions in a
@@ -195,77 +177,50 @@ fn inject_spikes(clean: &mut [f32], n_spikes: usize, seed: u32) {
     }
 }
 
-#[test]
-fn nan_audio_does_not_panic() {
-    // All-NaN input.
-    let samples = vec![f32::NAN; 8_000 * 3];
-
-    let mut wang = Wang::default();
-    let _ = wang.extract(&samples, SampleRate::HZ_8000);
-
-    let samples = vec![f32::NAN; 8_000 * 3];
-
-    let mut panako = Panako::default();
-    let _ = panako.extract(&samples, SampleRate::HZ_8000);
-
-    let samples = vec![f32::NAN; 5_000 * 3];
-
-    let mut h = Haitsma::default();
-    let _ = h.extract(&samples, SampleRate::HZ_8000);
+/// Offline extraction must reject `samples` naming its first non-finite
+/// sample, and a stream must accept the same samples.
+fn assert_non_finite_contract(samples: &[f32], rate: SampleRate) -> Result<(), TestCaseError> {
+    let first = samples
+        .iter()
+        .position(|s| !s.is_finite())
+        .expect("a non-finite sample");
+    let rejects = |r: Result<(), AfpError>| matches!(r, Err(AfpError::NonFiniteSample { index }) if index == first);
+    if rate == SampleRate::HZ_8000 {
+        prop_assert!(rejects(Wang::default().extract(samples, rate).map(drop)));
+        prop_assert!(rejects(Panako::default().extract(samples, rate).map(drop)));
+        prop_assert!(StreamingWang::default().push(samples).is_ok());
+        prop_assert!(StreamingPanako::default().push(samples).is_ok());
+    } else {
+        prop_assert!(rejects(Haitsma::default().extract(samples, rate).map(drop)));
+        prop_assert!(StreamingHaitsma::default().push(samples).is_ok());
+    }
+    Ok(())
 }
 
 #[test]
-fn infinity_audio_does_not_panic() {
-    // All-inf input.
-    let samples = vec![f32::INFINITY; 8_000 * 3];
-
-    let mut wang = Wang::default();
-    let _ = wang.extract(&samples, SampleRate::HZ_8000);
-
-    let samples = vec![f32::INFINITY; 8_000 * 3];
-
-    let mut panako = Panako::default();
-    let _ = panako.extract(&samples, SampleRate::HZ_8000);
-
-    let samples = vec![f32::INFINITY; 5_000 * 3];
-
-    let mut h = Haitsma::default();
-    let _ = h.extract(&samples, SampleRate::HZ_8000);
+fn all_nan_and_all_inf_audio_is_rejected_offline_and_sanitised_streaming() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_non_finite_contract(&vec![value; 8_000 * 3], SampleRate::HZ_8000).unwrap();
+        assert_non_finite_contract(&vec![value; 5_000 * 3], SampleRate::HZ_5000).unwrap();
+    }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
-    /// Sprinkling a few NaN/inf values into otherwise normal audio must
-    /// never cause `extract` to panic.  The fingerprints may be empty or
-    /// sparse — that's the documented contract — but a panic would be a
-    /// hard bug (stack unwind + potential data loss in a streaming
-    /// callback).
+    /// A few NaN/inf values sprinkled into otherwise normal audio.
     #[test]
-    fn wang_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
+    fn landmark_extractors_reject_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
         let mut samples = synth(seed, 8_000, 8_000 * 3);
         inject_spikes(&mut samples, n_spikes, seed);
-        let mut wang = Wang::default();
-        let _ = wang.extract(&samples, SampleRate::HZ_8000,
-        );
+        assert_non_finite_contract(&samples, SampleRate::HZ_8000)?;
     }
 
     #[test]
-    fn panako_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
-        let mut samples = synth(seed, 8_000, 8_000 * 3);
-        inject_spikes(&mut samples, n_spikes, seed);
-        let mut panako = Panako::default();
-        let _ = panako.extract(&samples, SampleRate::HZ_8000,
-        );
-    }
-
-    #[test]
-    fn haitsma_tolerates_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
+    fn haitsma_rejects_nan_inf_spikes(seed in 1u32..1024, n_spikes in 1usize..=20) {
         let mut samples = synth(seed, 5_000, 5_000 * 3);
         inject_spikes(&mut samples, n_spikes, seed);
-        let mut h = Haitsma::default();
-        let _ = h.extract(&samples, SampleRate::HZ_5000,
-        );
+        assert_non_finite_contract(&samples, SampleRate::HZ_5000)?;
     }
 }
 

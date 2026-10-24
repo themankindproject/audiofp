@@ -446,8 +446,10 @@ db[t][f] >  -50.0                    (min_anchor_mag_db)
 db[t][f] >= rolling_max_31x31(t, f)  (>= so flat plateaus emit every cell)
 ```
 
-`min_anchor_mag_db` is clamped to `[-200, 0]` and a `NaN` value is replaced
-by the default `-50.0`. (`f32::clamp` passes `NaN` through, and every
+`min_anchor_mag_db` is clamped to `[-119, 0]` and a `NaN` value is replaced
+by the default `-50.0`. (The dB spectrogram is floored at −120 dB, so digital
+silence sits exactly on that floor; a lower peak floor would let every silent
+cell through as a plateau peak, and silence would match silence.) (`f32::clamp` passes `NaN` through, and every
 comparison against `NaN` is false, so an unsanitised `NaN` floor dropped
 every peak and still returned `Ok` with an empty fingerprint.)
 
@@ -2780,7 +2782,7 @@ Default = `[]` (no_std + alloc, no codecs):
 
 | Feature      | Brings in                                                                    |
 | ------------ | ---------------------------------------------------------------------------- |
-| `std`        | Symphonia itself, no codecs; also enables `audiofp::cache` (`.afp` fingerprint files). Bare `std` without any codec/`neural`/… feature is a `compile_error!` when `audiofp::io` is touched. |
+| `std`        | `audiofp::cache` (`.afp` fingerprint files) and `IoError`; no codecs and no Symphonia. Bare `std` is a valid build, but `audiofp::io` only exists with a codec feature, so referring to it without one fails to resolve. |
 | `std-mp3`    | MP3 (`symphonia/mp3`)                                                        |
 | `std-aac`    | raw AAC (`symphonia/aac`)                                                    |
 | `std-flac`   | FLAC (`symphonia/flac`)                                                      |

@@ -14,6 +14,8 @@
 
 #![cfg(all(feature = "std", not(feature = "mimalloc")))]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 
 use audiofp::classical::{StreamingHaitsma, StreamingPanako, StreamingWang};
@@ -58,24 +60,7 @@ fn allocs() -> usize {
     LOCAL_ALLOCS.with(|c| c.get())
 }
 
-/// Deterministic two-tone + noise signal, rich enough to emit real frames.
-fn synth(seed: u32, sr: u32, len: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(len);
-    let mut x = seed.max(1);
-    for n in 0..len {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        let noise = (x as i32 as f32) / (i32::MAX as f32) * 0.05;
-        let t = n as f32 / sr as f32;
-        out.push(
-            0.5 * (2.0 * std::f32::consts::PI * 880.0 * t).sin()
-                + 0.3 * (2.0 * std::f32::consts::PI * 1320.0 * t).sin()
-                + noise,
-        );
-    }
-    out
-}
+use common::audio_gen::two_tone as synth;
 
 /// Assert `S: ZeroAllocStreaming` at the type level (the bound generic
 /// helpers rely on), then drive warmup + measured phases on ONE stream:
@@ -176,4 +161,42 @@ fn streaming_panako_is_zero_alloc_after_warmup() {
 #[test]
 fn streaming_haitsma_is_zero_alloc_after_warmup() {
     assert_zero_alloc(StreamingHaitsma::default, 5_000, 1_024, 120, 40);
+}
+
+/// `reset()` on a segment boundary (the documented practice for 24/7
+/// capture) must hand in-flight buffers back to the pools, so the first
+/// segment after it is as allocation-free as steady state. It used to
+/// drop them, costing ~30–50 allocations on the audio thread.
+fn assert_reset_is_zero_alloc<S: ZeroAllocStreaming>(mut s: S, reset: impl Fn(&mut S)) {
+    let audio = synth(0xBEEF, 8_000, 1_024 * 200);
+    let mut chunks = audio.chunks(1_024);
+    // Warm up mid-stream: buffers checked out in pending anchors/buckets.
+    for c in chunks.by_ref().take(120) {
+        let _ = s.push_with(c, |_, _| {});
+    }
+    reset(&mut s);
+    let before = allocs();
+    let mut emitted = 0usize;
+    for c in chunks.take(40) {
+        emitted += s.push_with(c, |_: TimestampMs, _| {}).unwrap();
+    }
+    let grown = allocs() - before;
+    assert_eq!(
+        grown, 0,
+        "first segment after reset allocated {grown} times"
+    );
+    assert!(
+        emitted > 0,
+        "fixture must emit frames or the test is vacuous"
+    );
+}
+
+#[test]
+fn streaming_wang_reset_is_zero_alloc() {
+    assert_reset_is_zero_alloc(StreamingWang::default(), StreamingWang::reset);
+}
+
+#[test]
+fn streaming_panako_reset_is_zero_alloc() {
+    assert_reset_is_zero_alloc(StreamingPanako::default(), StreamingPanako::reset);
 }

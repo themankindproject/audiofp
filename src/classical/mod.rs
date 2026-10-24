@@ -13,9 +13,11 @@
 //!
 //! Each fingerprinter has an offline ([`crate::Fingerprinter`]) and a
 //! streaming ([`crate::StreamingFingerprinter`]) variant. The streaming
-//! variants emit hashes incrementally with **bit-exact** parity to the
-//! offline extractor under arbitrary chunking — verified down to the
-//! 1-sample-per-push pathological case.
+//! variants emit hashes incrementally and match the offline extractor
+//! under arbitrary chunking — verified down to the 1-sample-per-push
+//! pathological case: Haitsma bit-exactly, Wang and Panako as hash
+//! multisets when the stream ends with `flush_complete` (the legacy
+//! `flush` can drop hashes near a fractional-second end; audit F01).
 //!
 //! All hash structs are `bytemuck::Pod` (cast-to-bytes safe), so you can
 //! persist them directly to mmap'd files or ship them across an FFI
@@ -60,7 +62,18 @@ macro_rules! sanitize_cfg {
         if $cfg.min_anchor_mag_db.is_nan() {
             $cfg.min_anchor_mag_db = -50.0;
         }
-        $cfg.min_anchor_mag_db = $cfg.min_anchor_mag_db.clamp(-200.0, 0.0);
+        // The front-end clamps power at 1e-12 before the dB conversion, so
+        // every cell is at least -120 dB and digital silence sits exactly
+        // on that floor. A peak floor at or below it lets every silent
+        // cell through as a plateau peak — silence then hashes, and
+        // matches other silence. Keep the floor strictly above it.
+        $cfg.min_anchor_mag_db = $cfg
+            .min_anchor_mag_db
+            .clamp(crate::classical::MIN_ANCHOR_MAG_DB_FLOOR, 0.0);
     }};
 }
 pub(crate) use sanitize_cfg;
+
+/// Lowest `min_anchor_mag_db` the landmark extractors accept: 1 dB above
+/// the -120 dB log floor (`10·log10(1e-12)`) of their dB spectrogram.
+pub(crate) const MIN_ANCHOR_MAG_DB_FLOOR: f32 = -119.0;

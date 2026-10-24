@@ -1,10 +1,12 @@
 //! In-memory fingerprint matching and identification.
 //!
 //! This module provides a [`Matcher`] trait and one algorithm per
-//! fingerprinter. All matching is **purely in memory** — there is no
-//! persistence, no serialisation format, no database adapter, and no
-//! on-disk index. Everything operates on in-memory fingerprints and
-//! returns an in-memory [`MatchResult`].
+//! fingerprinter. All matching is **purely in memory**: matcher and index
+//! state is never persisted, and there is no database adapter or on-disk
+//! index. (Fingerprints themselves can be stored — see [`crate::serial`]
+//! and, with `std`, the `.afp` cache — but indexes are rebuilt from them.)
+//! Everything operates on in-memory fingerprints and returns an in-memory
+//! [`MatchResult`].
 //!
 //! # Architecture
 //!
@@ -216,7 +218,7 @@ const FPS_REL_EPS: f32 = 1e-3;
 /// Return `true` when two frame rates are compatible for matching.
 ///
 /// Rates must be finite and positive, and agree within a relative
-/// tolerance (or both be near zero). Used by every matcher to soft-fail
+/// tolerance. Used by every matcher to soft-fail
 /// mismatched fingerprints in release builds (audit 67-5).
 #[inline]
 #[must_use]
@@ -231,8 +233,8 @@ pub(crate) fn frames_per_sec_compatible(a: f32, b: f32) -> bool {
 /// Compare two `f32` scores safely (NaN-proof).
 ///
 /// Uses `partial_cmp` with `unwrap_or(Ordering::Equal)` so NaN values
-/// don't cause a panic during sorting. For ranking, you almost always
-/// want `score_compare_desc`.
+/// don't cause a panic during sorting. For ranking results, you almost
+/// always want [`match_result_compare_desc`].
 #[inline]
 #[must_use]
 pub fn score_compare(a: f32, b: f32) -> Ordering {
@@ -274,6 +276,17 @@ pub fn match_result_compare_desc(a: &MatchResult, b: &MatchResult) -> Ordering {
 #[must_use]
 pub fn clamp_score(s: f32) -> f32 {
     if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0) }
+}
+
+/// `true` when `value` fails a `value >= threshold` acceptance gate.
+///
+/// A `NaN` on either side fails it. The plain `value < threshold` test is
+/// `false` against a `NaN` threshold, so a `NaN` `min_score` or
+/// `min_prominence` silently disabled the gate and accepted anything.
+#[inline]
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+pub(crate) fn below_threshold(value: f32, threshold: f32) -> bool {
+    !(value >= threshold)
 }
 
 /// Compute prominence: `peak / (mean_of_rest + 1.0)`.

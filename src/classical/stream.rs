@@ -35,9 +35,10 @@
 //! | Wang / Panako | 62.5 fps     | ~795 days of audio      |
 //! | Haitsma       | 78.125 fps   | ~636 days of audio      |
 //!
-//! Past that point the frame counter wraps: debug builds panic on the
-//! overflowing `+= 1`, release builds silently emit hashes with wrapped
-//! `t_anchor` values. Long-lived capture processes (24/7 broadcast
+//! Past that point the `u32` frame counter wraps: debug builds panic on
+//! the overflowing add, and release builds stop emitting hashes (the
+//! incremental peak detector never reports a frame index below the last
+//! one it emitted). Long-lived capture processes (24/7 broadcast
 //! monitoring) should call `reset()` on a segment boundary — e.g. hourly
 //! or daily — which is normal practice anyway, since matching operates on
 //! bounded windows rather than an unbounded stream. Re-creating the
@@ -48,7 +49,6 @@ use alloc::vec::Vec;
 
 use crate::TimestampMs;
 use crate::dsp::peaks::{IncrementalPeakDetector, Peak};
-use crate::dsp::power_to_db_wide;
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
 use crate::pcm;
@@ -104,8 +104,10 @@ pub(crate) struct StreamCore<F> {
     pub(crate) spec_tail: usize,
     pub(crate) spec_first_frame: u32,
 
-    pub(crate) n_frames_total: u32,
-    pub(crate) last_pd_frame: i32,
+    /// Last frame the peak detector reported, `-1` before the first.
+    /// `i64` so the `u32` frame range never turns negative (an `i32`
+    /// went negative at 2³¹ frames and silently stopped finalisation).
+    pub(crate) last_pd_frame: i64,
 
     pub(crate) peak_det: IncrementalPeakDetector,
     pub(crate) peak_row_max: Vec<f32>,
@@ -114,7 +116,8 @@ pub(crate) struct StreamCore<F> {
     // Per-second adaptive thresholding. Sorted Vec — bounded (≤ 3 entries
     // in steady state), so linear/binary search is faster than a tree.
     pub(crate) bucket_pending: Vec<(u32, Vec<Peak>)>,
-    pub(crate) last_finalized_bucket: i32,
+    /// Highest bucket finalised so far, `-1` before the first.
+    pub(crate) last_finalized_bucket: i64,
 
     pub(crate) pending_anchors: alloc::collections::VecDeque<PendingAnchor>,
 
@@ -245,7 +248,6 @@ impl<F> StreamCore<F> {
             spec_n_bins: n_bins,
             spec_tail: 0,
             spec_first_frame: 0,
-            n_frames_total: 0,
             last_pd_frame: -1,
             peak_det: IncrementalPeakDetector::new(neighborhood, neighborhood, n_bins),
             peak_row_max: vec![0.0_f32; n_bins],
@@ -278,11 +280,24 @@ impl<F> StreamCore<F> {
         self.spec_n_rows = 0;
         self.spec_tail = 0;
         self.spec_first_frame = 0;
-        self.n_frames_total = 0;
         self.last_pd_frame = -1;
-        self.bucket_pending.clear();
+        // Recycle in-flight buffers instead of dropping them, so the first
+        // pass after a `reset()` (recommended on segment boundaries for
+        // 24/7 capture) stays allocation-free like steady state.
+        for (_, mut peaks) in self.bucket_pending.drain(..) {
+            if self.bucket_pool.len() < BUCKET_POOL_MAX {
+                peaks.clear();
+                self.bucket_pool.push(peaks);
+            }
+        }
         self.last_finalized_bucket = -1;
-        self.pending_anchors.clear();
+        for anchor in self.pending_anchors.drain(..) {
+            if self.targets_pool.len() < TARGETS_POOL_MAX {
+                let mut targets = anchor.targets;
+                targets.clear();
+                self.targets_pool.push(targets);
+            }
+        }
         self.to_finalize.clear();
         self.emitted.clear();
     }
@@ -474,20 +489,31 @@ impl<F> StreamCore<F> {
         if self.bucket_pool.len() < BUCKET_POOL_MAX {
             self.bucket_pool.push(peaks);
         }
-        self.last_finalized_bucket = bucket as i32;
+        // `max`: after a mid-second `flush`, pushes can refill (and then
+        // finalise) a bucket at or below the last finalised one.
+        self.last_finalized_bucket = self.last_finalized_bucket.max(i64::from(bucket));
     }
 
-    /// Finalise every bucket whose ALL frames have been peak-detected.
+    /// Finalise every bucket whose ALL frames have been peak-detected, and
+    /// emit the anchors each one completes before finalising the next.
     /// Conservative: bucket B is finalisable iff `bucket(last_pd_frame) > B`.
+    ///
+    /// Emitting per bucket (rather than once after every ripe bucket of the
+    /// push) keeps the pending-anchor queue at its steady-state size no
+    /// matter how many seconds one `push` carries, so a
+    /// `max_pending_anchors` cap evicts the same anchors for one large push
+    /// as for many small ones. Without a cap the emitted sequence is
+    /// unchanged: the queue is FIFO and ripeness only grows.
     fn finalize_buckets(
         &mut self,
         cfg: PeakCfg,
         add_target: &mut impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
+        emit_anchor: &mut impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         if self.last_pd_frame < 0 {
             return;
         }
-        let current_bucket = (self.last_pd_frame as f32 / self.frames_per_sec) as i32;
+        let current_bucket = (self.last_pd_frame as f32 / self.frames_per_sec) as i64;
         // Collect into the pooled buffer instead of allocating a fresh
         // `Vec` on every `push`. `bucket_pending` is bounded (≤ 3 in
         // steady state), so the buffer never grows after warmup.
@@ -498,16 +524,24 @@ impl<F> StreamCore<F> {
         // `&mut self`. Indexing a `Copy` element produces a `u32` by
         // value, so the immutable borrow of `to_finalize` ends before
         // the mutable call begins.
+        //
+        // Every bucket still pending below the current one is ripe. (There
+        // used to be a `> last_finalized_bucket` clause too: it never
+        // excludes anything in a continuous stream, and after a flush that
+        // ended mid-second it stranded the rest of that second's peaks
+        // until the next flush.)
         self.to_finalize.clear();
         self.to_finalize.extend(
-            self.bucket_pending.iter().map(|e| e.0).filter(|&b| {
-                (b as i32) > self.last_finalized_bucket && (b as i32) < current_bucket
-            }),
+            self.bucket_pending
+                .iter()
+                .map(|e| e.0)
+                .filter(|&b| i64::from(b) < current_bucket),
         );
         let n = self.to_finalize.len();
         for i in 0..n {
             let bucket = self.to_finalize[i];
             self.finalize_bucket(cfg, bucket, &mut *add_target);
+            self.emit_finalized_anchors(cfg, &mut *emit_anchor);
         }
         self.to_finalize.clear();
     }
@@ -542,8 +576,8 @@ impl<F> StreamCore<F> {
                 // Panako uses strict `dt < target_zone_t`.
                 Zone::Strict => cfg.target_zone_t as u32 - 1,
             };
-            let last_target_frame = anchor.peak.t_frame + last_dt;
-            let last_target_bucket = (last_target_frame as f32 / self.frames_per_sec) as i32;
+            let last_target_frame = anchor.peak.t_frame.saturating_add(last_dt);
+            let last_target_bucket = (last_target_frame as f32 / self.frames_per_sec) as i64;
             if self.last_finalized_bucket < last_target_bucket {
                 self.pending_anchors.push_front(anchor);
                 break;
@@ -567,7 +601,7 @@ impl<F> StreamCore<F> {
         samples: &[f32],
         cfg: PeakCfg,
         mut add_target: impl FnMut(&mut Vec<Peak>, Peak, i32, i32, PeakCfg),
-        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
         pcm::extend_sanitized(&mut self.sample_carry, samples);
@@ -582,10 +616,18 @@ impl<F> StreamCore<F> {
                     &mut self.frame_scratch,
                 )
                 .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
-            power_to_db_wide(&mut self.frame_scratch, self.log_floor_power);
+            // Every bin on the vector `log2` path, as the offline
+            // `FrontEnd` converts every row but the last: converting the
+            // row as a standalone buffer sent bin 512 down the scalar tail,
+            // whose result can differ by 1 ULP and flip a peak tie.
+            crate::dsp::simd::db_into_split(
+                &mut self.frame_scratch,
+                self.log_floor_power,
+                crate::dsp::DB_LOG2_FACTOR,
+                usize::MAX,
+            );
             self.append_frame_scratch_row();
 
-            self.n_frames_total += 1;
             off += hop;
 
             if let Some(ripe_abs) = self
@@ -594,7 +636,7 @@ impl<F> StreamCore<F> {
             {
                 let row_idx = (ripe_abs - self.spec_first_frame) as usize;
                 self.detect_rows_range(cfg, row_idx, row_idx);
-                self.last_pd_frame = ripe_abs as i32;
+                self.last_pd_frame = i64::from(ripe_abs);
             }
         }
 
@@ -602,8 +644,7 @@ impl<F> StreamCore<F> {
             self.sample_carry.drain(0..off);
         }
 
-        self.finalize_buckets(cfg, &mut add_target);
-        self.emit_finalized_anchors(cfg, emit_anchor);
+        self.finalize_buckets(cfg, &mut add_target, &mut emit_anchor);
     }
 
     /// Common processing for `flush` and `flush_with`: drain remaining
@@ -643,7 +684,7 @@ impl<F> StreamCore<F> {
                         push_peak(bucket_pending, bucket_pool, bucket, peak);
                     }
                 }
-                *last_pd = ripe_abs as i32;
+                *last_pd = i64::from(ripe_abs);
             });
 
         self.to_finalize.clear();
@@ -723,7 +764,7 @@ impl<F> StreamCore<F> {
                         push_peak(bucket_pending, bucket_pool, bucket, peak);
                     }
                 }
-                *last_pd = ripe_abs as i32;
+                *last_pd = i64::from(ripe_abs);
             });
 
         self.to_finalize.clear();

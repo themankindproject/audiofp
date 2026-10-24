@@ -5,7 +5,7 @@
 //! place to tune vector width, rounding behaviour, and fallback paths.
 //!
 //! All functions are `#[inline]` and `no_std + alloc` compatible; the
-//! per-callsite wrappers in [`super`] (`dot_wide`, `power_to_db_wide`),
+//! per-callsite wrappers in [`super`] (`dot_wide`, `dot_sq_wide`),
 //! [`super::stft`], [`crate::neural::embedder`], and
 //! [`crate::matching`] keep their names and delegate here.
 //!
@@ -162,13 +162,15 @@ pub(crate) fn mul_into(src: &[f32], win: &[f32], dst: &mut [f32]) {
     }
 }
 
-/// Core power-to-dB conversion: `buf[i] = factor * log2(max(buf[i], floor))`
-/// in place, 8-wide with a scalar tail.
+/// Whole-buffer power-to-dB conversion:
+/// `buf[i] = factor * log2(max(buf[i], floor))` in place, 8-wide with a
+/// scalar tail.
 ///
 /// The vector path uses [`log2_lanes`] and the scalar tail uses
 /// `libm::log2f`; the two can differ by 1 ULP, but each is the same on
-/// every target. See [`power_to_db_wide`](crate::dsp::power_to_db_wide).
-#[inline]
+/// every target. Test oracle for [`db_into_split`], which the front-ends
+/// call row by row.
+#[cfg(test)]
 pub(crate) fn db_into(buf: &mut [f32], floor: f32, factor: f32) {
     let n = buf.len();
     let chunks = n / 8;
@@ -338,10 +340,7 @@ pub(crate) fn load_complex8(complex: &[num_complex::Complex<f32>], off: usize) -
 
 /// Core complex power: `dst[i] = re^2 + im^2`, 8-wide with a scalar tail.
 ///
-/// Vectorises the sqrt that the scalar path must take through
-/// `libm::sqrtf`, which cannot be auto-vectorised. `f32x8::sqrt` is the
-/// hardware IEEE sqrt (or the same musl-derived software sqrt in `wide`'s
-/// no-SIMD fallback) and both squares are rounded before the add, so the
+/// Both squares are rounded before the add (no fused multiply-add), so the
 /// vector and scalar paths are bit-identical on every target.
 #[inline]
 pub(crate) fn complex_power_into(complex: &[num_complex::Complex<f32>], dst: &mut [f32]) {

@@ -56,7 +56,7 @@ use libm::powf;
 
 use crate::dsp::stft::{ShortTimeFFT, StftConfig};
 use crate::dsp::windows::WindowKind;
-use crate::{AfpError, Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
+use crate::{Fingerprinter, Result, SampleRate, StreamingFingerprinter, TimestampMs};
 
 /// All bit-frames produced by [`Haitsma`] over an audio buffer.
 ///
@@ -156,8 +156,6 @@ pub struct Haitsma {
     /// (start_bin, end_bin)` (exclusive end). Eliminates per-bin branching
     /// in the energy accumulation loop and enables SIMD auto-vectorization.
     band_ranges: Vec<(usize, usize)>,
-    /// Reused buffer for packed frame hashes across `extract` calls.
-    frames_buf: Vec<u32>,
     /// Reused per-frame power spectrum (`n_bins` elements) across `extract`
     /// calls — one STFT frame at a time via [`ShortTimeFFT::process_frame_power`].
     power_buf: Vec<f32>,
@@ -184,41 +182,60 @@ impl Haitsma {
         Self::try_new(cfg).expect("invalid HaitsmaConfig (see AfpError::Config)")
     }
 
-    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
     /// `fmin`/`fmax`/Nyquist instead of panicking.
     pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
-        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
-            return Err(crate::AfpError::Config("fmin must be positive".into()));
-        }
-        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
-            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
-        }
-        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
-            return Err(crate::AfpError::Config(alloc::format!(
-                "fmax must be below Nyquist ({} Hz)",
-                HAITSMA_SR / 2
-            )));
-        }
-
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: HAITSMA_N_FFT,
-            hop: HAITSMA_HOP,
-            window: WindowKind::Hann,
-            center: false,
-        });
-
-        let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
-        ensure_all_bands_have_bins(&bin_to_band)?;
-        let band_ranges = build_band_ranges(&bin_to_band);
-
+        let (cfg, stft, band_ranges) = front_end(cfg)?;
         Ok(Self {
             cfg,
             stft,
             band_ranges,
-            frames_buf: Vec::new(),
             power_buf: Vec::new(),
         })
     }
+}
+
+/// Sanitised config, STFT, and per-band `(start, end)` bin ranges.
+type FrontEnd = (HaitsmaConfig, ShortTimeFFT, Vec<(usize, usize)>);
+
+/// Shared constructor body for [`Haitsma`] and [`StreamingHaitsma`]:
+/// validate the band range, sanitise the limits, and build the STFT and
+/// band table.
+///
+/// `Some(0)` limits are bumped to `Some(1)`, as Wang and Panako do: a zero
+/// `max_push_samples` would make every streaming `push` silently yield no
+/// frames.
+fn front_end(mut cfg: HaitsmaConfig) -> crate::Result<FrontEnd> {
+    if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
+        return Err(crate::AfpError::Config("fmin must be positive".into()));
+    }
+    if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
+        return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
+    }
+    if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
+        return Err(crate::AfpError::Config(alloc::format!(
+            "fmax must be below Nyquist ({} Hz)",
+            HAITSMA_SR / 2
+        )));
+    }
+
+    let stft = ShortTimeFFT::new(StftConfig {
+        n_fft: HAITSMA_N_FFT,
+        hop: HAITSMA_HOP,
+        window: WindowKind::Hann,
+        center: false,
+    });
+
+    if cfg.max_input_samples == Some(0) {
+        cfg.max_input_samples = Some(1);
+    }
+    if cfg.max_push_samples == Some(0) {
+        cfg.max_push_samples = Some(1);
+    }
+    let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
+    ensure_all_bands_have_bins(&bin_to_band)?;
+    let band_ranges = build_band_ranges(&bin_to_band);
+    Ok((cfg, stft, band_ranges))
 }
 
 /// Progress callback reporting interval for Haitsma (78.125 fps):
@@ -242,24 +259,13 @@ impl Haitsma {
         rate: SampleRate,
         mut progress: F,
     ) -> Result<HaitsmaFingerprint> {
-        crate::pcm::reject_non_finite(samples)?;
-        if let Some(limit) = self.cfg.max_input_samples
-            && samples.len() > limit
-        {
-            return Err(AfpError::InputTooLarge {
-                limit,
-                provided: samples.len(),
-            });
-        }
-        if rate.hz() != HAITSMA_SR {
-            return Err(AfpError::UnsupportedSampleRate(rate.hz()));
-        }
-        if samples.len() < self.min_samples() {
-            return Err(AfpError::AudioTooShort {
-                needed: self.min_samples(),
-                got: samples.len(),
-            });
-        }
+        crate::classical::landmark_common::check_extract_preamble(
+            samples,
+            rate,
+            HAITSMA_SR,
+            self.min_samples(),
+            self.cfg.max_input_samples,
+        )?;
 
         progress(0.0);
 
@@ -280,8 +286,9 @@ impl Haitsma {
         let total_frames = n_frames;
         let interval = HAITSMA_PROGRESS_INTERVAL;
 
-        self.frames_buf.clear();
-        self.frames_buf.reserve(total_frames.saturating_sub(1));
+        // The output vector itself: one allocation per call, moved into the
+        // returned fingerprint.
+        let mut frames = Vec::with_capacity(total_frames.saturating_sub(1));
 
         let hop = HAITSMA_HOP;
         let n_fft = HAITSMA_N_FFT;
@@ -293,7 +300,7 @@ impl Haitsma {
                 .expect("power_buf is sized n_bins and frames are exactly n_fft");
             let e = band_energies(&self.power_buf, &self.band_ranges);
             if let Some(prev) = prev_energy {
-                self.frames_buf.push(pack_frame_bits(&e, &prev));
+                frames.push(pack_frame_bits(&e, &prev));
             }
             prev_energy = Some(e);
 
@@ -304,7 +311,7 @@ impl Haitsma {
         progress(1.0);
 
         Ok(HaitsmaFingerprint {
-            frames: core::mem::take(&mut self.frames_buf),
+            frames,
             frames_per_sec: HAITSMA_FRAMES_PER_SEC,
         })
     }
@@ -534,31 +541,10 @@ impl StreamingHaitsma {
         Self::try_new(cfg).expect("invalid HaitsmaConfig (see AfpError::Config)")
     }
 
-    /// Fallible constructor — returns [`AfpError::Config`] on invalid
+    /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
     /// `fmin`/`fmax`/Nyquist instead of panicking.
     pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
-        if cfg.fmin <= 0.0 || cfg.fmin.is_nan() {
-            return Err(crate::AfpError::Config("fmin must be positive".into()));
-        }
-        if cfg.fmax <= cfg.fmin || cfg.fmax.is_nan() {
-            return Err(crate::AfpError::Config("fmax must exceed fmin".into()));
-        }
-        if cfg.fmax >= HAITSMA_SR as f32 / 2.0 {
-            return Err(crate::AfpError::Config(alloc::format!(
-                "fmax must be below Nyquist ({} Hz)",
-                HAITSMA_SR / 2
-            )));
-        }
-
-        let stft = ShortTimeFFT::new(StftConfig {
-            n_fft: HAITSMA_N_FFT,
-            hop: HAITSMA_HOP,
-            window: WindowKind::Hann,
-            center: false,
-        });
-        let bin_to_band = build_bin_to_band(&cfg, stft.n_bins());
-        ensure_all_bands_have_bins(&bin_to_band)?;
-        let band_ranges = build_band_ranges(&bin_to_band);
+        let (cfg, stft, band_ranges) = front_end(cfg)?;
         let n_bins = stft.n_bins();
         Ok(Self {
             cfg,
@@ -678,6 +664,7 @@ impl crate::ZeroAllocStreaming for StreamingHaitsma {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AfpError;
     use crate::SampleRate;
     use alloc::vec;
     use core::f32::consts::PI;
