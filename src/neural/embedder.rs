@@ -17,11 +17,11 @@ use crate::{AfpError, Fingerprinter, Result, TimestampMs};
 
 use super::frontend::LogMelFrontend;
 
-/// SIMD sum-of-squares over a slice via `wide::f32x8`.
-#[inline]
-pub(crate) fn sumsq_wide(v: &[f32]) -> f32 {
-    crate::dsp::simd::sumsq_core(v)
-}
+/// Front-end ceiling: the per-window log-mel frame (and the probe
+/// tensor) is `n_mels × n_frames` f32 cells, and the batched tensor is
+/// `batch_size ×` that. Capped so an extreme-but-finite config fails
+/// with `Config` instead of an OOM abort deep inside `vec![0.0; …]`.
+const MAX_FRONTEND_CELLS: usize = 1 << 28; // 268M f32 = 1 GiB
 
 /// In-place L2 normalisation: scales `v` so its Euclidean norm is 1.
 /// Leaves the vector unchanged if its norm is below `1e-12` (effectively
@@ -33,7 +33,7 @@ pub(crate) fn sumsq_wide(v: &[f32]) -> f32 {
 /// that path, so their result is unchanged.
 #[inline]
 fn l2_normalize_inplace(v: &mut [f32]) {
-    let norm = sumsq_wide(v).sqrt();
+    let norm = crate::dsp::simd::sumsq_core(v).sqrt();
     if norm.is_finite() {
         if norm > 1e-12 {
             let inv = 1.0 / norm;
@@ -192,6 +192,16 @@ pub struct NeuralFingerprint {
 /// in [`NeuralEmbedder::new`] and reuse it for every call.
 pub(crate) type Runnable = Arc<TypedSimplePlan>;
 
+/// Window geometry derived from a validated config.
+pub(crate) struct Geometry {
+    /// Samples in one analysis window (`round(window_secs · sr)`).
+    pub(crate) window_samples: usize,
+    /// Samples between successive windows (`round(hop_secs · sr)`).
+    pub(crate) hop_samples: usize,
+    /// STFT frame count for one analysis window.
+    pub(crate) n_frames: usize,
+}
+
 /// Heavy state shared by [`NeuralEmbedder`] and
 /// [`super::StreamingNeuralEmbedder`]. Both compose this rather than
 /// inherit, so neither re-implements the front-end.
@@ -216,6 +226,199 @@ pub(crate) struct EmbedderCore {
 }
 
 impl EmbedderCore {
+    /// Validate `cfg` and derive the window geometry shared by the real
+    /// constructor and the test fixture, so the two cannot drift.
+    ///
+    /// Covers every `Config` check that does not need the model: sample
+    /// rate, FFT / hop / mel bounds, window and hop seconds, `batch_size`,
+    /// and the front-end cell caps.
+    pub(crate) fn geometry(cfg: &NeuralEmbedderConfig) -> Result<Geometry> {
+        if cfg.sample_rate == 0 {
+            return Err(AfpError::Config("sample_rate must be > 0".to_string()));
+        }
+        if cfg.n_fft < 2 || !cfg.n_fft.is_power_of_two() {
+            return Err(AfpError::Config(format!(
+                "n_fft must be a power of two >= 2 (got {})",
+                cfg.n_fft,
+            )));
+        }
+        if cfg.n_fft > 1 << 20 {
+            return Err(AfpError::Config(format!(
+                "n_fft {} exceeds the maximum of {} (front-end scratch would be unbounded)",
+                cfg.n_fft,
+                1 << 20,
+            )));
+        }
+        if cfg.hop == 0 || cfg.hop > cfg.n_fft {
+            return Err(AfpError::Config(format!(
+                "hop must satisfy 0 < hop <= n_fft (hop={}, n_fft={})",
+                cfg.hop, cfg.n_fft,
+            )));
+        }
+        if cfg.n_mels == 0 {
+            return Err(AfpError::Config("n_mels must be > 0".to_string()));
+        }
+        if cfg.n_mels > 8_192 {
+            return Err(AfpError::Config(format!(
+                "n_mels {} exceeds the maximum of 8192",
+                cfg.n_mels,
+            )));
+        }
+        let nyquist = cfg.sample_rate as f32 / 2.0;
+        if !(cfg.fmin >= 0.0 && cfg.fmax > cfg.fmin && cfg.fmax <= nyquist) {
+            return Err(AfpError::Config(format!(
+                "require 0 <= fmin < fmax <= sr/2 (fmin={}, fmax={}, sr={})",
+                cfg.fmin, cfg.fmax, cfg.sample_rate,
+            )));
+        }
+        if !(cfg.window_secs > 0.0 && cfg.window_secs.is_finite()) {
+            return Err(AfpError::Config(format!(
+                "window_secs must be a positive finite number (got {})",
+                cfg.window_secs,
+            )));
+        }
+        if cfg.window_secs > 3_600.0 {
+            return Err(AfpError::Config(format!(
+                "window_secs {} exceeds the maximum of 3600 (one hour per window)",
+                cfg.window_secs,
+            )));
+        }
+        if !(cfg.hop_secs > 0.0 && cfg.hop_secs.is_finite()) {
+            return Err(AfpError::Config(format!(
+                "hop_secs must be a positive finite number (got {})",
+                cfg.hop_secs,
+            )));
+        }
+        if cfg.batch_size == 0 {
+            return Err(AfpError::Config("batch_size must be >= 1".to_string()));
+        }
+        // `extract` does `Vec::with_capacity(batch_size)` *before* touching
+        // the audio, so an unbounded `batch_size` is a reachable
+        // `capacity overflow` panic (e.g. `usize::MAX / 2`) or a multi-GiB
+        // allocation. Bound it, like the front-end cell cap below.
+        const MAX_BATCH_SIZE: usize = 4096;
+        if cfg.batch_size > MAX_BATCH_SIZE {
+            return Err(AfpError::Config(format!(
+                "batch_size {} exceeds the maximum of {MAX_BATCH_SIZE}",
+                cfg.batch_size,
+            )));
+        }
+
+        let window_samples = (cfg.window_secs * cfg.sample_rate as f32).round() as usize;
+        let hop_samples = (cfg.hop_secs * cfg.sample_rate as f32).round() as usize;
+        if window_samples < cfg.n_fft {
+            return Err(AfpError::Config(format!(
+                "window_samples ({}) must be >= n_fft ({})",
+                window_samples, cfg.n_fft,
+            )));
+        }
+        if hop_samples == 0 {
+            return Err(AfpError::Config(
+                "hop_samples must be > 0 (hop_secs * sample_rate too small)".to_string(),
+            ));
+        }
+        // The streaming buffer drains `hop_samples` per emitted embedding
+        // out of a buffer that is only guaranteed to contain
+        // `window_samples` — sparse-hop sampling (hop > window) would
+        // skip uncollected input and panic the drain. Reject up front.
+        if hop_samples > window_samples {
+            return Err(AfpError::Config(format!(
+                "hop_samples ({hop_samples}) must be <= window_samples ({window_samples}); \
+                 hop_secs ({}) > window_secs ({})",
+                cfg.hop_secs, cfg.window_secs,
+            )));
+        }
+        let n_frames = (window_samples - cfg.n_fft) / cfg.hop + 1;
+        let frontend_cells = cfg
+            .n_mels
+            .checked_mul(n_frames)
+            .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
+        if frontend_cells.is_none() {
+            return Err(AfpError::Config(format!(
+                "front-end spectrogram too large: {} mels × {} frames exceeds {} cells; \
+                 reduce window_secs, n_mels, or raise hop",
+                cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
+            )));
+        }
+        if cfg.batch_size > 1 {
+            let batch_cells = cfg
+                .batch_size
+                .checked_mul(cfg.n_mels)
+                .and_then(|c| c.checked_mul(n_frames))
+                .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
+            if batch_cells.is_none() {
+                return Err(AfpError::Config(format!(
+                    "batch front-end too large: {} × {} mels × {} frames exceeds {} cells",
+                    cfg.batch_size, cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
+                )));
+            }
+        }
+
+        Ok(Geometry {
+            window_samples,
+            hop_samples,
+            n_frames,
+        })
+    }
+
+    /// Assemble the core from a validated `cfg`, its [`Geometry`] and the
+    /// model-dependent parts. Builds the (non-centred) log-mel front-end.
+    pub(crate) fn from_parts(
+        cfg: NeuralEmbedderConfig,
+        geometry: Geometry,
+        runnable: Runnable,
+        batch_runnable: Option<Runnable>,
+        embedding_dim: usize,
+    ) -> Self {
+        let stft = ShortTimeFFT::new(StftConfig {
+            n_fft: cfg.n_fft,
+            hop: cfg.hop,
+            window: cfg.window_kind,
+            // We always use non-centred framing for predictable n_frames
+            // and zero-allocation framing in the hot loop.
+            center: false,
+        });
+        let mel = MelFilterBank::new(
+            cfg.n_mels,
+            cfg.n_fft,
+            cfg.sample_rate,
+            cfg.fmin,
+            cfg.fmax,
+            cfg.mel_scale,
+        );
+        let frontend = LogMelFrontend::new(stft, mel, geometry.window_samples);
+        Self {
+            cfg,
+            frontend,
+            runnable,
+            batch_runnable,
+            window_samples: geometry.window_samples,
+            hop_samples: geometry.hop_samples,
+            n_frames: geometry.n_frames,
+            embedding_dim,
+        }
+    }
+
+    /// Embedding dimension reported by the model.
+    pub(crate) fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Number of samples in one analysis window.
+    pub(crate) fn window_samples(&self) -> usize {
+        self.window_samples
+    }
+
+    /// Number of samples between successive analysis windows.
+    pub(crate) fn hop_samples(&self) -> usize {
+        self.hop_samples
+    }
+
+    /// `sample_rate / hop_samples`, from the quantised hop.
+    pub(crate) fn effective_frames_per_sec(&self) -> f32 {
+        self.cfg.sample_rate as f32 / self.hop_samples as f32
+    }
+
     /// Compute one embedding from exactly `window_samples` samples of
     /// PCM at the configured sample rate, writing into a caller-managed
     /// `Vec`. The vector is `clear()`ed first; on success it has
@@ -320,17 +523,13 @@ impl EmbedderCore {
         assert!(batch > 0, "embed_batch_into requires at least one window");
         let n_mels = self.frontend.n_mels();
         let n_frames = self.n_frames;
-        const MAX_FRONTEND_CELLS: usize = 1 << 28;
-        let batch_cells = batch
-            .checked_mul(n_mels)
-            .and_then(|c| c.checked_mul(n_frames))
-            .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
-        if batch_cells.is_none() {
-            return Err(AfpError::Config(format!(
-                "batch front-end too large: {batch} × {n_mels} mels × {n_frames} frames \
-                 exceeds {MAX_FRONTEND_CELLS} cells",
-            )));
-        }
+        // `new` capped `batch_size × n_mels × n_frames` at
+        // `MAX_FRONTEND_CELLS`; a smaller final chunk only lowers it.
+        debug_assert!(
+            batch <= self.cfg.batch_size,
+            "embed_batch_into: batch {batch} exceeds configured batch_size {}",
+            self.cfg.batch_size,
+        );
         let batch_runnable = self
             .batch_runnable
             .as_ref()
@@ -441,132 +640,8 @@ impl NeuralEmbedder {
     ///   contracted input shape, or the probe inference produced no /
     ///   empty outputs.
     pub fn new(cfg: NeuralEmbedderConfig) -> Result<Self> {
-        // --- Config validation ---------------------------------------
-        if cfg.sample_rate == 0 {
-            return Err(AfpError::Config("sample_rate must be > 0".to_string()));
-        }
-        if cfg.n_fft < 2 || !cfg.n_fft.is_power_of_two() {
-            return Err(AfpError::Config(format!(
-                "n_fft must be a power of two >= 2 (got {})",
-                cfg.n_fft,
-            )));
-        }
-        if cfg.n_fft > 1 << 20 {
-            return Err(AfpError::Config(format!(
-                "n_fft {} exceeds the maximum of {} (front-end scratch would be unbounded)",
-                cfg.n_fft,
-                1 << 20,
-            )));
-        }
-        if cfg.hop == 0 || cfg.hop > cfg.n_fft {
-            return Err(AfpError::Config(format!(
-                "hop must satisfy 0 < hop <= n_fft (hop={}, n_fft={})",
-                cfg.hop, cfg.n_fft,
-            )));
-        }
-        if cfg.n_mels == 0 {
-            return Err(AfpError::Config("n_mels must be > 0".to_string()));
-        }
-        if cfg.n_mels > 8_192 {
-            return Err(AfpError::Config(format!(
-                "n_mels {} exceeds the maximum of 8192",
-                cfg.n_mels,
-            )));
-        }
-        let nyquist = cfg.sample_rate as f32 / 2.0;
-        if !(cfg.fmin >= 0.0 && cfg.fmax > cfg.fmin && cfg.fmax <= nyquist) {
-            return Err(AfpError::Config(format!(
-                "require 0 <= fmin < fmax <= sr/2 (fmin={}, fmax={}, sr={})",
-                cfg.fmin, cfg.fmax, cfg.sample_rate,
-            )));
-        }
-        if !(cfg.window_secs > 0.0 && cfg.window_secs.is_finite()) {
-            return Err(AfpError::Config(format!(
-                "window_secs must be a positive finite number (got {})",
-                cfg.window_secs,
-            )));
-        }
-        if cfg.window_secs > 3_600.0 {
-            return Err(AfpError::Config(format!(
-                "window_secs {} exceeds the maximum of 3600 (one hour per window)",
-                cfg.window_secs,
-            )));
-        }
-        if !(cfg.hop_secs > 0.0 && cfg.hop_secs.is_finite()) {
-            return Err(AfpError::Config(format!(
-                "hop_secs must be a positive finite number (got {})",
-                cfg.hop_secs,
-            )));
-        }
-        if cfg.batch_size == 0 {
-            return Err(AfpError::Config("batch_size must be >= 1".to_string()));
-        }
-        // `extract` does `Vec::with_capacity(batch_size)` *before* touching
-        // the audio, so an unbounded `batch_size` is a reachable
-        // `capacity overflow` panic (e.g. `usize::MAX / 2`) or a multi-GiB
-        // allocation. Bound it, like the front-end cell cap below.
-        const MAX_BATCH_SIZE: usize = 4096;
-        if cfg.batch_size > MAX_BATCH_SIZE {
-            return Err(AfpError::Config(format!(
-                "batch_size {} exceeds the maximum of {MAX_BATCH_SIZE}",
-                cfg.batch_size,
-            )));
-        }
-
-        let window_samples = (cfg.window_secs * cfg.sample_rate as f32).round() as usize;
-        let hop_samples = (cfg.hop_secs * cfg.sample_rate as f32).round() as usize;
-        if window_samples < cfg.n_fft {
-            return Err(AfpError::Config(format!(
-                "window_samples ({}) must be >= n_fft ({})",
-                window_samples, cfg.n_fft,
-            )));
-        }
-        if hop_samples == 0 {
-            return Err(AfpError::Config(
-                "hop_samples must be > 0 (hop_secs * sample_rate too small)".to_string(),
-            ));
-        }
-        // The streaming buffer drains `hop_samples` per emitted embedding
-        // out of a buffer that is only guaranteed to contain
-        // `window_samples` — sparse-hop sampling (hop > window) would
-        // skip uncollected input and panic the drain. Reject up front.
-        if hop_samples > window_samples {
-            return Err(AfpError::Config(format!(
-                "hop_samples ({hop_samples}) must be <= window_samples ({window_samples}); \
-                 hop_secs ({}) > window_secs ({})",
-                cfg.hop_secs, cfg.window_secs,
-            )));
-        }
-        let n_frames = (window_samples - cfg.n_fft) / cfg.hop + 1;
-        // Front-end ceiling: the per-window log-mel frame (and the probe
-        // tensor below) is `n_mels × n_frames` f32 cells. Cap it so an
-        // extreme-but-finite config fails with `Config` instead of an
-        // OOM abort deep inside `vec![0.0; …]`.
-        const MAX_FRONTEND_CELLS: usize = 1 << 28; // 268M f32 = 1 GiB
-        let frontend_cells = cfg
-            .n_mels
-            .checked_mul(n_frames)
-            .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
-        if frontend_cells.is_none() {
-            return Err(AfpError::Config(format!(
-                "front-end spectrogram too large: {} mels × {} frames exceeds {} cells; \
-                 reduce window_secs, n_mels, or raise hop",
-                cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
-            )));
-        }
-        if cfg.batch_size > 1 {
-            let batch_cells = cfg
-                .batch_size
-                .checked_mul(cfg.n_mels)
-                .and_then(|c| c.checked_mul(n_frames))
-                .filter(|&cells| cells <= MAX_FRONTEND_CELLS);
-            if batch_cells.is_none() {
-                return Err(AfpError::Config(format!(
-                    "batch front-end too large: {} × {} mels × {} frames exceeds {} cells",
-                    cfg.batch_size, cfg.n_mels, n_frames, MAX_FRONTEND_CELLS,
-                )));
-            }
-        }
+        let geometry = EmbedderCore::geometry(&cfg)?;
+        let n_frames = geometry.n_frames;
 
         // --- Model loading -------------------------------------------
         if cfg.model_path.is_empty() {
@@ -598,25 +673,6 @@ impl NeuralEmbedder {
             .map_err(|e| AfpError::Inference(format!("optimize: {e}")))?
             .into_runnable()
             .map_err(|e| AfpError::Inference(format!("runnable: {e}")))?;
-
-        // --- Front-end pre-planning ----------------------------------
-        let stft_cfg = StftConfig {
-            n_fft: cfg.n_fft,
-            hop: cfg.hop,
-            window: cfg.window_kind,
-            // We always use non-centred framing for predictable n_frames
-            // and zero-allocation framing in the hot loop.
-            center: false,
-        };
-        let stft = ShortTimeFFT::new(stft_cfg);
-        let mel = MelFilterBank::new(
-            cfg.n_mels,
-            cfg.n_fft,
-            cfg.sample_rate,
-            cfg.fmin,
-            cfg.fmax,
-            cfg.mel_scale,
-        );
 
         // --- Probe inference to discover embedding_dim ----------------
         let probe = Tensor::from_shape(
@@ -667,38 +723,27 @@ impl NeuralEmbedder {
             None
         };
 
-        let frontend = LogMelFrontend::new(stft, mel, window_samples);
-
         Ok(Self {
-            core: EmbedderCore {
-                cfg,
-                frontend,
-                runnable,
-                batch_runnable,
-                window_samples,
-                hop_samples,
-                n_frames,
-                embedding_dim,
-            },
+            core: EmbedderCore::from_parts(cfg, geometry, runnable, batch_runnable, embedding_dim),
         })
     }
 
     /// Embedding dimension reported by the model.
     #[must_use]
     pub fn embedding_dim(&self) -> usize {
-        self.core.embedding_dim
+        self.core.embedding_dim()
     }
 
     /// Number of samples in one analysis window.
     #[must_use]
     pub fn window_samples(&self) -> usize {
-        self.core.window_samples
+        self.core.window_samples()
     }
 
     /// Number of samples between successive analysis windows.
     #[must_use]
     pub fn hop_samples(&self) -> usize {
-        self.core.hop_samples
+        self.core.hop_samples()
     }
 
     /// Effective embedding rate from the quantised hop in samples:
@@ -710,7 +755,7 @@ impl NeuralEmbedder {
     /// nominal rate (audit F16).
     #[must_use]
     pub fn effective_frames_per_sec(&self) -> f32 {
-        self.core.cfg.sample_rate as f32 / self.core.hop_samples as f32
+        self.core.effective_frames_per_sec()
     }
 
     /// Extract embeddings with frame-rate metadata derived from the actual
@@ -746,7 +791,7 @@ impl Fingerprinter for NeuralEmbedder {
     }
 
     fn min_samples(&self) -> usize {
-        self.core.window_samples
+        self.core.window_samples()
     }
 
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output> {

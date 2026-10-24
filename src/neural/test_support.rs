@@ -14,12 +14,10 @@ use alloc::vec::Vec;
 use tract_onnx::prelude::*;
 
 use crate::Result;
-use crate::dsp::mel::{MelFilterBank, MelScale};
-use crate::dsp::stft::{ShortTimeFFT, StftConfig};
+use crate::dsp::mel::MelScale;
 use crate::dsp::windows::WindowKind;
 
 use super::embedder::{EmbedderCore, NeuralEmbedder, NeuralEmbedderConfig, Runnable};
-use super::frontend::LogMelFrontend;
 use super::streaming::StreamingNeuralEmbedder;
 
 /// Build a tract `Runnable` whose single output equals its single input.
@@ -69,39 +67,8 @@ pub(crate) fn passthrough_streaming(cfg: NeuralEmbedderConfig) -> Result<Streami
 }
 
 fn passthrough_core(cfg: NeuralEmbedderConfig) -> Result<EmbedderCore> {
-    use crate::AfpError;
-    use alloc::format;
-    use alloc::string::ToString;
-
-    if cfg.sample_rate == 0 {
-        return Err(AfpError::Config("sample_rate must be > 0".to_string()));
-    }
-    if cfg.n_fft < 2 || !cfg.n_fft.is_power_of_two() {
-        return Err(AfpError::Config(format!(
-            "n_fft must be a power of two >= 2 (got {})",
-            cfg.n_fft,
-        )));
-    }
-    if cfg.hop == 0 || cfg.hop > cfg.n_fft {
-        return Err(AfpError::Config(format!(
-            "hop must satisfy 0 < hop <= n_fft (hop={}, n_fft={})",
-            cfg.hop, cfg.n_fft,
-        )));
-    }
-    if cfg.n_mels == 0 {
-        return Err(AfpError::Config("n_mels must be > 0".to_string()));
-    }
-    let nyquist = cfg.sample_rate as f32 / 2.0;
-    if !(cfg.fmin >= 0.0 && cfg.fmax > cfg.fmin && cfg.fmax <= nyquist) {
-        return Err(AfpError::Config("fmin/fmax out of range".to_string()));
-    }
-    let window_samples = (cfg.window_secs * cfg.sample_rate as f32).round() as usize;
-    let hop_samples = (cfg.hop_secs * cfg.sample_rate as f32).round() as usize;
-    if window_samples < cfg.n_fft || hop_samples == 0 || hop_samples > window_samples {
-        return Err(AfpError::Config("window/hop sizing invalid".to_string()));
-    }
-    let n_frames = (window_samples - cfg.n_fft) / cfg.hop + 1;
-
+    let geometry = EmbedderCore::geometry(&cfg)?;
+    let n_frames = geometry.n_frames;
     let runnable = build_passthrough_runnable(cfg.n_mels, n_frames);
     let batch_runnable = if cfg.batch_size > 1 {
         Some(build_passthrough_runnable_batched(
@@ -112,33 +79,14 @@ fn passthrough_core(cfg: NeuralEmbedderConfig) -> Result<EmbedderCore> {
     } else {
         None
     };
-    let stft = ShortTimeFFT::new(StftConfig {
-        n_fft: cfg.n_fft,
-        hop: cfg.hop,
-        window: cfg.window_kind,
-        center: false,
-    });
-    let mel = MelFilterBank::new(
-        cfg.n_mels,
-        cfg.n_fft,
-        cfg.sample_rate,
-        cfg.fmin,
-        cfg.fmax,
-        cfg.mel_scale,
-    );
-    let frontend = LogMelFrontend::new(stft, mel, window_samples);
     let embedding_dim = cfg.n_mels * n_frames;
-
-    Ok(EmbedderCore {
+    Ok(EmbedderCore::from_parts(
         cfg,
-        frontend,
+        geometry,
         runnable,
         batch_runnable,
-        window_samples,
-        hop_samples,
-        n_frames,
         embedding_dim,
-    })
+    ))
 }
 
 /// Synthetic deterministic PCM: sum of two sines + low-amplitude noise.

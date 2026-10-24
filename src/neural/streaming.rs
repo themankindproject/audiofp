@@ -109,25 +109,25 @@ impl StreamingNeuralEmbedder {
     /// Embedding dimension reported by the model.
     #[must_use]
     pub fn embedding_dim(&self) -> usize {
-        self.core.embedding_dim
+        self.core.embedding_dim()
     }
 
     /// Number of samples in one analysis window.
     #[must_use]
     pub fn window_samples(&self) -> usize {
-        self.core.window_samples
+        self.core.window_samples()
     }
 
     /// Number of samples between successive analysis windows.
     #[must_use]
     pub fn hop_samples(&self) -> usize {
-        self.core.hop_samples
+        self.core.hop_samples()
     }
 
     /// Effective embedding rate: `sample_rate / hop_samples`.
     #[must_use]
     pub fn effective_frames_per_sec(&self) -> f32 {
-        self.core.cfg.sample_rate as f32 / self.core.hop_samples as f32
+        self.core.effective_frames_per_sec()
     }
 
     /// Same contract as [`StreamingFingerprinter::push`] but propagates

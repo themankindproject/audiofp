@@ -327,7 +327,7 @@ fn cosine(a: &[f32], b: &[f32], norms: Option<(f32, f32)>) -> f32 {
 fn norms(embs: &[NeuralEmbedding], assume_norm: bool) -> Option<Vec<f32>> {
     (!assume_norm).then(|| {
         embs.iter()
-            .map(|e| crate::neural::embedder::sumsq_wide(&e.vector).sqrt())
+            .map(|e| crate::dsp::simd::sumsq_core(&e.vector).sqrt())
             .collect()
     })
 }
