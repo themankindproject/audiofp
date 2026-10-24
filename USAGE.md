@@ -32,7 +32,6 @@
 - [PanakoMatcher](#panakomatcher)
   - [Prebuilt index for repeated 1:1 Panako matches](#prebuilt-index-for-repeated-11-panako-matches)
   - [Tuning match thresholds](#tuning-match-thresholds)
-- [NeuralMatcher](#neuralmatcher)
 - [1:N helpers and in-memory indexes](#1n-helpers-and-in-memory-indexes)
   - [Mutable catalogs](#mutable-catalogs-insert--remove--live_count--estimated_bytes)
 - [Parallel 1:N matching (rayon)](#parallel-1n-matching-rayon)
@@ -40,11 +39,9 @@
 - [Fingerprint Serialization](#fingerprint-serialization)
   - [Cache files (.afp)](#cache-files-afp)
 - [Audio File Decoding](#audio-file-decoding)
-- [Watermark Detection](#watermark-detection)
 - [Classical Watermarking (embed + detect)](#classical-watermarking-embed--detect)
-- [Neural Embedder](#neural-embedder)
 - [DSP Primitives](#dsp-primitives)
-- [Async, batching, and models](#async-batching-and-models)
+- [Async and batching](#async-and-batching)
 - [Error Handling](#error-handling)
 - [Performance Tips](#performance-tips)
 - [Feature Flags](#feature-flags)
@@ -153,8 +150,8 @@ fn main() {
 
 The prelude carries the classical fingerprinters (offline + streaming), their
 config/hash types, `AfpError`/`Result`, `SampleRate`/`TimestampMs`,
-`FingerprintEnvelope`, and both traits. Feature-gated modules (`io`, `neural`,
-`watermark`) are **not** in the prelude — import those from their own modules.
+`FingerprintEnvelope`, and both traits. Feature-gated modules (`io`,
+`watermark::classical`) are **not** in the prelude — import those from their own modules.
 
 ---
 
@@ -167,18 +164,15 @@ at scale, yet stable across re-encoding, modest noise, and (for Panako) small
 tempo changes. Two recordings of the same song share many hashes; two
 unrelated recordings do not.
 
-`audiofp` ships three classical fingerprinters, one neural embedder, one
-AudioSeal-compatible watermark detector, and one keyed classical watermark
-embedder/detector:
+`audiofp` ships three classical fingerprinters and one keyed classical
+watermark embedder/detector:
 
 | Algorithm  | Output          | Rate  | Frame rate | Storage / s        | When to use                            |
 | ---------- | --------------- | ----- | ---------- | ------------------ | -------------------------------------- |
 | `Wang`     | Landmark pairs  | 8 kHz | 62.5 fps   | ~2.4 KB (fan-out 10) | Music ID; "Shazam-style" matching    |
 | `Panako`   | Triplet hashes  | 8 kHz | 62.5 fps   | ~2.0 KB (fan-out 5)  | Tempo search via 2-D Hough (grid-tuned) |
 | `Haitsma`  | 32 bits / frame | 5 kHz | 78.125 fps | 312 B               | Compact dense IDs; lowest latency    |
-| `NeuralEmbedder` | f32 vector / window | model-defined | 1/`hop_secs` | `4·dim` B / window | Semantic / cover detection (BYO ONNX model) |
-| `WatermarkDetector` | message + confidence | 16 kHz | — | — | AudioSeal-style watermark detection (BYO model) |
-| `QimBlock` / `LogHost` (classical watermark) | payload + CRC-32 | 16 kHz | — | — | Keyed provenance / asset IDs; blind detection, no model |
+| `QimBlock` / `LogHost` (classical watermark) | payload + CRC-32 | 16 kHz | — | — | Keyed provenance / asset IDs; blind detection |
 
 All three classical fingerprinters:
 
@@ -279,7 +273,6 @@ mix algorithm versions in one catalog:
 | `Wang`    | `"wang-v1"`    |
 | `Panako`  | `"panako-v2"`  |
 | `Haitsma` | `"haitsma-v1"` |
-| `NeuralEmbedder` | `"neural-onnx-v0"` |
 
 `extract` runs, in order: NaN/Inf rejection (`NonFiniteSample`), the
 `max_input_samples` check (`InputTooLarge`), the sample-rate check
@@ -317,7 +310,7 @@ Notes that matter in practice:
 
 - **All `push`/`flush` implementations are fallible** and return `Result`
   (since 0.4.0). The classical streams (Wang/Panako/Haitsma) never error on
-  valid input; `StreamingNeuralEmbedder` propagates ONNX inference errors.
+  valid input.
 - `push()` is non-blocking and returns only frames whose full lookahead has
   elapsed. `flush()` drains everything still pending — call it at
   end-of-stream.
@@ -367,7 +360,7 @@ fn main() {
 | `HZ_5000`  | 5 000   | Haitsma                        |
 | `HZ_8000`  | 8 000   | Wang, Panako                   |
 | `HZ_11025` | 11 025  | quarter-rate audio             |
-| `HZ_16000` | 16 000  | watermark + neural default     |
+| `HZ_16000` | 16 000  | classical watermark default    |
 | `HZ_22050` | 22 050  | half-rate audio                |
 | `HZ_44100` | 44 100  | CD audio                       |
 | `HZ_48000` | 48 000  | pro/video audio                |
@@ -594,14 +587,13 @@ bit-error rate, so it wants the whole frame sequence, not a hash set.
 `audiofp::matching` scores a **query** fingerprint against one or more
 **references** entirely in memory.
 
-| Matcher          | Fingerprint          | Strategy                                       | Feature |
-| ---------------- | -------------------- | ---------------------------------------------- | ------- |
-| `WangMatcher`    | `WangFingerprint`    | Offset-histogram voter (Shazam-style)          | —       |
-| `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT)   | —       |
-| `PanakoMatcher`  | `PanakoFingerprint`  | 2-D Hough (scale × offset) + optional RANSAC   | —       |
-| `NeuralMatcher`  | `NeuralFingerprint`  | Cosine similarity (Global / SlidingMax / DTW)  | `neural`|
+| Matcher          | Fingerprint          | Strategy                                       |
+| ---------------- | -------------------- | ---------------------------------------------- |
+| `WangMatcher`    | `WangFingerprint`    | Offset-histogram voter (Shazam-style)          |
+| `HaitsmaMatcher` | `HaitsmaFingerprint` | Sliding BER (+ optional sub-fingerprint LUT)   |
+| `PanakoMatcher`  | `PanakoFingerprint`  | 2-D Hough (scale × offset) + optional RANSAC   |
 
-All four implement the `Matcher` trait:
+All three implement the `Matcher` trait:
 
 ```rust,ignore
 // Reference definition (src/matching/mod.rs).
@@ -617,7 +609,7 @@ pub trait Matcher {
 ```
 
 `match_one` never panics on any input (including empty fingerprints, NaN
-frame rates, or length-mismatched neural sequences — those soft-fail to
+frame rates, or mismatched fingerprints — those soft-fail to
 `MatchResult::NONE`).
 
 ### MatchResult semantics
@@ -656,7 +648,6 @@ types**, do not threshold it with one global constant:
 | Wang | distinct contributing query hashes ÷ query hash count | consolidated peak (±tol window) | `peak / (mean_rest + 1)` on the consolidated offset histogram | `1.0` |
 | Haitsma | `1 − BER` at the best alignment | aligned frame count (overlap) | `median_BER / (BER + ε)` (matcher) — index path uses `0.5 / BER` | `1.0` |
 | Panako | inliers ÷ query hash count | RANSAC inliers (or Hough peak) | `peak / (mean_rest + 1)` on the consolidated 2-D Hough grid | `1 / fitted_scale`, clamped `[0.5, 2.0]` |
-| Neural | cosine similarity (0..1) | depends on aggregation | relative cosine excess (SlidingMax) or `1.0` | `1.0` |
 
 `offset.frames` is positive when the query starts **later** in the reference
 (reference anchor at a larger frame index); `offset.ms` uses the *reference's*
@@ -1155,79 +1146,20 @@ fn main() {
 ```
 
 The same map is available three ways: the inherent method on each
-matcher (`WangMatcher` / `PanakoMatcher` / `HaitsmaMatcher` /
-`NeuralMatcher::calibrated_score`), the query-side helpers on
+matcher (`WangMatcher` / `PanakoMatcher` /
+`HaitsmaMatcher::calibrated_score`), the query-side helpers on
 `WangIndex` / `HaitsmaIndex` / `PanakoIndex` (same map as the
 corresponding matcher), and the free functions
 (`audiofp::matching::calibrated_wang`, `calibrated_panako`,
-`calibrated_haitsma`, `calibrated_neural`) plus the versioned
+`calibrated_haitsma`) plus the versioned
 constants (`WANG_V1_MID`, `WANG_V1_SLOPE`, …) for fusion code that
-doesn't hold a matcher instance. The neural method anchors at its own
-`min_cosine`, so the decision boundary always maps to exactly 0.5.
+doesn't hold a matcher instance.
 
 Which knob to move follows the margin shape: positives scoring low
 means the evidence is weak (raise `min_votes` cautiously, or lengthen
 queries); negatives scoring high means collisions (raise
 `min_prominence` for Wang/Panako, lower `max_ber` for Haitsma). Move
 one knob at a time and re-sweep — the margins interact.
-
-### NeuralMatcher
-
-Cosine-similarity matching over `NeuralFingerprint` sequences (`neural`
-feature). Three aggregation strategies:
-
-| `Aggregation` | Strategy |
-| ------------- | -------- |
-| `Global`      | Mean-pool both sequences to one vector each; a single cosine. Fast, weakest. |
-| `SlidingMax`  | Slide the query's embeddings over the reference's; report the max mean cosine. Default. |
-| `Dtw`         | Dynamic time warping — tempo-flexible sequence alignment. |
-
-```rust,ignore
-// Reference definitions (src/matching/neural.rs).
-pub struct NeuralMatchConfig {
-    pub min_cosine: f32,        // default 0.80 — MODEL-DEPENDENT, tune per model
-    pub aggregation: Aggregation, // default SlidingMax
-    pub assume_normalized: bool,  // default true (embedder L2-normalises)
-}
-
-pub enum Aggregation { Global, SlidingMax, Dtw }
-```
-
-`min_cosine` depends entirely on the embedding model's cosine distribution —
-calibrate on your own data (same-track vs cross-track) before trusting the
-default. Length-mismatched or empty sequences soft-fail to `NONE`.
-
-```rust
-use audiofp::matching::{Aggregation, Matcher, NeuralMatchConfig, NeuralMatcher};
-use audiofp::neural::{NeuralEmbedding, NeuralFingerprint};
-use audiofp::TimestampMs;
-
-fn main() {
-    // Two sequences of unit-norm 4-dim embeddings.
-    let mk = |v: [f32; 4]| NeuralEmbedding { vector: v.to_vec(), t_start: TimestampMs(0) };
-    let query = NeuralFingerprint {
-        embeddings: vec![mk([1.0, 0.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0, 0.0])],
-        embedding_dim: 4,
-        frames_per_sec: 1.0,
-    };
-    let reference = NeuralFingerprint {
-        embeddings: vec![mk([1.0, 0.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0, 0.0])],
-        embedding_dim: 4,
-        frames_per_sec: 1.0,
-    };
-
-    let m = NeuralMatcher::new(NeuralMatchConfig::default()).match_one(&query, &reference);
-    assert!(m.is_match); // identical unit vectors → cosine 1.0
-
-    let cfg = NeuralMatchConfig {
-        aggregation: Aggregation::Dtw,
-        assume_normalized: true,
-        ..Default::default()
-    };
-    let m2 = NeuralMatcher::new(cfg).match_one(&query, &reference);
-    assert!(m2.is_match);
-}
-```
 
 ### 1:N helpers and in-memory indexes
 
@@ -1417,7 +1349,7 @@ fn main() {
 
 The `rayon` feature also parallelises batch *fingerprinting* via
 `fingerprint_batch_parallel` (see
-[Async, batching, and models](#async-batching-and-models)).
+[Async and batching](#async-and-batching)).
 
 Benchmarks: `cargo bench --bench matching` (Criterion; Wang/Haitsma/Panako
 1:1 and a 100-reference `WangIndex`).
@@ -1426,20 +1358,16 @@ Benchmarks: `cargo bench --bench matching` (Criterion; Wang/Haitsma/Panako
 
 ## Streaming Fingerprinters
 
-Each classical fingerprinter has a streaming sibling; the neural embedder
-has one too:
+Each classical fingerprinter has a streaming sibling:
 
 | Streaming           | `Frame`      | `latency_ms()` | Carry bound                    | `ZeroAllocStreaming` |
 | ------------------- | ------------ | -------------- | ------------------------------ | -------------------- |
 | `StreamingWang`     | `WangHash`   | 2 256          | `< n_fft + max_push` samples   | yes |
 | `StreamingPanako`   | `PanakoHash` | 2 784          | same                           | yes |
 | `StreamingHaitsma`  | `u32`        | 409            | one frame of band energies     | yes |
-| `StreamingNeuralEmbedder` | `Vec<f32>` | window length (ms) | `< window_samples + max_push` | no — see below |
 
 Each streaming variant exposes `config() -> &XConfig`, `reset()` (clear all
-state — start a fresh stream), and (for the neural streamer) the
-fallible-semantic `try_push` / `try_push_with` described in the
-[Neural Embedder](#neural-embedder) section.
+state — start a fresh stream).
 
 ### Microphone-style usage
 
@@ -1523,11 +1451,6 @@ Per-algorithm notes:
   plus pooled target/bucket buffers and Panako's pooled triplet heap.
 - **Haitsma** is a separate, simpler pipeline (STFT frame → band energies →
   sign bits); warmup covers the carry and pending-frame buffers.
-- **Neural is excluded by design**: `StreamingNeuralEmbedder::Frame` is
-  `Vec<f32>`, so every emit allocates through the `StreamingFingerprinter`
-  interface. Its zero-alloc path is the inherent `try_push_with`, whose
-  callback borrows internal scratch (`&[f32]`) — use that directly on
-  realtime neural paths.
 
 Warmup rule (all three marked types): construction may allocate, and the
 first pushes may grow buffers (`Vec` amortised growth). Feed representative
@@ -1908,110 +1831,11 @@ Notes:
 
 ---
 
-## Watermark Detection
-
-> **Deprecated since 0.4.5 — removed in 0.5.0.** This ONNX AudioSeal detector
-> leaves the crate together with the `watermark` feature and its `tract-onnx`
-> dependency. Use
-> [Classical Watermarking (embed + detect)](#classical-watermarking-embed--detect)
-> instead — keyed payload embed + blind recovery, no model and no `std`. The
-> two are not interchangeable: AudioSeal verifies a *provider's* neural mark,
-> the classical subsystem works on payloads you embed and control.
-
-Available with the `watermark` feature. Wraps `tract-onnx` to run an
-AudioSeal-compatible detector; the model is **not** bundled.
-
-```toml
-[dependencies]
-audiofp = { version = "0.4", features = ["watermark"] }
-```
-
-### `WatermarkConfig`
-
-```rust,ignore
-// Reference definition (src/watermark/mod.rs).
-pub struct WatermarkConfig {
-    pub model_path: String,
-    pub message_bits: u8,                   // ≤ 32, default 16
-    pub threshold: f32,                     // [0, 1], default 0.5
-    pub sample_rate: u32,                   // default 16_000
-    pub max_input_samples: Option<usize>,   // default None (unlimited)
-}
-
-impl WatermarkConfig {
-    pub fn new(model_path: impl Into<String>) -> Self;
-}
-```
-
-### Detect
-
-```rust
-use audiofp::watermark::{WatermarkConfig, WatermarkDetector};
-use audiofp::SampleRate;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = WatermarkConfig::new("/models/audioseal_v0.2.onnx");
-    let mut det = WatermarkDetector::new(cfg)?;
-
-    // 1 s of mono 16 kHz (a real detection wants ≥ a few seconds).
-    let audio = vec![0.0_f32; 16_000];
-    let r = det.detect(&audio, SampleRate::HZ_16000)?;
-
-    println!("detected={} confidence={:.3}", r.detected, r.confidence);
-    println!("message bits: {:#034b}", r.message); // LSB-first
-    println!("localization samples: {}", r.localization.len());
-    Ok(())
-}
-```
-
-Input validation order: rate check, `max_input_samples` check, empty check,
-then the NaN/Inf scan — cheap rejections before the O(n) pass.
-
-### `WatermarkResult`
-
-| Field          | Type       | Meaning                                                                 |
-| -------------- | ---------- | ----------------------------------------------------------------------- |
-| `detected`     | `bool`     | `true` iff `confidence > threshold`                                     |
-| `confidence`   | `f32`      | mean of the per-output detection scores                                 |
-| `message`      | `u32`      | decoded message bits, **LSB-first**; bits ≥ `message_bits` are 0        |
-| `localization` | `Vec<f32>` | flattened detection-score tensor (see below)                            |
-
-**`localization` contract** — it is the flattened first ONNX output copied
-element-wise with **no resampling or time-axis alignment** applied. Its
-length equals whatever the model emits (often one score per input sample
-for AudioSeal exports, but this is a property of the *model*, not the API).
-`confidence = mean(localization)` (or 0.0 when empty). For "where in the
-clip is the watermark", threshold `localization` against your model card's
-documented time base.
-
-### Model contract
-
-1. **One input** accepting `[1, 1, T] f32` at `cfg.sample_rate`.
-2. **≥ 2 outputs**, in order: `[0]` detection scores (any shape),
-   `[1]` message-bit logits (any shape; the first `message_bits` values
-   are read, `logit ≥ 0` ⇒ bit set).
-
-**Plan caching:** the first `detect` at a given input length builds a typed
-*and optimised* tract plan, cached per length; same-length calls reuse it,
-different lengths rebuild transparently. Batch at a fixed length for best
-throughput.
-
-Obtain a model from Meta's
-[AudioSeal](https://github.com/facebookresearch/audioseal) repository
-(ONNX export of `audioseal_detector_16khz`), then:
-
-```bash
-cargo run --example watermark_detect --features watermark,std-wav -- /path/to/audioseal.onnx clip.wav
-```
-
----
-
 ## Classical Watermarking (embed + detect)
 
 Available with the `classical-watermark` feature. A keyed embedder writes a
 payload into the signal and a blind detector recovers it with only the key —
-no reference copy and no ONNX model. FFT + `alloc` only: unlike `watermark`,
-this feature does **not** imply `std` and does not pull in `tract-onnx`.
+no reference copy. FFT + `alloc` only: this feature does **not** imply `std`.
 
 ```toml
 [dependencies]
@@ -2109,157 +1933,6 @@ fn main() -> Result<(), audiofp::AfpError> {
 The embedder and detector carry no state across calls and are `Clone`; build
 them once and reuse. See [Error Handling](#error-handling) for the `Result`
 contract and the crate's conventions.
-
----
-
-## Neural Embedder
-
-Available with the `neural` feature. A generic ONNX log-mel audio embedder:
-you bring the model, `audiofp` runs the front-end + inference.
-
-```toml
-[dependencies]
-audiofp = { version = "0.4", features = ["neural"] }
-```
-
-### Model contract
-
-1. **Input 0** accepts `[1, n_mels, n_frames] f32` where `n_mels` is your
-   configured mel count and
-   `n_frames = (window_samples − n_fft) / hop + 1` (non-centred framing).
-2. **Output 0** is any tensor whose flat length is the embedding dimension
-   — discovered by a probe inference at construction.
-
-The model is typed, optimised (`into_optimized`), and made runnable **once
-at construction**; per-call work is only the front-end (windowed FFT +
-log-mel) and inference. Public exports that fit: VGGish, YAMNet (channel
-dim removed), OpenL3, audio-MAE distillations.
-
-### `NeuralEmbedderConfig`
-
-```rust,ignore
-// Reference definition (src/neural/embedder.rs).
-pub struct NeuralEmbedderConfig {
-    pub model_path: String,
-    pub sample_rate: u32,        // default 16_000
-    pub n_fft: usize,            // default 1024 (power of two, ≤ 2^20)
-    pub hop: usize,              // default 320 (20 ms @ 16 kHz; 0 < hop ≤ n_fft)
-    pub n_mels: usize,           // default 128 (1..=8192)
-    pub fmin: f32,               // default 0.0
-    pub fmax: f32,               // default sample_rate / 2
-    pub mel_scale: MelScale,     // default Slaney (librosa default)
-    pub window_kind: WindowKind, // default Hann
-    pub window_secs: f32,        // default 1.0; analysis-window length (≤ 3600)
-    pub hop_secs: f32,           // default 1.0; between windows (≤ window_secs)
-    pub l2_normalize: bool,      // default true
-    pub max_input_samples: Option<usize>, // default None
-    pub max_push_samples: Option<usize>,  // default None; streaming truncate
-    pub batch_size: usize,       // default 1; >1 batches offline inference
-}
-```
-
-Construction validates the whole config up front — non-finite/degenerate
-values, upper bounds (`n_fft ≤ 2²⁰`, `n_mels ≤ 8192`, `window_secs ≤ 3600`,
-`n_mels × n_frames ≤ 2²⁸` cells) all fail with `AfpError::Config` instead
-of an OOM abort later. A degenerate-but-finite config can no longer take
-down the process.
-
-### `NeuralEmbedder` (offline)
-
-```rust
-use audiofp::neural::{NeuralEmbedder, NeuralEmbedderConfig};
-use audiofp::{Fingerprinter, SampleRate};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Construction performs the probe inference; embedding_dim is known
-    // even before you feed real audio.
-    let mut emb = NeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
-    println!("dim={} window={} samples hop={} samples",
-             emb.embedding_dim(), emb.window_samples(), emb.hop_samples());
-
-    // 16 kHz mono PCM (rate must match cfg.sample_rate).
-    let samples: Vec<f32> = vec![0.0; 16_000 * 5];
-    let fp = emb.extract(&samples, SampleRate::HZ_16000)?;
-
-    println!("{} embeddings of dim {}", fp.embeddings.len(), fp.embedding_dim);
-    for e in fp.embeddings.iter().take(3) {
-        println!("  t_start={} ms, |v| = {}", e.t_start.0, e.vector.len());
-    }
-    Ok(())
-}
-```
-
-```rust,ignore
-// Reference definitions (src/neural/embedder.rs).
-pub struct NeuralFingerprint {
-    pub embeddings: Vec<NeuralEmbedding>,
-    pub embedding_dim: usize,
-    pub frames_per_sec: f32,    // 1.0 / hop_secs
-}
-
-pub struct NeuralEmbedding {
-    pub vector: Vec<f32>,       // L2-normalised when l2_normalize = true
-    pub t_start: TimestampMs,
-}
-```
-
-`n_windows = (samples.len() − window_samples) / hop_samples + 1`; tail
-samples short of a window are dropped. `batch_size > 1` builds a second
-`[batch, n_mels, n_frames]` plan at construction and batches full groups in
-one inference; partial tails fall back to single-window calls. Output is
-bit-exact regardless of batch size.
-
-### `StreamingNeuralEmbedder` (incremental)
-
-```rust
-use audiofp::neural::{NeuralEmbedderConfig, StreamingNeuralEmbedder};
-use audiofp::StreamingFingerprinter;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
-
-    // Feed 16 kHz PCM in arbitrary chunks; push propagates inference errors.
-    let chunk = vec![0.0_f32; 320]; // 20 ms
-    for _ in 0..200 {
-        for (t, vector) in s.push(&chunk)? {
-            println!("t={} ms dim={}", t.0, vector.len());
-        }
-    }
-
-    // flush drops the sub-window tail (non-centred framing cannot emit a
-    // partial window) and is idempotent.
-    let drained = s.flush()?;
-    assert!(drained.is_empty());
-    Ok(())
-}
-```
-
-| Method                                                | Per-emit allocation | Errors  |
-| ----------------------------------------------------- | ------------------- | ------- |
-| `push(&[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>>` | one `Vec<f32>`     | `Result` |
-| `try_push(&[f32]) -> Result<Vec<…>>`                  | one `Vec<f32>`     | `Result` |
-| `try_push_with(&[f32], |t, &[f32]|) -> Result<usize>` | reuses embedding scratch; Tract may still allocate per window | `Result` |
-
-Prefer `try_push_with` on realtime paths: the embedding scratch is sized
-once at construction (`embedding_dim`) and reused across every emit of
-every push. The sample carry compacts once per push call, so one large
-push costs O(N) total — not O(N²/hop) of front-drains. `reset()` clears
-the carry and the consumed-sample counter between independent streams.
-
-**Bit-exactness:** streaming output equals offline `extract` for the same
-total input under any chunking (pinned by in-tree tests across chunk sizes
-`[1, 7, 17, 256, 1024, 8191]` and overlapping `hop_secs < window_secs`).
-
-### Errors
-
-| Failure                                          | Variant                       |
-| ------------------------------------------------ | ----------------------------- |
-| Empty `model_path`, file missing                 | `ModelNotFound(_)`            |
-| File present but not parseable as ONNX           | `ModelLoad(_)`                |
-| Invalid config (bounds, ranges, batch_size = 0)  | `Config(_)`                   |
-| Rate mismatch                                    | `UnsupportedSampleRate(_)`    |
-| Buffer shorter than `window_samples`             | `AudioTooShort { … }`         |
-| Tract typing / optimise / run failure            | `Inference(_)`                |
 
 ---
 
@@ -2457,7 +2130,7 @@ Periodic (period `N`, not `N−1`) — matches librosa /
 
 ---
 
-## Async, batching, and models
+## Async and batching
 
 ### Async usage
 
@@ -2641,15 +2314,6 @@ Notes:
 - `AfpError` is `#[non_exhaustive]`: keep the trailing catch-all arm so
   future variants don't break your enroll loop on upgrade.
 
-### Model sourcing
-
-Neither `watermark` nor `neural` ships ONNX weights:
-
-| Feature    | Model source                                                                             |
-| ---------- | ---------------------------------------------------------------------------------------- |
-| `watermark`| Meta [AudioSeal](https://github.com/facebookresearch/audioseal) ONNX detector export      |
-| `neural`   | Any log-mel embedder matching the [model contract](#neural-embedder) (VGGish, YAMNet, …) |
-
 ---
 
 ## Error Handling
@@ -2663,9 +2327,6 @@ pub enum AfpError {
     AudioTooShort { needed: usize, got: usize },
     UnsupportedSampleRate(u32),
     UnsupportedChannels(u16),
-    ModelNotFound(String),
-    ModelLoad(String),
-    Inference(String),
     BufferOverrun { dropped: usize },
     NonFiniteSample { index: usize },   // first offending sample's index
     InputTooLarge { limit: usize, provided: usize },
@@ -2714,11 +2375,11 @@ fn main() {
 
 1. **Reuse the fingerprinter across calls.** `Wang::new` allocates an FFT
    plan, window table, and scratch; recreating per file wastes all of it.
-   Same for `Panako`, `Haitsma`, `WatermarkDetector`, and the peak picker.
+   Same for `Panako`, `Haitsma`, and the peak picker.
 
 2. **Pick the algorithm for the workload.** Wang for music ID; Panako when
    tempo robustness matters; Haitsma for smallest fingerprints and lowest
-   streaming latency; neural for semantic/cover similarity.
+   streaming latency.
 
 3. **Tune `fan_out` / `peaks_per_sec` to your index.** Wang 5–10 is the
    useful range (3 for tight storage, ≥ 15 wastes index space). Halving
@@ -2737,19 +2398,14 @@ fn main() {
    ```
 
 6. **The streaming hot path is incremental and allocation-free** after
-   warmup: per-push CPU is proportional to the new samples only. The
-   neural streamer additionally reuses one embedding scratch and compacts
-   its carry once per push.
+   warmup: per-push CPU is proportional to the new samples only.
 
 7. **Build with LTO.** The crate ships `lto = "fat"`, `codegen-units = 1`
    in its release profile; if you consume it as a library, set the same in
    your binary's `[profile.release]` — cross-crate inlining of the DSP
    kernels is worth ~10–15 %.
 
-8. **Batch neural inference.** `batch_size > 1` amortises per-run ONNX
-   overhead; fixed-length watermark inputs reuse the cached plan.
-
-9. **Consider `target-cpu=native` for a single-machine deployment.** The
+8. **Consider `target-cpu=native` for a single-machine deployment.** The
    SIMD kernels (`wide::f32x8`) compile to SSE2 by default; compiling for
    the host CPU lets them use AVX2 or AVX-512 and hardware POPCNT.
    Fingerprints are bit-identical either way (the kernels never use FMA
@@ -2769,7 +2425,7 @@ fn main() {
    Enable it only when the build host and the run host are the same
    microarchitecture.
 
-10. **Batch index mutations.** `insert_many` reserves table capacity once
+9. **Batch index mutations.** `insert_many` reserves table capacity once
     for the whole batch; `remove_many` compacts each posting list once.
     A loop of single `insert`/`remove` pays table growth / full-map scans
     per call — fine for ones and twos, wasteful for ingests and purges.
@@ -2795,13 +2451,11 @@ Default = `[]` (no_std + alloc, no codecs):
 | `std-alac`   | ALAC in MP4/M4A (`symphonia/alac`, `symphonia/isomp4`)                       |
 | `all-codecs` | every codec feature above — the pre-0.4.0 monolithic `std`                    |
 | `rayon`      | parallel batch fingerprinting via `fingerprint_batch_parallel` + parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies std) |
-| `watermark`  | `tract-onnx`; enables `audiofp::watermark` (implies `std`). **Deprecated — removed in 0.5.0**; migrate to `classical-watermark` |
 | `classical-watermark` | keyed classical watermark embed + blind detect (`audiofp::watermark::classical`); FFT + `alloc` only — does not imply `std` |
-| `neural`     | `tract-onnx`; enables `audiofp::neural` (implies `std`)                      |
 | `mimalloc`   | `mimalloc` as process-wide `#[global_allocator]` (implies `std`)             |
 
-`all-codecs` deliberately excludes the heavyweight subsystems (`neural`,
-`watermark`, `rayon`, `mimalloc`) — enable those explicitly.
+`all-codecs` deliberately excludes the optional subsystems (`rayon`,
+`mimalloc`) — enable those explicitly.
 
 ```toml
 # WAV-only decoding (typical embedded-service case):
@@ -2813,10 +2467,7 @@ audiofp = { version = "0.4", features = ["all-codecs"] }
 # Minimal no_std + alloc build (no io at all):
 audiofp = { version = "0.4", default-features = false }
 
-# Watermark only:
-audiofp = { version = "0.4", default-features = false, features = ["watermark"] }
-
-# Keyed classical watermark only (no_std + alloc, no ONNX):
+# Keyed classical watermark only (no_std + alloc):
 audiofp = { version = "0.4", default-features = false, features = ["classical-watermark"] }
 ```
 
@@ -2844,7 +2495,6 @@ fn fingerprint_here(samples: &[f32]) -> audiofp::Result<audiofp::classical::Wang
 | --------------------- | ------------------------------------------------------------------- |
 | `audiofp::dsp` / `classical` / `matching` / `serial` | host-only no_std (rustfft transitively reaches std; your crate itself is `#![no_std]`) |
 | `audiofp::io`         | requires a `std-*` codec feature or `all-codecs`                    |
-| `audiofp::neural` / `watermark` | require `std`                                              |
 | `audiofp::watermark::classical` | `classical-watermark` — FFT + `alloc` only, no `std` requirement |
 
 > **Bare-metal caveat.** `rustfft` (the STFT backend) transitively pulls
@@ -2870,9 +2520,7 @@ fn fingerprint_here(samples: &[f32]) -> audiofp::Result<audiofp::classical::Wang
   and AVX2, and AVX-512), aarch64, and 32-bit ARM; CI re-checks x86_64
   with and without FMA, and aarch64, on every change. This covers the
   classical fingerprinters, the `dsp` primitives, and the `calibrated_*`
-  probabilities; `neural` and `watermark` outputs depend on tract's
-  CPU-specific kernels and are not guaranteed bit-identical across
-  machines.
+  probabilities.
 - **Deterministic matching.** All matchers and indexes break ties by total
   orders (offset, `(t, f)` position, reference id) — never by hash-map
   iteration order. Repeated 1:N queries return the same winner every run.
@@ -2903,8 +2551,6 @@ Runnable starters under `examples/`:
 | `stream_buffer`    | none | `cargo run --example stream_buffer` |
 | `dsp_starter`      | none | `cargo run --example dsp_starter` |
 | `cache_workflow`   | `rayon` | `cargo run --example cache_workflow --features rayon -- /tmp/afp-cache` |
-| `neural_embed`     | `neural` | `cargo run --example neural_embed --features neural -- model.onnx` |
-| `watermark_detect` | `watermark,std-wav` | `cargo run --example watermark_detect --features watermark,std-wav -- model.onnx [audio.wav]` |
 
 ## Links
 

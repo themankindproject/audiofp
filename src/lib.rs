@@ -9,12 +9,10 @@
 //! feature is disabled, but the current FFT dependency chain still
 //! keeps the no_std path host-only today. The file decoder
 //! ([`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html), behind
-//! `std-*` codec features) and the ONNX watermark detector
-//! ([`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html),
-//! feature `watermark`) live behind feature flags and require `std`. The
-//! ONNX AudioSeal detector is **deprecated** and is removed in 0.5.0;
-//! classical watermarking (`classical-watermark`) is the supported
-//! watermark subsystem and does not require `std`.
+//! `std-*` codec features) lives behind feature flags and requires `std`.
+//! Classical keyed watermarking
+//! ([`watermark::classical`](https://docs.rs/audiofp/latest/audiofp/watermark/classical/index.html),
+//! feature `classical-watermark`) does not require `std`.
 //!
 //! # Quick tour
 //!
@@ -34,7 +32,7 @@
 //!   streaming sibling.
 //! - **Matching** — [`matching`] identifies recordings from fingerprints
 //!   in memory (`WangMatcher`, `HaitsmaMatcher`, `PanakoMatcher` with
-//!   tempo-invariant 2-D Hough + RANSAC, optional neural cosine), plus
+//!   tempo-invariant 2-D Hough + RANSAC), plus
 //!   `WangIndex` / `HaitsmaIndex` / `PanakoIndex` 1:N accelerators.
 //! - **DSP primitives** — [`dsp`] exposes STFT, mel filterbank, peak
 //!   picker, resampler, and tapered windows for users building their
@@ -43,18 +41,12 @@
 //! # Panics in streaming APIs
 //!
 //! All `StreamingFingerprinter::push` / `flush` implementations are
-//! fallible and return `Result` — including
-//! [`neural::StreamingNeuralEmbedder::push`], which propagates ONNX
-//! inference errors instead of panicking (use
-//! [`neural::StreamingNeuralEmbedder::try_push`] / `try_push_with`
-//! for the callback-style equivalents). Classical streaming
+//! fallible and return `Result`. Classical streaming
 //! fingerprinters (Wang / Panako / Haitsma) never error on valid
 //! input. Constructors named `new` (e.g. [`ShortTimeFFT::new`]) panic
 //! on invalid configs; each has a `try_new` counterpart returning
 //! `Result`.
 //!
-//! [`neural::StreamingNeuralEmbedder::push`]: https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.push
-//! [`neural::StreamingNeuralEmbedder::try_push`]: https://docs.rs/audiofp/latest/audiofp/neural/struct.StreamingNeuralEmbedder.html#method.try_push
 //! [`ShortTimeFFT::new`]: crate::dsp::stft::ShortTimeFFT::new
 //!
 //! # Example
@@ -101,9 +93,7 @@
 //! | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | | Extended codecs → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html). |
 //! | `all-codecs` |         | Every format/codec above at once → [`io`](https://docs.rs/audiofp/latest/audiofp/io/index.html) (the pre-0.4.0 `std`). |
 //! | `rayon`      |         | Parallel batch fingerprinting via [`fingerprint_batch_parallel`] and parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies `std`). |
-//! | `watermark`  |         | Pulls in [`tract-onnx`](https://docs.rs/tract-onnx) → [`watermark`](https://docs.rs/audiofp/latest/audiofp/watermark/index.html) (implies `std`). **Deprecated** — removed in 0.5.0; migrate to `classical-watermark`. |
 //! | `classical-watermark` | | Keyed classical embed and detect ([`watermark::classical`](https://docs.rs/audiofp/latest/audiofp/watermark/classical/index.html)). Does not imply `std`. |
-//! | `neural`     |         | Generic ONNX log-mel embedder ([`neural`](https://docs.rs/audiofp/latest/audiofp/neural/index.html)); pulls in [`tract-onnx`](https://docs.rs/tract-onnx) (implies `std`). |
 //! | `mimalloc`   |         | Installs `mimalloc::MiMalloc` as the process-wide allocator (implies `std`). |
 //!
 //! [`fingerprint_batch_parallel`]: https://docs.rs/audiofp/latest/audiofp/fn.fingerprint_batch_parallel.html
@@ -123,7 +113,7 @@
 // feature, which is what gates `audiofp::io`. `std` on its
 // own is nonetheless a **valid** configuration: it enables `cache`
 // (plain `std::fs`, no Symphonia) and `IoError`, and simply leaves `io`
-// absent. Features that imply `std` (`neural`, `watermark`, `rayon`,
+// absent. Features that imply `std` (`rayon`,
 // `mimalloc`) behave the same way. `classical-watermark` is FFT + alloc
 // only and does not imply `std`.
 //
@@ -157,13 +147,11 @@ pub mod dsp;
 ))]
 pub mod io;
 pub mod matching;
-#[cfg(feature = "neural")]
-pub mod neural;
 /// Convenience re-exports of the most commonly used types. See
 /// [`prelude`] for details.
 pub mod prelude;
 pub mod serial;
-#[cfg(any(feature = "watermark", feature = "classical-watermark"))]
+#[cfg(feature = "classical-watermark")]
 pub mod watermark;
 
 mod error;
