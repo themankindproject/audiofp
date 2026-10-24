@@ -48,9 +48,19 @@ const FORMAT_VERSION: u8 = 1;
 /// hash_count (4) + fps (4) = 18 bytes.
 const HEADER_SIZE: usize = 8 + 1 + 1 + 4 + 4;
 
-const ALG_WANG: u8 = 0;
-const ALG_PANAKO: u8 = 1;
-const ALG_HAITSMA: u8 = 2;
+pub(crate) const ALG_WANG: u8 = 0;
+pub(crate) const ALG_PANAKO: u8 = 1;
+pub(crate) const ALG_HAITSMA: u8 = 2;
+
+/// The single algorithm table: wire id to `(name, expected sample rate in Hz)`.
+const fn alg_info(alg_id: u8) -> Option<(&'static str, u32)> {
+    match alg_id {
+        ALG_WANG => Some(("wang-v1", 8_000)),
+        ALG_PANAKO => Some(("panako-v2", 8_000)),
+        ALG_HAITSMA => Some(("haitsma-v1", 5_000)),
+        _ => None,
+    }
+}
 
 /// Metadata envelope for a serialized fingerprint.
 ///
@@ -101,34 +111,27 @@ impl FingerprintEnvelope {
     /// unsupported format version, an unknown algorithm id, or a
     /// non-finite / non-positive frame rate.
     pub fn peek(bytes: &[u8]) -> Result<Self> {
-        const fn alg_name(alg_id: u8) -> Option<&'static str> {
-            match alg_id {
-                ALG_WANG => Some("wang-v1"),
-                ALG_PANAKO => Some("panako-v2"),
-                ALG_HAITSMA => Some("haitsma-v1"),
-                _ => None,
-            }
-        }
-        const fn alg_sample_rate(alg_id: u8) -> u32 {
-            match alg_id {
-                ALG_PANAKO => 8_000,
-                ALG_HAITSMA => 5_000,
-                _ => 8_000,
-            }
-        }
-
         // No expected-algorithm check: peek validates the id against the
         // known-algorithm table itself so foreign ids get a precise error.
+        Self::peek_with_id(bytes).map(|(_, env)| env)
+    }
+
+    /// [`peek`](Self::peek), also returning the header's algorithm id so
+    /// callers can dispatch on it without re-matching the name string.
+    pub(crate) fn peek_with_id(bytes: &[u8]) -> Result<(u8, Self)> {
         let (alg_id, hash_count, fps) = read_header(bytes, None)?;
-        let algorithm = alg_name(alg_id)
+        let (algorithm, sample_rate) = alg_info(alg_id)
             .ok_or_else(|| AfpError::Deserialize(format!("unknown algorithm id: {alg_id}")))?;
-        Ok(FingerprintEnvelope {
-            algorithm,
-            crate_version: crate::VERSION,
-            sample_rate: alg_sample_rate(alg_id),
-            frames_per_sec: fps,
-            hash_count: hash_count as usize,
-        })
+        Ok((
+            alg_id,
+            FingerprintEnvelope {
+                algorithm,
+                crate_version: crate::VERSION,
+                sample_rate,
+                frames_per_sec: fps,
+                hash_count: hash_count as usize,
+            },
+        ))
     }
 }
 
@@ -252,13 +255,10 @@ fn read_payload<T: bytemuck::Pod>(bytes: &[u8], alg_id: u8, kind: &str) -> Resul
     Ok((values, fps))
 }
 
-/// Build a metadata envelope from the per-algorithm constants.
-fn envelope(
-    algorithm: &'static str,
-    sample_rate: u32,
-    fps: f32,
-    hash_count: usize,
-) -> FingerprintEnvelope {
+/// Build a metadata envelope for a known algorithm id from the shared table.
+fn envelope(alg_id: u8, fps: f32, hash_count: usize) -> FingerprintEnvelope {
+    let (algorithm, sample_rate) =
+        alg_info(alg_id).expect("envelope() is only called with a known algorithm id");
     FingerprintEnvelope {
         algorithm,
         crate_version: crate::VERSION,
@@ -288,7 +288,7 @@ impl WangFingerprint {
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        envelope("wang-v1", 8_000, self.frames_per_sec, self.hashes.len())
+        envelope(ALG_WANG, self.frames_per_sec, self.hashes.len())
     }
 }
 
@@ -310,7 +310,7 @@ impl PanakoFingerprint {
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        envelope("panako-v2", 8_000, self.frames_per_sec, self.hashes.len())
+        envelope(ALG_PANAKO, self.frames_per_sec, self.hashes.len())
     }
 }
 
@@ -332,7 +332,7 @@ impl HaitsmaFingerprint {
 
     /// Return a metadata envelope describing this fingerprint.
     pub fn envelope(&self) -> FingerprintEnvelope {
-        envelope("haitsma-v1", 5_000, self.frames_per_sec, self.frames.len())
+        envelope(ALG_HAITSMA, self.frames_per_sec, self.frames.len())
     }
 }
 

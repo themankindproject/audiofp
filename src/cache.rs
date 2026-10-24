@@ -36,6 +36,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::classical::{HaitsmaFingerprint, PanakoFingerprint, WangFingerprint};
+use crate::serial::{ALG_HAITSMA, ALG_PANAKO, ALG_WANG};
 use crate::{AfpError, Result};
 
 static ATOMIC_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -92,17 +93,18 @@ impl CachedFingerprint {
     /// `AfpError::Deserialize` if the blob's algorithm id is unknown or the
     /// payload fails validation for its declared algorithm.
     pub fn from_blob(bytes: &[u8]) -> Result<Self> {
-        // peek() validates magic/version/fps and resolves the algorithm.
-        let env = crate::serial::FingerprintEnvelope::peek(bytes)?;
-        match env.algorithm {
-            "wang-v1" => Ok(Self::Wang(WangFingerprint::from_bytes(bytes)?)),
-            "panako-v2" => Ok(Self::Panako(PanakoFingerprint::from_bytes(bytes)?)),
-            "haitsma-v1" => Ok(Self::Haitsma(HaitsmaFingerprint::from_bytes(bytes)?)),
-            // Unreachable today: `peek` validates the algorithm id against
-            // the known table first. Defensive: a future `serial` version
-            // adding an algorithm must not be misparsed here.
+        // One header parse picks the variant by algorithm id; it also
+        // validates magic/version/fps and rejects unknown ids.
+        let (alg_id, _) = crate::serial::FingerprintEnvelope::peek_with_id(bytes)?;
+        match alg_id {
+            ALG_WANG => Ok(Self::Wang(WangFingerprint::from_bytes(bytes)?)),
+            ALG_PANAKO => Ok(Self::Panako(PanakoFingerprint::from_bytes(bytes)?)),
+            ALG_HAITSMA => Ok(Self::Haitsma(HaitsmaFingerprint::from_bytes(bytes)?)),
+            // Unreachable today: `peek_with_id` rejects ids outside the
+            // serial table. Defensive against a future id added there but
+            // not handled here.
             other => Err(AfpError::Deserialize(format!(
-                "unknown algorithm tag: {other}"
+                "unknown algorithm id: {other}"
             ))),
         }
     }
@@ -651,10 +653,6 @@ impl Iterator for CacheDirIter {
             AfpError::Deserialize(msg) => {
                 AfpError::Deserialize(format!("{}: {msg}", path.display()))
             }
-            AfpError::InputTooLarge { limit, provided } => AfpError::Deserialize(format!(
-                "{}: payload exceeds limit (limit {limit}, provided {provided})",
-                path.display()
-            )),
             other => other,
         }) {
             Ok(fp) => fp,

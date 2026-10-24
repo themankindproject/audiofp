@@ -14,7 +14,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
 use crate::dsp::resample::SincResampler;
-use crate::error::IoError;
 use crate::io::riff_preflight::preflight_header_from_file;
 use crate::{AfpError, Result};
 
@@ -218,16 +217,8 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
     path: P,
     limits: DecodeLimits,
 ) -> Result<(Vec<f32>, u32)> {
-    let path = path.as_ref();
-    let (mss, hint, deadline) = open_source(path, &limits)?;
-
-    decode_inner(
-        mss,
-        &hint,
-        limits.max_samples,
-        limits.integrity_mode,
-        deadline,
-    )
+    let (samples, sample_rate, _) = decode_file(path.as_ref(), &limits)?;
+    Ok((samples, sample_rate))
 }
 
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
@@ -538,15 +529,27 @@ fn channel_count_u16(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
-fn decode_inner(
-    mss: MediaSourceStream,
-    hint: &Hint,
-    max_samples: Option<usize>,
-    integrity_mode: bool,
-    deadline: Option<(std::time::Instant, std::time::Duration)>,
-) -> Result<(Vec<f32>, u32)> {
-    decode_inner_report(mss, hint, max_samples, integrity_mode, deadline)
-        .map(|(samples, sr, _)| (samples, sr))
+/// An `Io` error for a decode failure with no underlying OS error, tagged
+/// with the file being decoded.
+fn decode_failure(
+    path: &Path,
+    msg: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> AfpError {
+    AfpError::io_with_path(path, std::io::Error::other(msg))
+}
+
+/// Open `path` and decode it with `limits`. Shared by every public decode
+/// entry point so the open + decode sequence cannot drift.
+fn decode_file(path: &Path, limits: &DecodeLimits) -> Result<(Vec<f32>, u32, DecodeStats)> {
+    let (mss, hint, deadline) = open_source(path, limits)?;
+    decode_inner_report(
+        path,
+        mss,
+        &hint,
+        limits.max_samples,
+        limits.integrity_mode,
+        deadline,
+    )
 }
 
 /// Decode with full observability: same output as
@@ -577,15 +580,7 @@ pub fn decode_to_mono_report<P: AsRef<Path>>(
     path: P,
     limits: DecodeLimits,
 ) -> Result<DecodeReport> {
-    let path = path.as_ref();
-    let (mss, hint, deadline) = open_source(path, &limits)?;
-    let (samples, sample_rate, stats) = decode_inner_report(
-        mss,
-        &hint,
-        limits.max_samples,
-        limits.integrity_mode,
-        deadline,
-    )?;
+    let (samples, sample_rate, stats) = decode_file(path.as_ref(), &limits)?;
     Ok(DecodeReport {
         samples,
         sample_rate,
@@ -594,6 +589,7 @@ pub fn decode_to_mono_report<P: AsRef<Path>>(
 }
 
 fn decode_inner_report(
+    path: &Path,
     mss: MediaSourceStream,
     hint: &Hint,
     max_samples: Option<usize>,
@@ -607,43 +603,32 @@ fn decode_inner_report(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|e| {
-            AfpError::Io(IoError::without_path(std::io::Error::other(format!(
-                "probe: {e}"
-            ))))
-        })?;
+        .map_err(|e| decode_failure(path, format!("probe: {e}")))?;
 
     let track = format
         .default_track(TrackType::Audio)
-        .ok_or_else(|| {
-            AfpError::Io(IoError::without_path(std::io::Error::other(
-                "no audio track",
-            )))
-        })?
+        .ok_or_else(|| decode_failure(path, "no audio track"))?
         .clone();
     let track_id = track.id;
 
     let audio_params = match track.codec_params.as_ref() {
         Some(symphonia::core::codecs::CodecParameters::Audio(params)) => params,
         _ => {
-            return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                "no audio codec params",
-            ))));
+            return Err(decode_failure(path, "no audio codec params"));
         }
     };
 
-    let sample_rate = audio_params.sample_rate.ok_or_else(|| {
-        AfpError::Io(IoError::without_path(std::io::Error::other(
-            "missing sample rate",
-        )))
-    })?;
+    let sample_rate = audio_params
+        .sample_rate
+        .ok_or_else(|| decode_failure(path, "missing sample rate"))?;
     // Reject a zero sample rate: it is never valid audio and would panic
     // the resampler (`SincResampler::new(0, _)`) downstream. Treat it as a
     // malformed container instead of crashing on untrusted input.
     if sample_rate == 0 {
-        return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
+        return Err(decode_failure(
+            path,
             "sample rate is zero (malformed container)",
-        ))));
+        ));
     }
 
     // Reject an absurd declared channel count before building the decoder:
@@ -662,17 +647,9 @@ fn decode_inner_report(
     let codecs = symphonia::default::get_codecs();
     let decoder_factory = codecs
         .get_audio_decoder(audio_params.codec)
-        .ok_or_else(|| {
-            AfpError::Io(IoError::without_path(std::io::Error::other(
-                "unsupported codec",
-            )))
-        })?;
+        .ok_or_else(|| decode_failure(path, "unsupported codec"))?;
     let mut decoder = (decoder_factory.factory)(audio_params, &AudioDecoderOptions::default())
-        .map_err(|e| {
-            AfpError::Io(IoError::without_path(std::io::Error::other(format!(
-                "make decoder: {e}"
-            ))))
-        })?;
+        .map_err(|e| decode_failure(path, format!("make decoder: {e}")))?;
 
     let mut samples: Vec<f32> = Vec::new();
 
@@ -730,9 +707,7 @@ fn decode_inner_report(
                 continue;
             }
             Err(e) => {
-                return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                    format!("next_packet: {e}"),
-                ))));
+                return Err(decode_failure(path, format!("next_packet: {e}")));
             }
         };
         // Skip packets from tracks other than the selected default audio
@@ -756,34 +731,26 @@ fn decode_inner_report(
                 match decoder.decode(&packet) {
                     Ok(d) => d,
                     Err(e) => {
-                        return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                            format!("decode after reset: {e}"),
-                        ))));
+                        return Err(decode_failure(path, format!("decode after reset: {e}")));
                     }
                 }
             }
             Err(SymphoniaError::IoError(e)) => {
                 if integrity_mode {
-                    return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                        format!("decode integrity: {e}"),
-                    ))));
+                    return Err(decode_failure(path, format!("decode integrity: {e}")));
                 }
                 stats.packets_skipped += 1;
                 continue;
             }
             Err(SymphoniaError::DecodeError(e)) => {
                 if integrity_mode {
-                    return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                        format!("decode integrity: {e}"),
-                    ))));
+                    return Err(decode_failure(path, format!("decode integrity: {e}")));
                 }
                 stats.packets_skipped += 1;
                 continue;
             }
             Err(e) => {
-                return Err(AfpError::Io(IoError::without_path(std::io::Error::other(
-                    format!("decode: {e}"),
-                ))));
+                return Err(decode_failure(path, format!("decode: {e}")));
             }
         };
 
@@ -838,19 +805,25 @@ fn decode_inner_report(
 
     if integrity_mode {
         if truncated_eof {
-            return Err(AfpError::Io(IoError::without_path(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated audio stream (unexpected end of container data)",
-            ))));
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated audio stream (unexpected end of container data)",
+                ),
+            ));
         }
         if stats.resets > 0 {
-            return Err(AfpError::Io(IoError::without_path(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "discontinuous container stream ({} resync(s); chained Ogg is not decoded past the first logical stream)",
-                    stats.resets
+            return Err(AfpError::io_with_path(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "discontinuous container stream ({} resync(s); chained Ogg is not decoded past the first logical stream)",
+                        stats.resets
+                    ),
                 ),
-            ))));
+            ));
         }
     }
 

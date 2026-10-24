@@ -193,14 +193,28 @@ fn malformed(msg: impl Into<String>) -> AfpError {
 mod tests {
     use super::*;
 
+    /// Minimal 44-byte WAV header declaring 65535 channels.
+    const WAV_65535_CHANNELS: [u8; 44] = [
+        b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ', 16, 0,
+        0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, b'd', b'a', b't', b'a',
+        0, 0, 0, 0,
+    ];
+
+    /// Process- and time-unique temp path for a fixture file.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "audiofp-{tag}-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ))
+    }
+
     #[test]
     fn rejects_65535_channel_wav_header() {
-        let bytes: [u8; 44] = [
-            b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ',
-            16, 0, 0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, b'd', b'a',
-            b't', b'a', 0, 0, 0, 0,
-        ];
-        let err = validate_riff_wave_bytes(&bytes).unwrap_err();
+        let err = validate_riff_wave_bytes(&WAV_65535_CHANNELS).unwrap_err();
         assert!(
             err.to_string().contains("channels"),
             "expected channel rejection, got {err}"
@@ -242,14 +256,7 @@ mod tests {
     }
 
     fn tempfile_from_bytes(bytes: &[u8]) -> File {
-        let path = std::env::temp_dir().join(format!(
-            "audiofp-riff-preflight-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
+        let path = unique_temp_path("riff-preflight");
         std::fs::write(&path, bytes).unwrap();
         let file = File::open(&path).unwrap();
         // Unlink now so the fixture never outlives the test (unix keeps the
@@ -355,20 +362,8 @@ mod tests {
 
     #[test]
     fn preflight_attaches_path_to_malformed_fmt_errors() {
-        let bytes: [u8; 44] = [
-            b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ',
-            16, 0, 0, 0, 1, 0, 0xFF, 0xFF, 0x40, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, b'd', b'a',
-            b't', b'a', 0, 0, 0, 0,
-        ];
-        let path = std::env::temp_dir().join(format!(
-            "audiofp-riff-path-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        std::fs::write(&path, bytes).unwrap();
+        let path = unique_temp_path("riff-path");
+        std::fs::write(&path, WAV_65535_CHANNELS).unwrap();
         let mut file = File::open(&path).unwrap();
         let err = preflight_header_from_file(&mut file, &path).unwrap_err();
         assert!(
