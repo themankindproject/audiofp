@@ -4,7 +4,7 @@ version      = "0.4.5"
 edition      = "2024"
 rust-version = "1.93.0"
 license      = "MIT"
-description  = "Pure-Rust audio fingerprinting: Wang, Panako, Haitsma–Kalker with streaming, in-memory matching, keyed classical watermarking, ONNX neural embeddings, no_std + alloc, Pod hash types."
+description  = "Pure-Rust classical audio fingerprinting (Wang, Panako, Haitsma–Kalker) and classical keyed watermarking, with streaming, in-memory matching, no_std + alloc, Pod hash types."
 repository   = "https://github.com/themankindproject/audiofp"
 homepage     = "https://github.com/themankindproject/audiofp"
 documentation = "https://docs.rs/audiofp"
@@ -34,8 +34,8 @@ default = []
 # `audiofp::io` absent. It is never a compile error, so enabling `std`
 # through feature unification cannot break a downstream build. It does not
 # pull in Symphonia: each `std-*` codec feature's `symphonia/<codec>` entry
-# enables the dependency, so `std`-only builds (and `rayon`, `neural`,
-# `watermark`, `mimalloc`) skip compiling a decoder they never use.
+# enables the dependency, so `std`-only builds (and `rayon`,
+# `classical-watermark`, `mimalloc`) skip compiling a decoder they never use.
 std = ["dep:ahash", "dep:rustix"]
 std-mp3 = ["std", "symphonia/mp3"]
 std-aac = ["std", "symphonia/aac"]
@@ -58,7 +58,7 @@ std-alac = ["std", "symphonia/alac", "symphonia/isomp4"]
 # pre-0.4.0 monolithic `std` feature.
 #
 # `all-codecs` deliberately covers ONLY the codec features. The optional
-# heavyweight subsystems (`neural`, `watermark`, `rayon`, `mimalloc`)
+# heavyweight subsystems (`rayon`, `mimalloc`)
 # are NOT included: they add large compile times or process-wide side
 # effects that most consumers don't want. Enable them explicitly.
 all-codecs = [
@@ -74,20 +74,8 @@ all-codecs = [
     "std-alac",
 ]
 
-# ONNX-based neural fingerprinter. The user supplies an ONNX model whose
-# input is a `[1, n_mels, n_frames]` log-mel spectrogram and whose first
-# output is a `[1, embedding_dim]` (or `[1, 1, embedding_dim]`) embedding.
-# Requires std (we read the model file and feed PCM at runtime).
-neural = ["std", "dep:tract-onnx"]
-
-# AudioSeal-compatible watermark detector. Requires std.
-#
-# DEPRECATED (since 0.4.5): removed in 0.5.0 together with the `tract-onnx`
-# dependency it pulls in — use `classical-watermark`.
-watermark = ["std", "dep:tract-onnx"]
-
 # Keyed classical embedder and detector (issue #153). FFT + alloc only:
-# does not imply `std` and does not pull in tract-onnx.
+# does not imply `std`.
 classical-watermark = []
 
 # Multi-threaded batch fingerprinting via rayon, plus the
@@ -127,7 +115,6 @@ bytemuck    = { version = "1.25.0", features = ["derive", "extern_crate_alloc"] 
 ahash       = { version = "0.8.11", default-features = false, features = ["compile-time-rng"], optional = true }
 symphonia   = { version = "0.6.1", default-features = false, optional = true }
 rayon       = { version = "1.10", optional = true }
-tract-onnx  = { version = "0.23", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0.8", default-features = false, features = ["fs"], optional = true }
@@ -141,12 +128,6 @@ approx    = "0.5.1"
 hound     = "3.5.1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest  = { version = "1.11", default-features = false, features = ["std"] }
-# Test-only: serialises the ONNX protobuf fixtures built in
-# `src/watermark/test_fixture.rs`. tract-onnx bundles the generated prost
-# types (`tract_onnx::pb`) but does not re-export the `prost` trait, so
-# building a model needs the matching prost version named here. Dev
-# dependencies are not part of the published dependency graph.
-prost     = "0.14"
 # Test-only: turns on rustfft's SIMD backends through feature unification,
 # as any downstream crate that also depends on rustfft does, so
 # `tests/cross_platform_determinism.rs` fails if the STFT ever plans
@@ -158,24 +139,12 @@ name    = "extract"
 harness = false
 
 [[bench]]
-name              = "neural_frontend"
-harness           = false
-required-features = ["neural"]
-
-[[bench]]
 name    = "streaming"
 harness = false
 
 [[bench]]
 name    = "matching"
 harness = false
-
-# Watermark plan-cache bench (audit §4.2 #11). Needs `watermark` for the
-# detector and `std` for the temp-file fixture.
-[[bench]]
-name              = "watermark_plans"
-harness           = false
-required-features = ["watermark", "std"]
 
 [lib]
 name = "audiofp"
@@ -206,14 +175,6 @@ required-features = ["rayon"]
 
 [[example]]
 name = "dsp_starter"
-
-[[example]]
-name = "neural_embed"
-required-features = ["neural"]
-
-[[example]]
-name = "watermark_detect"
-required-features = ["watermark", "std-wav"]
 
 [profile.dev]
 # Slimmer debug artifacts: line tables keep usable backtraces while

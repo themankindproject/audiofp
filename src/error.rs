@@ -48,18 +48,6 @@ pub enum AfpError {
     #[error("unsupported channel count: {0}")]
     UnsupportedChannels(u16),
 
-    /// A model file was expected at the given path but was not found.
-    #[error("model not found at {0}")]
-    ModelNotFound(String),
-
-    /// The model file was found but failed to load (corrupt, wrong format, …).
-    #[error("model load failed: {0}")]
-    ModelLoad(String),
-
-    /// Inference against a loaded model failed at runtime.
-    #[error("inference failed: {0}")]
-    Inference(String),
-
     /// The input exceeds the configured maximum. Raised early in decode
     /// and extract paths to prevent OOM from untrusted audio. The limit
     /// can be raised or disabled entirely via the config struct.
@@ -80,7 +68,7 @@ pub enum AfpError {
     /// A streaming pipeline dropped samples because the consumer fell behind.
     ///
     /// Reserved for bounded real-time capture (e.g. mic ring buffer). Not
-    /// emitted by classical/neural extractors today; see issue tracking the
+    /// emitted by the classical extractors today; see issue tracking the
     /// mic orchestrator.
     #[error("buffer overrun: dropped {dropped} samples")]
     BufferOverrun {
@@ -209,28 +197,6 @@ impl AfpError {
     pub fn io_with_path(path: impl Into<std::path::PathBuf>, source: std::io::Error) -> Self {
         AfpError::Io(IoError::new(path, source))
     }
-}
-
-/// Map a failed filesystem open into the appropriate [`AfpError`] variant.
-///
-/// Used by both the neural embedder and watermark detector when opening
-/// ONNX model files.
-#[cfg(any(feature = "neural", feature = "watermark"))]
-pub(crate) fn map_model_open_io(path: &str, e: std::io::Error) -> AfpError {
-    use alloc::string::ToString;
-    if e.kind() == std::io::ErrorKind::NotFound {
-        AfpError::ModelNotFound(path.to_string())
-    } else {
-        // Keep the path: a permission/IO failure without it is
-        // undiagnosable in a multi-model deployment.
-        AfpError::ModelLoad(alloc::format!("open {path}: {e}"))
-    }
-}
-
-/// Map any `Display`-able model-load error into [`AfpError::ModelLoad`].
-#[cfg(any(feature = "neural", feature = "watermark"))]
-pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
-    AfpError::ModelLoad(alloc::format!("load: {e}"))
 }
 
 /// Shorthand for `core::result::Result<T, AfpError>`.

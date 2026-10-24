@@ -2,7 +2,7 @@
 //! evidence onto one shared probability scale.
 //!
 //! [`MatchResult::score`] lives in incompatible units per algorithm
-//! (landmark contrib ratio, `1 − BER`, cosine), and `prominence` has a
+//! (landmark contrib ratio, `1 − BER`), and `prominence` has a
 //! different formula per matcher — even the two Haitsma paths disagree.
 //! Thresholds therefore do not transfer, and fusing matchers (cascades,
 //! ensembles, similarity-style APIs) needs a common scale. This module provides it: one closed-form logistic map per
@@ -30,13 +30,10 @@
 //! - The maps are *not* clamped and are not a shared floor: a
 //!   [`MatchResult::NONE`] (score 0) maps to a small value whose magnitude
 //!   depends on the algorithm's midpoint and slope — ≈0.012 for Wang,
-//!   ≈0.010 for Panako, but ≈6e-10 for Haitsma and ≈1e-7 for neural.
+//!   ≈0.010 for Panako, but ≈6e-10 for Haitsma.
 //!   Treat the output as a probability, not as a signal that a match
-//!   exists; `is_match` remains the decision. A non-finite `score` (or
-//!   `min_cosine`) propagates as `NaN`.
-//! - The neural map is provisional (no corpus coverage, model-dependent):
-//!   it anchors at the matcher's own `min_cosine` with a conservative
-//!   slope, and its docs say to refit per deployment.
+//!   exists; `is_match` remains the decision. A non-finite `score`
+//!   propagates as `NaN`.
 
 use crate::matching::MatchResult;
 
@@ -66,13 +63,6 @@ pub const PANAKO_V1_SLOPE: f32 = 19.0;
 pub const HAITSMA_V1_MID: f32 = 0.73;
 /// See [`HAITSMA_V1_MID`].
 pub const HAITSMA_V1_SLOPE: f32 = 29.0;
-
-/// Neural calibration slope: deliberately conservative (k=20) — there is
-/// no corpus coverage for embeddings, and cosine scales vary by model.
-/// The midpoint is NOT fixed here: it anchors at the matcher's own
-/// `min_cosine`, so the decision boundary always maps to exactly 0.5.
-/// Refit per deployment; see the recalibration recipe in `ROBUSTNESS.md`.
-pub const NEURAL_SLOPE: f32 = 20.0;
 
 /// Estimated P(same recording | Wang evidence): logistic map of the
 /// contrib-ratio score. Versioned `wang-v1`; see module docs.
@@ -106,16 +96,6 @@ pub fn calibrated_haitsma(r: &MatchResult) -> f32 {
     logistic(HAITSMA_V1_SLOPE * (r.score - HAITSMA_V1_MID))
 }
 
-/// Estimated P(same recording | neural evidence): logistic map of the
-/// cosine score anchored at `min_cosine` (the matcher's own decision
-/// boundary → exactly 0.5). Provisional slope ([`NEURAL_SLOPE`]): no
-/// corpus coverage, model-dependent — refit per deployment.
-#[inline]
-#[must_use]
-pub fn calibrated_neural(r: &MatchResult, min_cosine: f32) -> f32 {
-    logistic(NEURAL_SLOPE * (r.score - min_cosine))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +120,6 @@ mod tests {
                 calibrated_wang(&r),
                 calibrated_panako(&r),
                 calibrated_haitsma(&r),
-                calibrated_neural(&r, 0.8),
             ] {
                 for b in p.to_bits().to_le_bytes() {
                     h ^= u64::from(b);
@@ -149,7 +128,7 @@ mod tests {
             }
         }
         assert_eq!(
-            h, 0x1ccd_8561_823d_5401,
+            h, 0xf524_101b_481d_fb7d,
             "calibrated outputs changed: {h:#018x}"
         );
     }
@@ -199,19 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn neural_anchors_at_min_cosine() {
-        let at_boundary = MatchResult {
-            score: 0.80,
-            ..MatchResult::NONE
-        };
-        assert!((calibrated_neural(&at_boundary, 0.80) - 0.5).abs() < 1e-6);
-        assert!(calibrated_neural(&scored(0.95), 0.80) > 0.9);
-        assert!(calibrated_neural(&scored(0.65), 0.80) < 0.1);
-        // Custom config recenters: boundary is always 0.5.
-        assert!((calibrated_neural(&scored(0.70), 0.70) - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
     fn inherent_methods_delegate_to_free_functions() {
         use crate::matching::{
             HaitsmaIndex, HaitsmaMatchConfig, HaitsmaMatcher, Matcher, PanakoIndex,
@@ -238,19 +204,5 @@ mod tests {
             PanakoIndex::build(&[], 100).calibrated_score(&r),
             calibrated_panako(&r)
         );
-    }
-
-    #[cfg(feature = "neural")]
-    #[test]
-    fn neural_method_anchors_at_own_min_cosine() {
-        use crate::matching::{Matcher, NeuralMatchConfig, NeuralMatcher};
-
-        let cfg = NeuralMatchConfig::default();
-        let matcher = NeuralMatcher::new(cfg.clone());
-        let at_boundary = MatchResult {
-            score: cfg.min_cosine,
-            ..MatchResult::NONE
-        };
-        assert!((matcher.calibrated_score(&at_boundary) - 0.5).abs() < 1e-6);
     }
 }

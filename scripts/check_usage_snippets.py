@@ -5,8 +5,7 @@ Extracts each ```rust fenced block from USAGE.md and README.md, wraps it in
 a scratch crate that depends on the local audiofp checkout, and:
 
   * compiles every block (compile validity), and
-  * executes every block that has no external dependency (files, ONNX
-    models, tokio) as a test, so the snippets' own assertions run.
+  * executes every block that has no external dependency (files, tokio) as a test, so the snippets' own assertions run.
 
 Blocks tagged ```rust,ignore are reference definitions (trait/struct
 shapes mirrored from src/) and are skipped by design.
@@ -17,7 +16,7 @@ Usage:
 
     --keep       keep the scratch crate under target/usage-check for inspection
     --features   comma-separated Cargo features for the audiofp dependency
-                 (default: all-codecs,neural,watermark,classical-watermark,rayon)
+                 (default: all-codecs,classical-watermark,rayon)
     --docs       comma-separated doc basenames to check (default: USAGE.md and
                  README.md)
 
@@ -36,12 +35,11 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ALL_DOC_FILES = (REPO / "USAGE.md", REPO / "README.md")
-DEFAULT_FEATURES = ("all-codecs", "neural", "watermark", "classical-watermark", "rayon")
+DEFAULT_FEATURES = ("all-codecs", "classical-watermark", "rayon")
 
 # Blocks whose code touches files / models / other crates are compile-only.
 SKIP_RUN = (
     "decode_to_mono",
-    ".onnx",
     "tokio",
     "song.",
     "clip.wav",
@@ -56,10 +54,6 @@ SKIP_RUN = (
 
 # Skip entire blocks when the selected feature set does not include a gate.
 FEATURE_GATES: tuple[tuple[str, str], ...] = (
-    ("neural::", "neural"),
-    ("audiofp::neural", "neural"),
-    ("watermark::", "watermark"),
-    ("audiofp::watermark", "watermark"),
     ("watermark::classical", "classical-watermark"),
     ("fingerprint_batch_parallel", "rayon"),
     ("par_match_best", "rayon"),
@@ -94,13 +88,8 @@ def block_needs_features(block: str, enabled: set[str]) -> bool:
     codec_ok = "all-codecs" in enabled or any(
         f.startswith("std-") for f in enabled
     )
-    # `watermark::classical` contains the deprecated module's `watermark::`
-    # needle; strip it first so a classical-only block does not also demand
-    # the ONNX `watermark` feature (and silently drop out once it is gone).
-    generic = block.replace("watermark::classical", "")
     for needle, feature in FEATURE_GATES:
-        haystack = generic if feature == "watermark" else block
-        if needle not in haystack:
+        if needle not in block:
             continue
         if feature.startswith("std-") and codec_ok:
             continue

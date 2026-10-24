@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (breaking, 0.5.0)
+
+The crate now supports only the classical algorithms (Wang, Panako,
+Haitsma) and the keyed classical watermark. The ONNX neural and watermark
+stack is gone (#157).
+
+- Cargo features `neural` and `watermark`.
+- The `tract-onnx` dependency and the `prost` dev-dependency (and with them
+  the transitive `dyn-eq` MPL-2.0 license exception in `deny.toml`).
+- The `audiofp::neural` module: `NeuralEmbedder`, `StreamingNeuralEmbedder`,
+  `LogMelFrontend`, and the neural config and fingerprint types.
+- `audiofp::matching::NeuralMatcher` and its `NeuralMatchConfig` and
+  `Aggregation` types.
+- `audiofp::watermark::detector`: `WatermarkDetector`, `WatermarkConfig`,
+  `WatermarkResult`.
+- `AfpError::ModelNotFound`, `AfpError::ModelLoad`, `AfpError::Inference`.
+- `matching::calibrated_neural` and the `NEURAL_SLOPE` constant.
+- Benches `neural_frontend` and `watermark_plans`, and examples
+  `neural_embed` and `watermark_detect`.
+
+Migration: `watermark` users move to `audiofp::watermark::classical`
+(feature `classical-watermark`), which embeds as well as detects and needs
+no model. There is no replacement for `neural`.
+
 ### Fixed
 
 No hash layout, wire format, frame rate or default threshold changed; the

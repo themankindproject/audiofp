@@ -8,7 +8,7 @@
 ![Crates.io Downloads](https://img.shields.io/crates/d/audiofp)
 ![Rust Version](https://img.shields.io/badge/rust-1.93%2B-blue)
 
-Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, **keyed classical watermarking**, and **AudioSeal-compatible watermark detection**.
+Audio fingerprinting library for Rust with **classical landmark and band-power algorithms**, **in-memory matching**, **streaming extraction**, **file decoding**, and **keyed classical watermarking**.
 
 ## Overview
 
@@ -21,32 +21,28 @@ Audio fingerprinting library for Rust with **classical landmark and band-power a
 | **Haitsma** | Compact dense IDs, fastest extraction | 5 kHz | 78.125 fps | 312 B/s |
 | **Matching** | In-memory ID (`WangMatcher`, `HaitsmaMatcher`, …) | — | — | — |
 | **Streaming** | Real-time hash emission | (per algorithm) | (per algorithm) | Bit-exact offline parity |
-| **Watermark** (deprecated) | AudioSeal detection (BYO ONNX) | 16 kHz | (per model) | Detection + 16-bit message |
-| **Classical watermark** | Keyed embed + blind detect (no model) | 16 kHz | — | Payload + CRC-32 |
+| **Classical watermark** | Keyed embed + blind detect | 16 kHz | — | Payload + CRC-32 |
 
 Perfect for:
 - Music identification ("what is this song?")
 - Audio deduplication at scale
 - Royalty / rights enforcement against re-encoded content
-- Embedding-based similarity search and cover/remix detection (BYO ONNX model via the `neural` feature)
-- Watermark verification on generative-AI audio
+- Keyed watermark embedding and verification
 
 ## Features
 
 - **Three Classical Algorithms** - Wang (landmark pairs) + Panako (triplet hashes with tempo β) + Haitsma–Kalker (32-bit/frame band sign)
-- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC) / `NeuralMatcher` plus `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` accelerators for 1:N identification. No persistence or DB adapters.
+- **In-Memory Matching** - `WangMatcher` / `HaitsmaMatcher` / `PanakoMatcher` (tempo-invariant 2-D Hough + RANSAC) plus `match_best` / `match_ranked` and transient `WangIndex` / `HaitsmaIndex` / `PanakoIndex` accelerators for 1:N identification. No persistence or DB adapters.
 - **Truly Incremental Streaming** - Per-push CPU proportional to new samples, not total stream length. Rolling spectrogram + per-bucket finalisation + per-anchor target accumulator. Bit-exact parity with offline `extract` when you finalise with `flush_complete` (legacy `flush` is retained for byte-identical older streams).
 - **Bit-Exact Determinism** - Same input always produces the same hashes, on every CPU (tested on x86_64 with and without FMA/AVX2/AVX-512, aarch64, and 32-bit ARM); verified down to 1-sample-per-push streaming chunks
 - **`bytemuck::Pod` Hash Types** - Persist hashes directly to mmap'd files or ship over a C ABI without serialization
 - **Audio File Decoding** - MP3, FLAC, WAV, OGG-Vorbis, AAC-in-MP4, raw PCM via Symphonia
 - **High-Quality Resampling** - Built-in windowed-sinc Kaiser resampler with auto anti-aliasing cutoff
-- **Watermark Detection** - AudioSeal-compatible ONNX wrapper (Tract backend); typed model is cached per input length and rebuilt automatically when the length changes. **Deprecated — removed in 0.5.0**; use the classical watermarker instead
-- **Keyed Classical Watermarking** - Embed a payload and recover it blindly in the signal domain (`classical-watermark`; FFT + `alloc` only, no ONNX). Payloads are framed with a CRC-32 and returned only on a match
-- **Neural Embedder** - Generic ONNX log-mel embedder with offline + streaming modes; `try_push_with` reuses a caller-sized embedding scratch buffer (Tract may still allocate per inference window — see `neural::StreamingNeuralEmbedder` docs)
+- **Keyed Classical Watermarking** - Embed a payload and recover it blindly in the signal domain (`classical-watermark`; FFT + `alloc` only). Payloads are framed with a CRC-32 and returned only on a match
 - **DSP Primitives Reusable** - Public `dsp::stft`, `dsp::mel`, `dsp::peaks`, `dsp::resample`, `dsp::windows`
-- **Low-Allocation Hot Path** - Classical streaming `push` reuses pre-allocated scratch after warmup (`ZeroAllocStreaming`; neural/watermark ONNX paths may still allocate per inference window)
+- **Low-Allocation Hot Path** - Classical streaming `push` reuses pre-allocated scratch after warmup (`ZeroAllocStreaming`)
 - **`no_std + alloc` API Shape** - DSP and classical fingerprinters compile without `std` on the host today (FFT dependency chain is not bare-metal ready yet)
-- **Feature-Gated Heavy Deps** - Symphonia and Tract both opt-in via Cargo features
+- **Feature-Gated Heavy Deps** - Symphonia opt-in via Cargo features
 - **Optional `mimalloc`** - Single-flag opt-in to install `mimalloc` as the global allocator
 
 ## Installation
@@ -77,9 +73,7 @@ once (the pre-0.4.0 `std` behavior).
 | `std-aiff` / `std-mkv` / `std-adpcm` / `std-alac` | No | Extended codecs |
 | `all-codecs` | No | Every codec at once — the pre-0.4.0 `std` behavior |
 | `rayon` | No | Parallel batch fingerprinting via `fingerprint_batch_parallel` and parallel 1:N matching via `par_match_best` / `par_match_ranked` (implies `std`) |
-| `watermark` | No | Enables `audiofp::watermark` via Tract ONNX runtime (implies `std`). **Deprecated — removed in 0.5.0**; migrate to `classical-watermark` |
 | `classical-watermark` | No | Keyed classical watermark embed + blind detect (`audiofp::watermark::classical`). FFT + `alloc` only — does not imply `std` |
-| `neural` | No | Enables `audiofp::neural`: generic ONNX log-mel embedder via Tract (BYO model; implies `std`) |
 | `mimalloc` | No | Installs `mimalloc::MiMalloc` as the process-wide `#[global_allocator]` (implies `std`) |
 
 Minimal build (no_std + alloc, DSP and classical only):
@@ -195,8 +189,7 @@ fn main() {
 
 `StreamingWang`, `StreamingPanako`, and `StreamingHaitsma` all carry the
 bound (pinned by a counting-allocator test: zero allocs across 40 pushes
-plus flush after warmup). The neural streamer opts out (`Frame = Vec<f32>`
-allocates by design) — its inherent `try_push_with` is the zero-alloc path.
+plus flush after warmup).
 
 ## Documentation
 
@@ -219,14 +212,6 @@ Streaming push (`cargo bench --bench streaming`, 10 s of synthetic audio):
 | `StreamingWang`     | 10.5 ms                    | 10.6 ms            | 2 256 ms        |
 | `StreamingPanako`   | 11.6 ms                    | 11.4 ms            | 2 784 ms        |
 | `StreamingHaitsma`  |  6.3 ms                    |  6.7 ms            | 409 ms          |
-
-Neural front-end (`cargo bench --features neural --bench neural_frontend`):
-
-| Path                          | Time       |
-|-------------------------------|:----------:|
-| `log_mel_pipeline_1s_window`  | 297 µs     |
-| `strided_tensor_write`        | 7.6 µs     |
-| `l2_normalize_1024d`          | 2.5 µs     |
 
 Matching (`cargo bench --bench matching`, 5 s synthetic fingerprints):
 
@@ -288,7 +273,7 @@ cargo bench --bench extract -- --save-baseline main   # save for diffing later
 | Streaming variants | Yes | Limited | No |
 | Bit-exact streaming/offline parity | Yes | No | N/A |
 | File decoding included | Yes (Symphonia) | Yes (limited) | Yes (FFmpeg) |
-| Watermark detection | Yes (classical; AudioSeal deprecated) | No | No |
+| Watermark detection | Yes (classical) | No | No |
 | `no_std + alloc` capable | Yes (host) | No | N/A |
 | `bytemuck::Pod` hash types | Yes | No | N/A |
 | Built-in resampler | Yes | No | No |
@@ -301,8 +286,7 @@ latency): [BENCHMARKS.md](BENCHMARKS.md).
 
 Fingerprints are **perceptual**, not cryptographic MACs — do not use them as
 auth tokens or integrity proofs. Treat decoded audio as untrusted input and
-cap it with `DecodeLimits` / `decode_to_mono_limited`; treat ONNX model files
-as executable code and load only pinned, reviewed weights.
+cap it with `DecodeLimits` / `decode_to_mono_limited`.
 
 ## Contributing
 
@@ -326,4 +310,3 @@ MIT License — see [LICENSE](LICENSE) for details.
 - Avery Wang, *An Industrial-Strength Audio Search Algorithm* (ISMIR 2003) — Wang landmarks
 - Joren Six & Marc Leman, *Panako: A Scalable Acoustic Fingerprinting System* (ISMIR 2014); 2021 update — triplet β hash
 - Jaap Haitsma & Ton Kalker, *A Highly Robust Audio Fingerprinting System* (ISMIR 2002) — band-power sign bits
-- San Roman, R., Fernandez, P., Elsahar, H., Défossez, A., Furon, T. & Tran, T. *Proactive Detection of Voice Cloning with Localized Watermarking.* arXiv:2401.17264, 2024 (AudioSeal) — watermark model. <https://arxiv.org/abs/2401.17264>
