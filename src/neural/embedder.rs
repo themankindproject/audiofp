@@ -223,6 +223,10 @@ pub(crate) struct EmbedderCore {
     pub(crate) n_frames: usize,
     /// Embedding dimension reported by the model on a probe call.
     pub(crate) embedding_dim: usize,
+    /// Reused `[n_mels, n_frames]` staging buffer for one window's log-mel
+    /// frames; copied into the model input tensor per call, so the
+    /// per-embedding path makes no audiofp-owned allocation.
+    input_scratch: Vec<f32>,
 }
 
 impl EmbedderCore {
@@ -387,6 +391,7 @@ impl EmbedderCore {
             cfg.mel_scale,
         );
         let frontend = LogMelFrontend::new(stft, mel, geometry.window_samples);
+        let input_scratch = vec![0.0_f32; cfg.n_mels * geometry.n_frames];
         Self {
             cfg,
             frontend,
@@ -396,6 +401,7 @@ impl EmbedderCore {
             hop_samples: geometry.hop_samples,
             n_frames: geometry.n_frames,
             embedding_dim,
+            input_scratch,
         }
     }
 
@@ -438,38 +444,32 @@ impl EmbedderCore {
         let n_mels = self.frontend.n_mels();
         let n_frames = self.n_frames;
 
-        // Allocate the model input tensor and write log-mel straight
-        // into its `[1, n_mels, n_frames]` row-major buffer with strided
-        // writes — no intermediate `Vec` and no transpose.
+        // Write log-mel straight into the staging buffer, laid out as the
+        // `[1, n_mels, n_frames]` row-major model input: position (m, f)
+        // lives at `m * n_frames + f`. The buffer is cleared first, so any
+        // cell the front-end does not reach reads as zero, never as stale
+        // data from the previous window.
+        //
+        // The tensor is then built with `Tensor::from_shape`, which copies
+        // the staging buffer. That copy is one memcpy of `n_mels · n_frames`
+        // floats per window, against a model run. (Tract's typed-view APIs
+        // differ between releases: `try_as_plain_mut` is gone from the one a
+        // fresh resolve picks. `from_shape` compiles against both the locked
+        // release and that one.)
         //
         // NOTE: tract's `Tensor::clone()` is a deep copy, not a refcount
         // bump, so caching the tensor and cloning per call would not save
         // the allocation. A genuine zero-alloc path requires a tract API
         // change (`from_raw_vec` or similar); tracked in issue #7.
-        //
-        // Zero-initialised rather than `Tensor::uninitialized`: the fill
-        // is one memset (microseconds against a model run), and it keeps
-        // this path free of `unsafe` — a front-end whose frame count ever
-        // disagreed with `n_frames` would otherwise feed uninitialised
-        // heap memory to the model.
-        let mut tensor = Tensor::zero::<f32>(&[1, n_mels, n_frames])
+        let staging = &mut self.input_scratch;
+        staging.fill(0.0);
+        self.frontend.for_each_frame(window, |f, mel_row| {
+            for m in 0..n_mels {
+                staging[m * n_frames + f] = mel_row[m];
+            }
+        });
+        let tensor = Tensor::from_shape(&[1, n_mels, n_frames], staging)
             .map_err(|e| AfpError::Inference(format!("input alloc: {e}")))?;
-
-        {
-            let mut view = tensor
-                .try_as_plain_mut()
-                .map_err(|e| AfpError::Inference(format!("input view: {e}")))?;
-            let dst = view
-                .as_slice_mut::<f32>()
-                .map_err(|e| AfpError::Inference(format!("input view: {e}")))?;
-            self.frontend.for_each_frame(window, |f, mel_row| {
-                // Strided write: position (m, f) in the `[n_mels, n_frames]`
-                // matrix lives at `m * n_frames + f`.
-                for m in 0..n_mels {
-                    dst[m * n_frames + f] = mel_row[m];
-                }
-            });
-        }
 
         let outputs = self
             .runnable
@@ -538,32 +538,26 @@ impl EmbedderCore {
         let embedding_dim = self.embedding_dim;
         let window_stride = n_mels * n_frames; // elements per batch item
 
-        // Allocate input tensor [batch, n_mels, n_frames], zero-initialised
-        // for the same reason as `embed_window_into`.
-        let mut tensor = Tensor::zero::<f32>(&[batch, n_mels, n_frames])
-            .map_err(|e| AfpError::Inference(format!("batch input alloc: {e}")))?;
-
-        {
-            let mut view = tensor
-                .try_as_plain_mut()
-                .map_err(|e| AfpError::Inference(format!("batch input view: {e}")))?;
-            let dst = view
-                .as_slice_mut::<f32>()
-                .map_err(|e| AfpError::Inference(format!("batch input view: {e}")))?;
-            for (b, window) in windows.iter().enumerate() {
-                assert_eq!(
-                    window.len(),
-                    self.window_samples,
-                    "embed_batch_into: window {b} has wrong length"
-                );
-                let base = b * window_stride;
-                self.frontend.for_each_frame(window, |f, mel_row| {
-                    for m in 0..n_mels {
-                        dst[base + m * n_frames + f] = mel_row[m];
-                    }
-                });
-            }
+        // Stage every window's `[n_mels, n_frames]` block back to back, then
+        // build the `[batch, n_mels, n_frames]` input tensor (see the note in
+        // `embed_window_into` on `from_shape`). Offline batches allocate their
+        // staging buffer per call, as the batch tensor always did.
+        let mut staging = vec![0.0_f32; batch * window_stride];
+        for (b, window) in windows.iter().enumerate() {
+            assert_eq!(
+                window.len(),
+                self.window_samples,
+                "embed_batch_into: window {b} has wrong length"
+            );
+            let base = b * window_stride;
+            self.frontend.for_each_frame(window, |f, mel_row| {
+                for m in 0..n_mels {
+                    staging[base + m * n_frames + f] = mel_row[m];
+                }
+            });
         }
+        let tensor = Tensor::from_shape(&[batch, n_mels, n_frames], &staging)
+            .map_err(|e| AfpError::Inference(format!("batch input alloc: {e}")))?;
 
         let outputs = batch_runnable
             .run(tvec!(tensor.into()))
