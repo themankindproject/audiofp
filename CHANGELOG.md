@@ -173,8 +173,15 @@ unchanged.
 - CI: the golden job runs `regression` and `real_audio_golden` on Linux, macOS
   and Windows (`--skip golden` in the test matrix also skipped the real-audio
   goldens); the `cargo audit` job, which duplicated `cargo deny`'s advisories
-  check, and the matrix's duplicate doc-test step are gone. Two test files now
-  require the `std-wav` feature they use; `degradation` needs only `std-wav`.
+  check, and the matrix's duplicate doc-test step are gone. The separate
+  `matching-real-audio` job is gone too: the all-features test matrix already
+  runs those tests on all three systems. The MSRV job now only compiles the
+  library against the declared `rust-version`. Two test files now require the
+  `std-wav` feature they use; `degradation` needs only `std-wav`.
+- Tests: the real-audio catalog is decoded once per test binary, and three
+  calibration tests that repeated `matching_real_audio`'s assertions word for
+  word are gone. `generate_real_goldens.rs` is gone; regenerate the golden files
+  with `UPDATE_GOLDENS=1 cargo test --features std-ogg --test real_audio_golden`.
 - `neural/embedder.rs` no longer uses `unsafe`: each window's log-mel frames
   are staged in a reused buffer and copied into the model input with
   `Tensor::from_shape`. The crate is now `#![forbid(unsafe_code)]`.
