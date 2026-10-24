@@ -373,7 +373,7 @@ impl SincResampler {
             // at least `half`, so this cannot wrap.
             debug_assert!(i_centre >= half);
             let base = i_centre - half;
-            let acc = super::dot_wide(&input[base..base + taps], kernel);
+            let acc = super::simd::dot_core(&input[base..base + taps], kernel);
             out.push(acc);
         }
 
@@ -386,7 +386,7 @@ impl SincResampler {
 
     /// Single output sample with bounds-checked kernel gather. Shared by
     /// the left/right boundary loops (whose bodies were identical); the
-    /// middle region keeps its own unchecked `dot_wide` fast path.
+    /// middle region keeps its own unchecked `simd::dot_core` fast path.
     fn convolve_bounded(
         &self,
         input: &[f32],

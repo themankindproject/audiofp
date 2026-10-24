@@ -326,7 +326,18 @@ impl ShortTimeFFT {
             out.clear();
             return (0, 0);
         }
+        self.flat_frames(samples, out, crate::dsp::simd::complex_power_into)
+    }
 
+    /// Shared frame loop for the flat spectrogram APIs: window each frame,
+    /// FFT it, and reduce each spectrum into its row of `out` with
+    /// `compute`. `samples` must be non-empty.
+    fn flat_frames(
+        &mut self,
+        samples: &[f32],
+        out: &mut Vec<f32>,
+        compute: fn(&[Complex<f32>], &mut [f32]),
+    ) -> (usize, usize) {
         let n_fft = self.cfg.n_fft;
         let hop = self.cfg.hop;
         let n_frames = self.n_frames(samples.len());
@@ -348,7 +359,7 @@ impl ShortTimeFFT {
                 .process(&mut self.scratch_in, &mut self.scratch_out);
 
             let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            compute_power_wide(&self.scratch_out, row);
+            compute(&self.scratch_out, row);
         }
 
         (n_frames, n_bins)
@@ -411,31 +422,9 @@ impl ShortTimeFFT {
         if samples.is_empty() {
             return (Vec::new(), 0, 0);
         }
-
-        let n_fft = self.cfg.n_fft;
-        let hop = self.cfg.hop;
-        let n_frames = self.n_frames(samples.len());
-        let n_bins = self.n_bins();
-
-        let center_off = if self.cfg.center {
-            (n_fft / 2) as isize
-        } else {
-            0
-        };
-
-        let mut out = vec![0.0_f32; n_frames * n_bins];
-
-        for f in 0..n_frames {
-            let start = (f * hop) as isize - center_off;
-            self.fill_windowed(samples, start);
-
-            self.fft
-                .process(&mut self.scratch_in, &mut self.scratch_out);
-
-            let row = &mut out[f * n_bins..(f + 1) * n_bins];
-            compute_magnitude_wide(&self.scratch_out, row);
-        }
-
+        let mut out = Vec::new();
+        let (n_frames, n_bins) =
+            self.flat_frames(samples, &mut out, crate::dsp::simd::complex_magnitude_into);
         (out, n_frames, n_bins)
     }
 
@@ -466,7 +455,7 @@ impl ShortTimeFFT {
     /// assert!(out.iter().all(|&p| p == 0.0)); // silent input → zero power
     /// ```
     pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
-        self.run_frame(frame, out, compute_power_wide)
+        self.run_frame(frame, out, crate::dsp::simd::complex_power_into)
     }
 
     /// Streaming variant: window one `n_fft`-sized frame and emit its
@@ -477,12 +466,13 @@ impl ShortTimeFFT {
     /// Returns [`AfpError::Config`](crate::AfpError::Config) if
     /// `frame.len() != n_fft` or `out.len() != n_bins`.
     pub fn process_frame(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
-        self.run_frame(frame, out, compute_magnitude_wide)
+        self.run_frame(frame, out, crate::dsp::simd::complex_magnitude_into)
     }
 
     /// Shared single-frame pipeline: validate lengths, apply the window,
     /// run the FFT, then reduce the complex spectrum with `compute`
-    /// ([`compute_power_wide`] or [`compute_magnitude_wide`]).
+    /// ([`simd::complex_power_into`](crate::dsp::simd::complex_power_into) or
+    /// [`simd::complex_magnitude_into`](crate::dsp::simd::complex_magnitude_into)).
     fn run_frame(
         &mut self,
         frame: &[f32],
@@ -504,7 +494,7 @@ impl ShortTimeFFT {
             )));
         }
 
-        apply_window_wide(frame, &self.window, &mut self.scratch_in);
+        crate::dsp::simd::mul_into(frame, &self.window, &mut self.scratch_in);
 
         self.fft
             .process(&mut self.scratch_in, &mut self.scratch_out);
@@ -533,7 +523,7 @@ impl ShortTimeFFT {
             let win = &self.window[..n_fft];
             let dst = &mut self.scratch_in[..n_fft];
 
-            apply_window_wide(src, win, dst);
+            crate::dsp::simd::mul_into(src, win, dst);
             return;
         }
 
@@ -550,34 +540,6 @@ impl ShortTimeFFT {
             self.scratch_in[k] = s * self.window[k];
         }
     }
-}
-
-/// SIMD-accelerated window application: `dst[i] = src[i] * win[i]` using `wide`.
-///
-/// Processes 8 elements at a time via `f32x8` (AVX2/SSE/NEON depending on
-/// target), with a scalar tail for the remainder. Entirely safe code.
-fn apply_window_wide(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    crate::dsp::simd::mul_into(src, win, dst);
-}
-
-/// SIMD-accelerated magnitude computation: `dst[i] = sqrt(re² + im²)` using
-/// `wide`.
-///
-/// Vectorises the sqrt that the scalar path must take through `libm::sqrtf`,
-/// which cannot be auto-vectorised. `f32x8::sqrt` is the hardware IEEE sqrt
-/// (or the same musl-derived software sqrt in `wide`'s no-SIMD fallback), so
-/// results are bit-identical to the scalar loop on every target.
-fn compute_magnitude_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
-    crate::dsp::simd::complex_magnitude_into(complex, dst);
-}
-
-/// SIMD-accelerated power computation: `dst[i] = complex[i].re² + complex[i].im²`
-/// using `wide`.
-///
-/// Processes 8 power values at a time via `f32x8` by separately loading
-/// the real and imaginary parts, then computing `re * re + im * im`.
-fn compute_power_wide(complex: &[Complex<f32>], dst: &mut [f32]) {
-    crate::dsp::simd::complex_power_into(complex, dst);
 }
 
 /// Reflect `i` into `[0, len)` using the convention `numpy.pad(mode="reflect")`

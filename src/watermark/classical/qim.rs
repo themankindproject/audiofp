@@ -123,7 +123,9 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
                     continue;
                 }
                 let db = 20.0 * libm::log10f(mag);
-                let new_mag = libm::powf(10.0, quantize_db(db, target, Q_DB) / 20.0).max(1e-7);
+                let new_mag = libm::powf(10.0, quantize_db(db, target, Q_DB) / 20.0);
+                // Quantising within +-Q_DB/2 of a magnitude >= 1e-6 stays >= 7e-7.
+                debug_assert!(new_mag >= 1e-7);
                 set_herm_mag(&mut buf, bin, new_mag);
             }
         }
@@ -494,13 +496,10 @@ fn quantize_db(db: f32, target: f32, q: f32) -> f32 {
 
 fn set_herm_mag(buf: &mut [Complex<f32>], bin: usize, new_mag: f32) {
     let n = buf.len();
-    if bin == 0 || bin >= n / 2 {
-        return;
-    }
+    // Callers pass bins in BIN_LO..BIN_HI with a magnitude >= 1e-6.
+    debug_assert!(bin != 0 && bin < n / 2);
     let m = modulus(buf[bin]);
-    if m < 1e-8 {
-        return;
-    }
+    debug_assert!(m >= 1e-8);
     buf[bin] *= new_mag / m;
     buf[n - bin] = buf[bin].conj();
 }

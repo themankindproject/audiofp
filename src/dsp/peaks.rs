@@ -287,8 +287,8 @@ impl PeakPicker {
         // `ceil() as usize` saturates for huge/non-finite values and the
         // multiply then overflows (debug panic) or reserves gigabytes
         // (release abort). Bounding the frame term by `n_frames` is safe —
-        // it is only a capacity hint, and no candidate can exceed it.
-        // Capacity hint only — bound by actual spectrogram cell count so
+        // it is only a capacity hint, and no candidate can exceed it. The
+        // hint is also bounded by the actual spectrogram cell count, so
         // absurd `target_per_sec` / `frames_per_sec` cannot reserve gigabytes.
         let cell_count = n_frames.saturating_mul(n_bins);
         let upper = if frames_per_sec.is_finite() && frames_per_sec > 0.0 {
@@ -747,6 +747,13 @@ fn adaptive_per_second(mut peaks: Vec<Peak>, frames_per_sec: f32, target: usize)
 /// `O(n_rows · n_cols)` regardless of `kt` / `kf` — useful for one-shot
 /// offline peak picking where incremental maintenance isn't worth the
 /// state. The scratch buffers let callers reuse allocations across calls.
+///
+/// Nothing in the crate calls this function; [`PeakPicker`] is the
+/// supported peak-picking entry point.
+#[deprecated(
+    since = "0.4.6",
+    note = "unused by the crate; use PeakPicker. Removed in 0.5.0."
+)]
 #[allow(clippy::too_many_arguments)] // public helper, bundling would obscure intent
 pub fn rolling_max_2d_pooled(
     input: &[f32],
@@ -772,21 +779,13 @@ pub fn rolling_max_2d_pooled(
         rolling_max_1d(row_in, kf, row_out, dq);
     }
 
-    // Block-tile column pass to keep `temp` L1-resident. Each column
-    // read strides `n_cols` apart (a separate cache line per row);
-    // processing by TILE-wide blocks ensures recently-touched rows
-    // stay hot across columns in each block.
-    const TILE: usize = 64;
-    for c_block in (0..n_cols).step_by(TILE) {
-        let c_end = (c_block + TILE).min(n_cols);
-        for c in c_block..c_end {
-            for r in 0..n_rows {
-                col_in[r] = temp[r * n_cols + c];
-            }
-            rolling_max_1d(col_in, kt, col_out, dq);
-            for r in 0..n_rows {
-                output[r * n_cols + c] = col_out[r];
-            }
+    for c in 0..n_cols {
+        for r in 0..n_rows {
+            col_in[r] = temp[r * n_cols + c];
+        }
+        rolling_max_1d(col_in, kt, col_out, dq);
+        for r in 0..n_rows {
+            output[r * n_cols + c] = col_out[r];
         }
     }
 }
@@ -831,6 +830,8 @@ fn rolling_max_2d(
 /// `output[i] = max(input[max(0, i-k) ..= min(n-1, i+k)])` for each `i`.
 /// Total work is amortised O(n) — every index is pushed and popped at
 /// most once.
+///
+/// Only used by the deprecated [`rolling_max_2d_pooled`] and tests.
 #[inline]
 fn rolling_max_1d(input: &[f32], k: usize, output: &mut [f32], dq: &mut VecDeque<usize>) {
     // Fast path: Wang/Panako peak pickers always use neighbourhood 15

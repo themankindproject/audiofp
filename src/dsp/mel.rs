@@ -347,7 +347,7 @@ impl MelFilterBank {
     /// `n_bins()` / `n_mels` the filterbank was built with.
     pub fn log_mel(&self, magnitude: &[f32], out: &mut [f32]) {
         // Square magnitude to power inline while accumulating via SIMD.
-        self.log_mel_core(magnitude, out, super::dot_sq_wide);
+        self.log_mel_core(magnitude, out, super::simd::dot_sq_core);
     }
 
     /// Compute one log-mel frame from a **power** spectrum
@@ -366,13 +366,13 @@ impl MelFilterBank {
     /// Panics if `power.len()` or `out.len()` differs from the `n_bins()` /
     /// `n_mels` the filterbank was built with.
     pub fn log_mel_from_power(&self, power: &[f32], out: &mut [f32]) {
-        self.log_mel_core(power, out, super::dot_wide);
+        self.log_mel_core(power, out, super::simd::dot_core);
     }
 
     /// Shared sparse band accumulation: `out[k] = log10(dot(band, spec) +
     /// 1e-10)`. The `dot` param selects the accumulation —
-    /// [`super::dot_sq_wide`] (squares magnitude to power inline) for
-    /// [`log_mel`](Self::log_mel), [`super::dot_wide`] for
+    /// [`super::simd::dot_sq_core`] (squares magnitude to power inline) for
+    /// [`log_mel`](Self::log_mel), [`super::simd::dot_core`] for
     /// [`log_mel_from_power`](Self::log_mel_from_power) where the input
     /// is already power.
     ///

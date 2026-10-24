@@ -5,9 +5,8 @@
 //! place to tune vector width, rounding behaviour, and fallback paths.
 //!
 //! All functions are `#[inline]` and `no_std + alloc` compatible; the
-//! per-callsite wrappers in [`super`] (`dot_wide`, `dot_sq_wide`),
-//! [`super::stft`], [`crate::neural::embedder`], and
-//! [`crate::matching`] keep their names and delegate here.
+//! callers ([`super::stft`], [`super::mel`], [`super::resample`],
+//! [`crate::neural::embedder`], [`crate::matching`]) call them directly.
 //!
 //! # Cross-platform determinism
 //!

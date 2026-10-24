@@ -30,25 +30,3 @@ pub mod windows;
 /// power spectra without a `log10` call (`log2` is cheaper to evaluate
 /// than `log10` on the supported targets).
 pub(crate) const DB_LOG2_FACTOR: f32 = 10.0 / core::f32::consts::LOG2_10;
-
-/// SIMD-accelerated dot product: `sum(a[i] * b[i])` via `wide::f32x8`.
-///
-/// Processes 8 elements at a time (multiply and add rounded separately),
-/// then reduces the lanes in a fixed order, so the result is the same on
-/// every target. Used by the polyphase resampler and mel filterbank hot
-/// paths.
-#[inline]
-pub(crate) fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
-    simd::dot_core(a, b)
-}
-
-/// SIMD-accelerated squared dot product: `sum(a[i] * b[i]²)` via `wide::f32x8`.
-///
-/// Processes 8 elements at a time: squares `b`, multiplies by `a`, and
-/// accumulates, with the same target-independent rounding as
-/// [`dot_wide`]. Used by the mel filterbank `log_mel` hot path to avoid a
-/// separate power-spectrum allocation when starting from magnitudes.
-#[inline]
-pub(crate) fn dot_sq_wide(a: &[f32], b: &[f32]) -> f32 {
-    simd::dot_sq_core(a, b)
-}
