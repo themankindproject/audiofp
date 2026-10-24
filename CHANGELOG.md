@@ -175,9 +175,26 @@ unchanged.
   goldens); the `cargo audit` job, which duplicated `cargo deny`'s advisories
   check, and the matrix's duplicate doc-test step are gone. Two test files now
   require the `std-wav` feature they use; `degradation` needs only `std-wav`.
-- `neural/embedder.rs` no longer uses `unsafe`: model inputs are
-  zero-initialised (one memset per inference). The crate is now
-  `#![forbid(unsafe_code)]`.
+- `neural/embedder.rs` no longer uses `unsafe`: each window's log-mel frames
+  are staged in a reused buffer and copied into the model input with
+  `Tensor::from_shape`. The crate is now `#![forbid(unsafe_code)]`.
+- Decode errors from `io` now name the file: the `Display` text reads
+  `io error at <path>: …`. The `ErrorKind`s are unchanged. An unknown
+  algorithm id in a cache blob now reads `unknown algorithm id` (was
+  `unknown algorithm tag`).
+- Feature tables in `src/lib.rs` and `README.md` now list every feature in
+  `Cargo.toml`, including `std` and the `par_match_*` note under `rayon`.
+- Internal consolidation with no public API change (checked with
+  `cargo-semver-checks`): Wang/Panako streaming and extract plumbing, the
+  neural validated geometry shared with its test fixture, the serial algorithm
+  table, the DSP SIMD wrappers, and the classical and matching test helpers.
+  The Wang and Panako streaming `add_target` closures no longer take the
+  ignored `dt`/`df` arguments (`pub(crate)` only).
+
+### Deprecated
+
+- `dsp::peaks::rolling_max_2d_pooled` is deprecated. The crate does not call
+  it and `PeakPicker` is the supported peak picker. It is removed in 0.5.0.
 
 ### Performance
 
