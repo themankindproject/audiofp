@@ -16,7 +16,7 @@
 //! Sample-rate constants live on the [`SampleRate`] type itself
 //! (e.g. `SampleRate::HZ_8000`) and do not need a separate import.
 //!
-//! Feature-gated types (`io`, `watermark::classical`) are **not** included
+//! Feature-gated types (`io`, `neural`, `watermark`) are **not** included
 //! — import those from their respective modules.
 
 pub use crate::classical::{

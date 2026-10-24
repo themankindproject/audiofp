@@ -292,7 +292,7 @@ jobs:
       - name: detect bakeoff-related changes
         id: changes
         run: |
-          PATTERN='^(bakeoff/|benches/streaming\.rs|BENCHMARKS\.md|\.github/workflows/(bakeoff|ci)\.yml)'
+          PATTERN='^(bakeoff/|benches/(watermark_plans|streaming)\.rs|BENCHMARKS\.md|\.github/workflows/(bakeoff|ci)\.yml)'
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
             HEAD="${{ github.event.pull_request.head.sha }}"

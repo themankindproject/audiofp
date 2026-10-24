@@ -30,8 +30,9 @@ allow = [
 ]
 
 # MPL-2.0 (weak copyleft) is allowed only for the crates below, not
-# globally: the Symphonia family (the `std-*` decoders). A new MPL
-# dependency fails `cargo deny check` until it is listed here on purpose.
+# globally: the Symphonia family (the `std-*` decoders) and `dyn-eq` (pulled
+# in by tract for `neural` / `watermark`). A new MPL dependency fails
+# `cargo deny check` until it is listed here on purpose.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "symphonia" },
     { allow = ["MPL-2.0"], crate = "symphonia-bundle-flac" },
@@ -48,6 +49,7 @@ exceptions = [
     { allow = ["MPL-2.0"], crate = "symphonia-format-ogg" },
     { allow = ["MPL-2.0"], crate = "symphonia-format-riff" },
     { allow = ["MPL-2.0"], crate = "symphonia-metadata" },
+    { allow = ["MPL-2.0"], crate = "dyn-eq" },
 ]
 
 [bans]

@@ -15,6 +15,7 @@
 //! | [`WangMatcher`] | [`WangFingerprint`](crate::classical::WangFingerprint) | Offset-histogram voter (Shazam-style) |
 //! | [`PanakoMatcher`] | [`PanakoFingerprint`](crate::classical::PanakoFingerprint) | 2-D Hough + optional RANSAC (tempo-invariant) |
 //! | [`HaitsmaMatcher`] | [`HaitsmaFingerprint`](crate::classical::HaitsmaFingerprint) | BER sliding + sub-fingerprint LUT |
+//! | [`NeuralMatcher`](https://docs.rs/audiofp/latest/audiofp/matching/struct.NeuralMatcher.html) | [`NeuralFingerprint`](https://docs.rs/audiofp/latest/audiofp/neural/struct.NeuralFingerprint.html) | Cosine similarity (requires the `neural` feature) |
 //!
 //! # Quick example
 //!
@@ -45,8 +46,8 @@ pub use wang::{WangMatchConfig, WangMatcher, WangRefIndex};
 
 mod calibration;
 pub use calibration::{
-    HAITSMA_V1_MID, HAITSMA_V1_SLOPE, PANAKO_V1_MID, PANAKO_V1_SLOPE, WANG_V1_MID, WANG_V1_SLOPE,
-    calibrated_haitsma, calibrated_panako, calibrated_wang,
+    HAITSMA_V1_MID, HAITSMA_V1_SLOPE, NEURAL_SLOPE, PANAKO_V1_MID, PANAKO_V1_SLOPE, WANG_V1_MID,
+    WANG_V1_SLOPE, calibrated_haitsma, calibrated_neural, calibrated_panako, calibrated_wang,
 };
 
 mod panako;
@@ -54,6 +55,11 @@ pub use panako::{PanakoMatchConfig, PanakoMatcher, PanakoRefIndex};
 
 mod haitsma;
 pub use haitsma::{HaitsmaMatchConfig, HaitsmaMatcher};
+
+#[cfg(feature = "neural")]
+mod neural;
+#[cfg(feature = "neural")]
+pub use neural::{Aggregation, NeuralMatchConfig, NeuralMatcher};
 
 mod index;
 pub use index::{HaitsmaIndex, PanakoIndex, WangIndex, match_best, match_ranked};
@@ -145,6 +151,8 @@ pub struct MatchResult {
     /// - **Haitsma**: BER-derived proxy, **not** comparable to Wang/Panako
     ///   prominence. The matcher reports `median_BER / (BER + ε)`; the
     ///   index path reports `0.5 / BER`.
+    /// - **Neural**: relative cosine excess over other lag positions
+    ///   (SlidingMax) or `1.0` (Centroid / DTW).
     ///
     /// Do not threshold prominence with a single constant across matcher
     /// types.
@@ -153,7 +161,7 @@ pub struct MatchResult {
     pub offset: TimeOffset,
     /// Estimated time-scale: `query_duration / reference_duration`.
     ///
-    /// 1.0 for algorithms with no tempo model (Wang, Haitsma).
+    /// 1.0 for algorithms with no tempo model (Wang, Haitsma, neural).
     /// Panako reports the reciprocal of the internal Hough/RANSAC scale
     /// `s = ref_span / query_span` (i.e. `1/s`), clamped to `[0.5, 2.0]`.
     /// Note that [`PanakoMatchConfig::scale_min`] /

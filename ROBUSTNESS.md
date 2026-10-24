@@ -171,6 +171,7 @@ Measured on the same catalog (`audiofp` v0.4.1, maps in this tree):
 | Wang (`mid` 0.20, `k` 22) | σ(22·(score − 0.20)) | 0/136 at all three | 24/24, 24/24, 23/24 |
 | Haitsma (`mid` 0.73, `k` 29) | σ(29·(score − 0.73)) | 0/136 at all three | 24/24, 24/24, 23/24 |
 | Panako (`mid` 0.24, `k` 19) | σ(19·(score − 0.24)) | 0/136 at all three | 24/24, 24/24, 22/24 |
+| Neural | σ(20·(score − min_cosine)) | — (no corpus coverage) | — (no corpus coverage) |
 
 The sub-24/24 cells at the 0.99 cutoff are exact arithmetic, not a
 measurement gap: the weakest positives sit just under 0.99 by
@@ -184,7 +185,10 @@ rather than refitting a week after release.
 
 Caveats, stated plainly: the corpus is small (24 positives), so these
 tables confirm separation, not a fitted ROC — any threshold between the
-gap edges achieves the same perfect split.
+gap edges achieves the same perfect split. The neural map is provisional
+(no embedding corpus; cosine scales vary by model) with a deliberately
+conservative slope; its midpoint anchors at each deployment's own
+`min_cosine` so the decision boundary always maps to exactly 0.5.
 
 Recalibration recipe (custom catalogs — skewed genres, dense remixes):
 

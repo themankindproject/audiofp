@@ -6,7 +6,7 @@
 //!
 //! All functions are `#[inline]` and `no_std + alloc` compatible; the
 //! callers ([`super::stft`], [`super::mel`], [`super::resample`],
-//! [`crate::matching`]) call them directly.
+//! [`crate::neural::embedder`], [`crate::matching`]) call them directly.
 //!
 //! # Cross-platform determinism
 //!
@@ -93,8 +93,8 @@ pub(crate) fn dot_core(a: &[f32], b: &[f32]) -> f32 {
 /// Kept separate from [`dot_core`] (rather than `dot_core(v, v)`) so the
 /// hot loop loads each chunk once instead of twice.
 ///
-/// Currently exercised only by the kernel determinism tests; the allow
-/// keeps non-test builds warning-free.
+/// Used only by the `neural`-gated embedder/matcher; the allow keeps
+/// non-neural builds warning-free while keeping the canonical sumsq here.
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn sumsq_core(v: &[f32]) -> f32 {

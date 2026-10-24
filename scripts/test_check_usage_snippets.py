@@ -138,20 +138,21 @@ class CheckUsageSnippetsTests(unittest.TestCase):
         self.assertEqual(compiled, 1)
         self.assertEqual(ran, 0)
 
-    def test_feature_gating_skips_rayon_blocks(self) -> None:
+    def test_feature_gating_skips_neural_blocks(self) -> None:
         checker = load_checker()
-        blocks = ["fn main() { let _ = audiofp::fingerprint_batch_parallel::<audiofp::Wang, &str>; }"]
+        blocks = ["fn main() { let _ = audiofp::neural::NeuralEmbedderConfig::new(\"x.onnx\"); }"]
         _lib, compiled, ran = checker.build_lib_rs(blocks, {"std-wav", "std-mp3"})
         self.assertEqual(compiled, 0)
         self.assertEqual(ran, 0)
-        _lib, compiled, _ran = checker.build_lib_rs(blocks, {"rayon"})
-        self.assertEqual(compiled, 1)
 
-    def test_classical_watermark_block_needs_classical_watermark(self) -> None:
+    def test_classical_watermark_block_does_not_need_onnx_watermark(self) -> None:
         checker = load_checker()
         block = "use audiofp::watermark::classical::ClassicalConfig;"
         self.assertTrue(checker.block_needs_features(block, {"classical-watermark"}))
-        self.assertFalse(checker.block_needs_features(block, {"rayon"}))
+        self.assertFalse(checker.block_needs_features(block, {"watermark"}))
+        onnx = "use audiofp::watermark::WatermarkDetector;"
+        self.assertFalse(checker.block_needs_features(onnx, {"classical-watermark"}))
+        self.assertTrue(checker.block_needs_features(onnx, {"watermark"}))
 
 
 if __name__ == "__main__":

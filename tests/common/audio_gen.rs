@@ -369,7 +369,7 @@ pub fn resample_48k_to_5k(samples: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Resample 48 kHz to 16 kHz.
+/// Resample 48 kHz to 16 kHz for Neural.
 pub fn resample_48k_to_16k(samples: &[f32]) -> Vec<f32> {
     let ratio = SR48K as f32 / SR16K as f32;
     let out_len = (samples.len() as f32 / ratio) as usize;

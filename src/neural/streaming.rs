@@ -1,0 +1,684 @@
+//! Streaming variant of [`super::NeuralEmbedder`].
+
+use alloc::vec::Vec;
+
+use crate::{Result, StreamingFingerprinter, TimestampMs};
+
+use super::embedder::{EmbedderCore, NeuralEmbedderConfig};
+
+/// Generic ONNX log-mel audio embedder, streaming variant.
+///
+/// Buffers PCM until at least one full analysis window is available,
+/// emits one embedding per [`NeuralEmbedderConfig::hop_secs`], and
+/// drops consumed samples to keep memory bounded — buffer length is
+/// always strictly less than `window_samples + chunk_size`.
+///
+/// Output is bit-exactly equivalent to
+/// [`NeuralEmbedder::extract`](super::NeuralEmbedder) for the same
+/// total input, regardless of how the input is chunked across calls,
+/// with `batch_size == 1` and finite input. (Offline `extract` rejects
+/// NaN/±Inf while streaming zeroes it; a `batch_size > 1` offline run uses
+/// a separately optimised batch plan; and a push cut short by
+/// `max_push_samples` drops samples streaming never sees.)
+/// Both paths share the same `embed_window_into` routine, all scratch
+/// is reset per call, and non-centred framing means no STFT state
+/// crosses window boundaries. Verified end-to-end by the
+/// `streaming_matches_offline_on_full_buffer`,
+/// `streaming_chunk_size_invariant`, and
+/// `overlapping_window_streaming_matches_offline` tests using an
+/// in-process passthrough tract fixture.
+///
+/// # Example
+///
+/// ```no_run
+/// use audiofp::neural::{NeuralEmbedderConfig, StreamingNeuralEmbedder};
+/// use audiofp::StreamingFingerprinter;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut s = StreamingNeuralEmbedder::new(NeuralEmbedderConfig::new("my_model.onnx"))?;
+/// // Feed 16 kHz PCM in arbitrary-sized chunks.
+/// let chunk = vec![0.0_f32; 4_096];
+/// let frames = s.push(&chunk)?;
+/// for (t, vector) in frames {
+///     println!("t={} ms, dim={}", t.0, vector.len());
+/// }
+/// # Ok(()) }
+/// ```
+pub struct StreamingNeuralEmbedder {
+    core: EmbedderCore,
+    /// Linear buffer of unconsumed input samples (compacted with
+    /// `copy_within`, see `carry_read`). Bounded by
+    /// `window_samples - 1 + max push size`.
+    sample_carry: Vec<f32>,
+    /// Read cursor into `sample_carry`: index of the first sample not yet
+    /// consumed by an emitted window. Compacted back to `0` with a single
+    /// `copy_within` at the end of every [`try_push_with`] call, so one
+    /// large push costs `O(N)` total instead of `O(N²/hop)` of
+    /// front-drain memmoves.
+    ///
+    /// [`try_push_with`]: StreamingNeuralEmbedder::try_push_with
+    carry_read: usize,
+    /// Total samples consumed (i.e. drained from `sample_carry`) since
+    /// construction. Drives output timestamps so they match the offline
+    /// embedder.
+    samples_consumed: u64,
+    /// Embedding scratch reused across every emit in every
+    /// [`try_push_with`] call. Allocated **once** at construction with
+    /// capacity = `embedding_dim`, so the streaming hot path performs
+    /// zero allocations per push or per emit (the callback receives a
+    /// borrow of this buffer).
+    ///
+    /// [`try_push_with`]: StreamingNeuralEmbedder::try_push_with
+    embedding_scratch: Vec<f32>,
+}
+
+impl StreamingNeuralEmbedder {
+    /// Build a streaming embedder with the given config.
+    ///
+    /// Performs the same work as [`super::NeuralEmbedder::new`] —
+    /// validation, ONNX load, optimisation, runnable plan construction,
+    /// and a probe inference — and shares the same error contract, except
+    /// that no batched plan is built: streaming always runs one window per
+    /// call, so a `batch_size > 1` plan would only double model memory and
+    /// construction time (and fail on fixed-batch models streaming can
+    /// run). [`config`](Self::config) still reports the `batch_size` given.
+    pub fn new(cfg: NeuralEmbedderConfig) -> Result<Self> {
+        let batch_size = cfg.batch_size;
+        let inner = super::embedder::NeuralEmbedder::new(NeuralEmbedderConfig {
+            batch_size: 1,
+            ..cfg
+        })?;
+        let mut core = inner.core;
+        core.cfg.batch_size = batch_size;
+        let embedding_dim = core.embedding_dim;
+        Ok(Self {
+            core,
+            sample_carry: Vec::new(),
+            carry_read: 0,
+            samples_consumed: 0,
+            embedding_scratch: Vec::with_capacity(embedding_dim),
+        })
+    }
+
+    /// Borrow the configuration this stream was built with.
+    #[must_use]
+    pub fn config(&self) -> &NeuralEmbedderConfig {
+        &self.core.cfg
+    }
+
+    /// Embedding dimension reported by the model.
+    #[must_use]
+    pub fn embedding_dim(&self) -> usize {
+        self.core.embedding_dim()
+    }
+
+    /// Number of samples in one analysis window.
+    #[must_use]
+    pub fn window_samples(&self) -> usize {
+        self.core.window_samples()
+    }
+
+    /// Number of samples between successive analysis windows.
+    #[must_use]
+    pub fn hop_samples(&self) -> usize {
+        self.core.hop_samples()
+    }
+
+    /// Effective embedding rate: `sample_rate / hop_samples`.
+    #[must_use]
+    pub fn effective_frames_per_sec(&self) -> f32 {
+        self.core.effective_frames_per_sec()
+    }
+
+    /// Same contract as [`StreamingFingerprinter::push`] but propagates
+    /// inference errors instead of panicking. Prefer this entry point
+    /// when you need to surface model failures.
+    pub fn try_push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>> {
+        let mut out = Vec::new();
+        self.try_push_with(samples, |t, v| {
+            out.push((t, v.to_vec()));
+        })?;
+        Ok(out)
+    }
+
+    /// Callback streaming variant: feed PCM and invoke
+    /// `callback(t_start, &embedding)` for each embedding that becomes
+    /// available. The embedding slice borrows the embedder's internal
+    /// buffer and is overwritten on the next emit — copy out before
+    /// the next iteration if you need to keep it.
+    ///
+    /// Performs **no audiofp-owned allocations per embedding** for the
+    /// callback scratch vector (allocated once at construction). The ONNX
+    /// runtime still allocates per inference call (input tensor and tract
+    /// `run` internals), so this is **not** a whole-path zero-allocation
+    /// guarantee — see [`ZeroAllocStreaming`](crate::ZeroAllocStreaming). The sample carry
+    /// grows only when a push larger than one analysis window arrives
+    /// (amortised `O(1)` per sample).
+    ///
+    /// **On error**: if inference fails partway through a multi-window
+    /// push, embeddings already passed to the callback have been
+    /// committed (their samples are drained from the carry and
+    /// `samples_consumed` advanced), but timestamps for any subsequent
+    /// `push` will not realign to a hypothetical "fresh start". Call
+    /// [`reset`] before reusing the embedder if you need a clean
+    /// timeline after an error.
+    ///
+    /// [`reset`]: StreamingNeuralEmbedder::reset
+    pub fn try_push_with<F: FnMut(TimestampMs, &[f32])>(
+        &mut self,
+        samples: &[f32],
+        mut callback: F,
+    ) -> Result<usize> {
+        let kept = crate::pcm::truncate_push(samples, self.core.cfg.max_push_samples);
+        let dropped = samples.len() - kept.len();
+        crate::pcm::extend_sanitized(&mut self.sample_carry, kept);
+        let window_samples = self.core.window_samples;
+        let hop_samples = self.core.hop_samples;
+        let sr = self.core.cfg.sample_rate as u64;
+        let mut emitted = 0usize;
+
+        while self.sample_carry.len() - self.carry_read >= window_samples {
+            // Disjoint borrow: `sample_carry` (immutable), `core` (mutable),
+            // and `embedding_scratch` (mutable) are different fields of
+            // `self`, so this is sound under Rust 2024's borrow rules.
+            let embed_result = {
+                let window = &self.sample_carry[self.carry_read..self.carry_read + window_samples];
+                self.core
+                    .embed_window_into(window, &mut self.embedding_scratch)
+            };
+            if let Err(e) = embed_result {
+                // Preserve the "committed samples are drained" contract:
+                // compact past everything the successful iterations took.
+                self.compact_carry();
+                return Err(e);
+            }
+            let t_start = TimestampMs(self.samples_consumed * 1000 / sr);
+            callback(t_start, &self.embedding_scratch);
+            emitted += 1;
+
+            // Advance the cursor past the hop we've now committed to; the
+            // remainder becomes the prefix of the next window. The carry
+            // stays strictly bounded — never larger than
+            // `window_samples + max_push - hop_samples` after compaction.
+            self.carry_read += hop_samples;
+            self.samples_consumed += hop_samples as u64;
+        }
+
+        self.compact_carry();
+
+        if dropped > 0 {
+            // `max_push_samples` cut this push short, so the next push does
+            // not continue where the kept samples ended. Treat the cut like
+            // `flush`: drop the partial window and advance the timeline past
+            // it and the discarded samples. Splicing the next push onto the
+            // carry made one window straddle the gap and left every later
+            // `t_start` early by `dropped`.
+            let partial = self.sample_carry.len() - self.carry_read;
+            self.samples_consumed = self
+                .samples_consumed
+                .saturating_add((partial + dropped) as u64);
+            self.sample_carry.clear();
+            self.carry_read = 0;
+        }
+
+        Ok(emitted)
+    }
+
+    /// Move the unconsumed tail of `sample_carry` to the front and reset
+    /// the read cursor — one `memmove` of the surviving samples instead
+    /// of one front-drain per emitted window.
+    fn compact_carry(&mut self) {
+        if self.carry_read > 0 {
+            let keep = self.sample_carry.len() - self.carry_read;
+            self.sample_carry.copy_within(self.carry_read.., 0);
+            self.sample_carry.truncate(keep);
+            self.carry_read = 0;
+        }
+    }
+
+    /// Discard any unconsumed samples without emitting embeddings.
+    ///
+    /// Useful between independent input streams sharing one embedder
+    /// instance — call before feeding the next stream so leftover
+    /// samples from the previous one don't bleed into the first window.
+    pub fn reset(&mut self) {
+        self.sample_carry.clear();
+        self.carry_read = 0;
+        self.samples_consumed = 0;
+    }
+
+    /// Test-only: number of unconsumed samples currently buffered.
+    /// Exposed so the carry-bounded invariant can be checked directly.
+    #[cfg(test)]
+    pub(crate) fn carry_len(&self) -> usize {
+        self.sample_carry.len()
+    }
+
+    /// Test-only: total samples drained since construction (or last reset).
+    #[cfg(test)]
+    pub(crate) fn samples_consumed(&self) -> u64 {
+        self.samples_consumed
+    }
+
+    /// Test-only: capacity of the embedding scratch buffer. Constant
+    /// across the lifetime of the embedder (set once at construction);
+    /// used to assert that `try_push_with` never reallocates.
+    #[cfg(test)]
+    pub(crate) fn embedding_scratch_capacity(&self) -> usize {
+        self.embedding_scratch.capacity()
+    }
+
+    /// Test-only constructor: wrap a pre-built `EmbedderCore`. Used by
+    /// the in-process passthrough fixture in `test_support`.
+    #[cfg(test)]
+    pub(crate) fn __from_core_for_test(core: EmbedderCore) -> Self {
+        let embedding_dim = core.embedding_dim;
+        Self {
+            core,
+            sample_carry: Vec::new(),
+            carry_read: 0,
+            samples_consumed: 0,
+            embedding_scratch: Vec::with_capacity(embedding_dim),
+        }
+    }
+}
+
+impl StreamingFingerprinter for StreamingNeuralEmbedder {
+    type Frame = Vec<f32>;
+
+    fn required_sample_rate(&self) -> u32 {
+        self.core.cfg.sample_rate
+    }
+
+    /// Feed PCM samples and return any embeddings that became available.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if ONNX inference fails. The previous behaviour
+    /// panicked on inference errors; use the `Result` return to recover.
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
+        self.try_push(samples)
+    }
+
+    fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>> {
+        // Non-centred framing means partial windows can't produce
+        // embeddings — drop them, but keep the timeline continuous: the
+        // dropped samples were still fed to the stream, so advance
+        // `samples_consumed` past them. Otherwise a documented-valid
+        // `push` after this `flush` reports a `t_start` that rewinds to
+        // the start of the dropped tail.
+        let dropped = self.sample_carry.len().saturating_sub(self.carry_read);
+        self.samples_consumed = self.samples_consumed.saturating_add(dropped as u64);
+        self.sample_carry.clear();
+        self.carry_read = 0;
+        Ok(Vec::new())
+    }
+
+    fn latency_ms(&self) -> u32 {
+        // Worst-case latency between a sample entering `push` and the
+        // embedding covering it being returned: the time to fill one
+        // analysis window past that sample, capped at u32.
+        let ms = (self.core.window_samples as u64 * 1000) / self.core.cfg.sample_rate.max(1) as u64;
+        ms.min(u32::MAX as u64) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AfpError;
+    use crate::Fingerprinter;
+    use crate::SampleRate;
+    use crate::neural::test_support::{passthrough_streaming, small_cfg, synth_audio};
+
+    // Error path coverage (no model needed).
+
+    #[test]
+    fn missing_model_propagates_through_streaming_constructor() {
+        let cfg = NeuralEmbedderConfig::new("/definitely/does/not/exist.onnx");
+        match StreamingNeuralEmbedder::new(cfg) {
+            Err(AfpError::ModelNotFound(_)) => {}
+            Err(e) => panic!("expected ModelNotFound, got {e:?}"),
+            Ok(_) => panic!("expected ModelNotFound, got Ok"),
+        }
+    }
+
+    #[test]
+    fn empty_path_propagates_through_streaming_constructor() {
+        let cfg = NeuralEmbedderConfig::new("");
+        match StreamingNeuralEmbedder::new(cfg) {
+            Err(AfpError::ModelNotFound(p)) => assert!(p.is_empty()),
+            Err(e) => panic!("expected ModelNotFound, got {e:?}"),
+            Ok(_) => panic!("expected ModelNotFound, got Ok"),
+        }
+    }
+
+    // Behaviour tests via passthrough fixture.
+
+    fn fixture() -> StreamingNeuralEmbedder {
+        passthrough_streaming(small_cfg()).expect("fixture builds")
+    }
+
+    #[test]
+    fn embedding_dim_matches_passthrough_shape() {
+        let s = fixture();
+        // small_cfg: n_mels=8, n_frames=(4000-256)/128+1=30
+        assert_eq!(s.embedding_dim(), 8 * 30);
+    }
+
+    #[test]
+    fn latency_ms_matches_window_duration() {
+        let s = fixture();
+        // window_secs = 0.25 → 250 ms.
+        assert_eq!(s.latency_ms(), 250);
+    }
+
+    #[test]
+    fn effective_rate_matches_quantized_sample_hop() {
+        let mut cfg = small_cfg();
+        cfg.hop_secs = 0.10003;
+        let rate = cfg.sample_rate;
+        let mut stream = passthrough_streaming(cfg.clone()).unwrap();
+        let hop = stream.hop_samples();
+        assert_eq!(stream.effective_frames_per_sec(), rate as f32 / hop as f32);
+        assert_ne!(stream.effective_frames_per_sec(), 1.0 / cfg.hop_secs);
+        let audio = synth_audio(1, stream.window_samples() + 2 * hop, rate);
+        let output = stream.push(&audio).unwrap();
+        assert_eq!(output.len(), 3);
+        for (i, (timestamp, _)) in output.iter().enumerate() {
+            assert_eq!(timestamp.0, (i * hop * 1000 / rate as usize) as u64);
+        }
+    }
+
+    #[test]
+    fn empty_push_emits_nothing_and_does_not_buffer() {
+        let mut s = fixture();
+        let out = s.push(&[]).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(s.carry_len(), 0);
+    }
+
+    #[test]
+    fn sub_window_push_only_buffers() {
+        let mut s = fixture();
+        let half = s.window_samples() / 2;
+        let chunk = vec![0.0_f32; half];
+        let out = s.push(&chunk).unwrap();
+        assert!(out.is_empty(), "no embedding before window full");
+        assert_eq!(s.carry_len(), half);
+        assert_eq!(s.samples_consumed(), 0);
+    }
+
+    #[test]
+    fn one_full_window_emits_one_embedding() {
+        let mut s = fixture();
+        let chunk = synth_audio(1, s.window_samples(), 16_000);
+        let out = s.push(&chunk).unwrap();
+        assert_eq!(out.len(), 1);
+        let (t, vec) = &out[0];
+        assert_eq!(t.0, 0);
+        assert_eq!(vec.len(), s.embedding_dim());
+        assert_eq!(s.carry_len(), 0); // hop == window in small_cfg → fully drained
+    }
+
+    #[test]
+    fn timestamps_advance_by_hop_secs() {
+        let mut s = fixture();
+        // Push 4 windows worth of audio at once.
+        let n = 4 * s.window_samples();
+        let chunk = synth_audio(2, n, 16_000);
+        let out = s.push(&chunk).unwrap();
+        assert_eq!(out.len(), 4);
+        for (i, (t, _)) in out.iter().enumerate() {
+            // small_cfg hop_secs = 0.25 → 250 ms apart.
+            assert_eq!(t.0, (i as u64) * 250);
+        }
+    }
+
+    #[test]
+    fn carry_is_bounded_under_arbitrarily_large_pushes() {
+        let mut s = fixture();
+        // Push a lot of audio in one shot. Carry must end strictly less
+        // than window_samples after the loop drains complete windows.
+        let n = 100 * s.window_samples() + 17;
+        let chunk = synth_audio(3, n, 16_000);
+        let out = s.push(&chunk).unwrap();
+        assert_eq!(out.len(), 100);
+        assert!(
+            s.carry_len() < s.window_samples(),
+            "carry {} >= window {}",
+            s.carry_len(),
+            s.window_samples(),
+        );
+        // The 17 leftover samples remain in the carry.
+        assert_eq!(s.carry_len(), 17);
+    }
+
+    #[test]
+    fn flush_clears_carry_and_emits_nothing() {
+        let mut s = fixture();
+        let chunk = vec![0.0_f32; s.window_samples() / 2];
+        let _ = s.push(&chunk);
+        assert!(s.carry_len() > 0);
+        let f = s.flush().unwrap();
+        assert!(f.is_empty());
+        assert_eq!(s.carry_len(), 0);
+    }
+
+    #[test]
+    fn reset_clears_carry_and_consumed_count() {
+        let mut s = fixture();
+        let chunk = synth_audio(4, 3 * s.window_samples(), 16_000);
+        let _ = s.push(&chunk);
+        assert!(s.samples_consumed() > 0);
+        s.reset();
+        assert_eq!(s.carry_len(), 0);
+        assert_eq!(s.samples_consumed(), 0);
+    }
+
+    #[test]
+    fn try_push_returns_same_as_push_on_success() {
+        let mut a = fixture();
+        let mut b = fixture();
+        let chunk = synth_audio(5, 2 * a.window_samples(), 16_000);
+
+        let out_push = a.push(&chunk).unwrap();
+        let out_try = b.try_push(&chunk).expect("try_push ok");
+
+        assert_eq!(out_push.len(), out_try.len());
+        for ((t1, v1), (t2, v2)) in out_push.iter().zip(out_try.iter()) {
+            assert_eq!(t1.0, t2.0);
+            assert_eq!(v1, v2);
+        }
+    }
+
+    // Offline / streaming bit-exactness.
+
+    #[test]
+    fn streaming_matches_offline_on_full_buffer() {
+        let cfg = small_cfg();
+        let n = 5 * (cfg.window_secs * cfg.sample_rate as f32) as usize;
+        let audio = synth_audio(7, n, cfg.sample_rate);
+
+        // Offline.
+        let mut off = crate::neural::test_support::passthrough_embedder(cfg.clone()).unwrap();
+        let off_fp = off
+            .extract(&audio, SampleRate::new(cfg.sample_rate).unwrap())
+            .unwrap();
+
+        // Streaming, single big push.
+        let mut s = passthrough_streaming(cfg).unwrap();
+        let s_out = s.push(&audio).unwrap();
+
+        assert_eq!(off_fp.embeddings.len(), s_out.len());
+        for (e, (t, v)) in off_fp.embeddings.iter().zip(s_out.iter()) {
+            assert_eq!(e.t_start.0, t.0);
+            assert_eq!(&e.vector, v);
+        }
+    }
+
+    /// A push cut short by `max_push_samples` is a discontinuity: the next
+    /// push must start a fresh window on the input timeline. It used to be
+    /// spliced onto the leftover carry, so one window straddled the gap and
+    /// every later `t_start` was early by the dropped count.
+    #[test]
+    fn truncated_push_keeps_the_input_timeline() {
+        let mut cfg = small_cfg(); // 4 000-sample window and hop at 16 kHz
+        cfg.max_push_samples = Some(6_000);
+        let audio = synth_audio(5, 14_000, cfg.sample_rate);
+        let mut s = passthrough_streaming(cfg).unwrap();
+        // 10 000 offered, 6 000 kept: one window at 0 ms, 2 000 left over,
+        // 4 000 dropped.
+        let first = s.push(&audio[..10_000]).unwrap();
+        assert_eq!(first.iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [0]);
+        // The next window starts at input sample 10 000 = 625 ms.
+        let second = s.push(&audio[10_000..]).unwrap();
+        assert_eq!(second.iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [625]);
+    }
+
+    #[test]
+    fn streaming_chunk_size_invariant() {
+        // Same audio, fed in many different chunk patterns, must
+        // produce the same embedding sequence.
+        let cfg = small_cfg();
+        let n = 8 * (cfg.window_secs * cfg.sample_rate as f32) as usize + 23;
+        let audio = synth_audio(11, n, cfg.sample_rate);
+
+        let reference = {
+            let mut s = passthrough_streaming(cfg.clone()).unwrap();
+            s.push(&audio).unwrap()
+        };
+
+        for chunk_size in [1, 7, 17, 256, 1024, 8_191] {
+            let mut s = passthrough_streaming(cfg.clone()).unwrap();
+            let mut collected = Vec::new();
+            let mut start = 0;
+            while start < audio.len() {
+                let end = (start + chunk_size).min(audio.len());
+                collected.extend(s.push(&audio[start..end]).unwrap());
+                start = end;
+            }
+            assert_eq!(
+                collected.len(),
+                reference.len(),
+                "chunk_size={chunk_size}: count mismatch",
+            );
+            for ((t1, v1), (t2, v2)) in collected.iter().zip(reference.iter()) {
+                assert_eq!(t1.0, t2.0, "chunk_size={chunk_size}: timestamp drift");
+                assert_eq!(v1, v2, "chunk_size={chunk_size}: embedding drift");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_window_streaming_matches_offline() {
+        // hop_secs < window_secs → overlapping windows. Streaming must
+        // still match offline.
+        let mut cfg = small_cfg();
+        cfg.window_secs = 0.5; // 8000 samples
+        cfg.hop_secs = 0.25; // 4000 samples → 2:1 overlap
+        let n = 4 * (cfg.window_secs * cfg.sample_rate as f32) as usize;
+        let audio = synth_audio(13, n, cfg.sample_rate);
+
+        let mut off = crate::neural::test_support::passthrough_embedder(cfg.clone()).unwrap();
+        let off_fp = off
+            .extract(&audio, SampleRate::new(cfg.sample_rate).unwrap())
+            .unwrap();
+
+        let mut s = passthrough_streaming(cfg).unwrap();
+        let s_out = s.push(&audio).unwrap();
+
+        assert_eq!(off_fp.embeddings.len(), s_out.len());
+        for (e, (t, v)) in off_fp.embeddings.iter().zip(s_out.iter()) {
+            assert_eq!(e.t_start.0, t.0);
+            assert_eq!(&e.vector, v);
+        }
+    }
+
+    #[test]
+    fn l2_normalization_actually_normalises() {
+        let mut cfg = small_cfg();
+        cfg.l2_normalize = true;
+        let mut s = passthrough_streaming(cfg.clone()).unwrap();
+        let chunk = synth_audio(17, s.window_samples(), 16_000);
+        let out = s.push(&chunk).unwrap();
+        let v = &out[0].1;
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "expected L2 norm ~1, got {norm}",);
+    }
+
+    #[test]
+    fn try_push_with_callback_matches_try_push_collected() {
+        let mut a = fixture();
+        let mut b = fixture();
+        let chunk = synth_audio(23, 3 * a.window_samples(), 16_000);
+
+        let collected_via_vec = a.try_push(&chunk).unwrap();
+
+        let mut collected_via_cb: Vec<(TimestampMs, Vec<f32>)> = Vec::new();
+        let n = b
+            .try_push_with(&chunk, |t, v| collected_via_cb.push((t, v.to_vec())))
+            .unwrap();
+
+        assert_eq!(n, collected_via_vec.len());
+        assert_eq!(collected_via_cb.len(), collected_via_vec.len());
+        for ((t1, v1), (t2, v2)) in collected_via_vec.iter().zip(collected_via_cb.iter()) {
+            assert_eq!(t1.0, t2.0);
+            assert_eq!(v1, v2);
+        }
+    }
+
+    #[test]
+    fn no_l2_normalization_preserves_magnitude() {
+        let mut cfg = small_cfg();
+        cfg.l2_normalize = false;
+        let mut s = passthrough_streaming(cfg.clone()).unwrap();
+        let chunk = synth_audio(19, s.window_samples(), 16_000);
+        let out = s.push(&chunk).unwrap();
+        let v = &out[0].1;
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Log-mel of any non-trivial signal has |·| well away from 1.0.
+        assert!(
+            (norm - 1.0).abs() > 0.5,
+            "unexpected near-unit norm without L2: {norm}",
+        );
+    }
+
+    #[test]
+    fn try_push_with_does_not_reallocate_embedding_scratch() {
+        // Pin the zero-allocation contract: the embedding scratch buffer
+        // is sized once at construction (capacity = embedding_dim) and
+        // must never grow — even across many emits in a single push,
+        // and across many pushes.
+        let mut s = fixture();
+        let initial_cap = s.embedding_scratch_capacity();
+        assert_eq!(
+            initial_cap,
+            s.embedding_dim(),
+            "scratch must start sized for one embedding",
+        );
+
+        // Push enough audio to emit ~50 embeddings.
+        let chunk = synth_audio(31, 50 * s.window_samples(), 16_000);
+        let mut emitted = 0usize;
+        s.try_push_with(&chunk, |_, _| emitted += 1).unwrap();
+        assert_eq!(emitted, 50);
+        assert_eq!(
+            s.embedding_scratch_capacity(),
+            initial_cap,
+            "scratch reallocated during a multi-emit push",
+        );
+
+        // Now push again across multiple smaller calls — capacity must
+        // still be unchanged.
+        for _ in 0..10 {
+            let small = synth_audio(43, s.window_samples(), 16_000);
+            s.try_push_with(&small, |_, _| {}).unwrap();
+            assert_eq!(
+                s.embedding_scratch_capacity(),
+                initial_cap,
+                "scratch reallocated across pushes",
+            );
+        }
+    }
+}
