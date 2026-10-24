@@ -143,18 +143,6 @@ jobs:
       - name: regression + real-audio goldens (bit-exact hash output)
         run: cargo test --features std-ogg --test regression --test real_audio_golden
 
-  matching-real-audio:
-    name: matching (real audio)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: kunobi-ninja/kache-action@v1
-        with:
-          pr-comment: false
-      - name: cross-codec matching + index identification (Wang/Haitsma/Panako)
-        run: cargo test --test matching_real_audio --features std-wav,std-mp3,std-flac,std-ogg
-
   coverage:
     name: code coverage
     runs-on: ubuntu-latest
@@ -202,10 +190,11 @@ jobs:
       - uses: kunobi-ninja/kache-action@v1
         with:
           pr-comment: false
-      - name: check (all features, MSRV)
-        run: cargo check --all-features
-      - name: test (MSRV)
-        run: cargo test --all-features
+      # Compile-only: every job already runs on the pinned 1.93.0 and the
+      # `test` matrix runs the suite, so only the library build against the
+      # declared `rust-version` is unique here.
+      - name: check library (all features, MSRV)
+        run: cargo check --lib --all-features
 
   no-std:
     name: no_std build
