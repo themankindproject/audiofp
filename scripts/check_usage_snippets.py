@@ -224,6 +224,12 @@ def main() -> int:
         (scratch / "src").mkdir()
         (scratch / "Cargo.toml").write_text(cargo_toml(features))
         (scratch / "src" / "lib.rs").write_text(lib_rs)
+        # Seed the scratch crate with the repo's lockfile so the snippets
+        # build against the dependency versions CI tests. A fresh resolve
+        # picks the newest semver-compatible releases, which can require a
+        # newer rustc than the pinned toolchain (parking_lot 0.13 needs
+        # 1.95). Cargo keeps the pins and only resolves what is missing.
+        shutil.copyfile(REPO / "Cargo.lock", scratch / "Cargo.lock")
 
         proc = subprocess.run(
             ["cargo", "test", "--quiet"],
