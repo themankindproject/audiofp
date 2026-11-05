@@ -133,6 +133,7 @@ const NO_BAND: u8 = u8::MAX;
 /// # Example
 ///
 /// ```
+/// # fn main() -> audiofp::Result<()> {
 /// use audiofp::{Fingerprinter, SampleRate};
 /// use audiofp::classical::Haitsma;
 ///
@@ -142,12 +143,14 @@ const NO_BAND: u8 = u8::MAX;
 /// // Wrong rate is rejected immediately.
 /// assert!(fp.extract(&samples, SampleRate::HZ_8000).is_err());
 ///
-/// let fpr = fp.extract(&samples, SampleRate::HZ_5000).unwrap();
+/// let fpr = fp.extract(&samples, SampleRate::HZ_5000)?;
 /// assert_eq!(fpr.frames_per_sec, 78.125);
 /// // Silence → all-zero hash frames (no band differences).
 /// for &h in &fpr.frames {
 ///     assert_eq!(h, 0);
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct Haitsma {
     cfg: HaitsmaConfig,
@@ -159,6 +162,14 @@ pub struct Haitsma {
     /// Reused per-frame power spectrum (`n_bins` elements) across `extract`
     /// calls — one STFT frame at a time via [`ShortTimeFFT::process_frame_power`].
     power_buf: Vec<f32>,
+}
+
+impl core::fmt::Debug for Haitsma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Haitsma")
+            .field("config", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Haitsma {
@@ -184,6 +195,12 @@ impl Haitsma {
 
     /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
     /// `fmin`/`fmax`/Nyquist instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Config`](crate::AfpError::Config) when `cfg.fmin` is not
+    /// positive, `cfg.fmax <= cfg.fmin`, `cfg.fmax` is at or above Nyquist,
+    /// or the band layout leaves an FFT bin range empty.
     pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
         let (cfg, stft, band_ranges) = front_end(cfg)?;
         Ok(Self {
@@ -253,6 +270,12 @@ impl Haitsma {
     /// # Errors
     ///
     /// Same as [`Fingerprinter::extract`].
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal STFT scratch buffer is inconsistent with
+    /// the configured FFT size (a bug, not input-dependent), or if
+    /// `progress` itself panics.
     pub fn extract_with_progress<F: FnMut(f32)>(
         &mut self,
         samples: &[f32],
@@ -363,7 +386,11 @@ fn band_energies(power_row: &[f32], band_ranges: &[(usize, usize)]) -> [f32; HAI
 fn pack_frame_bits(curr: &[f32; HAITSMA_N_BANDS], prev: &[f32; HAITSMA_N_BANDS]) -> u32 {
     // SIMD loop assumes 4 chunks × 8 lanes = 32 bits from 33 bands.
     // If HAITSMA_N_BANDS ever changes, this function must be updated.
-    debug_assert_eq!(HAITSMA_N_BANDS, 4 * 8 + 1);
+    debug_assert_eq!(
+        HAITSMA_N_BANDS,
+        4 * 8 + 1,
+        "pack_frame_bits assumes 33 bands (4 SIMD chunks x 8 lanes + 1)"
+    );
 
     let mut hash = 0_u32;
 
@@ -520,6 +547,16 @@ pub struct StreamingHaitsma {
     pending: Vec<(TimestampMs, u32)>,
 }
 
+impl core::fmt::Debug for StreamingHaitsma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamingHaitsma")
+            .field("config", &self.cfg)
+            .field("next_frame_idx", &self.next_frame_idx)
+            .field("pending", &self.pending.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for StreamingHaitsma {
     fn default() -> Self {
         Self::new(HaitsmaConfig::default())
@@ -543,6 +580,12 @@ impl StreamingHaitsma {
 
     /// Fallible constructor — returns [`AfpError::Config`](crate::AfpError::Config) on invalid
     /// `fmin`/`fmax`/Nyquist instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Config`](crate::AfpError::Config) when `cfg.fmin` is not
+    /// positive, `cfg.fmax <= cfg.fmin`, `cfg.fmax` is at or above Nyquist,
+    /// or the band layout leaves an FFT bin range empty.
     pub fn try_new(cfg: HaitsmaConfig) -> crate::Result<Self> {
         let (cfg, stft, band_ranges) = front_end(cfg)?;
         let n_bins = stft.n_bins();

@@ -142,6 +142,17 @@ pub struct PeakPicker {
     bucket_rate: f32,
 }
 
+impl core::fmt::Debug for PeakPicker {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PeakPicker")
+            .field("config", &self.cfg)
+            .field("n_bins", &self.n_bins)
+            .field("rows_pushed", &self.rows_pushed)
+            .field("bucket_id", &self.bucket_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Heap entry ordered **worst first**: lowest magnitude on top, and among
 /// equal magnitudes the *latest* `(t_frame, f_bin)`. This is exactly the
 /// reverse of the order [`adaptive_per_second`] sorts by (magnitude
@@ -997,6 +1008,17 @@ pub struct IncrementalPeakDetector {
     vert: VertMax,
     // NaN-padded horizontal scratch (`n_bins + 2·kf`).
     hpad: Vec<f32>,
+}
+
+impl core::fmt::Debug for IncrementalPeakDetector {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IncrementalPeakDetector")
+            .field("kt", &self.kt)
+            .field("kf", &self.kf)
+            .field("n_bins", &self.n_bins)
+            .field("n_pushed", &self.n_pushed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IncrementalPeakDetector {

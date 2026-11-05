@@ -145,6 +145,16 @@ pub struct SincResampler {
     kernel_table: Vec<f32>,
 }
 
+impl core::fmt::Debug for SincResampler {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SincResampler")
+            .field("from_sr", &self.from_sr)
+            .field("to_sr", &self.to_sr)
+            .field("quality", &self.quality)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SincResampler {
     /// Build a resampler with default quality (`half_taps=32`, `β=8.6`).
     #[must_use]
@@ -371,7 +381,10 @@ impl SincResampler {
 
             // `n_safe_start` was chosen so the f64 product above floors to
             // at least `half`, so this cannot wrap.
-            debug_assert!(i_centre >= half);
+            debug_assert!(
+                i_centre >= half,
+                "safe-start bound violated: i_centre={i_centre}, half={half}"
+            );
             let base = i_centre - half;
             let acc = super::simd::dot_core(&input[base..base + taps], kernel);
             out.push(acc);

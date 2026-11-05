@@ -100,6 +100,14 @@ pub struct PanakoMatcher {
     cfg: PanakoMatchConfig,
 }
 
+impl core::fmt::Debug for PanakoMatcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PanakoMatcher")
+            .field("config", &self.cfg)
+            .finish()
+    }
+}
+
 /// Prebuilt reference index for [`PanakoMatcher::match_one_prebuilt`].
 ///
 /// Holds the stop-hash-filtered inverted map
@@ -115,6 +123,16 @@ pub struct PanakoRefIndex {
     index: HashMap<u32, Vec<(u32, u32, u32)>>,
     frames_per_sec: f32,
     hash_count: usize,
+}
+
+impl core::fmt::Debug for PanakoRefIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PanakoRefIndex")
+            .field("frames_per_sec", &self.frames_per_sec)
+            .field("hash_count", &self.hash_count)
+            .field("unique_hashes", &self.index.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PanakoRefIndex {

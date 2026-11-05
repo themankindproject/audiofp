@@ -168,6 +168,7 @@ const WANG_FREQ_BUCKETS: u32 = 512;
 /// # Example
 ///
 /// ```
+/// # fn main() -> audiofp::Result<()> {
 /// use audiofp::{Fingerprinter, SampleRate};
 /// use audiofp::classical::Wang;
 ///
@@ -175,13 +176,23 @@ const WANG_FREQ_BUCKETS: u32 = 512;
 /// // 3 seconds of silence — produces an empty fingerprint, not an error.
 /// let samples = vec![0.0_f32; 8_000 * 3];
 ///
-/// let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
+/// let fpr = fp.extract(&samples, SampleRate::HZ_8000)?;
 /// assert_eq!(fpr.frames_per_sec, 62.5);
 /// assert!(fpr.hashes.is_empty());
+/// # Ok(())
+/// # }
 /// ```
 pub struct Wang {
     cfg: WangConfig,
     frontend: FrontEnd,
+}
+
+impl core::fmt::Debug for Wang {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Wang")
+            .field("config", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Wang {
@@ -401,19 +412,30 @@ fn quantise_freq(bin: u16) -> u32 {
 /// # Example
 ///
 /// ```
+/// # fn main() -> audiofp::Result<()> {
 /// use audiofp::{SampleRate, StreamingFingerprinter};
 /// use audiofp::classical::StreamingWang;
 ///
 /// let mut s = StreamingWang::default();
 /// // Feed 4 seconds of silence in two chunks; nothing should be emitted.
 /// let zeros = vec![0.0_f32; 8_000 * 2];
-/// assert!(s.push(&zeros).unwrap().is_empty());
-/// assert!(s.push(&zeros).unwrap().is_empty());
-/// assert!(s.flush().unwrap().is_empty());
+/// assert!(s.push(&zeros)?.is_empty());
+/// assert!(s.push(&zeros)?.is_empty());
+/// assert!(s.flush()?.is_empty());
+/// # Ok(())
+/// # }
 /// ```
 pub struct StreamingWang {
     cfg: WangConfig,
     core: stream::StreamCore<WangHash>,
+}
+
+impl core::fmt::Debug for StreamingWang {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamingWang")
+            .field("config", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for StreamingWang {
@@ -533,11 +555,20 @@ impl StreamingWang {
     /// Idempotent with respect to anchor emission: a second call with no
     /// intervening `push` returns nothing. Safe after `push` following an
     /// earlier `flush_complete` (pending anchors/targets are empty).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible for every stream state; the `Result` matches
+    /// the [`StreamingFingerprinter`] contract.
     pub fn flush_complete(&mut self) -> Result<alloc::vec::Vec<(TimestampMs, WangHash)>> {
         Ok(self.run_collect(stream::Step::FlushComplete))
     }
 
     /// Callback variant of [`flush_complete`](Self::flush_complete).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; see [`flush_complete`](Self::flush_complete).
     pub fn flush_complete_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &WangHash),

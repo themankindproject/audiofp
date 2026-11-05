@@ -192,19 +192,30 @@ impl Default for PanakoConfig {
 /// # Example
 ///
 /// ```
+/// # fn main() -> audiofp::Result<()> {
 /// use audiofp::{Fingerprinter, SampleRate};
 /// use audiofp::classical::Panako;
 ///
 /// let mut fp = Panako::default();
 /// let samples = vec![0.0_f32; 8_000 * 3];
 ///
-/// let fpr = fp.extract(&samples, SampleRate::HZ_8000).unwrap();
+/// let fpr = fp.extract(&samples, SampleRate::HZ_8000)?;
 /// assert_eq!(fpr.frames_per_sec, 62.5);
 /// assert!(fpr.hashes.is_empty());
+/// # Ok(())
+/// # }
 /// ```
 pub struct Panako {
     cfg: PanakoConfig,
     frontend: FrontEnd,
+}
+
+impl core::fmt::Debug for Panako {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Panako")
+            .field("config", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Panako {
@@ -317,9 +328,7 @@ impl MinByScoreOwned {
 
 impl PartialEq for MinByScoreOwned {
     fn eq(&self, o: &Self) -> bool {
-        self.score == o.score
-            && (self.b.t_frame, self.b.f_bin) == (o.b.t_frame, o.b.f_bin)
-            && (self.c.t_frame, self.c.f_bin) == (o.c.t_frame, o.c.f_bin)
+        self.cmp(o) == core::cmp::Ordering::Equal
     }
 }
 impl Eq for MinByScoreOwned {}
@@ -331,8 +340,7 @@ impl PartialOrd for MinByScoreOwned {
 impl Ord for MinByScoreOwned {
     fn cmp(&self, o: &Self) -> core::cmp::Ordering {
         o.score
-            .partial_cmp(&self.score)
-            .unwrap_or(core::cmp::Ordering::Equal)
+            .total_cmp(&self.score)
             .then_with(|| (o.b.t_frame, o.b.f_bin).cmp(&(self.b.t_frame, self.b.f_bin)))
             .then_with(|| (o.c.t_frame, o.c.f_bin).cmp(&(self.c.t_frame, self.c.f_bin)))
     }
@@ -510,6 +518,16 @@ pub struct StreamingPanako {
     emit_scratch: Vec<(Peak, Peak, f32)>,
 }
 
+impl core::fmt::Debug for StreamingPanako {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamingPanako")
+            .field("config", &self.cfg)
+            .field("emit_pool_len", &self.emit_heap.len())
+            .field("emit_scratch_len", &self.emit_scratch.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for StreamingPanako {
     fn default() -> Self {
         Self::new(PanakoConfig::default())
@@ -674,11 +692,20 @@ impl StreamingPanako {
     ///
     /// See [`StreamingWang::flush_complete`](super::StreamingWang::flush_complete) for the legacy-vs-corrected
     /// flush contract and when to opt in.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible for every stream state; the `Result` matches
+    /// the [`StreamingFingerprinter`] contract.
     pub fn flush_complete(&mut self) -> Result<Vec<(TimestampMs, PanakoHash)>> {
         Ok(self.run_collect(stream::Step::FlushComplete))
     }
 
     /// Callback variant of [`flush_complete`](Self::flush_complete).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; see [`flush_complete`](Self::flush_complete).
     pub fn flush_complete_with<F>(&mut self, callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &PanakoHash),

@@ -32,7 +32,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut det = WatermarkDetector::new(WatermarkConfig::new("audioseal_v0.2.onnx"))?;
 //! let samples: Vec<f32> = vec![/* … 16 kHz mono PCM … */];
-//! let r = det.detect(&samples, SampleRate::new(16_000).unwrap())?;
+//! let r = det.detect(&samples, SampleRate::HZ_16000)?;
 //!
 //! if r.detected {
 //!     println!(
@@ -49,7 +49,10 @@
 // This module *is* the deprecated surface: its implementation, its tests, and
 // the fixture helpers necessarily use the deprecated types. Downstream users
 // still get the deprecation warnings.
-#![allow(deprecated)]
+#![expect(
+    deprecated,
+    reason = "this module is the deprecated ONNX detector surface"
+)]
 
 use crate::SampleRate;
 use alloc::format;
@@ -202,6 +205,15 @@ pub struct WatermarkDetector {
     plans: Vec<(usize, Runnable)>,
 }
 
+impl core::fmt::Debug for WatermarkDetector {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WatermarkDetector")
+            .field("config", &self.cfg)
+            .field("cached_plans", &self.plans.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl WatermarkDetector {
     /// Validate `cfg` and load the ONNX file at `cfg.model_path`.
     ///
@@ -275,6 +287,12 @@ impl WatermarkDetector {
     /// - [`AfpError::Inference`] — Tract failed at any of: shape inference,
     ///   typing, building the runnable plan, running inference, or extracting
     ///   the output tensors. The variant payload identifies which step.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal invariant is violated: the plan cache is
+    /// empty after insertion, or the output tensor count check is
+    /// inconsistent with indexing. Neither is input-dependent.
     pub fn detect(&mut self, samples: &[f32], rate: SampleRate) -> Result<WatermarkResult> {
         if rate.hz() != self.cfg.sample_rate {
             return Err(AfpError::UnsupportedSampleRate(rate.hz()));
@@ -390,6 +408,12 @@ impl WatermarkDetector {
     ///
     /// Message decoding retains the raw model contract; this method does not
     /// validate message logits. The legacy detection method is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`detect`](Self::detect) returns, plus
+    /// [`AfpError::Inference`] when a detection or localization score is
+    /// non-finite.
     pub fn detect_validated(
         &mut self,
         samples: &[f32],
@@ -416,6 +440,10 @@ impl WatermarkDetector {
     }
 
     /// Alias for [`detect_validated`](Self::detect_validated).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`detect_validated`](Self::detect_validated).
     pub fn detect_checked(&mut self, samples: &[f32], rate: SampleRate) -> Result<WatermarkResult> {
         self.detect_validated(samples, rate)
     }

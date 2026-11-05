@@ -84,6 +84,16 @@ pub struct WangRefIndex {
     frames_per_sec: f32,
 }
 
+impl core::fmt::Debug for WangRefIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WangRefIndex")
+            .field("frames_per_sec", &self.frames_per_sec)
+            .field("r_max", &self.r_max)
+            .field("postings", &self.postings.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl WangRefIndex {
     /// Build the index for `reference` using the stop-hash policy from
     /// `cfg` (`max_postings_per_hash`). Returns `None` when the reference
@@ -113,6 +123,14 @@ impl WangRefIndex {
 /// Offline 1:1 Wang matcher (Shazam-style offset-histogram voter).
 pub struct WangMatcher {
     cfg: WangMatchConfig,
+}
+
+impl core::fmt::Debug for WangMatcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WangMatcher")
+            .field("config", &self.cfg)
+            .finish()
+    }
 }
 
 impl Matcher for WangMatcher {

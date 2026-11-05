@@ -611,6 +611,15 @@ pub struct NeuralEmbedder {
     pub(crate) core: EmbedderCore,
 }
 
+impl core::fmt::Debug for NeuralEmbedder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NeuralEmbedder")
+            .field("embedding_dim", &self.core.embedding_dim)
+            .field("sample_rate", &self.core.cfg.sample_rate)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NeuralEmbedder {
     /// Validate `cfg`, load + optimise the ONNX model, and run a probe
     /// inference to determine the embedding dimension.
@@ -755,6 +764,12 @@ impl NeuralEmbedder {
     /// Extract embeddings with frame-rate metadata derived from the actual
     /// quantised sample hop. Embedding vectors and timestamps are unchanged.
     /// The trait's `extract` retains its historical nominal-rate metadata.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fingerprinter::extract`]:
+    /// input validation errors plus [`AfpError::Inference`] when the ONNX
+    /// runtime fails.
     pub fn extract_with_effective_rate(
         &mut self,
         samples: &[f32],

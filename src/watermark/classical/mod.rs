@@ -199,11 +199,13 @@ impl ClassicalConfig {
     }
 
     /// Algorithm this config will embed.
+    #[must_use]
     pub const fn algorithm(self) -> Algorithm {
         self.algorithm
     }
 
     /// Payload length in bytes, not counting the CRC-32 trailer.
+    #[must_use]
     pub const fn payload_len(self) -> usize {
         self.payload_len
     }
@@ -229,6 +231,7 @@ impl ClassicalConfig {
     ///
     /// The count is meaningful for configurations that pass `try_new`; it
     /// saturates rather than overflowing for absurd payload lengths.
+    #[must_use]
     pub const fn min_samples(self) -> usize {
         let n_bits = self
             .payload_len
@@ -302,7 +305,11 @@ impl ClassicalEmbedder {
     pub fn embed(&self, samples: &[f32], rate: SampleRate) -> Result<Vec<f32>> {
         let n_bits = check_audio(&self.config, samples, rate)?;
         let bits = coding::frame(&self.payload);
-        debug_assert_eq!(bits.len(), n_bits);
+        debug_assert_eq!(
+            bits.len(),
+            n_bits,
+            "framing must produce one bit per STFT frame"
+        );
         let marked = match self.config.algorithm {
             Algorithm::QimBlock => qim::embed(samples, &bits, &self.key),
             Algorithm::LogHost => log_host::embed(samples, &bits, &self.key),

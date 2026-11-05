@@ -46,7 +46,10 @@ pub(crate) struct RealFft {
 
 impl RealFft {
     pub(crate) fn new(len: usize) -> Self {
-        debug_assert!(len.is_power_of_two());
+        debug_assert!(
+            len.is_power_of_two(),
+            "FFT length must be a power of two, got {len}"
+        );
         if len == 1 {
             return Self {
                 len,
@@ -79,8 +82,12 @@ impl RealFft {
     /// Transform `input` (`len` samples; used as scratch) into `output`
     /// (`len / 2 + 1` bins, DC and Nyquist purely real).
     pub(crate) fn process(&mut self, input: &mut [f32], output: &mut [Complex<f32>]) {
-        debug_assert_eq!(input.len(), self.len);
-        debug_assert_eq!(output.len(), self.len / 2 + 1);
+        debug_assert_eq!(input.len(), self.len, "input must have self.len() samples");
+        debug_assert_eq!(
+            output.len(),
+            self.len / 2 + 1,
+            "output must hold self.len() / 2 + 1 bins"
+        );
         let Some(fft) = &self.fft else {
             output[0] = Complex::new(input[0], 0.0);
             return;
@@ -205,6 +212,15 @@ pub struct ShortTimeFFT {
     window: Vec<f32>,
     scratch_in: Vec<f32>,
     scratch_out: Vec<Complex<f32>>,
+}
+
+impl core::fmt::Debug for ShortTimeFFT {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShortTimeFFT")
+            .field("config", &self.cfg)
+            .field("n_bins", &(self.cfg.n_fft / 2 + 1))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShortTimeFFT {
@@ -446,13 +462,16 @@ impl ShortTimeFFT {
     /// # Example
     ///
     /// ```
+    /// # fn main() -> audiofp::Result<()> {
     /// use audiofp::dsp::stft::{ShortTimeFFT, StftConfig};
     ///
     /// let mut stft = ShortTimeFFT::new(StftConfig::new(256));
     /// let frame = vec![0.0_f32; 256];
     /// let mut out = vec![0.0_f32; 129]; // n_fft/2 + 1
-    /// stft.process_frame_power(&frame, &mut out).unwrap();
+    /// stft.process_frame_power(&frame, &mut out)?;
     /// assert!(out.iter().all(|&p| p == 0.0)); // silent input → zero power
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn process_frame_power(&mut self, frame: &[f32], out: &mut [f32]) -> crate::Result<()> {
         self.run_frame(frame, out, crate::dsp::simd::complex_power_into)

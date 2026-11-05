@@ -44,9 +44,12 @@ use crate::{AfpError, Result, SampleRate, TimestampMs};
 ///     }
 /// }
 ///
+/// # fn main() -> Result<()> {
 /// let mut fp = Energy;
 /// let samples = vec![0.0_f32; 16_000];
-/// assert_eq!(fp.extract(&samples, SampleRate::HZ_16000).unwrap(), 0.0);
+/// assert_eq!(fp.extract(&samples, SampleRate::HZ_16000)?, 0.0);
+/// # Ok(())
+/// # }
 /// ```
 #[must_use]
 pub trait Fingerprinter {
@@ -83,6 +86,15 @@ pub trait Fingerprinter {
 
     /// Compute the fingerprint of `samples` (mono PCM in `[-1.0, 1.0]`)
     /// captured at `rate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AfpError::AudioTooShort`] when `samples.len()` is below
+    /// [`min_samples`](Self::min_samples), [`AfpError::UnsupportedSampleRate`]
+    /// when `rate` is not [`required_sample_rate`](Self::required_sample_rate),
+    /// and [`AfpError::NonFiniteSample`] when the input contains NaN or ±Inf.
+    /// Implementations may also return [`AfpError::InputTooLarge`] when a
+    /// configured cap is exceeded.
     fn extract(&mut self, samples: &[f32], rate: SampleRate) -> Result<Self::Output>;
 }
 
@@ -117,8 +129,11 @@ pub trait Fingerprinter {
 ///     fn latency_ms(&self) -> u32 { 0 }
 /// }
 ///
+/// # fn main() -> audiofp::Result<()> {
 /// let mut fp = EveryThird { count: 0 };
-/// assert_eq!(fp.push(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().len(), 2);
+/// assert_eq!(fp.push(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0])?.len(), 2);
+/// # Ok(())
+/// # }
 /// ```
 #[must_use]
 pub trait StreamingFingerprinter {
@@ -150,6 +165,14 @@ pub trait StreamingFingerprinter {
     /// - **Empty slice** (`&[]`): returns `Ok(vec![])` immediately (no-op).
     /// - **Partial frames**: internally buffered until enough samples
     ///   accumulate for the next STFT frame.
+    ///
+    /// # Errors
+    ///
+    /// Classical implementations never fail on valid input; the neural
+    /// embedder returns [`AfpError::Inference`] when the ONNX model fails.
+    /// A configured `max_push_samples` cap truncates the chunk rather than
+    /// failing. Non-finite samples are sanitized to `0.0`; use
+    /// [`push_strict`](Self::push_strict) to reject them.
     fn push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Drain any pending fingerprint material at end-of-stream.
@@ -162,6 +185,11 @@ pub trait StreamingFingerprinter {
     ///   is valid and appends to the stream — the fingerprinter does not
     ///   enter a "finished" state. Call `reset()` on the concrete type
     ///   to start a fresh stream.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`push`](Self::push): classical implementations never fail;
+    /// the neural embedder may return [`AfpError::Inference`].
     fn flush(&mut self) -> Result<Vec<(TimestampMs, Self::Frame)>>;
 
     /// Conservative upper bound on emission latency: from the time a
@@ -184,6 +212,10 @@ pub trait StreamingFingerprinter {
     /// genuine zero-allocation hot path must override this method.
     ///
     /// [`push`]: StreamingFingerprinter::push
+    ///
+    /// # Errors
+    ///
+    /// Same as [`push`](Self::push).
     fn push_with<F>(&mut self, samples: &[f32], mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
@@ -208,6 +240,10 @@ pub trait StreamingFingerprinter {
     /// path must override this method.
     ///
     /// [`flush`]: StreamingFingerprinter::flush
+    ///
+    /// # Errors
+    ///
+    /// Same as [`flush`](Self::flush).
     fn flush_with<F>(&mut self, mut callback: F) -> Result<usize>
     where
         F: FnMut(TimestampMs, &Self::Frame),
@@ -235,6 +271,11 @@ pub trait StreamingFingerprinter {
     /// The pre-scan is one branchy pass that predicts perfectly on clean
     /// audio; the hot path (`push` itself) is untouched. Existing and
     /// future impls get it free — no override needed.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::NonFiniteSample`] when any sample is NaN or ±Inf, plus
+    /// every error [`push`](Self::push) can return.
     fn push_strict(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Self::Frame)>> {
         if let Some(index) = samples.iter().position(|s| !s.is_finite()) {
             return Err(AfpError::NonFiniteSample { index });
@@ -272,7 +313,7 @@ pub trait StreamingFingerprinter {
 ///         // Guaranteed allocation-free after warmup — safe on the audio
 ///         // thread. A plain `StreamingFingerprinter` bound cannot promise
 ///         // this (the defaults allocate per call).
-///         s.push_with(c, |_, _| {}).unwrap();
+///         s.push_with(c, |_, _| {}).expect("streaming push failed");
 ///     }
 /// }
 /// ```
@@ -322,9 +363,13 @@ pub trait ZeroAllocStreaming: StreamingFingerprinter {}
 /// let results = fingerprint_batch_parallel(items, || Sum);
 /// assert_eq!(results.len(), 2);
 /// assert_eq!(results[0].0, "a");
-/// assert!((results[0].1.as_ref().unwrap() - 6.0).abs() < 1e-6);
+/// assert!(
+///     (results[0].1.as_ref().expect("batch item must succeed") - 6.0).abs() < 1e-6
+/// );
 /// assert_eq!(results[1].0, "b");
-/// assert!((results[1].1.as_ref().unwrap() - 15.0).abs() < 1e-6);
+/// assert!(
+///     (results[1].1.as_ref().expect("batch item must succeed") - 15.0).abs() < 1e-6
+/// );
 /// ```
 #[cfg(feature = "rayon")]
 #[must_use]

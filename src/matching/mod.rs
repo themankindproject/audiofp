@@ -20,6 +20,7 @@
 //! # Quick example
 //!
 //! ```
+//! # fn main() -> audiofp::Result<()> {
 //! extern crate alloc;
 //! use audiofp::classical::{Wang, WangFingerprint};
 //! use audiofp::matching::{WangMatcher, WangMatchConfig, Matcher, MatchResult};
@@ -27,7 +28,7 @@
 //!
 //! let samples: alloc::vec::Vec<f32> = alloc::vec![0.0_f32; 8_000 * 4];
 //! let mut wang = Wang::default();
-//! let q = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
+//! let q = wang.extract(&samples, SampleRate::HZ_8000)?;
 //! let r = q.clone();
 //!
 //! let matcher = WangMatcher::new(WangMatchConfig::default());
@@ -35,6 +36,8 @@
 //! if m.is_match {
 //!     println!("same recording (score {:.2}, offset {} ms)", m.score, m.offset.ms);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 extern crate alloc;
@@ -284,7 +287,10 @@ pub fn clamp_score(s: f32) -> f32 {
 /// `false` against a `NaN` threshold, so a `NaN` `min_score` or
 /// `min_prominence` silently disabled the gate and accepted anything.
 #[inline]
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
+#[expect(
+    clippy::neg_cmp_op_on_partial_ord,
+    reason = "the negated >= is deliberate: it makes NaN fail the gate"
+)]
 pub(crate) fn below_threshold(value: f32, threshold: f32) -> bool {
     !(value >= threshold)
 }

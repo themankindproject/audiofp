@@ -58,7 +58,10 @@ impl LogMelFrontend {
     }
 
     /// Number of STFT frames produced for one analysis window.
-    #[allow(dead_code)] // exposed for tests + future callers
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "exposed for tests and future direct callers")
+    )]
     pub(crate) fn n_frames(&self) -> usize {
         self.n_frames
     }
@@ -69,7 +72,10 @@ impl LogMelFrontend {
     }
 
     /// Required analysis-window length (samples).
-    #[allow(dead_code)] // exposed for tests + future callers
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "exposed for tests and future direct callers")
+    )]
     pub(crate) fn window_samples(&self) -> usize {
         self.window_samples
     }
@@ -116,7 +122,10 @@ impl LogMelFrontend {
     ///
     /// Panics if `window.len() != self.window_samples` or
     /// `out.len() != n_frames * n_mels`.
-    #[allow(dead_code)] // retained for tests and future direct consumers
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "retained for tests and future direct consumers")
+    )]
     pub(crate) fn fill_frame_major(&mut self, window: &[f32], out: &mut [f32]) {
         assert_eq!(
             out.len(),

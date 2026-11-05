@@ -72,6 +72,16 @@ pub struct StreamingNeuralEmbedder {
     embedding_scratch: Vec<f32>,
 }
 
+impl core::fmt::Debug for StreamingNeuralEmbedder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamingNeuralEmbedder")
+            .field("embedding_dim", &self.core.embedding_dim)
+            .field("samples_consumed", &self.samples_consumed)
+            .field("carry_len", &self.sample_carry.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl StreamingNeuralEmbedder {
     /// Build a streaming embedder with the given config.
     ///
@@ -82,6 +92,15 @@ impl StreamingNeuralEmbedder {
     /// call, so a `batch_size > 1` plan would only double model memory and
     /// construction time (and fail on fixed-batch models streaming can
     /// run). [`config`](Self::config) still reports the `batch_size` given.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`NeuralEmbedder::new`](super::NeuralEmbedder::new):
+    /// [`AfpError::ModelNotFound`](crate::AfpError::ModelNotFound),
+    /// [`AfpError::ModelLoad`](crate::AfpError::ModelLoad),
+    /// [`AfpError::Config`](crate::AfpError::Config), or
+    /// [`AfpError::Inference`](crate::AfpError::Inference) when the probe
+    /// inference fails.
     pub fn new(cfg: NeuralEmbedderConfig) -> Result<Self> {
         let batch_size = cfg.batch_size;
         let inner = super::embedder::NeuralEmbedder::new(NeuralEmbedderConfig {
@@ -133,6 +152,11 @@ impl StreamingNeuralEmbedder {
     /// Same contract as [`StreamingFingerprinter::push`] but propagates
     /// inference errors instead of panicking. Prefer this entry point
     /// when you need to surface model failures.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Inference`](crate::AfpError::Inference) when the ONNX
+    /// runtime fails on any window.
     pub fn try_push(&mut self, samples: &[f32]) -> Result<Vec<(TimestampMs, Vec<f32>)>> {
         let mut out = Vec::new();
         self.try_push_with(samples, |t, v| {
@@ -162,6 +186,12 @@ impl StreamingNeuralEmbedder {
     /// `push` will not realign to a hypothetical "fresh start". Call
     /// [`reset`] before reusing the embedder if you need a clean
     /// timeline after an error.
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Inference`](crate::AfpError::Inference) when the ONNX
+    /// runtime fails. Embeddings already delivered to `callback` before the
+    /// failure remain committed.
     ///
     /// [`reset`]: StreamingNeuralEmbedder::reset
     pub fn try_push_with<F: FnMut(TimestampMs, &[f32])>(

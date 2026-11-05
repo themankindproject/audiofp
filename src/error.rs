@@ -169,6 +169,7 @@ impl IoError {
     }
 
     /// Create a new `IoError` without a path.
+    #[must_use]
     pub fn without_path(source: std::io::Error) -> Self {
         let kind = source.kind();
         Self {
@@ -246,7 +247,10 @@ pub(crate) fn map_model_load_err(e: impl core::fmt::Display) -> AfpError {
 ///     }
 ///     Ok(())
 /// }
-/// # at_least_one_second(&vec![0.0; 16_000]).unwrap();
+/// # fn main() -> Result<()> {
+/// # at_least_one_second(&[0.0; 16_000])?;
+/// # Ok(())
+/// # }
 /// ```
 pub type Result<T> = core::result::Result<T, AfpError>;
 

@@ -18,6 +18,27 @@ pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomSta
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::collections::BTreeMap as HashMap;
 
+/// Set alias matching [`HashMap`]: AHash-backed under `std`, `BTreeSet`
+/// otherwise.
+#[cfg(feature = "std")]
+pub(crate) type HashSet<K> = std::collections::HashSet<K, ahash::RandomState>;
+
+#[cfg(not(feature = "std"))]
+pub(crate) use alloc::collections::BTreeSet as HashSet;
+
+/// Create an empty set.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn hashset_new<K: core::hash::Hash + Eq>() -> HashSet<K> {
+    HashSet::with_hasher(ahash::RandomState::default())
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn hashset_new<K: Ord>() -> HashSet<K> {
+    HashSet::new()
+}
+
 /// Create a map with pre-allocated capacity (HashMap) or just empty (BTreeMap).
 #[cfg(feature = "std")]
 #[inline]
@@ -158,7 +179,8 @@ impl<'a, P: Copy> IntoIterator for &'a Postings<P> {
 
 // The inline singleton must not grow the map slot beyond a `Vec` header.
 const _: () = assert!(
-    core::mem::size_of::<Postings<(u32, u32)>>() == core::mem::size_of::<Vec<(u32, u32)>>()
+    core::mem::size_of::<Postings<(u32, u32)>>() == core::mem::size_of::<Vec<(u32, u32)>>(),
+    "Postings singleton must not grow the map slot beyond a Vec header"
 );
 // A 16-byte Panako posting fits in a 64-bit `Vec` header's niche (24 bytes)
 // but not in a 32-bit one (12 bytes); there the enum is 20 bytes and each
@@ -167,7 +189,8 @@ const _: () = assert!(
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     core::mem::size_of::<Postings<(u32, u32, u32, u32)>>()
-        == core::mem::size_of::<Vec<(u32, u32, u32, u32)>>()
+        == core::mem::size_of::<Vec<(u32, u32, u32, u32)>>(),
+    "Panako Postings must fit in a Vec header on 64-bit targets"
 );
 
 /// A sorted inverted index for `(hash, t_anchor)` pairs.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Debug` for the public types that lacked it: `Wang`, `Panako`, `Haitsma`
+  and their streaming forms, `PeakPicker`, `IncrementalPeakDetector`,
+  `SincResampler`, `ShortTimeFFT`, the four matchers, `WangRefIndex`,
+  `PanakoRefIndex`, the three indexes, `CacheDirIter`, `NeuralEmbedder`,
+  `StreamingNeuralEmbedder` and the deprecated `WatermarkDetector`. The output
+  shows configuration and sizes, not sample buffers, FFT plans or model state.
+
 ### Fixed
 
 No hash layout, wire format, frame rate or default threshold changed; the
@@ -191,6 +200,12 @@ unchanged.
   `unknown algorithm tag`).
 - Feature tables in `src/lib.rs` and `README.md` now list every feature in
   `Cargo.toml`, including `std` and the `par_match_*` note under `rayon`.
+- `#[must_use]` on `to_bytes` and `envelope` of the three fingerprint types,
+  `WangIndex::build`, `PanakoIndex::build`, `HaitsmaIndex::build`,
+  `ClassicalConfig::algorithm` / `payload_len` / `min_samples` and
+  `IoError::without_path`: discarding their result now warns.
+- Fallible public functions document their errors under `# Errors`, and the
+  doc examples propagate errors with `?` instead of calling `unwrap()`.
 - Internal consolidation with no public API change (checked with
   `cargo-semver-checks`): Wang/Panako streaming and extract plumbing, the
   neural validated geometry shared with its test fixture, the serial algorithm

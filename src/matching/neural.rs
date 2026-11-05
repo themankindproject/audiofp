@@ -68,6 +68,14 @@ pub struct NeuralMatcher {
     cfg: NeuralMatchConfig,
 }
 
+impl core::fmt::Debug for NeuralMatcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NeuralMatcher")
+            .field("config", &self.cfg)
+            .finish()
+    }
+}
+
 impl NeuralMatcher {
     /// Estimated P(same recording | neural evidence): logistic map of the
     /// cosine score anchored at this matcher's own `min_cosine` (the

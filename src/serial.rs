@@ -70,15 +70,18 @@ const fn alg_info(alg_id: u8) -> Option<(&'static str, u32)> {
 /// # Example
 ///
 /// ```
+/// # fn main() -> audiofp::Result<()> {
 /// use audiofp::classical::Wang;
 /// use audiofp::{Fingerprinter, SampleRate};
 ///
 /// let samples = vec![0.0_f32; 8_000 * 3];
 /// let mut wang = Wang::default();
-/// let fp = wang.extract(&samples, SampleRate::HZ_8000).unwrap();
+/// let fp = wang.extract(&samples, SampleRate::HZ_8000)?;
 /// let env = fp.envelope();
 /// assert_eq!(env.algorithm, "wang-v1");
 /// assert_eq!(env.sample_rate, 8_000);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct FingerprintEnvelope {
@@ -202,7 +205,11 @@ fn read_pod_vec<T: bytemuck::Pod>(src: &[u8]) -> Vec<T> {
     if elem_size == 0 || src.is_empty() {
         return Vec::new();
     }
-    debug_assert_eq!(src.len() % elem_size, 0);
+    debug_assert_eq!(
+        src.len() % elem_size,
+        0,
+        "payload length must be a multiple of the element size"
+    );
     let mut values: Vec<T> = bytemuck::allocation::pod_collect_to_vec(src);
     // A no-op on little-endian hosts (`from_le` is the identity).
     for word in bytemuck::cast_slice_mut::<T, u32>(&mut values) {
@@ -272,12 +279,20 @@ impl WangFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
     ///
     /// The format is documented in the [`serial`](crate::serial) module.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         pod_blob(&self.hashes, ALG_WANG, self.frames_per_sec)
     }
 
     /// Deserialize a Wang fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Deserialize`] when the blob is shorter than the 18-byte
+    /// header, has bad magic, an unsupported version, the wrong algorithm
+    /// id, a non-finite or non-positive frame rate, or a payload shorter
+    /// than `hash_count` requires.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (hashes, frames_per_sec) = read_payload::<WangHash>(bytes, ALG_WANG, "hashes")?;
         Ok(Self {
@@ -287,6 +302,7 @@ impl WangFingerprint {
     }
 
     /// Return a metadata envelope describing this fingerprint.
+    #[must_use]
     pub fn envelope(&self) -> FingerprintEnvelope {
         envelope(ALG_WANG, self.frames_per_sec, self.hashes.len())
     }
@@ -294,12 +310,20 @@ impl WangFingerprint {
 
 impl PanakoFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         pod_blob(&self.hashes, ALG_PANAKO, self.frames_per_sec)
     }
 
     /// Deserialize a Panako fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Deserialize`] when the blob is shorter than the 18-byte
+    /// header, has bad magic, an unsupported version, the wrong algorithm
+    /// id, a non-finite or non-positive frame rate, or a payload shorter
+    /// than `hash_count` requires.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (hashes, frames_per_sec) = read_payload::<PanakoHash>(bytes, ALG_PANAKO, "hashes")?;
         Ok(Self {
@@ -309,6 +333,7 @@ impl PanakoFingerprint {
     }
 
     /// Return a metadata envelope describing this fingerprint.
+    #[must_use]
     pub fn envelope(&self) -> FingerprintEnvelope {
         envelope(ALG_PANAKO, self.frames_per_sec, self.hashes.len())
     }
@@ -316,12 +341,20 @@ impl PanakoFingerprint {
 
 impl HaitsmaFingerprint {
     /// Serialize this fingerprint to a compact binary blob.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         pod_blob(&self.frames, ALG_HAITSMA, self.frames_per_sec)
     }
 
     /// Deserialize a Haitsma fingerprint from a binary blob produced by
     /// [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`AfpError::Deserialize`] when the blob is shorter than the 18-byte
+    /// header, has bad magic, an unsupported version, the wrong algorithm
+    /// id, a non-finite or non-positive frame rate, or a payload shorter
+    /// than `hash_count` requires.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (frames, frames_per_sec) = read_payload::<u32>(bytes, ALG_HAITSMA, "frames")?;
         Ok(Self {
@@ -331,6 +364,7 @@ impl HaitsmaFingerprint {
     }
 
     /// Return a metadata envelope describing this fingerprint.
+    #[must_use]
     pub fn envelope(&self) -> FingerprintEnvelope {
         envelope(ALG_HAITSMA, self.frames_per_sec, self.frames.len())
     }

@@ -580,6 +580,17 @@ pub struct CacheDirIter {
     done: bool,
 }
 
+impl core::fmt::Debug for CacheDirIter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CacheDirIter")
+            .field("index", &self.index)
+            .field("files_loaded", &self.files_loaded)
+            .field("bytes_loaded", &self.bytes_loaded)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Iterator for CacheDirIter {
     type Item = Result<(PathBuf, CachedFingerprint)>;
 

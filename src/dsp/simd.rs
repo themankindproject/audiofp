@@ -70,7 +70,7 @@ fn hsum8(v: f32x8) -> f32 {
 /// reduced with [`hsum8`], so the result is identical on every target.
 #[inline]
 pub(crate) fn dot_core(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), b.len(), "dot core requires equal input lengths");
     let n = a.len();
     let chunks = n / 8;
     let tail_start = chunks * 8;
@@ -93,9 +93,13 @@ pub(crate) fn dot_core(a: &[f32], b: &[f32]) -> f32 {
 /// Kept separate from [`dot_core`] (rather than `dot_core(v, v)`) so the
 /// hot loop loads each chunk once instead of twice.
 ///
-/// Used only by the `neural`-gated embedder/matcher; the allow keeps
-/// non-neural builds warning-free while keeping the canonical sumsq here.
-#[allow(dead_code)]
+/// Used only by the `neural`-gated embedder/matcher and this module's
+/// tests; the expectation keeps non-neural library builds warning-free
+/// while keeping the canonical sumsq here.
+#[cfg_attr(
+    not(any(feature = "neural", test)),
+    expect(dead_code, reason = "used only by the neural-gated embedder/matcher")
+)]
 #[inline]
 pub(crate) fn sumsq_core(v: &[f32]) -> f32 {
     let n = v.len();
@@ -121,7 +125,7 @@ pub(crate) fn sumsq_core(v: &[f32]) -> f32 {
 /// power-spectrum allocation when starting from magnitudes.
 #[inline]
 pub(crate) fn dot_sq_core(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), b.len(), "dot core requires equal input lengths");
     let n = a.len();
     let chunks = n / 8;
     let tail_start = chunks * 8;
@@ -144,8 +148,12 @@ pub(crate) fn dot_sq_core(a: &[f32], b: &[f32]) -> f32 {
 /// scalar tail. Entirely safe code.
 #[inline]
 pub(crate) fn mul_into(src: &[f32], win: &[f32], dst: &mut [f32]) {
-    debug_assert_eq!(src.len(), win.len());
-    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(src.len(), win.len(), "mul_into requires equal lengths");
+    debug_assert_eq!(
+        src.len(),
+        dst.len(),
+        "mul_into requires dst.len() == src.len()"
+    );
 
     let n = src.len();
     let chunks = n / 8;

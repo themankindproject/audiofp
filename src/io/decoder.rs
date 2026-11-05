@@ -259,6 +259,13 @@ pub fn decode_to_mono_at<P: AsRef<Path>>(path: P, target_sr: u32) -> Result<Vec<
 }
 
 /// Same as [`decode_to_mono_at`] with full [`DecodeLimits`].
+///
+/// # Errors
+///
+/// [`AfpError::Config`] when `target_sr` is zero; otherwise every error
+/// [`decode_to_mono_limited`] can return (I/O, unsupported channels or
+/// sample rate, decode failure, [`AfpError::InputTooLarge`], and
+/// [`AfpError::Timeout`] when a deadline is configured).
 pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     path: P,
     target_sr: u32,
@@ -373,7 +380,10 @@ fn open_source(path: &Path, limits: &DecodeLimits) -> Result<OpenedSource> {
     // This is not a testability concern — tests exercise the timeout via
     // `Duration::from_nanos(0)` which fires on the first packet regardless
     // of when the Instant was captured.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "decode timeout measures wall-clock time from the caller's perspective"
+    )]
     let deadline = limits.timeout.map(|d| (std::time::Instant::now(), d));
 
     let mut file = File::open(path).map_err(|e| AfpError::io_with_path(path, e))?;
@@ -560,6 +570,12 @@ fn decode_file(path: &Path, limits: &DecodeLimits) -> Result<(Vec<f32>, u32, Dec
 /// particular, with `integrity_mode: false` (the default) corrupt packets
 /// are still skipped, not fatal; the difference is that
 /// [`DecodeStats::packets_skipped`] now tells you how many.
+///
+/// # Errors
+///
+/// Identical to [`decode_to_mono_limited`]: I/O, unsupported channels or
+/// sample rate, decode failure, [`AfpError::InputTooLarge`], and
+/// [`AfpError::Timeout`] when a deadline is configured.
 ///
 /// # Example
 ///

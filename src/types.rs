@@ -50,7 +50,7 @@ impl SampleRate {
     /// ```
     /// use audiofp::SampleRate;
     ///
-    /// assert_eq!(SampleRate::new(32_000).unwrap().hz(), 32_000);
+    /// assert_eq!(SampleRate::new(32_000).map(SampleRate::hz), Some(32_000));
     /// assert!(SampleRate::new(0).is_none());
     /// ```
     #[must_use]

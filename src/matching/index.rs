@@ -23,7 +23,7 @@ use crate::matching::{MatchResult, Matcher};
 
 use alloc::vec::Vec;
 
-use crate::matching::maps::{HashMap, Postings, hashmap_new};
+use crate::matching::maps::{HashMap, HashSet, Postings, hashset_new};
 
 /// Hard cap on the **total** votes a single [`WangIndex::query`] or
 /// [`PanakoIndex::query`] may accumulate across all references (audit
@@ -201,6 +201,22 @@ fn map_heap_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     }
 }
 
+fn set_heap_bytes<K>(set: &HashSet<K>) -> usize {
+    #[cfg(feature = "std")]
+    {
+        let capacity = set.capacity();
+        if capacity == 0 {
+            return 0;
+        }
+        let buckets = (capacity * 8 / 7).next_power_of_two();
+        buckets * (size_of::<K>() + 1) + 16
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        set.len() * (size_of::<K>() + BTREEMAP_NODE_OVERHEAD)
+    }
+}
+
 /// Assign a reference id for `insert`: reuse the most-recently-vacated slot
 /// (LIFO) when one exists so steady enroll/erase churn does not grow the id
 /// space, else append. Returns the id as `u32` for posting storage.
@@ -249,12 +265,12 @@ fn track_best(best: &mut Option<(usize, MatchResult)>, ref_id: usize, result: Ma
 /// stop-hash removal, shared by the three `build`s): drop it from `map` and
 /// return the tombstones, so a later `insert` cannot resurrect it with a
 /// short list.
-fn stop_list<P: Copy>(map: &mut HashMap<u32, Postings<P>>, limit: u32) -> HashMap<u32, ()> {
-    let mut stopped = hashmap_new();
+fn stop_list<P: Copy>(map: &mut HashMap<u32, Postings<P>>, limit: u32) -> HashSet<u32> {
+    let mut stopped = hashset_new();
     map.retain(|key, list| {
         let keep = (list.len() as u32) <= limit;
         if !keep {
-            stopped.insert(*key, ());
+            stopped.insert(*key);
         }
         keep
     });
@@ -279,7 +295,7 @@ fn stop_list<P: Copy>(map: &mut HashMap<u32, Postings<P>>, limit: u32) -> HashMa
 ///   zero keys.
 fn insert_postings<P: Copy>(
     map: &mut HashMap<u32, Postings<P>>,
-    stopped: &mut HashMap<u32, ()>,
+    stopped: &mut HashSet<u32>,
     touched: &mut Vec<u32>,
     postings: impl ExactSizeIterator<Item = (u32, P)>,
     limit: u32,
@@ -288,7 +304,7 @@ fn insert_postings<P: Copy>(
     touched.reserve(postings.len().min(1024));
     let limit = limit as usize;
     for (key, posting) in postings {
-        if stopped.contains_key(&key) {
+        if stopped.contains(&key) {
             continue;
         }
         let list = map.entry(key).or_default();
@@ -299,7 +315,7 @@ fn insert_postings<P: Copy>(
     }
     for key in touched.drain(..) {
         if map.get(&key).is_some_and(|list| list.len() > limit) {
-            stopped.insert(key, ());
+            stopped.insert(key);
             map.remove(&key);
         }
     }
@@ -393,7 +409,17 @@ pub struct WangIndex {
     /// it. Lowering `max_postings_per_hash` on a later insert stops only
     /// the keys that insert touches; raising it does not resurrect stopped
     /// keys (audit F05). Rebuild from the surviving references to reset.
-    stopped: HashMap<u32, ()>,
+    stopped: HashSet<u32>,
+}
+
+impl core::fmt::Debug for WangIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WangIndex")
+            .field("references", &self.fps.len())
+            .field("live_count", &self.live_count)
+            .field("unique_hashes", &self.map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WangIndex {
@@ -406,6 +432,7 @@ impl WangIndex {
     ///
     /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
     /// as `u32`).
+    #[must_use]
     pub fn build(refs: &[crate::classical::WangFingerprint], max_postings_per_hash: u32) -> Self {
         assert!(
             refs.len() <= u32::MAX as usize,
@@ -499,7 +526,11 @@ impl WangIndex {
             self.r_max[ref_id] = t_max;
             self.live[ref_id] = true;
         } else {
-            debug_assert_eq!(ref_id, self.fps.len());
+            debug_assert_eq!(
+                ref_id,
+                self.fps.len(),
+                "new reference id must equal the catalog length"
+            );
             self.fps.push(fp.frames_per_sec);
             self.r_max.push(t_max);
             self.live.push(true);
@@ -637,7 +668,7 @@ impl WangIndex {
     pub fn estimated_bytes(&self) -> usize {
         // The table bytes already hold one key and one value per bucket, so
         // there is no separate per-key term (audit §4.2 #10).
-        let mut bytes = map_heap_bytes(&self.map) + map_heap_bytes(&self.stopped);
+        let mut bytes = map_heap_bytes(&self.map) + set_heap_bytes(&self.stopped);
         for list in self.map.values() {
             bytes += list.heap_bytes();
         }
@@ -908,7 +939,17 @@ pub struct HaitsmaIndex {
     /// Reused touched-key scratch for [`HaitsmaIndex::insert`].
     touched: alloc::vec::Vec<u32>,
     /// Stop-hash tombstones (see [`WangIndex::stopped`]).
-    stopped: HashMap<u32, ()>,
+    stopped: HashSet<u32>,
+}
+
+impl core::fmt::Debug for HaitsmaIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HaitsmaIndex")
+            .field("references", &self.frames.len())
+            .field("live_count", &self.live_count)
+            .field("unique_hashes", &self.lut.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl HaitsmaIndex {
@@ -925,6 +966,7 @@ impl HaitsmaIndex {
     ///
     /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
     /// as `u32`).
+    #[must_use]
     pub fn build(
         refs: &[crate::classical::HaitsmaFingerprint],
         max_postings_per_hash: u32,
@@ -1012,7 +1054,11 @@ impl HaitsmaIndex {
             self.fps[ref_id] = fp.frames_per_sec;
             self.live[ref_id] = true;
         } else {
-            debug_assert_eq!(ref_id, self.frames.len());
+            debug_assert_eq!(
+                ref_id,
+                self.frames.len(),
+                "new reference id must equal the catalog length"
+            );
             self.frames.push(fp.frames.clone());
             self.fps.push(fp.frames_per_sec);
             self.live.push(true);
@@ -1148,7 +1194,7 @@ impl HaitsmaIndex {
     pub fn estimated_bytes(&self) -> usize {
         // The table bytes already hold one key and one value per bucket, so
         // there is no separate per-key term (audit §4.2 #10).
-        let mut bytes = map_heap_bytes(&self.lut) + map_heap_bytes(&self.stopped);
+        let mut bytes = map_heap_bytes(&self.lut) + set_heap_bytes(&self.stopped);
         for list in self.lut.values() {
             bytes += list.heap_bytes();
         }
@@ -1394,7 +1440,17 @@ pub struct PanakoIndex {
     /// Reused touched-key scratch for [`PanakoIndex::insert`].
     touched: alloc::vec::Vec<u32>,
     /// Stop-hash tombstones (see [`WangIndex::stopped`]).
-    stopped: HashMap<u32, ()>,
+    stopped: HashSet<u32>,
+}
+
+impl core::fmt::Debug for PanakoIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PanakoIndex")
+            .field("references", &self.fps.len())
+            .field("live_count", &self.live_count)
+            .field("unique_hashes", &self.map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PanakoIndex {
@@ -1404,6 +1460,7 @@ impl PanakoIndex {
     ///
     /// Panics if `refs.len()` exceeds `u32::MAX` (reference ids are stored
     /// as `u32`).
+    #[must_use]
     pub fn build(refs: &[crate::classical::PanakoFingerprint], max_postings_per_hash: u32) -> Self {
         assert!(
             refs.len() <= u32::MAX as usize,
@@ -1480,7 +1537,11 @@ impl PanakoIndex {
             self.fps[ref_id] = fp.frames_per_sec;
             self.live[ref_id] = true;
         } else {
-            debug_assert_eq!(ref_id, self.fps.len());
+            debug_assert_eq!(
+                ref_id,
+                self.fps.len(),
+                "new reference id must equal the catalog length"
+            );
             self.fps.push(fp.frames_per_sec);
             self.live.push(true);
         }
@@ -1584,7 +1645,7 @@ impl PanakoIndex {
     pub fn estimated_bytes(&self) -> usize {
         // The table bytes already hold one key and one value per bucket, so
         // there is no separate per-key term (audit §4.2 #10).
-        let mut bytes = map_heap_bytes(&self.map) + map_heap_bytes(&self.stopped);
+        let mut bytes = map_heap_bytes(&self.map) + set_heap_bytes(&self.stopped);
         for list in self.map.values() {
             bytes += list.heap_bytes();
         }

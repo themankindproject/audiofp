@@ -46,5 +46,8 @@ mod test_fixture;
 // Re-exporting the deprecated types is deliberate: the paths stay available
 // (with warnings at every call site) until the 0.5.0 removal.
 #[cfg(feature = "watermark")]
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "deprecated paths stay available until the 0.5.0 removal"
+)]
 pub use detector::{WatermarkConfig, WatermarkDetector, WatermarkResult};

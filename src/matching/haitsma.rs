@@ -374,6 +374,14 @@ pub struct HaitsmaMatcher {
     cfg: HaitsmaMatchConfig,
 }
 
+impl core::fmt::Debug for HaitsmaMatcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HaitsmaMatcher")
+            .field("config", &self.cfg)
+            .finish()
+    }
+}
+
 impl HaitsmaMatcher {
     /// Estimated P(same recording | Haitsma evidence): logistic map of the
     /// `1 − BER` score, versioned `haitsma-v1` (see
