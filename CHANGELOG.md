@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No hash layout, wire format, frame rate, default threshold or public signature
+changed. The offline and real-audio goldens and the cross-platform determinism
+test are unchanged, and every item under Performance and Memory returns the
+same output to the bit. What could not be done without breaking something is
+written up in `BREAKING-PROPOSALS.md`, and none of it is implemented.
+
+### Fixed
+
+**Streaming extraction**
+
+- **`flush()` no longer drops the last anchors when no second is pending.**
+  Audio followed by a long quiet tail finalises every second that holds peaks
+  during the pushes; the legacy `flush` drained pending anchors only from
+  inside its per-second loop, which then never ran, and a second `flush` did
+  not recover them. `flush_complete` and offline extraction were not affected.
+- **A second without peaks no longer holds anchors back.** Emission waited for
+  the last finalised second, and only seconds that hold peaks were finalised,
+  so across a silent gap hashes arrived after the gap instead of within
+  `latency_ms()` (never, on a paused live stream).
+
+**Decoding and cache**
+
+- **A FIFO or `/dev/stdin` decodes.** The WAV / AIFF header check rewound the
+  handle, which fails on a pipe; it is now skipped for anything that is not a
+  regular file. Formats that need to seek still fail, and `max_bytes` still
+  rejects a pipe, which has no length to check.
+- **Strict `integrity_mode` fails on a packet that reports no channels or a
+  zero sample rate.** Such packets were skipped, as lenient mode does.
+- **`load_all_cached_limited` reports a `max_files` overflow before reading any
+  file.** It read and parsed the first `max_files` files first. A directory
+  that both exceeds the count and holds a corrupt file therefore reports
+  `InputTooLarge`, where it could report that file's `Deserialize` error.
+
+**Matching**
+
+- **The 10 M-vote bound holds wherever votes are collected.**
+  `PanakoMatcher::match_one` had no cap; a pair that produces more than 10 M
+  votes is now scored on the first 10 M, as the index queries do.
+  `PanakoIndex` and `HaitsmaIndex` queries stopped at the cap but let the
+  list's capacity double past it (270 to 320 MB against the documented
+  160 MB); they now grow only up to it.
+
+**Watermark**
+
+- **LogHost detection reports a score of `0.0`, not `-inf`, for finite samples
+  large enough to overflow the transform** (noise from about `1e37`).
+
+### Performance
+
+- **Wang, Panako and Haitsma extraction, offline and streaming: 1.15× to
+  1.19× faster.** The real-FFT post-processing runs eight bins at a time, the
+  peak picker takes a branch-free maximum when a row holds no NaN, and Panako's
+  triplet selection prunes on the right bound (its sentinel never pruned dB
+  values, which are negative).
+- **`SincResampler`: 1.3× to 1.5× faster**, and its kernel table is built from
+  half the transcendental calls by mirroring. A same-rate resampler builds no
+  table.
+- **1:1 matching indexes only the hashes the query carries.** A 5 s clip
+  against a 4-minute reference: `WangMatcher` 6× to 7.6×, `PanakoMatcher` 5.6×
+  to 15×, `HaitsmaMatcher` 7.7× to 9.9× faster; against a 20 s reference 1.6×
+  to 12×. A track matched against itself, where nothing can be skipped, is no
+  slower. Prebuilt `WangRefIndex` / `PanakoRefIndex` still hold every hash.
+- **Panako consolidation.** The Hough peak search sweeps each row with two
+  cursors instead of a binary search per bin, and RANSAC counts the inliers
+  of each distinct line once: on a 2-minute self-match the two drop from about
+  68 M to 17 M and from 96 M to 1 M instructions.
+- **Index queries drop references that cannot reach `min_votes` before the
+  sort**: 2.3× (`WangIndex`) and 1.8× (`PanakoIndex`) on a noisy query against
+  a 100 000-reference catalog.
+- **`remove_many` is 4.4× faster** removing 5 % of 100 000 references.
+  **`HaitsmaIndex::remove` of a reference that repeats a frame value** (digital
+  silence, a held tone) visits each of its keys once: 27.5 ms → 60 µs. Removing
+  a reference whose frames are all distinct pays for that with one sort, about
+  0.3 ms more on 20 000 frames.
+- **`HaitsmaMatcher`** returns at once when the fingerprints cannot overlap by
+  `min_overlap`, and the exhaustive scan stops at a perfect alignment.
+- **Classical watermark.** QIM embedding takes each lattice magnitude's power
+  once per clip instead of once per carrier and no longer computes every
+  carrier's modulus twice: 1.56×. LogHost embedding overlap-adds without a
+  division per sample: 1.2×. LogHost detection evaluates four phase
+  correlations side by side: 1.2× for an 8-byte payload, 1.6× to 1.7× for 32
+  bytes. QIM detection gains about 1.1× from the faster real FFT.
+- **`.afp` files are read into a buffer sized from the file's length**, and
+  the cache iterator no longer stats each file twice.
+
+### Memory
+
+- **Streaming `Wang`, `Panako` and `Haitsma` take a push in 1024-sample
+  blocks**, so the sample carry stays at `n_fft + 1024` samples. It grew to the
+  size of the largest push and kept that capacity. Each stream also keeps half
+  the spectrogram rows it did, and the peak detector one block of columns
+  instead of two (about 95 KB less per Wang or Panako stream).
+- **`StreamingNeuralEmbedder` releases what a push of many windows grew its
+  carry by** when the call returns (230 MB after an hour of 16 kHz audio
+  pushed at once).
+- **Indexes give memory back.** Removing references shrinks the tables once
+  they are mostly empty (more than 2× smaller after removing 90 % of a
+  catalog), a posting list that shrinks to one entry is stored inline again,
+  and the scratch list of over-limit hashes is gone.
+- **Classical watermark detection no longer grows with the clip.** LogHost
+  kept every frame's levels (45 MB for 10 minutes) and QIM every block's
+  (7.5 MB); both now keep the few frames their sliding estimates read:
+  0.45 MB and 0.24 MB for any length.
+- **Decoded PCM is returned without the growth slack** of the buffer it was
+  collected in (up to 2× the samples before).
+
+### Changed
+
+- Docs: `score_compare` is not a total order when a score is NaN and must not
+  be used in `sort_by`; `MatchResult::time_scale` describes the neural DTW
+  length ratio; `max_postings_per_hash` on the 1:1 match configs does not
+  apply to index queries; more than 64 channels in a WAV / AIFF is reported as
+  `Io`, in other containers as `UnsupportedChannels`;
+  `StreamingNeuralEmbedder::new` does not range-check `batch_size`.
+- The three indexes share their vote cap, vote filtering, posting insertion
+  and removal code, the Panako matcher and index share their scale binning,
+  and the streaming anchor emitters share one loop, instead of carrying copies.
+
 ## [0.4.6] - 2026-11-05
 
 ### Added
