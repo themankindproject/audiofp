@@ -164,7 +164,12 @@ pub struct MatchResult {
     pub offset: TimeOffset,
     /// Estimated time-scale: `query_duration / reference_duration`.
     ///
-    /// 1.0 for algorithms with no tempo model (Wang, Haitsma, neural).
+    /// 1.0 for algorithms with no tempo model (Wang, Haitsma, and the
+    /// neural matcher's sliding-max and centroid modes). The neural DTW
+    /// mode reports the ratio of the two window counts, unclamped: it
+    /// aligns the whole query to the whole reference, so this is their
+    /// length ratio (about 0.04 for a 10 s clip against a 4 min track),
+    /// not a tempo estimate for a matched segment.
     /// Panako reports the reciprocal of the internal Hough/RANSAC scale
     /// `s = ref_span / query_span` (i.e. `1/s`), clamped to `[0.5, 2.0]`.
     /// Note that [`PanakoMatchConfig::scale_min`] /
@@ -233,11 +238,14 @@ pub(crate) fn frames_per_sec_compatible(a: f32, b: f32) -> bool {
     (a - b).abs() <= FPS_REL_EPS * scale
 }
 
-/// Compare two `f32` scores safely (NaN-proof).
+/// Compare two `f32` scores, treating a NaN as equal to anything.
 ///
-/// Uses `partial_cmp` with `unwrap_or(Ordering::Equal)` so NaN values
-/// don't cause a panic during sorting. For ranking results, you almost
-/// always want [`match_result_compare_desc`].
+/// This is `partial_cmp` with `unwrap_or(Ordering::Equal)`: convenient for
+/// comparing two scores, but **not a total order** once a NaN is involved
+/// (`1.0 == NaN == 2.0` while `1.0 < 2.0`). Do not pass it to `sort_by` /
+/// `sort_unstable_by` on scores that may hold a NaN — since Rust 1.81
+/// those may panic on an inconsistent comparator. Use [`f32::total_cmp`]
+/// there, or [`match_result_compare_desc`] to rank results.
 #[inline]
 #[must_use]
 pub fn score_compare(a: f32, b: f32) -> Ordering {

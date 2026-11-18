@@ -38,6 +38,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::classical::HaitsmaFingerprint;
+use crate::matching::maps::KeyFilter;
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 /// Hamming distance over `overlap` frames at offset `delta`.
@@ -254,46 +255,29 @@ impl BestAlignment {
 /// the binary search.
 struct Lut {
     pairs: Vec<(u32, usize)>,
-    filter: Vec<u64>,
-    /// `32 − log2(filter bits)`: a slot is the top bits of a
-    /// multiplicative hash of the frame.
-    shift: u32,
+    filter: KeyFilter,
 }
 
 impl Lut {
-    fn build(reference: &[u32]) -> Self {
+    /// Index `reference`. With `wanted`, only the frames it may contain
+    /// are indexed: every position of such a frame is kept, so looking one
+    /// up returns what the full table would.
+    fn build(reference: &[u32], wanted: Option<&KeyFilter>) -> Self {
         let mut pairs: Vec<(u32, usize)> = reference
             .iter()
             .enumerate()
+            .filter(|&(_, &frame)| wanted.is_none_or(|wanted| wanted.may_contain(frame)))
             .map(|(pos, &frame)| (frame, pos))
             .collect();
         pairs.sort_unstable();
-        let bits = (reference.len() * 16)
-            .next_power_of_two()
-            .clamp(64, 1 << 24);
-        let shift = 32 - bits.trailing_zeros();
-        let mut filter = alloc::vec![0_u64; bits / 64];
-        for &frame in reference {
-            let slot = Self::slot(frame, shift);
-            filter[slot / 64] |= 1 << (slot % 64);
-        }
-        Self {
-            pairs,
-            filter,
-            shift,
-        }
-    }
-
-    #[inline]
-    fn slot(frame: u32, shift: u32) -> usize {
-        (frame.wrapping_mul(0x9E37_79B1) >> shift) as usize
+        let filter = KeyFilter::new(pairs.iter().map(|&(frame, _)| frame), 16);
+        Self { pairs, filter }
     }
 
     /// Every `(frame, position)` entry for `frame`, positions ascending.
     #[inline]
     fn get(&self, frame: u32) -> &[(u32, usize)] {
-        let slot = Self::slot(frame, self.shift);
-        if self.filter[slot / 64] & (1 << (slot % 64)) == 0 {
+        if !self.filter.may_contain(frame) {
             return &[];
         }
         let start = self.pairs.partition_point(|&(f, _)| f < frame);
@@ -430,74 +414,32 @@ impl Matcher for HaitsmaMatcher {
             return MatchResult::NONE;
         }
 
+        // No alignment of two fingerprints overlaps by more than the
+        // shorter one, so none can reach the required overlap.
         let min_overlap = self.cfg.min_overlap_frames as usize;
+        if q_len.min(r_len) < min_overlap {
+            return MatchResult::NONE;
+        }
 
-        // LUT path
-        let use_lut = self.cfg.use_lut && r_len > 512;
-        if use_lut {
-            let lut = Lut::build(r_frames);
-            let mut best = BestAlignment::new();
-
-            // Deduplicated body across the three probe modes: verify
-            // each candidate offset by BER with a rate-normalized
-            // early-abort bound.
-            // A repeated exact frame hit can identify the same alignment
-            // hundreds of times. Remember deltas for this entire query;
-            // consideration still occurs in first-seen order for stable ties.
-            // Deltas span `[-(q_len - 1), r_len - 1]`, so a bitset over that
-            // range replaces a `BTreeSet` (one node per candidate).
-            let d_min = -(q_len as i64 - 1);
-            let mut seen_deltas = alloc::vec![0_u64; (q_len + r_len).div_ceil(64)];
-
-            for (q_pos, &q_frame) in q_frames.iter().enumerate() {
-                let mut consider = |hits: &[(u32, usize)]| {
-                    for &(_, r_pos) in hits {
-                        let delta = r_pos as i64 - q_pos as i64;
-                        let bit = (delta - d_min) as usize;
-                        let (word, mask) = (bit / 64, 1_u64 << (bit % 64));
-                        if seen_deltas[word] & mask != 0 {
-                            continue;
-                        }
-                        seen_deltas[word] |= mask;
-                        best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-                    }
-                };
-                match self.cfg.probe_bit_flips {
-                    0 => probe_exact(q_frame, &lut, &mut consider),
-                    1 => probe_1flip(q_frame, &lut, &mut consider),
-                    _ => probe_2flip(q_frame, &lut, &mut consider),
-                }
-                if best.ber == 0.0 {
-                    break;
-                }
-            }
-
-            if !best.found() {
-                return MatchResult::NONE;
-            }
-
-            return build_result(
-                best.hamming,
-                best.delta,
-                best.overlap,
+        let best = if self.cfg.use_lut && r_len > 512 {
+            // With exact probing a reference frame can only be hit if it
+            // equals a query frame, so only those are indexed: sorting a
+            // whole track to match a short clip against it was most of the
+            // cost of this call. Bit-flip probing looks up frames the query
+            // does not contain, and needs the full table.
+            let wanted = (self.cfg.probe_bit_flips == 0)
+                .then(|| KeyFilter::new(q_frames.iter().copied(), 16));
+            let lut = Lut::build(r_frames, wanted.as_ref());
+            best_lut_alignment(
                 q_frames,
                 r_frames,
-                reference.frames_per_sec,
-                &self.cfg,
-            );
-        }
-
-        // Exact BER path (scan all offsets, ascending delta so
-        // BER ties resolve to the smallest offset deterministically).
-        let dmin: i64 = -((q_len as i64).saturating_sub(1));
-        let dmax: i64 = (r_len as i64).saturating_sub(1);
-
-        let mut best = BestAlignment::new();
-
-        for delta in dmin..=dmax {
-            best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
-        }
-
+                &lut,
+                self.cfg.probe_bit_flips,
+                min_overlap,
+            )
+        } else {
+            best_exact_alignment(q_frames, r_frames, min_overlap)
+        };
         if !best.found() {
             return MatchResult::NONE;
         }
@@ -512,6 +454,71 @@ impl Matcher for HaitsmaMatcher {
             &self.cfg,
         )
     }
+}
+
+/// The best alignment among the offsets at which a query frame (or, with
+/// `probe_bit_flips`, a 1- or 2-bit variant of one) equals a reference
+/// frame in `lut`, each verified by BER with a rate-normalized early-abort
+/// bound.
+fn best_lut_alignment(
+    q_frames: &[u32],
+    r_frames: &[u32],
+    lut: &Lut,
+    probe_bit_flips: u8,
+    min_overlap: usize,
+) -> BestAlignment {
+    let (q_len, r_len) = (q_frames.len(), r_frames.len());
+    let mut best = BestAlignment::new();
+
+    // A repeated exact frame hit can identify the same alignment hundreds
+    // of times. Remember deltas for this entire query; consideration still
+    // occurs in first-seen order for stable ties. Deltas span
+    // `[-(q_len - 1), r_len - 1]`, so a bitset over that range replaces a
+    // `BTreeSet` (one node per candidate).
+    let d_min = -(q_len as i64 - 1);
+    let mut seen_deltas = alloc::vec![0_u64; (q_len + r_len).div_ceil(64)];
+
+    for (q_pos, &q_frame) in q_frames.iter().enumerate() {
+        let mut consider = |hits: &[(u32, usize)]| {
+            for &(_, r_pos) in hits {
+                let delta = r_pos as i64 - q_pos as i64;
+                let bit = (delta - d_min) as usize;
+                let (word, mask) = (bit / 64, 1_u64 << (bit % 64));
+                if seen_deltas[word] & mask != 0 {
+                    continue;
+                }
+                seen_deltas[word] |= mask;
+                best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
+            }
+        };
+        match probe_bit_flips {
+            0 => probe_exact(q_frame, lut, &mut consider),
+            1 => probe_1flip(q_frame, lut, &mut consider),
+            _ => probe_2flip(q_frame, lut, &mut consider),
+        }
+        if best.ber == 0.0 {
+            break;
+        }
+    }
+    best
+}
+
+/// The best alignment over every offset, by exact BER. Offsets are scanned
+/// in ascending order and a tie keeps the first, so BER ties resolve to the
+/// smallest offset — which also means nothing after a BER of zero can win.
+fn best_exact_alignment(q_frames: &[u32], r_frames: &[u32], min_overlap: usize) -> BestAlignment {
+    let (q_len, r_len) = (q_frames.len(), r_frames.len());
+    let dmin: i64 = -((q_len as i64).saturating_sub(1));
+    let dmax: i64 = (r_len as i64).saturating_sub(1);
+
+    let mut best = BestAlignment::new();
+    for delta in dmin..=dmax {
+        best.consider(q_frames, r_frames, q_len, r_len, delta, min_overlap);
+        if best.ber == 0.0 {
+            break;
+        }
+    }
+    best
 }
 
 /// BER, score and match verdict of an alignment already accepted by
@@ -628,6 +635,102 @@ mod tests {
                 v
             })
             .collect()
+    }
+
+    fn alignment_bits(best: &BestAlignment) -> (u64, u64, i64, usize) {
+        (best.ber.to_bits(), best.hamming, best.delta, best.overlap)
+    }
+
+    /// With exact probing `match_one` indexes only the reference frames
+    /// that equal a query frame; the alignment it settles on must be the one
+    /// the full table gives.
+    #[test]
+    fn filtered_lut_finds_the_same_alignment_as_the_full_one() {
+        let mut x: u32 = 0x2545_F491;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut found = 0;
+        for case in 0..80 {
+            // Stretches drawn from 16 values (repeats, shared with any
+            // query) between stretches of distinct frames.
+            let reference: Vec<u32> = (0..2_000)
+                .map(|i| {
+                    if (i / 100) % 3 == 0 {
+                        next() % 16
+                    } else {
+                        next()
+                    }
+                })
+                .collect();
+            let start = (next() % 1_500) as usize;
+            let mut query: Vec<u32> = if case % 5 == 0 {
+                (0..300).map(|_| next()).collect()
+            } else {
+                reference[start..start + 300].to_vec()
+            };
+            for frame in &mut query {
+                if next() % 4 == 0 {
+                    *frame ^= 1 << (next() % 32);
+                }
+            }
+
+            let wanted = KeyFilter::new(query.iter().copied(), 16);
+            let full = Lut::build(&reference, None);
+            let filtered = Lut::build(&reference, Some(&wanted));
+            assert!(filtered.pairs.len() <= full.pairs.len());
+            let full = best_lut_alignment(&query, &reference, &full, 0, 64);
+            let filtered = best_lut_alignment(&query, &reference, &filtered, 0, 64);
+            assert_eq!(
+                alignment_bits(&filtered),
+                alignment_bits(&full),
+                "case {case}"
+            );
+            found += usize::from(full.found());
+        }
+        assert!(found > 40, "only {found} of 80 cases found an alignment");
+    }
+
+    /// The exact scan stops at the first alignment with no bit errors;
+    /// nothing after it could have replaced it.
+    #[test]
+    fn exact_scan_stops_at_a_perfect_alignment_without_changing_the_answer() {
+        let reference: Vec<u32> = (0..400_u32)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
+        // The clip occurs twice in the reference: at 40 and again at 200.
+        let mut twice = reference.clone();
+        twice.copy_within(40..104, 200);
+        let query = twice[40..104].to_vec();
+
+        let best = best_exact_alignment(&query, &twice, 32);
+        let mut every_offset = BestAlignment::new();
+        for delta in -63..400 {
+            every_offset.consider(&query, &twice, query.len(), twice.len(), delta, 32);
+        }
+        assert_eq!(alignment_bits(&best), alignment_bits(&every_offset));
+        assert_eq!((best.delta, best.hamming), (40, 0));
+    }
+
+    #[test]
+    fn fingerprints_shorter_than_the_required_overlap_never_match() {
+        let frames: Vec<u32> = (0..1_000_u32)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
+        let matcher = HaitsmaMatcher::new(HaitsmaMatchConfig::default());
+        let min_overlap = matcher.config().min_overlap_frames as usize;
+        let long = make_fp(&frames);
+        let short = make_fp(&frames[..min_overlap - 1]);
+        assert_eq!(matcher.match_one(&short, &long), MatchResult::NONE);
+        assert_eq!(matcher.match_one(&long, &short), MatchResult::NONE);
+        assert!(
+            matcher
+                .match_one(&make_fp(&frames[..min_overlap]), &long)
+                .is_match
+        );
     }
 
     #[test]
