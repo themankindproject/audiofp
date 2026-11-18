@@ -1020,6 +1020,43 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// One push of any size must leave the sample carry at the capacity it
+    /// was built with — it used to grow to the size of the largest push and
+    /// stay there — and must produce what feeding the same audio in small
+    /// chunks produces.
+    #[test]
+    fn a_large_push_does_not_grow_the_sample_carry() {
+        let samples = synthetic_audio(7, SR as usize * 60);
+
+        let mut whole = StreamingWang::default();
+        let capacity = whole.core.sample_carry.capacity();
+        let mut got: Vec<WangHash> = Vec::new();
+        got.extend(whole.push(&samples).unwrap().into_iter().map(|(_, h)| h));
+        assert_eq!(whole.core.sample_carry.capacity(), capacity);
+        assert!(whole.core.sample_carry.len() < N_FFT);
+        got.extend(whole.flush_complete().unwrap().into_iter().map(|(_, h)| h));
+
+        let mut chunked = StreamingWang::default();
+        let mut want: Vec<WangHash> = Vec::new();
+        for chunk in samples.chunks(777) {
+            want.extend(chunked.push(chunk).unwrap().into_iter().map(|(_, h)| h));
+            assert_eq!(chunked.core.sample_carry.capacity(), capacity);
+        }
+        want.extend(
+            chunked
+                .flush_complete()
+                .unwrap()
+                .into_iter()
+                .map(|(_, h)| h),
+        );
+
+        got.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        want.sort_unstable_by_key(|h| (h.t_anchor, h.hash));
+        assert!(!got.is_empty());
+        assert_eq!(got.len(), want.len());
+        assert!(got == want, "one large push and small chunks disagree");
+    }
+
     #[test]
     fn streaming_state_stays_bounded_under_long_input() {
         // Push 30 s of audio in 256-sample chunks (~940 pushes) and
@@ -1031,7 +1068,7 @@ mod tests {
         let chunk = 256usize;
 
         let mut s = StreamingWang::default();
-        let max_spec_rows = 2 * PEAK_NEIGHBOURHOOD + 1;
+        let max_spec_rows = PEAK_NEIGHBOURHOOD + 1;
 
         let mut peak_carry = 0usize;
         let mut peak_spec_rows = 0usize;

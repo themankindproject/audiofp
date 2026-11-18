@@ -150,3 +150,87 @@ fn silence_has_no_hashes_at_any_peak_floor() {
         assert!(panako.hashes.is_empty(), "Panako floor {floor}");
     }
 }
+
+/// A tone followed by a long silent tail: every second that holds peaks is
+/// finalised during the pushes, so at `flush` no bucket is pending. The
+/// legacy `flush` only drained the pending anchors from inside its
+/// per-bucket loop, which then never ran: the last second's anchors (and
+/// all their hashes) were dropped, and a second `flush` did not recover
+/// them. Offline extraction and `flush_complete` emit them.
+#[test]
+fn legacy_flush_emits_pending_anchors_when_no_bucket_is_pending() {
+    let mut audio = synth(7, 8_000 * 3);
+    audio.resize(8_000 * 7, 0.0);
+    let offline = Wang::default()
+        .extract(&audio, SampleRate::HZ_8000)
+        .unwrap()
+        .hashes;
+    assert!(!offline.is_empty());
+
+    for chunk in [1_024, audio.len()] {
+        let mut s = StreamingWang::default();
+        let mut out = Vec::new();
+        for c in audio.chunks(chunk) {
+            out.extend(s.push(c).unwrap().into_iter().map(|(_, h)| h));
+        }
+        out.extend(s.flush().unwrap().into_iter().map(|(_, h)| h));
+        assert_eq!(
+            out.len(),
+            offline.len(),
+            "chunk {chunk}: legacy flush must not drop anchors"
+        );
+        assert!(
+            sorted(out) == sorted(offline.clone()),
+            "chunk {chunk}: legacy flush hashes differ from offline"
+        );
+        assert!(s.flush().unwrap().is_empty(), "flush is idempotent");
+    }
+
+    let mut s = StreamingPanako::default();
+    let mut legacy = s.push(&audio).unwrap().len();
+    legacy += s.flush().unwrap().len();
+    let mut s = StreamingPanako::default();
+    let mut complete = s.push(&audio).unwrap().len();
+    complete += s.flush_complete().unwrap().len();
+    assert_eq!(legacy, complete, "Panako legacy flush vs flush_complete");
+}
+
+/// A second without peaks must not hold back the anchors waiting on it.
+/// Emission was gated on the last *finalised* bucket, and only buckets
+/// that hold peaks were ever finalised, so anchors whose target zone ends
+/// in a silent second stayed queued for the length of the silence
+/// (unbounded on a paused live stream) instead of `latency_ms`.
+#[test]
+fn anchors_are_emitted_during_a_silent_gap() {
+    let mut audio = synth(7, 8_000 * 3);
+    audio.resize(8_000 * 8, 0.0);
+    let offline = Wang::default()
+        .extract(&audio, SampleRate::HZ_8000)
+        .unwrap()
+        .hashes;
+
+    for chunk in [800, 1_024, audio.len()] {
+        let mut s = StreamingWang::default();
+        let mut during_pushes = Vec::new();
+        for c in audio.chunks(chunk) {
+            during_pushes.extend(s.push(c).unwrap().into_iter().map(|(_, h)| h));
+        }
+        // 5 s of silence is far beyond the ~2.3 s latency bound: nothing
+        // may be left for the flush.
+        assert_eq!(
+            during_pushes.len(),
+            offline.len(),
+            "chunk {chunk}: every hash must arrive during the pushes"
+        );
+        assert!(
+            sorted(during_pushes) == sorted(offline.clone()),
+            "chunk {chunk}: pushed hashes differ from offline"
+        );
+        assert!(s.flush_complete().unwrap().is_empty());
+    }
+
+    let mut s = StreamingPanako::default();
+    let pushed = s.push(&audio).unwrap().len();
+    assert!(pushed > 0);
+    assert_eq!(s.flush_complete().unwrap().len(), 0, "Panako");
+}

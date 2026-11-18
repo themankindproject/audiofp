@@ -389,17 +389,16 @@ fn build_triplet_hashes(peaks: &[Peak], cfg: &PanakoConfig) -> Result<Vec<Panako
         }
 
         // Heap-based top-K over (b, c) tuples, scored by `b.mag + c.mag`.
-        // Suffix-max array enables early-exit without reordering targets.
+        // `suffix_max[j]` is the largest magnitude among `targets[j..]`,
+        // which bounds every pair a given `b` can still form without
+        // reordering the targets. The empty suffix is −∞: magnitudes are
+        // dB and usually negative, so the `0.0` used before sat above
+        // all of them and the bound never pruned anything.
         let targets_len = targets.len();
-        suffix_max.resize(targets_len + 1, 0.0_f32);
-        suffix_max[targets_len] = 0.0_f32;
+        suffix_max.clear();
+        suffix_max.resize(targets_len + 1, f32::NEG_INFINITY);
         for j in (0..targets_len).rev() {
-            let m = targets[j].mag;
-            suffix_max[j] = if m > suffix_max[j + 1] {
-                m
-            } else {
-                suffix_max[j + 1]
-            };
+            suffix_max[j] = targets[j].mag.max(suffix_max[j + 1]);
         }
 
         heap.clear();
@@ -1178,7 +1177,7 @@ mod tests {
         let chunk = 256usize;
 
         let mut s = StreamingPanako::default();
-        let max_spec_rows = 2 * PEAK_NEIGHBOURHOOD + 1;
+        let max_spec_rows = PEAK_NEIGHBOURHOOD + 1;
 
         let mut peak_carry = 0usize;
         let mut peak_spec_rows = 0usize;
