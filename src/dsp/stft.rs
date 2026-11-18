@@ -12,10 +12,13 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::{Add, Mul, Sub};
 
 use num_complex::Complex;
 use rustfft::{Fft, FftPlannerScalar};
+use wide::f32x8;
 
+use crate::dsp::simd;
 use crate::dsp::windows::{WindowKind, make_window};
 
 /// Forward real-input FFT with a fixed, target-independent backend.
@@ -39,8 +42,11 @@ pub(crate) struct RealFft {
     len: usize,
     /// Complex FFT of length `len / 2`; `None` when `len == 1`.
     fft: Option<Arc<dyn Fft<f32>>>,
-    /// `0.5 * e^{-2πik/len}` for `k in 1..ceil(len/4)`.
-    twiddles: Vec<Complex<f32>>,
+    /// Real and imaginary parts of `0.5 * e^{-2πik/len}` for
+    /// `k in 1..ceil(len/4)`, kept as two arrays so the post-processing
+    /// loop can load eight of each at a time.
+    twiddle_re: Vec<f32>,
+    twiddle_im: Vec<f32>,
     scratch: Vec<Complex<f32>>,
 }
 
@@ -54,7 +60,8 @@ impl RealFft {
             return Self {
                 len,
                 fft: None,
-                twiddles: Vec::new(),
+                twiddle_re: Vec::new(),
+                twiddle_im: Vec::new(),
                 scratch: Vec::new(),
             };
         }
@@ -63,18 +70,20 @@ impl RealFft {
         } else {
             len / 4 + 1
         };
-        let twiddles = (1..twiddle_count)
-            .map(|k| {
-                let angle = -2.0 * core::f64::consts::PI / len as f64 * k as f64;
-                Complex::new(libm::cos(angle) as f32, libm::sin(angle) as f32) * 0.5
-            })
+        let angle = |k: usize| -2.0 * core::f64::consts::PI / len as f64 * k as f64;
+        let twiddle_re = (1..twiddle_count)
+            .map(|k| libm::cos(angle(k)) as f32 * 0.5)
+            .collect();
+        let twiddle_im = (1..twiddle_count)
+            .map(|k| libm::sin(angle(k)) as f32 * 0.5)
             .collect();
         let fft = FftPlannerScalar::new().plan_fft_forward(len / 2);
         let scratch = vec![Complex::new(0.0, 0.0); fft.get_outofplace_scratch_len()];
         Self {
             len,
             fft: Some(fft),
-            twiddles,
+            twiddle_re,
+            twiddle_im,
             scratch,
         }
     }
@@ -109,31 +118,41 @@ impl RealFft {
         let left = &mut left[1..];
         let right = &mut right[..right_len - 1];
 
-        for (twiddle, (out, out_rev)) in self
-            .twiddles
-            .iter()
-            .zip(left.iter_mut().zip(right.iter_mut().rev()))
-        {
-            let sum = *out + *out_rev;
-            let diff = *out - *out_rev;
-            let twiddled_re_sum = sum * twiddle.re;
-            let twiddled_im_sum = sum * twiddle.im;
-            let twiddled_re_diff = diff * twiddle.re;
-            let twiddled_im_diff = diff * twiddle.im;
-            let half_sum_re = 0.5 * sum.re;
-            let half_diff_im = 0.5 * diff.im;
+        // Bin `1 + i` (`left[i]`) pairs with its mirror `right[pairs - 1 - i]`.
+        let pairs = self.twiddle_re.len().min(left.len()).min(right.len());
+        let left = &mut left[..pairs];
+        let right = &mut right[right_len - 1 - pairs..];
 
-            let output_twiddled_real = twiddled_re_sum.im + twiddled_im_diff.re;
-            let output_twiddled_im = twiddled_im_sum.im - twiddled_re_diff.re;
+        // Eight pairs at a time, then one at a time. Both run `untangle`,
+        // whose lane-wise adds, subtracts and multiplies round exactly like
+        // the scalar ones, so the spectrum does not depend on the split.
+        let (left_wide, left_tail) = left.as_chunks_mut::<8>();
+        let (right_tail, right_wide) = right.as_rchunks_mut::<8>();
+        let (re_wide, re_tail) = self.twiddle_re[..pairs].as_chunks::<8>();
+        let (im_wide, im_tail) = self.twiddle_im[..pairs].as_chunks::<8>();
 
-            *out = Complex::new(
-                half_sum_re + output_twiddled_real,
-                half_diff_im + output_twiddled_im,
+        let mirrored = left_wide.iter_mut().zip(right_wide.iter_mut().rev());
+        for ((out, rev), twiddle) in mirrored.zip(re_wide.iter().zip(im_wide)) {
+            let (bin, mirror) = untangle(
+                simd::load_complex8(out),
+                simd::load_complex8_reversed(rev),
+                (f32x8::new(*twiddle.0), f32x8::new(*twiddle.1)),
+                f32x8::splat(0.5),
             );
-            *out_rev = Complex::new(
-                half_sum_re - output_twiddled_real,
-                output_twiddled_im - half_diff_im,
+            simd::store_complex8(out, bin.0, bin.1);
+            simd::store_complex8_reversed(rev, mirror.0, mirror.1);
+        }
+
+        let mirrored = left_tail.iter_mut().zip(right_tail.iter_mut().rev());
+        for ((out, rev), twiddle) in mirrored.zip(re_tail.iter().zip(im_tail)) {
+            let (bin, mirror) = untangle(
+                (out.re, out.im),
+                (rev.re, rev.im),
+                (*twiddle.0, *twiddle.1),
+                0.5,
             );
+            *out = Complex::new(bin.0, bin.1);
+            *rev = Complex::new(mirror.0, mirror.1);
         }
 
         // Odd bin count: the centre bin has no partner; conjugate it.
@@ -142,6 +161,30 @@ impl RealFft {
             output[centre].im = -output[centre].im;
         }
     }
+}
+
+/// One step of the real-FFT post-processing: turns a bin of the half-length
+/// complex FFT and its mirror bin (each `(re, im)`) into the two bins of
+/// the real-input spectrum they stand for. `twiddle` is that pair's
+/// `0.5 * e^{-2πik/len}`.
+///
+/// Generic so the scalar tail and the 8-lane loop share one definition of
+/// the arithmetic, and with it one rounding sequence.
+#[inline(always)]
+fn untangle<T>(bin: (T, T), mirror: (T, T), twiddle: (T, T), half: T) -> ((T, T), (T, T))
+where
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
+{
+    let (sum_re, sum_im) = (bin.0 + mirror.0, bin.1 + mirror.1);
+    let (diff_re, diff_im) = (bin.0 - mirror.0, bin.1 - mirror.1);
+    let half_sum_re = half * sum_re;
+    let half_diff_im = half * diff_im;
+    let twiddled_re = sum_im * twiddle.0 + diff_re * twiddle.1;
+    let twiddled_im = sum_im * twiddle.1 - diff_re * twiddle.0;
+    (
+        (half_sum_re + twiddled_re, half_diff_im + twiddled_im),
+        (half_sum_re - twiddled_re, twiddled_im - half_diff_im),
+    )
 }
 
 /// Parameters controlling an [`ShortTimeFFT`] instance.
@@ -389,8 +432,8 @@ impl ShortTimeFFT {
     /// Useful when the next stage applies `log10` (which combines
     /// algebraically with the missing `sqrt`: `20·log10(sqrt(p)) ==
     /// 10·log10(p)`) or any other operation that doesn't need the
-    /// magnitude itself. The classical fingerprinters all consume
-    /// `power_flat` for this reason.
+    /// magnitude itself. The classical fingerprinters work on power for
+    /// this reason, a frame at a time through `process_frame_power`.
     ///
     /// # Example
     ///
@@ -583,6 +626,103 @@ mod tests {
     use alloc::string::ToString;
     use approx::assert_relative_eq;
     use core::f32::consts::PI;
+
+    /// The real FFT as it was before the post-processing ran eight pairs
+    /// at a time: the same packing and complex FFT, then one bin and its
+    /// mirror per step.
+    fn reference_real_fft(input: &[f32]) -> Vec<Complex<f32>> {
+        let len = input.len();
+        if len == 1 {
+            return vec![Complex::new(input[0], 0.0)];
+        }
+        let mut output: Vec<Complex<f32>> = input
+            .chunks_exact(2)
+            .map(|pair| Complex::new(pair[0], pair[1]))
+            .collect();
+        FftPlannerScalar::new()
+            .plan_fft_forward(len / 2)
+            .process(&mut output);
+        output.push(Complex::new(0.0, 0.0));
+
+        let twiddle_count = if len.is_multiple_of(4) {
+            len / 4
+        } else {
+            len / 4 + 1
+        };
+        let twiddles: Vec<Complex<f32>> = (1..twiddle_count)
+            .map(|k| {
+                let angle = -2.0 * core::f64::consts::PI / len as f64 * k as f64;
+                Complex::new(libm::cos(angle) as f32, libm::sin(angle) as f32) * 0.5
+            })
+            .collect();
+
+        let n_bins = output.len();
+        let (left, right) = output.split_at_mut(n_bins / 2);
+        let dc = left[0];
+        left[0] = Complex::new(dc.re + dc.im, 0.0);
+        let right_len = right.len();
+        right[right_len - 1] = Complex::new(dc.re - dc.im, 0.0);
+        let left = &mut left[1..];
+        let right = &mut right[..right_len - 1];
+        for (twiddle, (out, out_rev)) in twiddles
+            .iter()
+            .zip(left.iter_mut().zip(right.iter_mut().rev()))
+        {
+            let sum = *out + *out_rev;
+            let diff = *out - *out_rev;
+            let twiddled_re_sum = sum * twiddle.re;
+            let twiddled_im_sum = sum * twiddle.im;
+            let twiddled_re_diff = diff * twiddle.re;
+            let twiddled_im_diff = diff * twiddle.im;
+            let half_sum_re = 0.5 * sum.re;
+            let half_diff_im = 0.5 * diff.im;
+            let output_twiddled_real = twiddled_re_sum.im + twiddled_im_diff.re;
+            let output_twiddled_im = twiddled_im_sum.im - twiddled_re_diff.re;
+            *out = Complex::new(
+                half_sum_re + output_twiddled_real,
+                half_diff_im + output_twiddled_im,
+            );
+            *out_rev = Complex::new(
+                half_sum_re - output_twiddled_real,
+                output_twiddled_im - half_diff_im,
+            );
+        }
+        if n_bins % 2 == 1 {
+            output[n_bins / 2].im = -output[n_bins / 2].im;
+        }
+        output
+    }
+
+    #[test]
+    fn real_fft_matches_the_one_pair_per_step_reference_bit_for_bit() {
+        let mut state = 0x9E37_79B9_u32;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as i32 as f32 * (1.0 / 2_147_483_648.0)
+        };
+        // Every length from "no pairs at all" through "tail only", "one
+        // wide chunk" and "wide chunks plus a tail" (len / 4 - 1 pairs).
+        for exp in 0..=13 {
+            let len = 1_usize << exp;
+            let input: Vec<f32> = (0..len).map(|_| noise()).collect();
+            let want = reference_real_fft(&input);
+
+            let mut fft = RealFft::new(len);
+            let mut scratch = input.clone();
+            let mut got = vec![Complex::new(f32::NAN, f32::NAN); len / 2 + 1];
+            fft.process(&mut scratch, &mut got);
+
+            let bits = |spectrum: &[Complex<f32>]| -> Vec<(u32, u32)> {
+                spectrum
+                    .iter()
+                    .map(|bin| (bin.re.to_bits(), bin.im.to_bits()))
+                    .collect()
+            };
+            assert!(bits(&got) == bits(&want), "len {len}: spectrum differs");
+        }
+    }
 
     #[test]
     fn reflect_matches_numpy() {

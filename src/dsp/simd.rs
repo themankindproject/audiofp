@@ -31,6 +31,7 @@
 //! baseline x86_64 (SSE2, no FMA), so golden hashes are unchanged there.
 
 use bytemuck::cast;
+use num_complex::Complex;
 use wide::{f32x8, i32x8, u32x8};
 
 /// Load 8 floats starting at `off`. The caller guarantees
@@ -72,6 +73,8 @@ fn hsum8(v: f32x8) -> f32 {
 pub(crate) fn dot_core(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot core requires equal input lengths");
     let n = a.len();
+    // One length check up front instead of one per chunk.
+    let b = &b[..n];
     let chunks = n / 8;
     let tail_start = chunks * 8;
 
@@ -86,6 +89,48 @@ pub(crate) fn dot_core(a: &[f32], b: &[f32]) -> f32 {
         sum += a[i] * b[i];
     }
     sum
+}
+
+/// Four [`dot_core`] products at once: `out[j] = dot_core(a[j], b[j])`,
+/// bit for bit.
+///
+/// Each product keeps its own accumulator, updated in the same chunk
+/// order and reduced by the same [`hsum8`] and scalar tail, so every
+/// result is exactly what `dot_core` returns. Interleaving the four
+/// accumulator chains is what makes it faster: one `dot_core` is a serial
+/// chain of dependent adds, so its cost is the add latency times the chunk
+/// count, while four independent chains overlap. All eight slices must
+/// have the same length.
+#[inline]
+pub(crate) fn dot_core_x4(a: [&[f32]; 4], b: [&[f32]; 4]) -> [f32; 4] {
+    let n = a[0].len();
+    debug_assert!(
+        a.iter().chain(&b).all(|s| s.len() == n),
+        "dot_core_x4 requires eight slices of equal length"
+    );
+    let a = a.map(|s| s.as_chunks::<8>());
+    let b = b.map(|s| s.as_chunks::<8>());
+    // The shortest chunk count bounds every index below, so none of the
+    // eight lookups in the loop is checked.
+    let mut chunks = n / 8;
+    for j in 0..4 {
+        chunks = chunks.min(a[j].0.len()).min(b[j].0.len());
+    }
+
+    let mut acc = [f32x8::ZERO; 4];
+    for i in 0..chunks {
+        for j in 0..4 {
+            acc[j] = f32x8::new(a[j].0[i]) * f32x8::new(b[j].0[i]) + acc[j];
+        }
+    }
+
+    core::array::from_fn(|j| {
+        let mut sum = hsum8(acc[j]);
+        for (&x, &y) in a[j].1.iter().zip(b[j].1) {
+            sum += x * y;
+        }
+        sum
+    })
 }
 
 /// Core sum-of-squares: `sum(v[i] * v[i])`, 8-wide with a scalar tail.
@@ -319,30 +364,41 @@ pub(crate) fn log2_lanes(x1: f32x8) -> f32x8 {
     res * f32x8::LOG2_E
 }
 
-/// Load the real and imaginary parts of 8 complex spectrum bins.
-#[inline]
-pub(crate) fn load_complex8(complex: &[num_complex::Complex<f32>], off: usize) -> (f32x8, f32x8) {
-    let re = f32x8::new([
-        complex[off].re,
-        complex[off + 1].re,
-        complex[off + 2].re,
-        complex[off + 3].re,
-        complex[off + 4].re,
-        complex[off + 5].re,
-        complex[off + 6].re,
-        complex[off + 7].re,
-    ]);
-    let im = f32x8::new([
-        complex[off].im,
-        complex[off + 1].im,
-        complex[off + 2].im,
-        complex[off + 3].im,
-        complex[off + 4].im,
-        complex[off + 5].im,
-        complex[off + 6].im,
-        complex[off + 7].im,
-    ]);
-    (re, im)
+/// Split 8 complex spectrum bins into their real and imaginary lanes.
+///
+/// Takes the bins as an array so the eight loads need no bounds checks and
+/// compile to shuffles of two vector loads.
+#[inline(always)]
+pub(crate) fn load_complex8(bins: &[Complex<f32>; 8]) -> (f32x8, f32x8) {
+    (
+        f32x8::new(bins.map(|bin| bin.re)),
+        f32x8::new(bins.map(|bin| bin.im)),
+    )
+}
+
+/// [`load_complex8`] with the lanes in reverse order: lane `l` holds
+/// `bins[7 - l]`.
+#[inline(always)]
+pub(crate) fn load_complex8_reversed(bins: &[Complex<f32>; 8]) -> (f32x8, f32x8) {
+    (
+        f32x8::new(core::array::from_fn(|l| bins[7 - l].re)),
+        f32x8::new(core::array::from_fn(|l| bins[7 - l].im)),
+    )
+}
+
+/// Write 8 complex spectrum bins from their real and imaginary lanes.
+#[inline(always)]
+pub(crate) fn store_complex8(bins: &mut [Complex<f32>; 8], re: f32x8, im: f32x8) {
+    let (re, im) = (re.to_array(), im.to_array());
+    *bins = core::array::from_fn(|l| Complex::new(re[l], im[l]));
+}
+
+/// [`store_complex8`] with the lanes in reverse order: `bins[7 - l]` takes
+/// lane `l`.
+#[inline(always)]
+pub(crate) fn store_complex8_reversed(bins: &mut [Complex<f32>; 8], re: f32x8, im: f32x8) {
+    let (re, im) = (re.to_array(), im.to_array());
+    *bins = core::array::from_fn(|l| Complex::new(re[7 - l], im[7 - l]));
 }
 
 /// Core complex power: `dst[i] = re^2 + im^2`, 8-wide with a scalar tail.
@@ -350,14 +406,14 @@ pub(crate) fn load_complex8(complex: &[num_complex::Complex<f32>], off: usize) -
 /// Both squares are rounded before the add (no fused multiply-add), so the
 /// vector and scalar paths are bit-identical on every target.
 #[inline]
-pub(crate) fn complex_power_into(complex: &[num_complex::Complex<f32>], dst: &mut [f32]) {
+pub(crate) fn complex_power_into(complex: &[Complex<f32>], dst: &mut [f32]) {
     complex_power_impl::<false>(complex, dst);
 }
 
 /// Core complex magnitude: `dst[i] = sqrt(re^2 + im^2)`, 8-wide with a
 /// scalar tail. See [`complex_power_into`] for numerics notes.
 #[inline]
-pub(crate) fn complex_magnitude_into(complex: &[num_complex::Complex<f32>], dst: &mut [f32]) {
+pub(crate) fn complex_magnitude_into(complex: &[Complex<f32>], dst: &mut [f32]) {
     complex_power_impl::<true>(complex, dst);
 }
 
@@ -365,25 +421,21 @@ pub(crate) fn complex_magnitude_into(complex: &[num_complex::Complex<f32>], dst:
 /// hot loop contains no branch (the pre-split code passed a runtime
 /// `sqrt: bool`, which relies on the predictor / loop versioning).
 #[inline]
-fn complex_power_impl<const SQRT: bool>(complex: &[num_complex::Complex<f32>], dst: &mut [f32]) {
+fn complex_power_impl<const SQRT: bool>(complex: &[Complex<f32>], dst: &mut [f32]) {
     debug_assert_eq!(complex.len(), dst.len());
+    let dst = &mut dst[..complex.len()];
 
-    let n = complex.len();
-    let chunks = n / 8;
-    let tail_start = chunks * 8;
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let (re, im) = load_complex8(complex, off);
+    let (wide, tail) = complex.as_chunks::<8>();
+    let (dst_wide, dst_tail) = dst.as_chunks_mut::<8>();
+    for (bins, out) in wide.iter().zip(dst_wide) {
+        let (re, im) = load_complex8(bins);
         let power = re * re + im * im;
-        store8(dst, off, if SQRT { power.sqrt() } else { power });
+        *out = if SQRT { power.sqrt() } else { power }.to_array();
     }
 
-    // Scalar tail.
-    for i in tail_start..n {
-        let c = &complex[i];
-        let p = c.re * c.re + c.im * c.im;
-        dst[i] = if SQRT { libm::sqrtf(p) } else { p };
+    for (bin, out) in tail.iter().zip(dst_tail) {
+        let power = bin.re * bin.re + bin.im * bin.im;
+        *out = if SQRT { libm::sqrtf(power) } else { power };
     }
 }
 
@@ -488,10 +540,29 @@ mod tests {
     }
 
     #[test]
+    fn dot_core_x4_matches_four_dot_cores_bit_for_bit() {
+        for n in [0_usize, 1, 7, 8, 9, 16, 31, 64, 65, 129, 1_031] {
+            let a: [Vec<f32>; 4] = core::array::from_fn(|j| random_vec(17 + j as u32, n));
+            let b: [Vec<f32>; 4] = core::array::from_fn(|j| random_vec(91 + j as u32, n));
+            let got = dot_core_x4(
+                core::array::from_fn(|j| a[j].as_slice()),
+                core::array::from_fn(|j| b[j].as_slice()),
+            );
+            for j in 0..4 {
+                assert_eq!(
+                    got[j].to_bits(),
+                    dot_core(&a[j], &b[j]).to_bits(),
+                    "n={n} product {j}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn complex_power_rounds_each_square() {
         let re = random_vec(11, 1027);
         let im = random_vec(12, 1027);
-        let spec: Vec<num_complex::Complex<f32>> = re
+        let spec: Vec<Complex<f32>> = re
             .iter()
             .zip(&im)
             .map(|(&r, &i)| num_complex::Complex::new(r, i))
