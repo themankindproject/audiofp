@@ -527,6 +527,8 @@ pub struct StreamingHaitsma {
     cfg: HaitsmaConfig,
 
     stft: ShortTimeFFT,
+    /// Input samples not yet consumed by a frame. Allocated once and never
+    /// grown (see [`PUSH_BLOCK`](crate::pcm::PUSH_BLOCK)).
     sample_carry: Vec<f32>,
     /// Precomputed contiguous bin ranges for each band.
     band_ranges: Vec<(usize, usize)>,
@@ -592,7 +594,7 @@ impl StreamingHaitsma {
         Ok(Self {
             cfg,
             stft,
-            sample_carry: Vec::new(),
+            sample_carry: Vec::with_capacity(HAITSMA_N_FFT + crate::pcm::PUSH_BLOCK),
             band_ranges,
             frame_power: alloc::vec![0.0_f32; n_bins],
             has_prev: false,
@@ -623,32 +625,32 @@ impl StreamingHaitsma {
     /// `self.pending`. Shared by `push()` and `push_with()`.
     fn process_push(&mut self, samples: &[f32]) {
         let samples = crate::pcm::truncate_push(samples, self.cfg.max_push_samples);
-        crate::pcm::extend_sanitized(&mut self.sample_carry, samples);
 
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= HAITSMA_N_FFT {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + HAITSMA_N_FFT],
-                    &mut self.frame_power,
-                )
-                .expect("frame_power is sized n_bins and frames are exactly n_fft");
-            let e = band_energies(&self.frame_power, &self.band_ranges);
+        for block in samples.chunks(crate::pcm::PUSH_BLOCK) {
+            crate::pcm::extend_sanitized(&mut self.sample_carry, block);
 
-            if self.has_prev {
-                let hash = pack_frame_bits(&e, &self.prev_energy);
-                let abs_frame = self.next_frame_idx;
-                let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
-                self.pending.push((TimestampMs(t_ms), hash));
-                self.next_frame_idx += 1;
-            } else {
-                self.has_prev = true;
+            let mut off = 0usize;
+            while self.sample_carry.len() - off >= HAITSMA_N_FFT {
+                self.stft
+                    .process_frame_power(
+                        &self.sample_carry[off..off + HAITSMA_N_FFT],
+                        &mut self.frame_power,
+                    )
+                    .expect("frame_power is sized n_bins and frames are exactly n_fft");
+                let e = band_energies(&self.frame_power, &self.band_ranges);
+
+                if self.has_prev {
+                    let hash = pack_frame_bits(&e, &self.prev_energy);
+                    let abs_frame = self.next_frame_idx;
+                    let t_ms = (abs_frame as u64 * HAITSMA_HOP as u64 * 1000) / HAITSMA_SR as u64;
+                    self.pending.push((TimestampMs(t_ms), hash));
+                    self.next_frame_idx += 1;
+                } else {
+                    self.has_prev = true;
+                }
+                self.prev_energy = e;
+                off += HAITSMA_HOP;
             }
-            self.prev_energy = e;
-            off += HAITSMA_HOP;
-        }
-
-        if off > 0 {
             self.sample_carry.drain(0..off);
         }
     }
@@ -984,6 +986,28 @@ mod tests {
         online.extend(streaming.flush().unwrap().into_iter().map(|(_, h)| h));
 
         assert_eq!(off.frames, online, "streaming != offline frame sequence");
+    }
+
+    /// One push of any size must leave the sample carry at the capacity it
+    /// was built with, and produce the offline frame sequence.
+    #[test]
+    fn a_large_push_does_not_grow_the_sample_carry() {
+        let samples = synthetic_audio(13, HAITSMA_SR as usize * 60);
+        let offline = Haitsma::default()
+            .extract(&samples, SampleRate::new(HAITSMA_SR).unwrap())
+            .unwrap();
+
+        let mut s = StreamingHaitsma::default();
+        let capacity = s.sample_carry.capacity();
+        let frames: Vec<u32> = s
+            .push(&samples)
+            .unwrap()
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        assert_eq!(s.sample_carry.capacity(), capacity);
+        assert!(s.sample_carry.len() < HAITSMA_N_FFT);
+        assert!(frames == offline.frames, "one large push != offline frames");
     }
 
     #[test]

@@ -25,6 +25,17 @@ pub(crate) fn truncate_push(samples: &[f32], max: Option<usize>) -> &[f32] {
     }
 }
 
+/// How many samples a classical streaming `push` copies into its carry at
+/// a time.
+///
+/// Frames are cut from the carry as each block lands, so the carry never
+/// holds more than `n_fft − 1 + PUSH_BLOCK` samples however large the push
+/// is. Copying a whole push in first made the carry — whose capacity a
+/// stream keeps for life — as large as the largest push it ever received
+/// (19 MB after one 10-minute push at 8 kHz), and reallocated it, on the
+/// hot path, whenever a push outgrew every earlier one.
+pub(crate) const PUSH_BLOCK: usize = 1024;
+
 /// Append `samples` to `carry`, replacing any non-finite value with `0.0`.
 ///
 /// Streaming `push` is infallible, so sanitize rather than error. Clean

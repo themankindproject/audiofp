@@ -86,9 +86,15 @@ pub(crate) struct PeakCfg {
 /// per-algorithm emission closure.
 pub(crate) struct StreamCore<F> {
     pub(crate) stft: ShortTimeFFT,
+    /// Input samples not yet consumed by a frame. Allocated once, at
+    /// `n_fft + PUSH_BLOCK` samples, and never grown (see
+    /// [`pcm::PUSH_BLOCK`]).
     pub(crate) sample_carry: Vec<f32>,
 
-    // Rolling log-power spectrogram window (ring buffer, row-major).
+    // Rolling log-power spectrogram window (ring buffer, row-major): the
+    // newest row back to the one the peak detector reports on, which
+    // trails it by `neighborhood` rows. Nothing reads further back — the
+    // detector keeps its own running maximum of the older rows.
     //
     // audit C2: `append_frame_scratch_row` used to memmove the whole
     // window down one row at every frame past capacity (~4 MB/s of
@@ -116,7 +122,8 @@ pub(crate) struct StreamCore<F> {
     // Per-second adaptive thresholding. Sorted Vec — bounded (≤ 3 entries
     // in steady state), so linear/binary search is faster than a tree.
     pub(crate) bucket_pending: Vec<(u32, Vec<Peak>)>,
-    /// Highest bucket finalised so far, `-1` before the first.
+    /// Highest bucket known to be complete, `-1` before the first: every
+    /// bucket up to it has either been finalised or holds no peaks.
     pub(crate) last_finalized_bucket: i64,
 
     pub(crate) pending_anchors: alloc::collections::VecDeque<PendingAnchor>,
@@ -277,11 +284,10 @@ impl<F> StreamCore<F> {
             center: false,
         });
         let n_bins = stft.n_bins();
-        let window_capacity = 2 * neighborhood + 1;
         Self {
             stft,
-            sample_carry: Vec::new(),
-            spec: vec![0.0_f32; window_capacity * n_bins],
+            sample_carry: Vec::with_capacity(n_fft + pcm::PUSH_BLOCK),
+            spec: vec![0.0_f32; (neighborhood + 1) * n_bins],
             spec_n_rows: 0,
             spec_n_bins: n_bins,
             spec_tail: 0,
@@ -340,10 +346,11 @@ impl<F> StreamCore<F> {
         self.emitted.clear();
     }
 
-    /// Capacity of the spec ring buffer, in rows.
+    /// Capacity of the spec ring buffer, in rows: the row the peak detector
+    /// is reporting on and the `neighborhood` rows pushed since.
     #[inline]
     fn spec_capacity(&self) -> usize {
-        2 * self.neighborhood + 1
+        self.neighborhood + 1
     }
 
     /// Base offset of logical row `row` (0 = oldest) inside `spec`.
@@ -561,10 +568,30 @@ impl<F> StreamCore<F> {
         let n = self.to_finalize.len();
         for i in 0..n {
             let bucket = self.to_finalize[i];
+            // Everything below this bucket is complete: finalised above or
+            // earlier, or it holds no peaks at all. Release the anchors
+            // that were waiting only on those seconds before this bucket
+            // queues its own, so a `max_pending_anchors` cap sees the same
+            // queue for one large push as for many small ones.
+            self.mark_complete_below(i64::from(bucket));
+            self.emit_finalized_anchors(cfg, &mut *emit_anchor);
             self.finalize_bucket(cfg, bucket, &mut *add_target);
             self.emit_finalized_anchors(cfg, &mut *emit_anchor);
         }
         self.to_finalize.clear();
+        // A second without peaks is never finalised, but once every frame
+        // of it has been peak-detected it is just as complete. Without
+        // this, anchors whose target zone ends in a silent second stayed
+        // queued for as long as the silence lasted.
+        self.mark_complete_below(current_bucket);
+        self.emit_finalized_anchors(cfg, &mut *emit_anchor);
+    }
+
+    /// Record that every bucket below `bucket` is complete (no further
+    /// peaks can land in it).
+    #[inline]
+    fn mark_complete_below(&mut self, bucket: i64) {
+        self.last_finalized_bucket = self.last_finalized_bucket.max(bucket - 1);
     }
 
     /// Pop anchors whose target zone is fully observed, build hashes from
@@ -580,33 +607,51 @@ impl<F> StreamCore<F> {
         cfg: PeakCfg,
         emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
-        // Pop-and-push pattern: take the front anchor, decide whether its
-        // target zone is fully observed, and if not put it back. This avoids
-        // an `unwrap` after a separate `front()` peek and stays a clean
-        // `while let` over the pop result.
-        //
+        self.emit_anchors(cfg, false, emit_anchor);
+    }
+
+    /// Emit every pending anchor, ripe or not: at the end of a stream no
+    /// further target can arrive.
+    fn emit_all_pending(
+        &mut self,
+        cfg: PeakCfg,
+        emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        self.emit_anchors(cfg, true, emit_anchor);
+    }
+
+    /// Drain `pending_anchors` from the front. With `all` the whole queue
+    /// goes; otherwise the drain stops at the first anchor whose target
+    /// zone reaches into a second that is not complete yet (the queue is
+    /// ordered, so every anchor behind it is waiting too).
+    fn emit_anchors(
+        &mut self,
+        cfg: PeakCfg,
+        all: bool,
+        mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
+    ) {
+        let last_dt = match self.zone {
+            // Wang's target zone is inclusive (`dt ≤ target_zone_t`),
+            // so the last possible target frame is exactly `t + zone_t`.
+            Zone::Inclusive => cfg.target_zone_t as u32,
+            // Panako uses strict `dt < target_zone_t`.
+            Zone::Strict => cfg.target_zone_t as u32 - 1,
+        };
         // Temporarily take `emitted` to split the borrow: the loop body
-        // needs `&self` (for `emit_anchor`) and `&mut emitted`.
+        // needs `&mut self` (queue, pool) and `&mut emitted`.
         let mut emitted = core::mem::take(&mut self.emitted);
-        let mut emit_anchor = emit_anchor;
         while let Some(anchor) = self.pending_anchors.pop_front() {
-            let last_dt = match self.zone {
-                // Wang's target zone is inclusive (`dt ≤ target_zone_t`),
-                // so the last possible target frame is exactly `t + zone_t`.
-                Zone::Inclusive => cfg.target_zone_t as u32,
-                // Panako uses strict `dt < target_zone_t`.
-                Zone::Strict => cfg.target_zone_t as u32 - 1,
-            };
             let last_target_frame = anchor.peak.t_frame.saturating_add(last_dt);
             let last_target_bucket = (last_target_frame as f32 / self.frames_per_sec) as i64;
-            if self.last_finalized_bucket < last_target_bucket {
+            if !all && self.last_finalized_bucket < last_target_bucket {
+                // Not ripe: put it back (pop-then-push avoids an `unwrap`
+                // after a separate `front()` peek).
                 self.pending_anchors.push_front(anchor);
                 break;
             }
             let freed = emit_anchor(anchor, cfg, &mut emitted);
-            // Recycle the consumed anchor's target buffer. `mut` access to
-            // the pool while `emitted` is taken is disjoint — no borrow
-            // conflict. Capped (see TARGETS_POOL_MAX): excess is dropped.
+            // Recycle the consumed anchor's target buffer. Capped (see
+            // TARGETS_POOL_MAX): excess is dropped.
             if self.targets_pool.len() < TARGETS_POOL_MAX {
                 self.targets_pool.push(freed);
             }
@@ -678,43 +723,44 @@ impl<F> StreamCore<F> {
         mut emit_anchor: impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
     ) {
         let samples = pcm::truncate_push(samples, cfg.max_push_samples);
-        pcm::extend_sanitized(&mut self.sample_carry, samples);
-
         let n_fft = self.n_fft;
         let hop = self.hop;
-        let mut off = 0usize;
-        while self.sample_carry.len() - off >= n_fft {
-            self.stft
-                .process_frame_power(
-                    &self.sample_carry[off..off + n_fft],
+
+        for block in samples.chunks(pcm::PUSH_BLOCK) {
+            pcm::extend_sanitized(&mut self.sample_carry, block);
+
+            let mut off = 0usize;
+            while self.sample_carry.len() - off >= n_fft {
+                self.stft
+                    .process_frame_power(
+                        &self.sample_carry[off..off + n_fft],
+                        &mut self.frame_scratch,
+                    )
+                    .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
+                // Every bin on the vector `log2` path, as the offline
+                // `FrontEnd` converts every row but the last: converting
+                // the row as a standalone buffer sent bin 512 down the
+                // scalar tail, whose result can differ by 1 ULP and flip a
+                // peak tie.
+                crate::dsp::simd::db_into_split(
                     &mut self.frame_scratch,
-                )
-                .expect("frame_scratch is sized n_bins and frames are exactly n_fft");
-            // Every bin on the vector `log2` path, as the offline
-            // `FrontEnd` converts every row but the last: converting the
-            // row as a standalone buffer sent bin 512 down the scalar tail,
-            // whose result can differ by 1 ULP and flip a peak tie.
-            crate::dsp::simd::db_into_split(
-                &mut self.frame_scratch,
-                self.log_floor_power,
-                crate::dsp::DB_LOG2_FACTOR,
-                usize::MAX,
-            );
-            self.append_frame_scratch_row();
+                    self.log_floor_power,
+                    crate::dsp::DB_LOG2_FACTOR,
+                    usize::MAX,
+                );
+                self.append_frame_scratch_row();
 
-            off += hop;
+                off += hop;
 
-            if let Some(ripe_abs) = self
-                .peak_det
-                .push_row(&self.frame_scratch, &mut self.peak_row_max)
-            {
-                let row_idx = (ripe_abs - self.spec_first_frame) as usize;
-                self.detect_row(cfg, row_idx);
-                self.last_pd_frame = i64::from(ripe_abs);
+                if let Some(ripe_abs) = self
+                    .peak_det
+                    .push_row(&self.frame_scratch, &mut self.peak_row_max)
+                {
+                    let row_idx = (ripe_abs - self.spec_first_frame) as usize;
+                    self.detect_row(cfg, row_idx);
+                    self.last_pd_frame = i64::from(ripe_abs);
+                }
             }
-        }
-
-        if off > 0 {
             self.sample_carry.drain(0..off);
         }
 
@@ -762,26 +808,6 @@ impl<F> StreamCore<F> {
         self.to_finalize.len()
     }
 
-    /// Emit every pending anchor unconditionally, recycling each consumed
-    /// target buffer into the pool.
-    fn emit_all_pending(
-        &mut self,
-        cfg: PeakCfg,
-        emit_anchor: &mut impl FnMut(PendingAnchor, PeakCfg, &mut Vec<(TimestampMs, F)>) -> Vec<Peak>,
-    ) {
-        // Temporarily take `emitted` to split the borrow (as in
-        // `emit_finalized_anchors`).
-        let mut emitted = core::mem::take(&mut self.emitted);
-        while let Some(anchor) = self.pending_anchors.pop_front() {
-            let freed = emit_anchor(anchor, cfg, &mut emitted);
-            // Capped (see TARGETS_POOL_MAX): excess is dropped.
-            if self.targets_pool.len() < TARGETS_POOL_MAX {
-                self.targets_pool.push(freed);
-            }
-        }
-        self.emitted = emitted;
-    }
-
     /// Common processing for `flush` and `flush_with`: drain remaining
     /// peaks from the incremental detector, finalise all buckets, emit
     /// all anchors into `self.emitted`.
@@ -817,6 +843,11 @@ impl<F> StreamCore<F> {
             self.emit_all_pending(cfg, &mut emit_anchor);
         }
         self.to_finalize.clear();
+        // With no bucket pending the loop above never runs, yet anchors
+        // can still be queued (their target zone reaches past the end of
+        // the stream, or into seconds that held no peaks). They used to be
+        // dropped here, and by every later `flush` too.
+        self.emit_all_pending(cfg, &mut emit_anchor);
     }
 
     /// Corrected end-of-stream finalisation: finalize every remaining bucket
@@ -839,7 +870,7 @@ impl<F> StreamCore<F> {
             self.finalize_bucket(cfg, bucket, &mut add_target);
         }
 
-        self.emit_finalized_anchors(cfg, &mut emit_anchor);
+        // One FIFO drain: at end of stream every anchor emits, ripe or not.
         self.emit_all_pending(cfg, &mut emit_anchor);
         self.to_finalize.clear();
     }
@@ -852,22 +883,22 @@ mod tests {
     #[test]
     fn spec_ring_overwrites_oldest_row_at_capacity() {
         let mut core = StreamCore::<u32>::new(256, 64, 8_000, 2, -80.0, Zone::Inclusive, 8, 0);
-        assert_eq!(core.spec_capacity(), 5);
+        assert_eq!(core.spec_capacity(), 3);
         let n_bins = core.spec_n_bins;
         core.frame_scratch = alloc::vec![0.0f32; n_bins];
 
-        // Push 12 rows into a 5-row ring: rows 0..7 must be gone,
-        // rows 8..12 must be readable as logical rows 0..4.
+        // Push 12 rows into a 3-row ring: rows 0..9 must be gone,
+        // rows 9..12 must be readable as logical rows 0..3.
         for f in 0..12u32 {
             core.frame_scratch.fill(f as f32 / 10.0);
             core.append_frame_scratch_row();
         }
 
-        assert_eq!(core.spec_n_rows, 5, "ring stays at capacity");
-        assert_eq!(core.spec_first_frame, 7, "seven oldest frames dropped");
-        for row in 0..5usize {
+        assert_eq!(core.spec_n_rows, 3, "ring stays at capacity");
+        assert_eq!(core.spec_first_frame, 9, "nine oldest frames dropped");
+        for row in 0..3usize {
             let base = core.spec_row_base(row);
-            let expect = (7 + row) as f32 / 10.0;
+            let expect = (9 + row) as f32 / 10.0;
             assert!(
                 core.spec[base..base + n_bins].iter().all(|&v| v == expect),
                 "logical row {row} must hold frame data {expect}"
@@ -882,7 +913,7 @@ mod tests {
         for _ in 0..12 {
             core.append_frame_scratch_row();
         }
-        assert_eq!(core.spec_first_frame, 7);
+        assert_eq!(core.spec_first_frame, 9);
         core.reset();
         assert_eq!(core.spec_first_frame, 0);
         assert_eq!(core.spec_n_rows, 0);
