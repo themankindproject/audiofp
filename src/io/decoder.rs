@@ -13,19 +13,10 @@ use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
+use super::MAX_DECODE_CHANNELS;
 use crate::dsp::resample::SincResampler;
 use crate::io::riff_preflight::preflight_header_from_file;
 use crate::{AfpError, Result};
-
-/// Maximum channel count `audiofp` will decode.
-///
-/// The decoder downmixes to mono, so more than a handful of channels is
-/// already pathological for fingerprinting — and the per-packet
-/// conversion buffer is `frames × channels` `f32`s, so an unbounded
-/// channel count is a memory amplification vector (Matroska
-/// `Channels::Discrete(u16)` and AIFF can both carry counts up to
-/// 65535). 64 comfortably covers 7.1, ambisonics, and stem files.
-const MAX_DECODE_CHANNELS: usize = 64;
 
 /// Floor of the ceiling on the mono buffer produced by an upsampling
 /// [`decode_to_mono_at_limited`] call when the caller set no
@@ -67,8 +58,9 @@ pub struct DecodeLimits {
     /// Reject when decoded mono PCM would exceed this many samples.
     /// `None` disables the sample check.
     pub max_samples: Option<usize>,
-    /// When `true`, any per-packet decode error (corrupt frame, I/O glitch)
-    /// becomes a fatal error instead of being silently skipped.
+    /// When `true`, any per-packet decode error (corrupt frame, I/O glitch,
+    /// a packet reporting no channels or a zero sample rate) becomes a
+    /// fatal error instead of being silently skipped.
     /// Default: `false` (skip recoverable errors, matching legacy behavior).
     pub integrity_mode: bool,
     /// Maximum wall-clock time allowed for the entire decode operation.
@@ -218,14 +210,27 @@ pub fn decode_to_mono_limited<P: AsRef<Path>>(
     limits: DecodeLimits,
 ) -> Result<(Vec<f32>, u32)> {
     let (samples, sample_rate, _) = decode_file(path.as_ref(), &limits)?;
-    Ok((samples, sample_rate))
+    Ok((trim_capacity(samples), sample_rate))
+}
+
+/// Give back the slack the decode buffer's growth left behind.
+///
+/// The buffer grows by doubling as packets arrive, so it can reach the
+/// caller with almost half its capacity unused — 151 MB held for the
+/// 106 MB of a ten-minute 44.1 kHz file. A small remainder is not worth
+/// a reallocation.
+fn trim_capacity(mut samples: Vec<f32>) -> Vec<f32> {
+    if samples.capacity() - samples.len() > samples.len() / 8 {
+        samples.shrink_to_fit();
+    }
+    samples
 }
 
 /// Decode an audio file and resample it to `target_sr` Hz mono `f32`.
 ///
 /// Pass-through (no resample) when the file already matches `target_sr`.
 /// Otherwise resamples via [`SincResampler`] at default quality
-/// (32-tap Kaiser, β = 8.6). Equivalent to calling [`decode_to_mono`]
+/// (65-tap Kaiser-windowed sinc, β = 8.6). Equivalent to calling [`decode_to_mono`]
 /// then [`SincResampler::process`] yourself, but in one step.
 ///
 /// # Security
@@ -274,9 +279,11 @@ pub fn decode_to_mono_at_limited<P: AsRef<Path>>(
     if target_sr == 0 {
         return Err(AfpError::Config("target sample rate must be > 0".into()));
     }
-    let (samples, sr) = decode_to_mono_limited(path, limits)?;
+    // The native-rate buffer is only an intermediate here unless the rates
+    // already match, so it is trimmed in that case alone.
+    let (samples, sr, _) = decode_file(path.as_ref(), &limits)?;
     if sr == target_sr {
-        Ok(samples)
+        Ok(trim_capacity(samples))
     } else {
         // Upsampling can grow the buffer by `target_sr / sr`. `sr` comes
         // from the container and has no lower bound beyond 1, while
@@ -598,7 +605,7 @@ pub fn decode_to_mono_report<P: AsRef<Path>>(
 ) -> Result<DecodeReport> {
     let (samples, sample_rate, stats) = decode_file(path.as_ref(), &limits)?;
     Ok(DecodeReport {
-        samples,
+        samples: trim_capacity(samples),
         sample_rate,
         stats,
     })
@@ -779,8 +786,15 @@ fn decode_inner_report(
         // allocation.
         let n_chans = decoded.spec().channels().count();
         if n_chans == 0 {
-            // Malformed / corrupt packet. Skip it (matching the lenient
-            // default); `decode_to_mono_report` counts it as skipped.
+            // Malformed / corrupt packet: fatal under `integrity_mode` like
+            // any other per-packet failure, otherwise skipped and counted
+            // (see `decode_to_mono_report`).
+            if integrity_mode {
+                return Err(decode_failure(
+                    path,
+                    "decode integrity: packet reports no channels",
+                ));
+            }
             stats.packets_skipped += 1;
             continue;
         }
@@ -803,11 +817,16 @@ fn decode_inner_report(
         }
 
         // Record the decoder's real output rate (once). A mid-stream rate
-        // change is a codec reset we do not model; adopt the first value
-        // and let the spec-change branch above handle the buffer.
+        // change is a codec reset we do not model; the first value stands.
         if decoded_rate.is_none() {
             let actual = decoded.spec().rate();
             if actual == 0 {
+                if integrity_mode {
+                    return Err(decode_failure(
+                        path,
+                        "decode integrity: packet reports a zero sample rate",
+                    ));
+                }
                 stats.packets_skipped += 1;
                 continue;
             }
@@ -980,6 +999,64 @@ mod tests {
             }
             writer.finalize().unwrap();
             path
+        }
+
+        /// A WAV read through a FIFO must decode to what the file itself
+        /// decodes to. The header preflight used to rewind its input
+        /// unconditionally, which fails on a pipe with "Illegal seek", so
+        /// no pipe could be decoded at all.
+        #[cfg(unix)]
+        #[test]
+        fn a_wav_arriving_through_a_fifo_decodes_like_the_file() {
+            let wav = write_test_wav(2, 8_000, 20_000);
+            let want = decode_to_mono(&wav).unwrap();
+            let bytes = std::fs::read(&wav).unwrap();
+            std::fs::remove_file(&wav).ok();
+
+            let fifo = wav.with_extension("fifo.wav");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if !made.is_ok_and(|status| status.success()) {
+                // No `mkfifo` on this machine: nothing to test with.
+                return;
+            }
+            let writer = std::thread::spawn({
+                let fifo = fifo.clone();
+                move || {
+                    use std::io::Write;
+                    // A decode that fails early closes the pipe under us;
+                    // the assertion below reports that, not this thread.
+                    if let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) {
+                        let _ = pipe.write_all(&bytes);
+                    }
+                }
+            });
+            let got = decode_to_mono(&fifo);
+            writer.join().unwrap();
+            std::fs::remove_file(&fifo).ok();
+
+            let got = got.expect("a WAV through a pipe must decode");
+            assert_eq!(got.1, want.1);
+            assert!(got.0 == want.0, "pipe and file decode differ");
+        }
+
+        /// The decode buffer grows by doubling; what reaches the caller
+        /// must not carry that growth's slack with it.
+        #[test]
+        fn decoded_samples_arrive_without_growth_slack() {
+            let within = |v: &Vec<f32>| v.capacity() <= v.len() + v.len() / 8;
+
+            let wav = write_test_wav(1, 8_000, 100_000);
+            let (samples, _) = decode_to_mono(&wav).unwrap();
+            assert_eq!(samples.len(), 100_000);
+            assert!(within(&samples), "capacity {}", samples.capacity());
+
+            let report = decode_to_mono_report(&wav, DecodeLimits::default()).unwrap();
+            assert!(within(&report.samples), "{}", report.samples.capacity());
+
+            // Same rate: the native buffer is returned as is.
+            let same_rate = decode_to_mono_at(&wav, 8_000).unwrap();
+            assert!(within(&same_rate), "capacity {}", same_rate.capacity());
+            std::fs::remove_file(&wav).ok();
         }
 
         #[test]

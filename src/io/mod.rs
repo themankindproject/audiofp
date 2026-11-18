@@ -26,9 +26,18 @@
 //! [`AfpError::NonFiniteSample`](crate::AfpError::NonFiniteSample);
 //! validate or clamp yourself if you need a hard range guarantee.
 //!
-//! Files with more than 64 channels are rejected with
+//! Files with more than 64 channels are rejected (the per-packet downmix
+//! buffer is `frames × channels` samples): with
 //! [`AfpError::UnsupportedChannels`](crate::AfpError::UnsupportedChannels)
-//! (the per-packet downmix buffer is `frames × channels` samples).
+//! when the decoder finds the count, and with an
+//! [`AfpError::Io`](crate::AfpError::Io) of kind `InvalidData` when the
+//! WAV / AIFF header check catches it first, before the file is probed.
+//!
+//! **Pipes.** A FIFO or `/dev/stdin` decodes like a file when its format
+//! can be read without seeking (WAV, FLAC, MP3, Ogg), as long as no
+//! `max_bytes` cap is set — a pipe has no length to check. Opening a FIFO
+//! that has no writer blocks inside the operating system's `open`, before
+//! any limit or timeout applies.
 //!
 //! Supported formats are whatever Symphonia provides with the codec
 //! features enabled in `audiofp`'s `Cargo.toml`: MP3, FLAC, WAV,
@@ -39,6 +48,16 @@
 //! [`SincResampler`]: crate::dsp::resample::SincResampler
 
 mod riff_preflight;
+
+/// Maximum channel count `audiofp` will decode.
+///
+/// The decoder downmixes to mono, so more than a handful of channels is
+/// already pathological for fingerprinting — and the per-packet
+/// conversion buffer is `frames × channels` `f32`s, so an unbounded
+/// channel count is a memory amplification vector (Matroska
+/// `Channels::Discrete(u16)` and AIFF can both carry counts up to
+/// 65535). 64 comfortably covers 7.1, ambisonics, and stem files.
+const MAX_DECODE_CHANNELS: usize = 64;
 
 pub mod decoder;
 

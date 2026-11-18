@@ -19,9 +19,8 @@ use std::path::Path;
 use crate::error::IoError;
 use crate::{AfpError, Result};
 
-/// Same ceiling as [`decoder::MAX_DECODE_CHANNELS`]; kept local so this
-/// module does not depend on private decoder constants.
-const MAX_PREFLIGHT_CHANNELS: u32 = 64;
+/// The decoder's channel ceiling, as the `u32` the header fields widen to.
+const MAX_PREFLIGHT_CHANNELS: u32 = super::MAX_DECODE_CHANNELS as u32;
 
 /// Which interchange-file family the header belongs to. The two share the
 /// chunk walk (4-byte id, 4-byte size, payload padded to even length) and
@@ -55,15 +54,23 @@ impl Container {
 /// is absent, well-formed, or uses channel counts within
 /// [`MAX_PREFLIGHT_CHANNELS`].
 ///
+/// A pipe, FIFO or device is not inspected: it cannot be rewound, and
+/// reading its header here would take those bytes away from the decoder.
+/// (Rewinding one unconditionally used to fail every such input with
+/// "Illegal seek".) The decoder's own channel check still applies to it.
+///
 /// The walk stops at the first format chunk: that is the only chunk it
 /// validates, and junk chunks after it cost nothing. Reads go through a
 /// `BufReader` so a long run of small chunks before the format chunk costs
 /// buffered reads rather than two syscalls each.
 pub(crate) fn preflight_header_from_file(file: &mut File, path: &Path) -> Result<()> {
-    let len = file
+    let meta = file
         .metadata()
-        .map_err(|e| AfpError::io_with_path(path, e))?
-        .len();
+        .map_err(|e| AfpError::io_with_path(path, e))?;
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let len = meta.len();
     if len >= 12 {
         let mut reader = BufReader::new(&mut *file);
         walk_header(&mut reader, len).map_err(|e| match e {
