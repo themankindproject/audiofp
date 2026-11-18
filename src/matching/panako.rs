@@ -6,8 +6,8 @@
 //!
 //! # Algorithm
 //!
-//! 1. **Index the reference** — `HashMap<hash, Vec<(t_anchor, t_b, t_c)>>`,
-//!    dropping hashes whose posting list exceeds `max_postings_per_hash`.
+//! 1. **Index the reference** — `hash → [(t_anchor, t_c)]`, dropping
+//!    hashes whose posting list exceeds `max_postings_per_hash`.
 //! 2. **Match & vote** — for each query triple, for each ref triple with
 //!    the same hash: compute local scale `s = ref_span / query_span` and
 //!    predicted offset `b = t_anchor_ref − s·t_anchor_query`. Vote into a
@@ -37,7 +37,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::classical::PanakoFingerprint;
-use crate::matching::maps::{HashMap, hashmap_new};
+use crate::matching::consolidate::{MAX_VOTES_PER_QUERY, ScaleGrid, push_capped};
+use crate::matching::maps::{HashMap, KeyFilter, Postings, hashmap_new, hashmap_with_capacity};
 use crate::matching::{MatchResult, Matcher, TimeOffset, clamp_score, frames_per_sec_compatible};
 
 /// Configuration for [`PanakoMatcher`].
@@ -70,6 +71,10 @@ pub struct PanakoMatchConfig {
     /// Peak ÷ background floor. Default 5.0.
     pub min_prominence: f32,
     /// Skip hashes whose reference posting list exceeds this. Default 100.
+    ///
+    /// Read by [`PanakoMatcher`] and [`PanakoRefIndex::build`]. A
+    /// [`PanakoIndex`](super::PanakoIndex) takes its limit as an argument
+    /// to `build` / `insert` instead, and its `query` ignores this field.
     pub max_postings_per_hash: u32,
     /// Refine the coarse 2-D Hough peak with RANSAC line-fitting. Default true.
     pub ransac_refine: bool,
@@ -110,17 +115,18 @@ impl core::fmt::Debug for PanakoMatcher {
 
 /// Prebuilt reference index for [`PanakoMatcher::match_one_prebuilt`].
 ///
-/// Holds the stop-hash-filtered inverted map
-/// `hash → Vec<(t_anchor, t_b, t_c)>` plus the reference's
+/// Holds the stop-hash-filtered inverted map `hash → [(t_anchor, t_c)]`
+/// (the two triplet times matching reads) plus the reference's
 /// `frames_per_sec`. Build once with [`PanakoRefIndex::build`], then
 /// match many queries against the same reference without the per-call
 /// O(R) HashMap construction.
 ///
-/// The two entry points are guaranteed to agree: `match_one` is defined
-/// as build-then-`match_one_prebuilt`, so results are identical by
-/// construction.
+/// The two entry points are guaranteed to agree: `match_one` runs
+/// `match_one_prebuilt` on an index of just the reference hashes its query
+/// carries, which answers every lookup that query makes exactly as the
+/// full index does.
 pub struct PanakoRefIndex {
-    index: HashMap<u32, Vec<(u32, u32, u32)>>,
+    index: HashMap<u32, Postings<(u32, u32)>>,
     frames_per_sec: f32,
     hash_count: usize,
 }
@@ -141,15 +147,27 @@ impl PanakoRefIndex {
     /// has no hashes or every hash is filtered out.
     #[must_use]
     pub fn build(reference: &PanakoFingerprint, cfg: &PanakoMatchConfig) -> Option<Self> {
-        if reference.hashes.is_empty() {
-            return None;
-        }
-        let mut index: HashMap<u32, Vec<(u32, u32, u32)>> = hashmap_new();
+        Self::build_for(reference, cfg, None)
+    }
+
+    /// [`PanakoRefIndex::build`], indexing only the reference hashes
+    /// `wanted` may contain when it is given. A kept hash keeps all of its
+    /// postings, in order, so its stop-hash count and every lookup of it
+    /// are those of the full index.
+    fn build_for(
+        reference: &PanakoFingerprint,
+        cfg: &PanakoMatchConfig,
+        wanted: Option<&KeyFilter>,
+    ) -> Option<Self> {
+        let mut index: HashMap<u32, Postings<(u32, u32)>> = match wanted {
+            None => hashmap_with_capacity(reference.hashes.len()),
+            Some(_) => hashmap_new(),
+        };
         for h in &reference.hashes {
-            index
-                .entry(h.hash)
-                .or_default()
-                .push((h.t_anchor, h.t_b, h.t_c));
+            let hash = h.hash;
+            if wanted.is_none_or(|wanted| wanted.may_contain(hash)) {
+                index.entry(hash).or_default().push((h.t_anchor, h.t_c));
+            }
         }
         index.retain(|_, v| (v.len() as u32) <= cfg.max_postings_per_hash);
         if index.is_empty() {
@@ -200,12 +218,15 @@ impl Matcher for PanakoMatcher {
             return MatchResult::NONE;
         }
 
-        // Delegate to build-then-prebuilt so both paths agree by construction.
-        let index = match PanakoRefIndex::build(reference, &self.cfg) {
-            Some(index) => index,
-            None => return MatchResult::NONE,
-        };
-        self.match_one_prebuilt(query, &index)
+        // Build-then-prebuilt, so both paths agree. Only a reference hash
+        // the query carries can be looked up, so only those are indexed:
+        // a map entry for every hash of a whole track was most of the cost
+        // of matching a short clip against it.
+        let wanted = KeyFilter::new(query.hashes.iter().map(|h| h.hash), 16);
+        match PanakoRefIndex::build_for(reference, &self.cfg, Some(&wanted)) {
+            Some(index) => self.match_one_prebuilt(query, &index),
+            None => MatchResult::NONE,
+        }
     }
 }
 
@@ -254,17 +275,17 @@ impl PanakoMatcher {
         //
         // We also collect the raw (t_query, t_ref) anchor pairs so the
         // optional RANSAC pass can re-fit without rescanning the index.
-        let scale_min = cfg.scale_min as f64;
-        let scale_max = cfg.scale_max as f64;
-        let scale_per_bin = (scale_max - scale_min) / cfg.scale_bins as f64;
-        // ±half-bin slack so a scale at the grid edge still votes into the
-        // boundary bin.
-        let eps_scale = scale_per_bin * 0.5;
+        let grid = ScaleGrid::new(cfg);
 
         // Votes as a flat `(scale_bin, offset_bin)` list, counted after one
         // sort below — cheaper than a map entry per vote (≈ 4× on a
         // 100k-vote accumulator with the no_std `BTreeMap`), and the sort
         // yields the key order consolidation needs anyway.
+        //
+        // Capped like the index queries: the reference side is stop-hash
+        // filtered but the query side is not, so a query that repeats one
+        // hash (a loop, or a crafted `.afp`) multiplies its votes by up to
+        // `max_postings_per_hash`.
         let mut votes: Vec<(u32, i64)> = Vec::new();
         // Candidate anchor pairs for RANSAC: (t_query_anchor, t_ref_anchor),
         // with the accumulator key each one voted into (same order), so
@@ -273,50 +294,23 @@ impl PanakoMatcher {
         let mut pair_keys: Vec<(u32, i64)> = Vec::new();
         let tol = cfg.offset_tolerance_frames as i64;
 
-        for h in &query.hashes {
+        'voting: for h in &query.hashes {
             let hash = h.hash;
-            let q_ta = h.t_anchor;
-            let q_tc = h.t_c;
+            let q_times = (h.t_anchor, h.t_c);
             if let Some(list) = index.get(&hash) {
-                for &(tr_a, _tr_b, tr_c) in list {
-                    // `PanakoHash` documents `t_anchor < t_b <= t_c`, but the
-                    // fields are `pub` and the type is `Pod`, so a malformed
-                    // triplet is constructible in safe Rust and reachable
-                    // verbatim from `from_bytes` (mmap / flat-file path).
-                    // Saturating arithmetic keeps this total: debug builds
-                    // previously panicked on `t_c < t_anchor`, release builds
-                    // wrapped to a garbage scale. Degenerate spans carry no
-                    // alignment information, so skip them.
-                    let q_span = q_tc.saturating_sub(q_ta);
-                    let r_span = tr_c.saturating_sub(tr_a);
-                    if q_span == 0 || r_span == 0 {
+                for &r_times in list {
+                    let Some(vote) = grid.vote(q_times, r_times) else {
                         continue;
+                    };
+                    if !push_capped(&mut votes, vote, MAX_VOTES_PER_QUERY) {
+                        break 'voting;
                     }
-                    let s = r_span as f64 / q_span as f64;
-
-                    if s < scale_min - eps_scale || s > scale_max + eps_scale {
-                        continue;
-                    }
-
-                    let b = tr_a as f64 - s * q_ta as f64;
-
-                    let s_bin = ((s - scale_min) / scale_per_bin)
-                        .clamp(0.0, (cfg.scale_bins - 1) as f64)
-                        as u32;
-                    // Offset bin at 1-frame granularity. Binning at
-                    // `tol`-frame granularity would combine the ±tol-bin
-                    // consolidation into an effective ±tol²-frame window
-                    // (and quantize the reported offset to `tol` frames);
-                    // keeping 1-frame keys makes consolidation ±tol frames
-                    // exactly, matching `WangMatcher`'s semantics.
-                    let off_key = b.round() as i64;
-
-                    votes.push((s_bin, off_key));
-                    // Only the refinement pass reads `pairs`; skip the push
-                    // (and the per-pair growth) when refinement is disabled.
+                    // Only the refinement pass reads these; skip the pushes
+                    // (and the growth) when refinement is disabled.
                     if cfg.ransac_refine {
-                        pairs.push((q_ta as f64, tr_a as f64));
-                        pair_keys.push((s_bin, off_key));
+                        let pair = (q_times.0 as f64, r_times.0 as f64);
+                        push_capped(&mut pairs, pair, MAX_VOTES_PER_QUERY);
+                        push_capped(&mut pair_keys, vote, MAX_VOTES_PER_QUERY);
                     }
                 }
             }
@@ -374,7 +368,7 @@ impl PanakoMatcher {
         // offset in the peak's neighbourhood (`consolidate::mode_offset`) —
         // the first consolidated maximum in `(scale, offset)` order leans
         // toward lower offsets when background votes border the peak.
-        let coarse_s = scale_min + (peak_s_bin as f64 + 0.5) * scale_per_bin;
+        let coarse_s = grid.centre(peak_s_bin);
         let coarse_b = super::consolidate::panako_peak_offset(
             &acc_vec,
             peak_linear_idx,
@@ -529,6 +523,12 @@ fn ransac_refine(
     let mut best_inliers = 0u32;
     let mut best_s = coarse_s;
     let mut best_b = coarse_b;
+    // Lines already counted. The pairs of a strong match mostly lie on one
+    // exact line, so draw after draw proposes the same `(s, b)`; a line's
+    // count never changes, and a count that did not win the first time
+    // cannot win later. Counting each line once is the same search with a
+    // fraction of the passes over `pairs`.
+    let mut counted: Vec<(f32, f64)> = Vec::with_capacity(n_iter);
 
     for _ in 0..n_iter {
         let i = (rng.next() % samples.len() as u64) as usize;
@@ -549,6 +549,10 @@ fn ransac_refine(
             continue;
         }
         let b = tr1 - s as f64 * tq1;
+        if counted.contains(&(s, b)) {
+            continue;
+        }
+        counted.push((s, b));
 
         let inliers = count_inliers_wide(pairs, s as f64, b, inlier_tol);
 
@@ -595,6 +599,150 @@ mod tests {
                 .collect(),
             frames_per_sec: 62.5,
         }
+    }
+
+    /// `ransac_refine` as it was before it remembered the lines it had
+    /// counted: every draw that yields a valid line recounts all pairs.
+    fn ransac_recounting_every_draw(
+        samples: &[(f64, f64)],
+        pairs: &[(f64, f64)],
+        coarse: (f32, f64),
+        tol_frames: i64,
+        cfg: &PanakoMatchConfig,
+    ) -> (f32, f64, u32) {
+        if samples.len() < 2 {
+            return (coarse.0, coarse.1, 0);
+        }
+        let inlier_tol = (tol_frames.max(2)) as f64;
+        let n_iter = 128usize.min(samples.len() * 4);
+        let seed = samples.len().wrapping_mul(2_654_435_761) as u64;
+        let mut rng = XorShift64(seed.max(1));
+        let (mut best_inliers, mut best_s, mut best_b) = (0u32, coarse.0, coarse.1);
+        for _ in 0..n_iter {
+            let i = (rng.next() % samples.len() as u64) as usize;
+            let j = (rng.next() % samples.len() as u64) as usize;
+            if i == j {
+                continue;
+            }
+            let ((tq1, tr1), (tq2, tr2)) = (samples[i], samples[j]);
+            let dq = tq2 - tq1;
+            if dq.abs() < 1.0 {
+                continue;
+            }
+            let s = ((tr2 - tr1) / dq) as f32;
+            if !s.is_finite() || s < cfg.scale_min || s > cfg.scale_max {
+                continue;
+            }
+            let b = tr1 - s as f64 * tq1;
+            let inliers = count_inliers_wide(pairs, s as f64, b, inlier_tol);
+            if inliers > best_inliers {
+                (best_inliers, best_s, best_b) = (inliers, s, b);
+            }
+        }
+        (best_s, best_b, best_inliers)
+    }
+
+    #[test]
+    fn ransac_counting_each_line_once_changes_no_result() {
+        let cfg = normalize_config(PanakoMatchConfig::default());
+        let mut x: u32 = 0x2545_F491;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for case in 0..200_u32 {
+            // Pairs on one of two lines (an exact one and a 3 % stretch),
+            // with frame jitter in some cases, plus unrelated pairs.
+            let on_line: usize = [0, 2, 9, 60, 400][case as usize % 5];
+            let jitter = case / 5 % 2 == 1;
+            let mut pairs: Vec<(f64, f64)> = (0..on_line)
+                .map(|_| {
+                    let tq = f64::from(next() % 2_000);
+                    let scale = if case / 10 % 2 == 0 { 1.0 } else { 1.03 };
+                    let wobble = if jitter { f64::from(next() % 3) } else { 0.0 };
+                    (tq, (tq * scale).round() + 250.0 + wobble)
+                })
+                .collect();
+            pairs.extend((0..40).map(|_| (f64::from(next() % 2_000), f64::from(next() % 2_500))));
+            let samples = &pairs[..pairs.len().min(on_line + 5)];
+
+            let got = ransac_refine(samples, &pairs, 1.0, 250.0, 2, &cfg);
+            let want = ransac_recounting_every_draw(samples, &pairs, (1.0, 250.0), 2, &cfg);
+            assert_eq!(
+                (got.0.to_bits(), got.1.to_bits(), got.2),
+                (want.0.to_bits(), want.1.to_bits(), want.2),
+                "case {case}"
+            );
+        }
+    }
+
+    /// `match_one` indexes only the reference hashes its query carries; the
+    /// result must be exactly what the full prebuilt index gives — stop
+    /// hashes, misses and RANSAC refinement included.
+    #[test]
+    fn match_one_agrees_with_the_full_prebuilt_index() {
+        let mut x: u32 = 0x2545_F491;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut matched = 0;
+        for case in 0..300_usize {
+            let hash_space = [50, 400, 5_000][case % 3];
+            let cfg = PanakoMatchConfig {
+                max_postings_per_hash: [1, 3, 100][case / 3 % 3],
+                min_votes: [0, 3][case / 9 % 2],
+                ransac_refine: case / 18 % 2 == 0,
+                ..Default::default()
+            };
+            let triplet = |hash: u32, t_anchor: u32, span: u32| PanakoHash {
+                hash,
+                t_anchor,
+                t_b: t_anchor + span / 2,
+                t_c: t_anchor + span,
+            };
+            let reference = PanakoFingerprint {
+                hashes: (0..600)
+                    .map(|_| triplet(next() % hash_space, next() % 3_000, 8 + next() % 8))
+                    .collect(),
+                frames_per_sec: 62.5,
+            };
+            // A shifted clip of the reference diluted with unrelated
+            // triplets, or (every fourth case) unrelated triplets alone.
+            let start = (next() % 400) as usize;
+            let clip = &reference.hashes[start..start + 80];
+            let mut hashes: Vec<PanakoHash> = if case % 4 == 0 {
+                Vec::new()
+            } else {
+                clip.iter()
+                    .map(|h| {
+                        let (hash, t_anchor, span) = (h.hash, h.t_anchor, h.t_c - h.t_anchor);
+                        triplet(hash, t_anchor + 17, span)
+                    })
+                    .collect()
+            };
+            hashes.extend(
+                (0..40).map(|_| triplet(next() % (hash_space * 2), next() % 500, 8 + next() % 8)),
+            );
+            let query = PanakoFingerprint {
+                hashes,
+                frames_per_sec: 62.5,
+            };
+
+            let matcher = PanakoMatcher::new(cfg.clone());
+            let direct = matcher.match_one(&query, &reference);
+            let prebuilt = PanakoRefIndex::build(&reference, &cfg)
+                .map_or(MatchResult::NONE, |index| {
+                    matcher.match_one_prebuilt(&query, &index)
+                });
+            assert_eq!(direct, prebuilt, "case {case}");
+            matched += usize::from(direct.is_match);
+        }
+        assert!(matched > 20, "only {matched} of 300 cases matched");
     }
 
     #[test]

@@ -85,14 +85,15 @@ use alloc::vec::Vec;
 /// Behaviour is exactly that of the `Vec` it replaces: postings are kept in
 /// insertion order, `retain` preserves the order of survivors, and iteration
 /// yields postings in the same order, so index queries are bit-identical.
-/// An empty list stays in the map (as before) as `Empty`.
+/// An emptied list is `Empty`; whether it stays in the map is the caller's
+/// choice.
 #[derive(Clone, Debug)]
 pub(crate) enum Postings<P> {
     /// No postings (a list emptied by `remove`).
     Empty,
     /// Exactly one posting, stored inline.
     One(P),
-    /// Two or more postings (or a list that shrank from two or more).
+    /// Two or more postings, on the heap.
     Many(Vec<P>),
 }
 
@@ -144,6 +145,11 @@ impl<P: Copy> Postings<P> {
 
     /// Keep only the postings for which `keep` returns `true`, preserving
     /// order (same contract as [`Vec::retain`]).
+    ///
+    /// A spilled list gives its heap block back as it shrinks: none or one
+    /// survivor returns to the inline forms, and a block left more than
+    /// half unused is trimmed to fit. A catalog purge would otherwise keep
+    /// every surviving list at its peak size.
     #[inline]
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&P) -> bool) {
         match self {
@@ -153,7 +159,15 @@ impl<P: Copy> Postings<P> {
                     *self = Postings::Empty;
                 }
             }
-            Postings::Many(v) => v.retain(|p| keep(p)),
+            Postings::Many(v) => {
+                v.retain(|p| keep(p));
+                match v[..] {
+                    [] => *self = Postings::Empty,
+                    [only] => *self = Postings::One(only),
+                    _ if v.capacity() > 2 * v.len() => v.shrink_to_fit(),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -193,6 +207,55 @@ const _: () = assert!(
     "Panako Postings must fit in a Vec header on 64-bit targets"
 );
 
+/// One-bit-per-slot membership filter over `u32` keys.
+///
+/// [`KeyFilter::may_contain`] is `true` for every key the filter was built
+/// from, and for a small share of the others (about one in
+/// `slots_per_key`). It is used to skip work an exact lookup would only
+/// have found pointless: the reference entries no query key can hit, the
+/// probes no reference frame can answer.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyFilter {
+    words: Vec<u64>,
+    /// `32 − log2(slots)`: a slot is the top bits of a multiplicative hash
+    /// of the key.
+    shift: u32,
+}
+
+impl KeyFilter {
+    /// Build a filter with `slots_per_key` slots per key, rounded up to a
+    /// power of two between 64 and 2^24 slots (2 MiB).
+    pub(crate) fn new(keys: impl ExactSizeIterator<Item = u32>, slots_per_key: usize) -> Self {
+        let slots = keys
+            .len()
+            .saturating_mul(slots_per_key)
+            .clamp(64, 1 << 24)
+            .next_power_of_two();
+        let mut filter = Self {
+            words: alloc::vec![0; slots / 64],
+            shift: 32 - slots.trailing_zeros(),
+        };
+        for key in keys {
+            let slot = filter.slot(key);
+            filter.words[slot / 64] |= 1 << (slot % 64);
+        }
+        filter
+    }
+
+    #[inline]
+    fn slot(&self, key: u32) -> usize {
+        (key.wrapping_mul(0x9E37_79B1) >> self.shift) as usize
+    }
+
+    /// `false` only if `key` is not one of the keys the filter was built
+    /// from.
+    #[inline]
+    pub(crate) fn may_contain(&self, key: u32) -> bool {
+        let slot = self.slot(key);
+        self.words[slot / 64] & (1 << (slot % 64)) != 0
+    }
+}
+
 /// A sorted inverted index for `(hash, t_anchor)` pairs.
 ///
 /// Replaces `HashMap<hash, Vec<t_anchor>>` with a single sort + three
@@ -223,60 +286,58 @@ impl SortedPostings {
     /// positions (stop-hash removal). Returns `None` if nothing remains.
     #[cfg(test)]
     pub(crate) fn build(pairs: &[(u32, u32)], max_postings: u32) -> Option<Self> {
-        if pairs.is_empty() {
-            return None;
-        }
         Self::build_sorted(pairs.to_vec(), max_postings)
     }
 
     /// Build from [`WangHash`] anchors without an intermediate projection
     /// buffer in the caller (audit perf #6).
+    ///
+    /// With `wanted`, only hashes the filter may contain are indexed. A
+    /// kept hash keeps every one of its postings, so its stop-hash count —
+    /// and with it every lookup of a wanted hash — is the same as in the
+    /// full index.
     pub(crate) fn build_from_wang(
         hashes: &[crate::classical::WangHash],
         max_postings: u32,
+        wanted: Option<&KeyFilter>,
     ) -> Option<Self> {
-        if hashes.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<(u32, u32)> = Vec::with_capacity(hashes.len());
-        sorted.extend(hashes.iter().map(|h| (h.hash, h.t_anchor)));
+        let pair = |h: &crate::classical::WangHash| (h.hash, h.t_anchor);
+        let sorted: Vec<(u32, u32)> = match wanted {
+            None => hashes.iter().map(pair).collect(),
+            Some(wanted) => hashes
+                .iter()
+                .filter(|h| wanted.may_contain(h.hash))
+                .map(pair)
+                .collect(),
+        };
         Self::build_sorted(sorted, max_postings)
     }
 
     fn build_sorted(mut sorted: Vec<(u32, u32)>, max_postings: u32) -> Option<Self> {
-        let n = sorted.len();
-        sorted.sort_unstable_by_key(|&(hash, t_anchor)| (hash, t_anchor));
+        sorted.sort_unstable();
 
-        // Build hash → range index, filtering stop-hashes in one pass.
-        let mut hashes = Vec::new();
-        let mut starts = Vec::new();
-        let mut anchors = Vec::new();
-
-        let mut i = 0;
-        while i < n {
-            let hash = sorted[i].0;
-            let run_start = i;
-            while i < n && sorted[i].0 == hash {
-                i += 1;
-            }
-            let run_end = i;
-            let count = (run_end - run_start) as u32;
-
-            if count <= max_postings {
-                hashes.push(hash);
-                starts.push(anchors.len() as u32);
-                anchors.extend(
-                    sorted[run_start..run_end]
-                        .iter()
-                        .map(|&(_, t_anchor)| t_anchor),
-                );
-            }
-        }
-
-        if hashes.is_empty() {
+        // One run per hash; a run longer than `max_postings` is a stop-hash.
+        let kept_runs = || {
+            sorted
+                .chunk_by(|a, b| a.0 == b.0)
+                .filter(|run| run.len() as u64 <= u64::from(max_postings))
+        };
+        // Counted first so the three arrays are allocated once, exactly.
+        let (n_hashes, n_anchors) = kept_runs().fold((0, 0), |(hashes, anchors), run| {
+            (hashes + 1, anchors + run.len())
+        });
+        if n_hashes == 0 {
             return None;
         }
 
+        let mut hashes = Vec::with_capacity(n_hashes);
+        let mut starts = Vec::with_capacity(n_hashes + 1);
+        let mut anchors = Vec::with_capacity(n_anchors);
+        for run in kept_runs() {
+            hashes.push(run[0].0);
+            starts.push(anchors.len() as u32);
+            anchors.extend(run.iter().map(|&(_, t_anchor)| t_anchor));
+        }
         starts.push(anchors.len() as u32); // sentinel
 
         Some(Self {
@@ -327,6 +388,106 @@ impl SortedPostings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retain_gives_a_shrunken_list_its_heap_block_back() {
+        let mut list: Postings<(u32, u32)> = Postings::default();
+        for i in 0..100 {
+            list.push((i, i));
+        }
+        let peak = list.heap_bytes();
+        assert!(peak >= 100 * 8);
+
+        // Left more than half unused: trimmed.
+        list.retain(|&(r, _)| r < 40);
+        assert_eq!(list.len(), 40);
+        assert!(list.heap_bytes() < peak / 2, "{}", list.heap_bytes());
+
+        // One survivor, then none: back to the inline forms.
+        list.retain(|&(r, _)| r == 7);
+        assert!(matches!(list, Postings::One((7, 7))));
+        assert_eq!(list.heap_bytes(), 0);
+        list.retain(|_| false);
+        assert!(matches!(list, Postings::Empty));
+
+        // A list that stays more than half full keeps its block, and the
+        // survivors keep their order.
+        let mut list: Postings<u32> = Postings::default();
+        for i in 0..8 {
+            list.push(i);
+        }
+        let block = list.heap_bytes();
+        list.retain(|&p| p != 3);
+        assert_eq!(list.as_slice(), &[0, 1, 2, 4, 5, 6, 7]);
+        assert_eq!(list.heap_bytes(), block);
+    }
+
+    #[test]
+    fn key_filter_never_misses_and_passes_few_others() {
+        let mut x: u32 = 0x1234_5678;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for n in [0_usize, 1, 5, 1_000, 50_000] {
+            let keys: Vec<u32> = (0..n).map(|_| next()).collect();
+            let filter = KeyFilter::new(keys.iter().copied(), 16);
+            assert!(keys.iter().all(|&key| filter.may_contain(key)), "n = {n}");
+            let strangers = (0..20_000).filter(|_| filter.may_contain(next())).count();
+            assert!(
+                strangers < 20_000 / 8,
+                "n = {n}: {strangers} of 20000 passed"
+            );
+        }
+    }
+
+    /// Indexing only the hashes a query carries must answer every lookup of
+    /// those hashes exactly as the full index does, stop-hashes included.
+    #[test]
+    fn filtered_build_answers_wanted_lookups_like_the_full_one() {
+        use crate::classical::WangHash;
+
+        let mut x: u32 = 0x9E37_79B9;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for max_postings in [0_u32, 1, 3, u32::MAX] {
+            let reference: Vec<WangHash> = (0..2_000)
+                .map(|_| WangHash {
+                    hash: next() % 600,
+                    t_anchor: next() % 5_000,
+                })
+                .collect();
+            let wanted_keys: Vec<u32> = (0..40).map(|_| next() % 700).collect();
+            let wanted = KeyFilter::new(wanted_keys.iter().copied(), 16);
+
+            let full = SortedPostings::build_from_wang(&reference, max_postings, None);
+            let filtered = SortedPostings::build_from_wang(&reference, max_postings, Some(&wanted));
+            let get = |index: &Option<SortedPostings>, hash| {
+                index.as_ref().map_or(Vec::new(), |i| i.get(hash).to_vec())
+            };
+            for &key in &wanted_keys {
+                assert_eq!(get(&filtered, key), get(&full, key), "hash {key}");
+            }
+            if let (Some(full), Some(filtered)) = (&full, &filtered) {
+                assert!(filtered.len() <= full.len());
+            }
+        }
+    }
+
+    #[test]
+    fn build_allocates_each_array_exactly() {
+        let pairs: Vec<(u32, u32)> = (0..500_u32).map(|i| (i % 50, i)).collect();
+        let sp = SortedPostings::build(&pairs, 100).unwrap();
+        assert_eq!(sp.hashes.capacity(), 50);
+        assert_eq!(sp.starts.capacity(), 51);
+        assert_eq!(sp.anchors.capacity(), 500);
+    }
 
     #[test]
     fn empty_input() {

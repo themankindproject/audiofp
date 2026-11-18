@@ -7,6 +7,105 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+/// Hard cap on the votes one match may gather: the **total** across all
+/// references for [`WangIndex::query`](super::WangIndex::query),
+/// [`PanakoIndex::query`](super::PanakoIndex::query) and
+/// [`HaitsmaIndex::query`](super::HaitsmaIndex::query), and the votes of
+/// one [`PanakoMatcher`](super::PanakoMatcher) 1:1 match (audit §4.1 #6,
+/// 67-6).
+///
+/// One flat-list entry is 16 bytes, so a vote list is bounded at 160 MB,
+/// and [`push_capped`] keeps its capacity from growing past this value
+/// either; the in-place unstable sort adds no buffer. A legitimate
+/// query — a few thousand hashes, each hitting stop-hash-pruned postings —
+/// lands orders of magnitude below it; one that does reach it is scored on
+/// the votes gathered so far. (A separate per-reference cap of the same
+/// size used to exist; with the per-query cap equal to it, it could never
+/// bind.)
+pub(crate) const MAX_VOTES_PER_QUERY: usize = 10_000_000;
+
+/// Append `vote` unless the list already holds `cap` of them; `false` means
+/// it was full and the vote was dropped.
+///
+/// Grows by doubling as [`Vec::push`] does, but never reserves past `cap`:
+/// plain doubling takes a list that fills up just under the cap to nearly
+/// twice it.
+#[inline]
+pub(crate) fn push_capped<T>(votes: &mut Vec<T>, vote: T, cap: usize) -> bool {
+    if votes.len() >= cap {
+        return false;
+    }
+    if votes.len() == votes.capacity() {
+        let capacity = votes.capacity().saturating_mul(2).max(4).min(cap);
+        votes.reserve_exact(capacity - votes.len());
+    }
+    votes.push(vote);
+    true
+}
+
+/// The scale axis of Panako's `(scale, offset)` Hough accumulator.
+///
+/// [`PanakoMatcher`](super::PanakoMatcher) and
+/// [`PanakoIndex`](super::PanakoIndex) both bin their votes through this,
+/// so the two cannot come to place a vote differently.
+pub(crate) struct ScaleGrid {
+    min: f64,
+    max: f64,
+    per_bin: f64,
+    last_bin: f64,
+}
+
+impl ScaleGrid {
+    /// The grid of a normalized config (see `panako::normalize_config`).
+    pub(crate) fn new(cfg: &super::PanakoMatchConfig) -> Self {
+        let (min, max) = (cfg.scale_min as f64, cfg.scale_max as f64);
+        Self {
+            min,
+            max,
+            per_bin: (max - min) / cfg.scale_bins as f64,
+            last_bin: (cfg.scale_bins - 1) as f64,
+        }
+    }
+
+    /// The accumulator cell `(scale_bin, offset)` that a query triplet and a
+    /// reference triplet with the same hash vote for. Each triplet is given
+    /// as its `(t_anchor, t_c)`. `None` when a span is empty or the scale
+    /// between the two falls outside the grid.
+    ///
+    /// The local scale is `s = ref_span / query_span` and the offset is
+    /// the `b` of `t_ref = s·t_query + b`, at 1-frame granularity. (Binning
+    /// offsets `tol` frames wide would turn the ±`tol`-bin consolidation
+    /// into a ±`tol`² frame window and quantize the reported offset.)
+    #[inline]
+    pub(crate) fn vote(&self, query: (u32, u32), reference: (u32, u32)) -> Option<(u32, i64)> {
+        // `PanakoHash` documents `t_anchor < t_b <= t_c`, but its fields are
+        // `pub` and the type is `Pod`, so a malformed triplet can be built
+        // in safe Rust and arrives verbatim through `from_bytes`.
+        // Saturating keeps this total; an empty span carries no scale.
+        let q_span = query.1.saturating_sub(query.0);
+        let r_span = reference.1.saturating_sub(reference.0);
+        if q_span == 0 || r_span == 0 {
+            return None;
+        }
+        let s = r_span as f64 / q_span as f64;
+        // Half a bin of slack, so a scale at the grid edge still votes
+        // into the boundary bin.
+        let slack = self.per_bin * 0.5;
+        if s < self.min - slack || s > self.max + slack {
+            return None;
+        }
+        let b = reference.0 as f64 - s * query.0 as f64;
+        let s_bin = ((s - self.min) / self.per_bin).clamp(0.0, self.last_bin) as u32;
+        Some((s_bin, b.round() as i64))
+    }
+
+    /// The scale at the centre of `s_bin`.
+    #[inline]
+    pub(crate) fn centre(&self, s_bin: u32) -> f64 {
+        self.min + (s_bin as f64 + 0.5) * self.per_bin
+    }
+}
+
 /// Bounds `(start, end)` (inclusive) of the **first** connected maximal
 /// plateau at `peak_val` in a dense consolidated histogram; `(0, 0)` when
 /// there is none. Taking the first connected run means disconnected equal
@@ -175,17 +274,58 @@ pub(crate) fn panako_hough_peak(
     tol: i64,
     scratch: &mut HoughScratch,
 ) -> (u32, usize) {
-    panako_scale_rows_into(bin_vec, &mut scratch.rows);
-    panako_vote_prefix_into(bin_vec, &mut scratch.prefix);
-    scratch.consolidated.clear();
+    let HoughScratch {
+        rows,
+        prefix,
+        consolidated,
+        ..
+    } = scratch;
+    panako_scale_rows_into(bin_vec, rows);
+    panako_vote_prefix_into(bin_vec, prefix);
+    consolidated.clear();
+    consolidated.reserve(bin_vec.len());
+
     let mut peak_votes = 0u32;
     let mut peak_idx = 0usize;
-    for i in 0..bin_vec.len() {
-        let neigh = panako_neighborhood_sum(bin_vec, &scratch.rows, &scratch.prefix, i, tol);
-        scratch.consolidated.push(neigh);
-        if neigh > peak_votes {
-            peak_votes = neigh;
-            peak_idx = i;
+    for (r, &(s_bin, start, end)) in rows.iter().enumerate() {
+        // A bin consolidates over its own scale row and the rows one scale
+        // bin either side, where those are occupied. Scanning each row on
+        // its own means running out of one does not skip valid neighbours
+        // in another (audit F04).
+        let below = r
+            .checked_sub(1)
+            .map(|i| rows[i])
+            .filter(|&(s, _, _)| s.checked_add(1) == Some(s_bin));
+        let above = rows
+            .get(r + 1)
+            .filter(|&&(s, _, _)| s_bin.checked_add(1) == Some(s));
+        // Bins are sorted by offset within a row, so as the centre walks
+        // along this row every neighbour's `[offset − tol, offset + tol]`
+        // window only slides forward. Two cursors per neighbour row
+        // (`lo`, `hi`, and the row's end) follow it in O(1) amortised per
+        // bin, where a pair of binary searches per bin and row used to.
+        let mut windows = [below, Some((s_bin, start, end)), above.copied()]
+            .map(|row| row.map(|(_, start, end)| (start, start, end)));
+
+        for (i, &((_, offset), _)) in bin_vec.iter().enumerate().take(end).skip(start) {
+            let first = offset.saturating_sub(tol);
+            let last = offset.saturating_add(tol);
+            let mut sum = 0u64;
+            for (lo, hi, row_end) in windows.iter_mut().flatten() {
+                while *lo < *row_end && bin_vec[*lo].0.1 < first {
+                    *lo += 1;
+                }
+                while *hi < *row_end && bin_vec[*hi].0.1 <= last {
+                    *hi += 1;
+                }
+                sum += prefix[*hi] - prefix[*lo];
+            }
+            let neigh = sum.min(u64::from(u32::MAX)) as u32;
+            consolidated.push(neigh);
+            if neigh > peak_votes {
+                peak_votes = neigh;
+                peak_idx = i;
+            }
         }
     }
     (peak_votes, peak_idx)
@@ -288,37 +428,6 @@ fn panako_scale_rows_into(bin_vec: &[((u32, i64), u32)], rows: &mut Vec<(u32, us
     }
 }
 
-/// Neighbourhood vote sum for Panako 2-D consolidation: scale ±1 and offset
-/// ±`tol` around `center_i`, scanning each scale row independently so an
-/// early break within one row does not skip valid neighbours on adjacent
-/// scale rows (audit F04).
-#[must_use]
-fn panako_neighborhood_sum(
-    bin_vec: &[((u32, i64), u32)],
-    rows: &[(u32, usize, usize)],
-    prefix: &[u64],
-    center_i: usize,
-    tol: i64,
-) -> u32 {
-    let (s_bin, off_key) = bin_vec[center_i].0;
-    let mut sum = 0u64;
-    for ns in [s_bin.checked_sub(1), Some(s_bin), s_bin.checked_add(1)]
-        .into_iter()
-        .flatten()
-    {
-        if let Ok(row_idx) = rows.binary_search_by_key(&ns, |&(s, _, _)| s) {
-            let (_, start, end) = rows[row_idx];
-            let row = &bin_vec[start..end];
-            let lo = off_key.saturating_sub(tol);
-            let hi = off_key.saturating_add(tol);
-            let i0 = row.partition_point(|&((_, no), _)| no < lo);
-            let i1 = row.partition_point(|&((_, no), _)| no <= hi);
-            sum += prefix[start + i1] - prefix[start + i0];
-        }
-    }
-    sum.min(u64::from(u32::MAX)) as u32
-}
-
 fn panako_vote_prefix_into(bins: &[((u32, i64), u32)], prefix: &mut Vec<u64>) {
     prefix.clear();
     prefix.reserve(bins.len() + 1);
@@ -374,6 +483,49 @@ mod tests {
         }
         assert_eq!(peak, scratch.consolidated[peak_idx]);
         assert_eq!(peak, *scratch.consolidated.iter().max().unwrap());
+    }
+
+    /// The cursor sweep must give every bin the sum the naive scan over all
+    /// bins gives it, and report the first bin holding the largest one.
+    #[test]
+    fn panako_hough_sweep_matches_the_naive_scan_on_random_accumulators() {
+        let mut rng = crate::matching::XorShift(0x5EED);
+        let mut scratch = HoughScratch::default();
+        for case in 0..300 {
+            // Scale rows with gaps (so some bins have one neighbour row or
+            // none) over an offset range narrow enough for windows to
+            // overlap and wide enough for them to run off both ends.
+            let scale_rows = [3, 8, 24][case % 3];
+            let mut bins: Vec<((u32, i64), u32)> = Vec::new();
+            for s in 0..scale_rows {
+                if rng.next().is_multiple_of(4) {
+                    continue;
+                }
+                for offset in -40_i64..=40 {
+                    let votes = rng.next() % 9;
+                    if votes > 5 {
+                        bins.push(((s, offset), votes - 5));
+                    }
+                }
+            }
+            if case % 7 == 0 {
+                bins.truncate(1);
+            }
+            for tol in [0_i64, 1, 3, 17, 1_000] {
+                let (peak, peak_idx) = panako_hough_peak(&bins, tol, &mut scratch);
+                let naive: Vec<u32> = (0..bins.len())
+                    .map(|i| panako_neighborhood_sum_naive(&bins, i, tol))
+                    .collect();
+                assert_eq!(scratch.consolidated, naive, "case {case}, tol {tol}");
+                let want_peak = naive.iter().copied().max().unwrap_or(0);
+                let want_idx = naive.iter().position(|&v| v == want_peak).unwrap_or(0);
+                assert_eq!(
+                    (peak, peak_idx),
+                    (want_peak, want_idx),
+                    "case {case}, tol {tol}"
+                );
+            }
+        }
     }
 
     #[test]

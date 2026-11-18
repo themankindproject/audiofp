@@ -32,7 +32,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::classical::WangFingerprint;
-use crate::matching::maps::SortedPostings;
+use crate::matching::maps::{KeyFilter, SortedPostings};
 use crate::matching::{
     MatchResult, Matcher, TimeOffset, clamp_score, compute_prominence, frames_per_sec_compatible,
 };
@@ -49,6 +49,10 @@ pub struct WangMatchConfig {
     /// Peak ÷ background floor (false-positive guard). Default 5.0.
     pub min_prominence: f32,
     /// Skip hashes whose reference posting list exceeds this. Default 100.
+    ///
+    /// Read by [`WangMatcher`] and [`WangRefIndex::build`]. A
+    /// [`WangIndex`](super::WangIndex) takes its limit as an argument to
+    /// `build` / `insert` instead, and its `query` ignores this field.
     pub max_postings_per_hash: u32,
 }
 
@@ -75,9 +79,10 @@ impl Default for WangMatchConfig {
 /// the pure O(Q log U + range) voting pass, and the index applies the
 /// same stop-hash filter the 1:1 path would.
 ///
-/// The two entry points are guaranteed to agree: `match_one` is defined
-/// as build-then-`match_one_prebuilt`, so results are identical by
-/// construction.
+/// The two entry points are guaranteed to agree: `match_one` runs
+/// `match_one_prebuilt` on an index of just the reference hashes its query
+/// carries, which answers every lookup that query makes exactly as the
+/// full index does.
 pub struct WangRefIndex {
     postings: SortedPostings,
     r_max: i64,
@@ -101,11 +106,19 @@ impl WangRefIndex {
     /// under which `match_one` returns [`MatchResult::NONE`].
     #[must_use]
     pub fn build(reference: &WangFingerprint, cfg: &WangMatchConfig) -> Option<Self> {
-        if reference.hashes.is_empty() {
-            return None;
-        }
+        Self::build_for(reference, cfg, None)
+    }
+
+    /// [`WangRefIndex::build`], indexing only the reference hashes `wanted`
+    /// may contain when it is given. `r_max` always spans the whole
+    /// reference: it sets the histogram range, whatever was indexed.
+    fn build_for(
+        reference: &WangFingerprint,
+        cfg: &WangMatchConfig,
+        wanted: Option<&KeyFilter>,
+    ) -> Option<Self> {
         let postings =
-            SortedPostings::build_from_wang(&reference.hashes, cfg.max_postings_per_hash)?;
+            SortedPostings::build_from_wang(&reference.hashes, cfg.max_postings_per_hash, wanted)?;
         let r_max = reference
             .hashes
             .iter()
@@ -155,13 +168,16 @@ impl Matcher for WangMatcher {
             return MatchResult::NONE;
         }
 
-        // audit C1: the prebuilt index path and the 1:1 path must agree;
-        // `match_one` is exactly build-then-`match_one_prebuilt`.
-        let index = match WangRefIndex::build(reference, &self.cfg) {
-            Some(index) => index,
-            None => return MatchResult::NONE,
-        };
-        self.match_one_prebuilt(query, &index)
+        // audit C1: the prebuilt index path and the 1:1 path must agree, so
+        // this is build-then-`match_one_prebuilt`. Only a reference hash the
+        // query carries can be looked up, so only those are indexed: sorting
+        // a whole track to match a short clip against it was most of the
+        // cost of this call.
+        let wanted = KeyFilter::new(query.hashes.iter().map(|h| h.hash), 16);
+        match WangRefIndex::build_for(reference, &self.cfg, Some(&wanted)) {
+            Some(index) => self.match_one_prebuilt(query, &index),
+            None => MatchResult::NONE,
+        }
     }
 }
 
@@ -381,6 +397,70 @@ mod tests {
                 .collect(),
             frames_per_sec: 62.5,
         }
+    }
+
+    /// `match_one` indexes only the reference hashes its query carries; the
+    /// result must be exactly what the full prebuilt index gives — stop
+    /// hashes, misses and all.
+    #[test]
+    fn match_one_agrees_with_the_full_prebuilt_index() {
+        let mut x: u32 = 0x2545_F491;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut matched = 0;
+        for case in 0..300_usize {
+            let hash_space = [50, 400, 5_000][case % 3];
+            let cfg = WangMatchConfig {
+                max_postings_per_hash: [1, 3, 100][case / 3 % 3],
+                min_votes: [0, 3][case / 9 % 2],
+                ..Default::default()
+            };
+            let reference = WangFingerprint {
+                hashes: (0..600)
+                    .map(|_| WangHash {
+                        hash: next() % hash_space,
+                        t_anchor: next() % 3_000,
+                    })
+                    .collect(),
+                frames_per_sec: 62.5,
+            };
+            // A shifted clip of the reference diluted with unrelated hashes,
+            // or (every fourth case) unrelated hashes alone.
+            let start = (next() % 400) as usize;
+            let clip = &reference.hashes[start..start + 80];
+            let mut hashes: Vec<WangHash> = if case % 4 == 0 {
+                Vec::new()
+            } else {
+                clip.iter()
+                    .map(|h| WangHash {
+                        hash: h.hash,
+                        t_anchor: h.t_anchor + 17,
+                    })
+                    .collect()
+            };
+            hashes.extend((0..40).map(|_| WangHash {
+                hash: next() % (hash_space * 2),
+                t_anchor: next() % 500,
+            }));
+            let query = WangFingerprint {
+                hashes,
+                frames_per_sec: 62.5,
+            };
+
+            let matcher = WangMatcher::new(cfg.clone());
+            let direct = matcher.match_one(&query, &reference);
+            let prebuilt = WangRefIndex::build(&reference, &cfg)
+                .map_or(MatchResult::NONE, |index| {
+                    matcher.match_one_prebuilt(&query, &index)
+                });
+            assert_eq!(direct, prebuilt, "case {case}");
+            matched += usize::from(direct.is_match);
+        }
+        assert!(matched > 20, "only {matched} of 300 cases matched");
     }
 
     #[test]

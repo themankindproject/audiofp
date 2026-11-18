@@ -267,8 +267,9 @@ impl NeuralMatcher {
         let mean_dist = total_cost / path_len;
         let equiv_cos = 1.0 - mean_dist;
 
-        // DTW is the one mode with a tempo model: report the
-        // query/reference window-count ratio.
+        // DTW warps the whole query onto the whole reference, so the one
+        // scale it can report is their window-count ratio (documented on
+        // `MatchResult::time_scale`).
         let time_scale = if n > 0 { m as f32 / n as f32 } else { 1.0 };
         let mut result = self.build(equiv_cos, 1.0, TimeOffset::ZERO, m.min(n) as u32);
         result.time_scale = time_scale;
