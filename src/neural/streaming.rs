@@ -91,7 +91,10 @@ impl StreamingNeuralEmbedder {
     /// that no batched plan is built: streaming always runs one window per
     /// call, so a `batch_size > 1` plan would only double model memory and
     /// construction time (and fail on fixed-batch models streaming can
-    /// run). [`config`](Self::config) still reports the `batch_size` given.
+    /// run). [`config`](Self::config) still reports the `batch_size` given,
+    /// which is the one field this constructor does not range-check: a
+    /// `batch_size` that [`NeuralEmbedder::new`](super::NeuralEmbedder::new)
+    /// rejects is accepted here and never used.
     ///
     /// # Errors
     ///
@@ -177,7 +180,9 @@ impl StreamingNeuralEmbedder {
     /// `run` internals), so this is **not** a whole-path zero-allocation
     /// guarantee — see [`ZeroAllocStreaming`](crate::ZeroAllocStreaming). The sample carry
     /// grows only when a push larger than one analysis window arrives
-    /// (amortised `O(1)` per sample).
+    /// (amortised `O(1)` per sample), and what a push of many windows
+    /// grew it by is released before the call returns: between pushes it
+    /// holds at most a few windows' worth of capacity.
     ///
     /// **On error**: if inference fails partway through a multi-window
     /// push, embeddings already passed to the callback have been
@@ -257,6 +262,13 @@ impl StreamingNeuralEmbedder {
     /// Move the unconsumed tail of `sample_carry` to the front and reset
     /// the read cursor — one `memmove` of the surviving samples instead
     /// of one front-drain per emitted window.
+    ///
+    /// Between pushes the carry holds less than one window, so a push of
+    /// many windows leaves it with the capacity of that whole push. That
+    /// is given back here rather than kept for the life of the stream
+    /// (230 MB after one hour of 16 kHz audio pushed at once). Streams fed
+    /// a window or two at a time never reach the threshold and keep their
+    /// buffer.
     fn compact_carry(&mut self) {
         if self.carry_read > 0 {
             let keep = self.sample_carry.len() - self.carry_read;
@@ -264,7 +276,16 @@ impl StreamingNeuralEmbedder {
             self.sample_carry.truncate(keep);
             self.carry_read = 0;
         }
+        let window = self.core.window_samples;
+        let in_use = window.max(self.sample_carry.len());
+        if self.sample_carry.capacity() > Self::CARRY_SLACK * in_use {
+            self.sample_carry.shrink_to(window);
+        }
     }
+
+    /// How many times what the carry holds (or one window, if that is
+    /// more) its capacity may reach before the spare part is released.
+    const CARRY_SLACK: usize = 4;
 
     /// Discard any unconsumed samples without emitting embeddings.
     ///
@@ -275,6 +296,12 @@ impl StreamingNeuralEmbedder {
         self.sample_carry.clear();
         self.carry_read = 0;
         self.samples_consumed = 0;
+    }
+
+    /// Test-only: samples the carry has room for without reallocating.
+    #[cfg(test)]
+    pub(crate) fn carry_capacity(&self) -> usize {
+        self.sample_carry.capacity()
     }
 
     /// Test-only: number of unconsumed samples currently buffered.
@@ -482,6 +509,37 @@ mod tests {
         );
         // The 17 leftover samples remain in the carry.
         assert_eq!(s.carry_len(), 17);
+    }
+
+    #[test]
+    fn a_push_of_many_windows_does_not_leave_its_capacity_behind() {
+        let mut s = fixture();
+        let window = s.window_samples();
+        let chunk = synth_audio(3, 100 * window + 17, 16_000);
+        assert_eq!(s.push(&chunk).unwrap().len(), 100);
+        assert_eq!(s.carry_len(), 17);
+        assert!(
+            s.carry_capacity() <= 4 * window,
+            "carry keeps room for {} samples, {} windows",
+            s.carry_capacity(),
+            s.carry_capacity() / window,
+        );
+        // The stream goes on exactly as one fed a window at a time does.
+        let mut steady = fixture();
+        let mut expected = Vec::new();
+        for piece in chunk.chunks(window) {
+            expected.extend(steady.push(piece).unwrap());
+        }
+        let tail = synth_audio(4, 3 * window, 16_000);
+        expected.extend(steady.push(&tail).unwrap());
+        let mut found = fixture();
+        let mut emitted = found.push(&chunk).unwrap();
+        emitted.extend(found.push(&tail).unwrap());
+        assert_eq!(emitted, expected);
+        // A stream fed in small pieces keeps the buffer it has.
+        let before = steady.carry_capacity();
+        steady.push(&tail[..window / 2]).unwrap();
+        assert_eq!(steady.carry_capacity(), before);
     }
 
     #[test]

@@ -103,15 +103,16 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
         .max(inv.get_inplace_scratch_len());
     let mut scratch = vec![Complex::new(0.0, 0.0); scratch_len];
     let mut buf = vec![Complex::new(0.0, 0.0); N_FFT];
+    let mut lattice = LatticeMagnitudes::new();
+    let scale = 1.0 / N_FFT as f32;
+    // Samples past the last whole block stay as they are.
     let mut y = samples.to_vec();
-    let mut pos = 0usize;
-    while pos + N_FFT <= samples.len() {
-        for i in 0..N_FFT {
-            buf[i] = Complex::new(samples[pos + i], 0.0);
+    for block in y.chunks_exact_mut(N_FFT) {
+        for (cell, &s) in buf.iter_mut().zip(&*block) {
+            *cell = Complex::new(s, 0.0);
         }
         fwd.process_with_scratch(&mut buf, &mut scratch);
         for (b, &bit) in bits.iter().enumerate() {
-            let target = if bit == 1 { Q_DB * 0.5 } else { 0.0 };
             for k in 0..BINS_PER_BIT {
                 let idx = b + k * n_bits;
                 if idx >= order.len() {
@@ -122,24 +123,64 @@ pub(crate) fn embed(samples: &[f32], bits: &[u8], key: &[u8]) -> Vec<f32> {
                 if mag < 1e-6 {
                     continue;
                 }
-                let db = 20.0 * libm::log10f(mag);
-                let new_mag = libm::powf(10.0, quantize_db(db, target, Q_DB) / 20.0);
+                let new_mag = lattice.nearest(20.0 * libm::log10f(mag), bit == 1);
                 // Quantising within +-Q_DB/2 of a magnitude >= 1e-6 stays >= 7e-7.
                 debug_assert!(
                     new_mag >= 1e-7,
                     "quantised magnitude underflowed: {new_mag}"
                 );
-                set_herm_mag(&mut buf, bin, new_mag);
+                scale_herm(&mut buf, bin, new_mag / mag);
             }
         }
         inv.process_with_scratch(&mut buf, &mut scratch);
-        let scale = 1.0 / N_FFT as f32;
-        for i in 0..N_FFT {
-            y[pos + i] = buf[i].re * scale;
+        for (s, cell) in block.iter_mut().zip(&buf) {
+            *s = cell.re * scale;
         }
-        pos += N_FFT;
     }
     y
+}
+
+/// Linear magnitudes of the lattice points carriers are moved to.
+///
+/// A carrier goes to `10^(dB / 20)` for the lattice point nearest its
+/// level. A clip's carriers share a few dozen such points, so each power is
+/// taken the first time its point comes up and kept, instead of once for
+/// each of the 384 carriers of every block.
+struct LatticeMagnitudes {
+    /// `[bit][step - MIN_STEP]`, NaN until first asked for.
+    known: [[f32; Self::STEPS]; 2],
+}
+
+impl LatticeMagnitudes {
+    /// Lowest lattice step kept. With [`Self::STEPS`] of them the table
+    /// spans -144 dB to +147 dB, far beyond what audio reaches. A level
+    /// outside it is computed each time.
+    const MIN_STEP: f32 = -24.0;
+    const STEPS: usize = 49;
+
+    fn new() -> Self {
+        Self {
+            known: [[f32::NAN; Self::STEPS]; 2],
+        }
+    }
+
+    /// Magnitude of the lattice point for a 1 or a 0 bit that is nearest
+    /// `db`: `10^(quantize_db(db, target, Q_DB) / 20)`, to the bit.
+    fn nearest(&mut self, db: f32, bit_is_one: bool) -> f32 {
+        let target = if bit_is_one { Q_DB * 0.5 } else { 0.0 };
+        // The quantised level depends on `db` only through its step.
+        let magnitude = || libm::powf(10.0, quantize_db(db, target, Q_DB) / 20.0);
+        let slot = lattice_step(db, target, Q_DB) - Self::MIN_STEP;
+        // False for a NaN or infinite level too, which is then not kept.
+        if !(0.0..Self::STEPS as f32).contains(&slot) {
+            return magnitude();
+        }
+        let known = &mut self.known[usize::from(bit_is_one)][slot as usize];
+        if known.is_nan() {
+            *known = magnitude();
+        }
+        *known
+    }
 }
 
 /// Detect a payload: find the alignment, track the level, vote, check the CRC.
@@ -384,20 +425,40 @@ impl<'a> Search<'a> {
     }
 
     /// Decode every block at `offset`.
+    ///
+    /// A block's level is averaged over the [`GAIN_SMOOTH`] blocks on
+    /// either side of it, so a block votes once that many later blocks have
+    /// been read, and only the carriers of those blocks are kept until
+    /// then: [`DECODE_ROWS`] rows whatever the length of the clip.
     fn decode(&mut self, offset: usize, payload_len: usize, n_bits: usize) -> Decoded {
         let width = self.row.len();
         let blocks = self.blocks_at(offset);
-        let mut db = vec![SKIPPED; blocks * width];
+        let mut rows = vec![SKIPPED; DECODE_ROWS * width];
+        let row_of = |j: usize| {
+            let start = (j % DECODE_ROWS) * width;
+            start..start + width
+        };
         let mut phasors = Vec::with_capacity(blocks);
-        for (j, row) in db.chunks_exact_mut(width).enumerate() {
+        let mut level = LevelTracker::default();
+        let mut votes = Votes::new(n_bits);
+        for j in 0..blocks {
+            let row = &mut rows[row_of(j)];
             if self.is_live(offset, j) {
                 self.carriers
                     .block_db(self.samples, offset + j * N_FFT, row);
+            } else {
+                row.fill(SKIPPED);
             }
             phasors.push(Phasor::of(row));
+            if let Some(ready) = j.checked_sub(GAIN_SMOOTH) {
+                votes.add(&rows[row_of(ready)], level.next(&phasors, ready));
+            }
         }
-        let level = level_track(&phasors);
-        let Some(votes) = block_votes(&db, width, n_bits, &level) else {
+        // The clip ends before these blocks' windows do.
+        for ready in blocks.saturating_sub(GAIN_SMOOTH)..blocks {
+            votes.add(&rows[row_of(ready)], level.next(&phasors, ready));
+        }
+        let Some(votes) = votes.mean() else {
             return Decoded {
                 payload: None,
                 mean_vote: 0.0,
@@ -415,6 +476,10 @@ fn wrap_lattice(x: f64) -> f64 {
     x - LATTICE_DB * (x / LATTICE_DB).round()
 }
 
+/// Rows of carrier levels [`Search::decode`] holds: a block's own, and
+/// those of the [`GAIN_SMOOTH`] blocks read while it waits for its level.
+const DECODE_ROWS: usize = GAIN_SMOOTH + 1;
+
 /// Gain of each block in dB, from the phasors of the blocks around it.
 ///
 /// A phasor gives the gain modulo 3 dB. Starting from the first block with
@@ -422,25 +487,32 @@ fn wrap_lattice(x: f64) -> f64 {
 /// level that drifts by less than 1.5 dB between neighbouring blocks is
 /// followed through any number of lattice periods. Blocks without carriers
 /// keep the last level.
-fn level_track(phasors: &[Phasor]) -> Vec<f64> {
-    let mut level = vec![0.0; phasors.len()];
-    let mut previous: Option<f64> = None;
-    for (j, slot) in level.iter_mut().enumerate() {
+#[derive(Default)]
+struct LevelTracker {
+    /// The last level that came from carriers.
+    previous: Option<f64>,
+}
+
+impl LevelTracker {
+    /// Gain of block `j`. Blocks are asked for in order, each once
+    /// `phasors` holds the [`GAIN_SMOOTH`] blocks after it or the clip's
+    /// last block, whichever comes first.
+    fn next(&mut self, phasors: &[Phasor], j: usize) -> f64 {
         let lo = j.saturating_sub(GAIN_SMOOTH);
         let hi = (j + GAIN_SMOOTH + 1).min(phasors.len());
         let (re, im) = phasors[lo..hi]
             .iter()
             .fold((0.0, 0.0), |(re, im), p| (re + p.re, im + p.im));
         if re * re + im * im < 1e-18 {
-            *slot = previous.unwrap_or(0.0);
-            continue;
+            return self.previous.unwrap_or(0.0);
         }
         let modulo = libm::atan2(im, re) * (LATTICE_DB / core::f64::consts::TAU);
-        let unwrapped = previous.map_or(modulo, |p| p + wrap_lattice(modulo - p));
-        *slot = unwrapped;
-        previous = Some(unwrapped);
+        let unwrapped = self
+            .previous
+            .map_or(modulo, |p| p + wrap_lattice(modulo - p));
+        self.previous = Some(unwrapped);
+        unwrapped
     }
-    level
 }
 
 /// Positive when `db` is nearer the bit-1 lattice than the bit-0 lattice.
@@ -449,13 +521,26 @@ fn lattice_vote(db: f64) -> f64 {
     lattice_dist(db, 0.0, q) - lattice_dist(db, q * 0.5, q)
 }
 
-/// Mean lattice vote per bit over all blocks, after removing each block's
-/// level. A block votes with the mean of its bit's usable carriers; `None`
-/// when some bit never had one.
-fn block_votes(db: &[f32], width: usize, n_bits: usize, level: &[f64]) -> Option<Vec<f64>> {
-    let mut sum = vec![0.0f64; n_bits];
-    let mut voters = vec![0u32; n_bits];
-    for (row, &gain) in db.chunks_exact(width).zip(level) {
+/// Lattice votes per bit, summed over the blocks added so far.
+struct Votes {
+    sum: Vec<f64>,
+    /// Blocks in which the bit had a usable carrier.
+    voters: Vec<u32>,
+}
+
+impl Votes {
+    fn new(n_bits: usize) -> Self {
+        Self {
+            sum: vec![0.0; n_bits],
+            voters: vec![0; n_bits],
+        }
+    }
+
+    /// Add one block: `row` holds its carriers' dB and `gain` is its level,
+    /// which is removed first. The block votes on each bit with the mean of
+    /// that bit's usable carriers.
+    fn add(&mut self, row: &[f32], gain: f64) {
+        let n_bits = self.sum.len();
         for b in 0..n_bits {
             let (mut vote, mut n) = (0.0f64, 0u32);
             for k in 0..BINS_PER_BIT {
@@ -466,15 +551,21 @@ fn block_votes(db: &[f32], width: usize, n_bits: usize, level: &[f64]) -> Option
                 }
             }
             if n > 0 {
-                sum[b] += vote / f64::from(n);
-                voters[b] += 1;
+                self.sum[b] += vote / f64::from(n);
+                self.voters[b] += 1;
             }
         }
     }
-    sum.iter()
-        .zip(&voters)
-        .map(|(&s, &n)| (n > 0).then(|| s / f64::from(n)))
-        .collect()
+
+    /// Mean vote per bit over the blocks that voted on it; `None` when
+    /// some bit never had a usable carrier.
+    fn mean(self) -> Option<Vec<f64>> {
+        self.sum
+            .iter()
+            .zip(&self.voters)
+            .map(|(&s, &n)| (n > 0).then(|| s / f64::from(n)))
+            .collect()
+    }
 }
 
 fn qim_bins(key: &[u8], n_bits: usize) -> Vec<usize> {
@@ -492,21 +583,25 @@ fn lattice_dist(db: f64, offset: f64, q: f64) -> f64 {
     (x - x.round()).abs()
 }
 
-fn quantize_db(db: f32, target: f32, q: f32) -> f32 {
-    let step = ((db - target) / q).round();
-    step * q + target
+/// Which point of the lattice `target + step * q` is nearest `db`.
+fn lattice_step(db: f32, target: f32, q: f32) -> f32 {
+    ((db - target) / q).round()
 }
 
-fn set_herm_mag(buf: &mut [Complex<f32>], bin: usize, new_mag: f32) {
+fn quantize_db(db: f32, target: f32, q: f32) -> f32 {
+    lattice_step(db, target, q) * q + target
+}
+
+/// Scale `bin` by `ratio` and mirror it, so the spectrum stays that of a
+/// real signal.
+fn scale_herm(buf: &mut [Complex<f32>], bin: usize, ratio: f32) {
     let n = buf.len();
-    // Callers pass bins in BIN_LO..BIN_HI with a magnitude >= 1e-6.
+    // Callers pass bins in BIN_LO..BIN_HI.
     debug_assert!(
         bin != 0 && bin < n / 2,
         "bin out of range: bin={bin}, n={n}"
     );
-    let m = modulus(buf[bin]);
-    debug_assert!(m >= 1e-8, "host magnitude too small: {m}");
-    buf[bin] *= new_mag / m;
+    buf[bin] *= ratio;
     buf[n - bin] = buf[bin].conj();
 }
 
@@ -532,6 +627,115 @@ mod tests {
 
     fn assert_payload(detection: &Detection, what: &str) {
         assert_eq!(detection.payload.as_deref(), Some(&PAYLOAD[..]), "{what}");
+    }
+
+    /// The level of every block of a clip whose phasors are all known.
+    fn level_track(phasors: &[Phasor]) -> Vec<f64> {
+        let mut level = LevelTracker::default();
+        (0..phasors.len()).map(|j| level.next(phasors, j)).collect()
+    }
+
+    /// The mean votes of a clip held as one `(blocks, width)` matrix of
+    /// carrier levels, row-major.
+    fn block_votes(db: &[f32], width: usize, n_bits: usize, level: &[f64]) -> Option<Vec<f64>> {
+        let mut votes = Votes::new(n_bits);
+        for (row, &gain) in db.chunks_exact(width).zip(level) {
+            votes.add(row, gain);
+        }
+        votes.mean()
+    }
+
+    /// Decoding with every block's carriers in memory at once, as it was
+    /// before blocks were read as they vote.
+    fn decode_from_the_whole_matrix(samples: &[f32], offset: usize) -> (Option<Vec<u8>>, f64) {
+        let order = qim_bins(KEY, N_BITS);
+        let width = order.len();
+        let mut search = Search::new(samples, &order);
+        let blocks = search.blocks_at(offset);
+        let mut db = vec![SKIPPED; blocks * width];
+        let mut phasors = Vec::with_capacity(blocks);
+        for (j, row) in db.chunks_exact_mut(width).enumerate() {
+            if search.is_live(offset, j) {
+                search.carriers.block_db(samples, offset + j * N_FFT, row);
+            }
+            phasors.push(Phasor::of(row));
+        }
+        let level = level_track(&phasors);
+        let Some(votes) = block_votes(&db, width, N_BITS, &level) else {
+            return (None, 0.0);
+        };
+        let mean_vote = votes.iter().map(|v| v.abs()).sum::<f64>() / N_BITS as f64;
+        let payload =
+            hard_bits(&votes).and_then(|bits| unframe_either_polarity(&bits, PAYLOAD.len()));
+        (payload, mean_vote)
+    }
+
+    #[test]
+    fn decoding_block_by_block_matches_the_whole_matrix_bit_for_bit() {
+        // A level that drifts, and a stretch of digital silence, so the
+        // tracker unwraps and carries its level across blocks with none.
+        let mut clip = marked(40);
+        for (i, s) in clip.iter_mut().enumerate() {
+            // 0 dB rising to +4 dB, more than a lattice period.
+            *s *= libm::powf(10.0, 4.0 * (i as f32 / (40 * N_FFT) as f32) / 20.0);
+        }
+        clip[11 * N_FFT..14 * N_FFT].fill(0.0);
+        let order = qim_bins(KEY, N_BITS);
+        // Fewer blocks than a level window, exactly one, and many.
+        for blocks in [1, 2, 4, 5, 6, 9, 10, 23, 40] {
+            for offset in [0, 1, 777] {
+                let samples = &clip[..blocks * N_FFT];
+                if offset + N_FFT > samples.len() {
+                    continue;
+                }
+                let (payload, mean_vote) = decode_from_the_whole_matrix(samples, offset);
+                let found = Search::new(samples, &order).decode(offset, PAYLOAD.len(), N_BITS);
+                assert_eq!(found.payload, payload, "{blocks} blocks at {offset}");
+                assert_eq!(
+                    found.mean_vote.to_bits(),
+                    mean_vote.to_bits(),
+                    "{blocks} blocks at {offset}"
+                );
+            }
+        }
+        // The aligned, long clips do carry the payload.
+        let found = Search::new(&clip, &order).decode(0, PAYLOAD.len(), N_BITS);
+        assert_eq!(found.payload.as_deref(), Some(&PAYLOAD[..]));
+    }
+
+    #[test]
+    fn kept_lattice_magnitudes_are_the_directly_computed_ones_bit_for_bit() {
+        let mut lattice = LatticeMagnitudes::new();
+        let direct = |db: f32, bit_is_one: bool| {
+            let target = if bit_is_one { Q_DB * 0.5 } else { 0.0 };
+            libm::powf(10.0, quantize_db(db, target, Q_DB) / 20.0)
+        };
+        // Levels on a fine grid across and well beyond the kept range, the
+        // edges of that range, and levels that are not numbers. Each is
+        // asked for twice: once computed, once from the table.
+        let mut levels: Vec<f32> = (-4000..=4000).map(|i| i as f32 * 0.0537).collect();
+        levels.extend([-147.0, -146.99, -144.0, -141.0, 144.0, 146.99, 147.0, 150.0]);
+        levels.extend([
+            1e30,
+            -1e30,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ]);
+        for _ in 0..2 {
+            for &db in &levels {
+                for bit_is_one in [false, true] {
+                    assert_eq!(
+                        lattice.nearest(db, bit_is_one).to_bits(),
+                        direct(db, bit_is_one).to_bits(),
+                        "{db} dB, bit {bit_is_one}"
+                    );
+                }
+            }
+        }
+        // The grid filled the whole table.
+        assert!(lattice.known.iter().flatten().all(|known| !known.is_nan()));
     }
 
     /// The detector runs on [`RealFft`]; the embedder (and the bakeoff

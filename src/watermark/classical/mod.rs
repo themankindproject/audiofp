@@ -553,6 +553,29 @@ mod tests {
         }
     }
 
+    /// Finite samples so large that the transform itself overflows, so
+    /// nothing read from the spectrum is evidence. Noise up to 2e37 leaves
+    /// infinite bins, for which LogHost reported a score of `-inf`; noise
+    /// up to 3e38 leaves bins that are not numbers at all.
+    #[test]
+    fn samples_that_overflow_the_transform_detect_as_no_mark() {
+        for (boost, scale) in [(1.0f32, 1e38f32), (5.0, 3e38)] {
+            let host: Vec<f32> = noise(64_000).iter().map(|&s| s * boost * scale).collect();
+            assert!(host.iter().all(|s| s.is_finite()));
+            for algorithm in [Algorithm::QimBlock, Algorithm::LogHost] {
+                let config = ClassicalConfig::new(4).with_algorithm(algorithm);
+                let detector = ClassicalDetector::try_new(config, b"key").unwrap();
+                let result = detector.detect(&host, SampleRate::HZ_16000).unwrap();
+                let what = format!("{algorithm:?} at {boost} x {scale:e}: {result:?}");
+                assert!(result.payload.is_none(), "{what}");
+                assert!(result.score.is_finite(), "{what}");
+                if algorithm == Algorithm::LogHost {
+                    assert_eq!((result.score, result.sync_offset), (0.0, 0), "{what}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn wrong_key_and_unwatermarked_audio_return_no_payload() {
         let samples = noise(16_000 * 8);
