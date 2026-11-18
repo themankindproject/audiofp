@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-11-19
+
 No hash layout, wire format, frame rate, default threshold or public signature
 changed. The offline and real-audio goldens and the cross-platform determinism
 test are unchanged, and every item under Performance and Memory returns the
@@ -135,6 +137,8 @@ written up in `BREAKING-PROPOSALS.md`, and none of it is implemented.
 - The three indexes share their vote cap, vote filtering, posting insertion
   and removal code, the Panako matcher and index share their scale binning,
   and the streaming anchor emitters share one loop, instead of carrying copies.
+- The repository lockfile takes `rustix` 1.1.6 for RUSTSEC-2026-0486. The
+  lockfile is not part of the published crate; dependents resolve their own.
 
 ## [0.4.6] - 2026-11-05
 
@@ -3168,7 +3172,8 @@ Initial release of `audiofp`, an audio fingerprinting SDK for Rust.
   committed v1 outputs aren't included; codec robustness benchmarks against a
   held-out corpus are also pending.
 
-[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/themankindproject/audiofp/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/themankindproject/audiofp/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/themankindproject/audiofp/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/themankindproject/audiofp/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/themankindproject/audiofp/compare/v0.4.3...v0.4.4
