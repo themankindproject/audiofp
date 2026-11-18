@@ -281,12 +281,12 @@ impl PeakPicker {
         resize_scratch(&mut self.raw_ring, (kt + 1) * n_bins);
         resize_scratch(&mut self.vmax_row, n_bins);
         self.vert.reset(2 * kt + 1, n_bins);
-        // Leading edge: the window of row 0 is clamped at the start. NaN
-        // rows never win a max, so `kt` NaN rows reproduce the clamp
+        // Leading edge: the window of row 0 is clamped at the start. A
+        // `-inf` row never wins a max, so `kt` of them reproduce the clamp
         // exactly (and cannot complete a window yet: kt < 2·kt + 1).
         for _ in 0..kt {
-            self.vert.next_slot().fill(f32::NAN);
-            self.vert.commit(None);
+            self.vert.next_slot().fill(f32::NEG_INFINITY);
+            self.vert.commit(true, None);
         }
 
         let target_per_sec = self.cfg.target_per_sec;
@@ -332,22 +332,22 @@ impl PeakPicker {
         let slot = self.rows_pushed % ring_rows;
         self.raw_ring[slot * n_bins..(slot + 1) * n_bins].copy_from_slice(row);
         self.rows_pushed += 1;
-        hmax_row(
+        let nan_free = hmax_row(
             row,
             self.cfg.neighborhood_f,
             &mut self.hpad,
             self.vert.next_slot(),
         );
-        self.commit_and_emit();
+        self.commit_and_emit(nan_free);
     }
 
     /// Drain the trailing edge and return the peaks sorted by
     /// `(t_frame, f_bin)`.
     pub(crate) fn finish(&mut self) -> Vec<Peak> {
-        // Trailing edge: NaN rows reproduce the end-of-spectrogram clamp.
+        // Trailing edge: `-inf` rows reproduce the end-of-spectrogram clamp.
         for _ in 0..self.cfg.neighborhood_t {
-            self.vert.next_slot().fill(f32::NAN);
-            self.commit_and_emit();
+            self.vert.next_slot().fill(f32::NEG_INFINITY);
+            self.commit_and_emit(true);
         }
         // The last bucket is still open.
         self.flush_bucket();
@@ -358,17 +358,18 @@ impl PeakPicker {
         core::mem::take(&mut self.candidates)
     }
 
-    /// Commit the row just written into the vertical engine's slot; when a
-    /// centre row's full window is complete, test its cells.
+    /// Commit the row just written into the vertical engine's slot
+    /// (`row_nan_free`: it is known to hold no NaN); when a centre row's
+    /// full window is complete, test its cells.
     #[inline]
-    fn commit_and_emit(&mut self) {
+    fn commit_and_emit(&mut self, row_nan_free: bool) {
         let w = self.vert.w;
         let pos = self.vert.pos;
         if pos + 1 < w {
-            self.vert.commit(None);
+            self.vert.commit(row_nan_free, None);
             return;
         }
-        self.vert.commit(Some(&mut self.vmax_row));
+        self.vert.commit(row_nan_free, Some(&mut self.vmax_row));
         // Padded row `pos` completed the window of padded row
         // `pos + 1 - w`, which is original row `pos + 1 - w` (the `kt`
         // leading pads shift both window ends equally).
@@ -447,6 +448,45 @@ fn resize_scratch(v: &mut Vec<f32>, len: usize) {
     v.resize(len, 0.0);
 }
 
+/// Whether the plain SIMD max equals the NaN-aware one whenever neither
+/// operand is a NaN. True on the vector back-ends `wide` compiles to
+/// (SSE, NEON, WASM SIMD), where both reduce to the same instruction
+/// result for ordered operands — signed zeros included. `wide`'s scalar
+/// fallback picks between `+0.0` and `-0.0` differently in the two, so
+/// there the NaN-aware max is kept and nothing changes.
+const PLAIN_MAX_IS_EXACT: bool = cfg!(any(
+    target_feature = "sse",
+    target_feature = "simd128",
+    all(target_feature = "neon", target_arch = "aarch64"),
+));
+
+/// Lane-wise max for the rolling-max passes: a NaN never wins.
+///
+/// With `NAN_FREE` the caller guarantees that neither operand holds a NaN,
+/// and the plain SIMD max is used instead — the same result in a fifth of
+/// the instructions on x86, where the NaN-aware form is a max, an unordered
+/// compare and a three-instruction blend.
+#[inline(always)]
+fn lane_max<const NAN_FREE: bool>(a: wide::f32x8, b: wide::f32x8) -> wide::f32x8 {
+    if NAN_FREE && PLAIN_MAX_IS_EXACT {
+        a.fast_max(b)
+    } else {
+        a.max(b)
+    }
+}
+
+/// Whether `row` holds a NaN anywhere.
+#[inline]
+fn has_nan(row: &[f32]) -> bool {
+    let (chunks, tail) = row.as_chunks::<8>();
+    let mut unordered = wide::f32x8::ZERO;
+    for &chunk in chunks {
+        let v = wide::f32x8::new(chunk);
+        unordered |= v.simd_ne(v);
+    }
+    unordered.any() || tail.iter().any(|v| v.is_nan())
+}
+
 /// `buf[i] = max(buf[i], buf[i + d])` for `i in 0..m`, in place.
 ///
 /// Ascending order keeps every read at an index that is not yet
@@ -454,12 +494,14 @@ fn resize_scratch(v: &mut Vec<f32>, len: usize) {
 /// the in-place update equals the out-of-place one. Requires
 /// `m + d <= buf.len()`.
 #[inline]
-fn max_shift_in_place(buf: &mut [f32], d: usize, m: usize) {
+fn max_shift_in_place<const NAN_FREE: bool>(buf: &mut [f32], d: usize, m: usize) {
     use crate::dsp::simd::{load8, store8};
     debug_assert!(m + d <= buf.len());
+    // Every index below is under `m + d`: one check here, none in the loop.
+    let buf = &mut buf[..m + d];
     let mut i = 0;
     while i + 8 <= m {
-        let v = load8(buf, i).max(load8(buf, i + d));
+        let v = lane_max::<NAN_FREE>(load8(buf, i), load8(buf, i + d));
         store8(buf, i, v);
         i += 8;
     }
@@ -471,36 +513,33 @@ fn max_shift_in_place(buf: &mut [f32], d: usize, m: usize) {
 
 /// `out[i] = max(a[i], b[i])`.
 #[inline]
-fn max_pair_into(a: &[f32], b: &[f32], out: &mut [f32]) {
-    use crate::dsp::simd::{load8, store8};
+fn max_pair_into<const NAN_FREE: bool>(a: &[f32], b: &[f32], out: &mut [f32]) {
     debug_assert!(a.len() == out.len() && b.len() == out.len());
     let n = out.len();
-    let mut i = 0;
-    while i + 8 <= n {
-        store8(out, i, load8(a, i).max(load8(b, i)));
-        i += 8;
+    let (a, b) = (&a[..n], &b[..n]);
+    let (out_chunks, out_tail) = out.as_chunks_mut::<8>();
+    let (a_chunks, a_tail) = a.as_chunks::<8>();
+    let (b_chunks, b_tail) = b.as_chunks::<8>();
+    for ((o, &x), &y) in out_chunks.iter_mut().zip(a_chunks).zip(b_chunks) {
+        *o = lane_max::<NAN_FREE>(wide::f32x8::new(x), wide::f32x8::new(y)).to_array();
     }
-    while i < n {
-        out[i] = a[i].max(b[i]);
-        i += 1;
+    for ((o, &x), &y) in out_tail.iter_mut().zip(a_tail).zip(b_tail) {
+        *o = x.max(y);
     }
 }
 
 /// `acc[i] = max(acc[i], x[i])`.
 #[inline]
-fn max_assign(acc: &mut [f32], x: &[f32]) {
-    use crate::dsp::simd::{load8, store8};
+fn max_assign<const NAN_FREE: bool>(acc: &mut [f32], x: &[f32]) {
     debug_assert_eq!(acc.len(), x.len());
-    let n = acc.len();
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = load8(acc, i).max(load8(x, i));
-        store8(acc, i, v);
-        i += 8;
+    let x = &x[..acc.len()];
+    let (acc_chunks, acc_tail) = acc.as_chunks_mut::<8>();
+    let (x_chunks, x_tail) = x.as_chunks::<8>();
+    for (a, &b) in acc_chunks.iter_mut().zip(x_chunks) {
+        *a = lane_max::<NAN_FREE>(wide::f32x8::new(*a), wide::f32x8::new(b)).to_array();
     }
-    while i < n {
-        acc[i] = acc[i].max(x[i]);
-        i += 1;
+    for (a, &b) in acc_tail.iter_mut().zip(x_tail) {
+        *a = a.max(b);
     }
 }
 
@@ -511,15 +550,31 @@ fn max_assign(acc: &mut [f32], x: &[f32]) {
 /// wins (`f32::max` / `f32x8::max` semantics; an all-NaN window yields
 /// NaN).
 ///
-/// Uses doubling on a NaN-padded copy: after `log2(p)` in-place passes
+/// Uses doubling on a padded copy: after `log2(p)` in-place passes
 /// (`p` = largest power of two `≤ 2k+1`) `pad[j]` holds the max of
 /// `pad[j .. j+p]`, and two overlapping `p`-windows cover each
 /// `(2k+1)`-window. For Wang/Panako (`k = 15`) that is 5 vector max
 /// passes per row instead of 30, and every pass is contiguous SIMD.
-/// NaN padding reproduces the edge clamp exactly because NaN never wins.
+///
+/// Returns whether `row` was free of NaNs. Such a row — every row of a
+/// real spectrogram — takes the plain-max path (see [`lane_max`]) with
+/// `-inf` padding; a row holding a NaN takes the NaN-aware path with NaN
+/// padding. Either padding reproduces the edge clamp exactly because it
+/// never wins, and the two paths agree on every NaN-free row.
 ///
 /// `pad` must have length `row.len() + 2k`.
-fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
+fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) -> bool {
+    let nan_free = !has_nan(row);
+    if nan_free {
+        hmax_row_with::<true>(row, k, pad, out);
+    } else {
+        hmax_row_with::<false>(row, k, pad, out);
+    }
+    nan_free
+}
+
+#[inline]
+fn hmax_row_with<const NAN_FREE: bool>(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
     let n = row.len();
     debug_assert_eq!(out.len(), n);
     debug_assert_eq!(pad.len(), n + 2 * k);
@@ -527,9 +582,14 @@ fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
         out.copy_from_slice(row);
         return;
     }
-    pad[..k].fill(f32::NAN);
+    let edge = if NAN_FREE {
+        f32::NEG_INFINITY
+    } else {
+        f32::NAN
+    };
+    pad[..k].fill(edge);
     pad[k..k + n].copy_from_slice(row);
-    pad[k + n..].fill(f32::NAN);
+    pad[k + n..].fill(edge);
     let w = 2 * k + 1;
     let p = 1usize << (usize::BITS - 1 - w.leading_zeros());
     let len = pad.len();
@@ -537,11 +597,11 @@ fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
     while d < p {
         // After this pass `pad[j] = max(pad[j .. j + 2d])` for every
         // `j <= len - 2d` — every index the final combine reads.
-        max_shift_in_place(pad, d, len + 1 - 2 * d);
+        max_shift_in_place::<NAN_FREE>(pad, d, len + 1 - 2 * d);
         d *= 2;
     }
     let s = w - p;
-    max_pair_into(&pad[..n], &pad[s..s + n], out);
+    max_pair_into::<NAN_FREE>(&pad[..n], &pad[s..s + n], out);
 }
 
 /// Streaming vertical sliding max over rows (van Herk / Gil-Werman).
@@ -549,52 +609,69 @@ fn hmax_row(row: &[f32], k: usize, pad: &mut [f32], out: &mut [f32]) {
 /// Rows are grouped into blocks of `w`; a window `[s, s + w)` spans the
 /// suffix of one block and the prefix of the next, so its max is
 /// `max(suffix[s], prefix[s + w - 1])` — about three vector max ops per
-/// row regardless of `w`. Only two blocks of rows are held, so memory is
+/// row regardless of `w`. One block of rows is held, so memory is
 /// `O(w · n_bins)` independent of the spectrogram length.
 #[derive(Default)]
 struct VertMax {
     /// Window length in rows (`2·kt + 1`).
     w: usize,
     n_bins: usize,
-    /// Rows of the block being filled.
-    cur: Vec<f32>,
-    /// Suffix maxima of the previous complete block.
-    prev: Vec<f32>,
-    /// Running prefix max of the current block.
+    /// `w` row slots shared by two blocks. While the open block is at slot
+    /// `j`, slots `[0, j]` hold its rows and slots `(j, w)` still hold the
+    /// suffix maxima of the previous block — exactly the ones a window
+    /// ending in the open block can reach. A new row overwrites a suffix
+    /// that no later window needs.
+    rows: Vec<f32>,
+    /// Running prefix max of the open block.
     g: Vec<f32>,
     /// Rows committed so far (padding included).
     pos: usize,
+    /// No committed row has held a NaN, so the plain max is exact (see
+    /// [`lane_max`]). Cleared for good by the first row that does.
+    nan_free: bool,
 }
 
 impl VertMax {
     fn reset(&mut self, w: usize, n_bins: usize) {
         self.w = w;
         self.n_bins = n_bins;
-        resize_scratch(&mut self.cur, w * n_bins);
-        resize_scratch(&mut self.prev, w * n_bins);
+        resize_scratch(&mut self.rows, w * n_bins);
         resize_scratch(&mut self.g, n_bins);
         self.pos = 0;
+        self.nan_free = true;
     }
 
     /// Slot the next row must be written into before [`commit`](Self::commit).
     #[inline]
     fn next_slot(&mut self) -> &mut [f32] {
         let j = self.pos % self.w;
-        &mut self.cur[j * self.n_bins..(j + 1) * self.n_bins]
+        &mut self.rows[j * self.n_bins..(j + 1) * self.n_bins]
     }
 
-    /// Commit the row in [`next_slot`](Self::next_slot). When `out` is
-    /// `Some`, write the max over rows `[max(0, pos + 1 - w), pos]` into it
-    /// (the window ending at this row, clamped at the stream start).
-    fn commit(&mut self, out: Option<&mut [f32]>) {
+    /// Commit the row in [`next_slot`](Self::next_slot); `row_nan_free`
+    /// says whether it is known to hold no NaN. When `out` is `Some`,
+    /// write the max over rows `[max(0, pos + 1 - w), pos]` into it (the
+    /// window ending at this row, clamped at the stream start).
+    #[inline]
+    fn commit(&mut self, row_nan_free: bool, out: Option<&mut [f32]>) {
+        self.nan_free &= row_nan_free;
+        if self.nan_free {
+            self.commit_with::<true>(out);
+        } else {
+            self.commit_with::<false>(out);
+        }
+    }
+
+    #[inline]
+    fn commit_with<const NAN_FREE: bool>(&mut self, out: Option<&mut [f32]>) {
         let w = self.w;
         let nb = self.n_bins;
         let j = self.pos % w;
-        let row = &self.cur[j * nb..(j + 1) * nb];
+        let row = &self.rows[j * nb..(j + 1) * nb];
         if j == 0 {
             self.g.copy_from_slice(row);
         } else {
-            max_assign(&mut self.g, row);
+            max_assign::<NAN_FREE>(&mut self.g, row);
         }
         if let Some(out) = out {
             if j == w - 1 || self.pos < w {
@@ -603,16 +680,15 @@ impl VertMax {
             } else {
                 // Suffix of the previous block from `j + 1`, plus this
                 // block's prefix through `j`.
-                max_pair_into(&self.prev[(j + 1) * nb..(j + 2) * nb], &self.g, out);
+                max_pair_into::<NAN_FREE>(&self.rows[(j + 1) * nb..(j + 2) * nb], &self.g, out);
             }
         }
         if j == w - 1 {
             // Block complete: turn it into suffix maxima for the next block.
             for i in (0..w - 1).rev() {
-                let (lo, hi) = self.cur.split_at_mut((i + 1) * nb);
-                max_assign(&mut lo[i * nb..], &hi[..nb]);
+                let (lo, hi) = self.rows.split_at_mut((i + 1) * nb);
+                max_assign::<NAN_FREE>(&mut lo[i * nb..], &hi[..nb]);
             }
-            core::mem::swap(&mut self.cur, &mut self.prev);
         }
         self.pos += 1;
     }
@@ -622,6 +698,15 @@ impl VertMax {
     /// drain right-clamped tail windows at end of stream while leaving the
     /// stream resumable.
     fn max_since(&self, a: usize, out: &mut [f32]) {
+        if self.nan_free {
+            self.max_since_with::<true>(a, out);
+        } else {
+            self.max_since_with::<false>(a, out);
+        }
+    }
+
+    #[inline]
+    fn max_since_with<const NAN_FREE: bool>(&self, a: usize, out: &mut [f32]) {
         let w = self.w;
         let nb = self.n_bins;
         debug_assert!(self.pos > 0 && a < self.pos && self.pos - a <= w);
@@ -631,20 +716,21 @@ impl VertMax {
         if a / w == last / w {
             if j_last == w - 1 {
                 // The block was just finalised into suffix maxima.
-                out.copy_from_slice(&self.prev[row(a % w)]);
+                out.copy_from_slice(&self.rows[row(a % w)]);
             } else {
                 // Raw rows of the open block.
-                out.copy_from_slice(&self.cur[row(a % w)]);
+                out.copy_from_slice(&self.rows[row(a % w)]);
                 for i in a % w + 1..=j_last {
-                    max_assign(out, &self.cur[row(i)]);
+                    max_assign::<NAN_FREE>(out, &self.rows[row(i)]);
                 }
             }
         } else {
             // `a` is in the previous (finalised) block and the open block
             // holds rows through `j_last` (a window of at most `w` rows
-            // cannot span a finalised current block plus an earlier one).
-            debug_assert!(j_last < w - 1);
-            max_pair_into(&self.prev[row(a % w)], &self.g, out);
+            // cannot span a finalised current block plus an earlier one),
+            // so slot `a % w > j_last` still holds that block's suffix.
+            debug_assert!(j_last < w - 1 && a % w > j_last);
+            max_pair_into::<NAN_FREE>(&self.rows[row(a % w)], &self.g, out);
         }
     }
 }
@@ -1062,7 +1148,7 @@ impl IncrementalPeakDetector {
 
         // 1. Horizontal rolling-max of the new row, written straight into
         //    the vertical engine's slot for this row.
-        hmax_row(row, self.kf, &mut self.hpad, self.vert.next_slot());
+        let nan_free = hmax_row(row, self.kf, &mut self.hpad, self.vert.next_slot());
 
         // 2. A row is ripe once its forward context (`kt` rows) has been
         //    pushed; skip rows an earlier `flush` already emitted —
@@ -1077,12 +1163,12 @@ impl IncrementalPeakDetector {
         //    the stream start) is exactly the window ending at `abs`.
         match ripe_abs {
             Some(ripe_abs) => {
-                self.vert.commit(Some(out_max));
+                self.vert.commit(nan_free, Some(out_max));
                 self.last_emitted = ripe_abs as i64;
                 Some(ripe_abs)
             }
             None => {
-                self.vert.commit(None);
+                self.vert.commit(nan_free, None);
                 None
             }
         }
@@ -1966,6 +2052,89 @@ mod tests {
                 assert_eq!(bits(&got), bits(&want), "n={n} k={k}");
             }
         }
+    }
+
+    /// NaN-free values that stress the max itself: both signed zeros,
+    /// both infinities, and plenty of exact ties.
+    fn tricky_finite_values(seed: u32, n: usize) -> Vec<f32> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                match x % 11 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f32::NEG_INFINITY,
+                    3 => f32::INFINITY,
+                    _ => (x % 7) as f32 - 3.0,
+                }
+            })
+            .collect()
+    }
+
+    /// The plain-max path must be indistinguishable from the NaN-aware one
+    /// on rows without NaNs — down to the sign of a zero — because which
+    /// of the two runs depends only on whether a NaN has been seen.
+    #[test]
+    fn plain_max_path_matches_nan_aware_path_bit_for_bit() {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for n in [1usize, 2, 7, 8, 9, 31, 32, 33, 64, 65, 513] {
+            for k in [0usize, 1, 2, 3, 7, 8, 15, 16, 40] {
+                let row = tricky_finite_values(n as u32 * 131 + k as u32, n);
+                assert!(!has_nan(&row));
+                let mut pad = vec![0.0; n + 2 * k];
+                let (mut plain, mut aware) = (vec![0.0; n], vec![0.0; n]);
+                hmax_row_with::<true>(&row, k, &mut pad, &mut plain);
+                hmax_row_with::<false>(&row, k, &mut pad, &mut aware);
+                assert_eq!(bits(&plain), bits(&aware), "hmax n={n} k={k}");
+            }
+        }
+
+        // Vertical engine: same rows through both flavours, every output row.
+        for (w, nb) in [(1usize, 9usize), (2, 8), (3, 17), (7, 33), (31, 70)] {
+            let (mut plain, mut aware) = (VertMax::default(), VertMax::default());
+            plain.reset(w, nb);
+            aware.reset(w, nb);
+            let (mut out_p, mut out_a) = (vec![0.0; nb], vec![0.0; nb]);
+            for r in 0..5 * w + 3 {
+                let row = tricky_finite_values((w * 1000 + r) as u32, nb);
+                plain.next_slot().copy_from_slice(&row);
+                aware.next_slot().copy_from_slice(&row);
+                plain.commit_with::<true>(Some(&mut out_p));
+                aware.commit_with::<false>(Some(&mut out_a));
+                assert_eq!(bits(&out_p), bits(&out_a), "commit w={w} row {r}");
+                for a in (r + 1).saturating_sub(w)..=r {
+                    plain.max_since_with::<true>(a, &mut out_p);
+                    aware.max_since_with::<false>(a, &mut out_a);
+                    assert_eq!(bits(&out_p), bits(&out_a), "max_since w={w} [{a}, {r}]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn has_nan_finds_a_nan_in_any_lane() {
+        for n in [0usize, 1, 7, 8, 9, 16, 65] {
+            let mut row = vec![1.0_f32; n];
+            assert!(!has_nan(&row), "n={n}");
+            for i in 0..n {
+                row[i] = f32::NAN;
+                assert!(has_nan(&row), "n={n} i={i}");
+                row[i] = f32::INFINITY;
+            }
+            assert!(!has_nan(&row), "infinities are not NaN (n={n})");
+        }
+    }
+
+    /// One buffer serves two blocks (see `VertMax::rows`): scratch per
+    /// detector is `w + 1` rows, not `2·w + 1`.
+    #[test]
+    fn vertical_engine_holds_one_block_of_rows() {
+        let det = IncrementalPeakDetector::new(15, 15, 513);
+        assert_eq!(det.vert.rows.len(), 31 * 513);
+        assert_eq!(det.vert.g.len(), 513);
     }
 
     #[test]

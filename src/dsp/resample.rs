@@ -247,24 +247,51 @@ impl SincResampler {
             )));
         }
 
+        if from_sr == to_sr {
+            // `process_into` copies the input through and never reads a
+            // kernel, so there is nothing to build.
+            return Ok(Self {
+                from_sr,
+                to_sr,
+                quality,
+                kernel_table: Vec::new(),
+            });
+        }
+
         let cutoff = from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0;
         let inv_i0_beta = 1.0 / modified_bessel_i0(quality.kaiser_beta);
         // Precompute the polyphase kernel table.
         let mut kernel_table = vec![0.0_f32; table_len];
         let two_cutoff = 2.0 * cutoff;
         let half_f = half as f32;
-        for s in 0..steps {
+        // Tap position relative to the kernel centre, shifted by the
+        // fractional phase of polyphase step `s`.
+        let tap_x = |s: usize, k: usize| {
             let frac = s as f32 / steps as f32;
-            let row = &mut kernel_table[s * taps..(s + 1) * taps];
-            for (k, cell) in row.iter_mut().enumerate() {
-                // Sample position relative to kernel centre, shifted by the
-                // fractional phase `frac` for this polyphase step.
-                let x = (k as isize - half as isize) as f32 - frac;
+            (k as isize - half as isize) as f32 - frac
+        };
+        for s in 0..steps {
+            for k in 0..taps {
+                let x = tap_x(s, k);
+                // The kernel is even in `x`, and phase `s` read forwards is
+                // phase `steps - s` read backwards, so about half the cells
+                // repeat one computed earlier. Reuse it only when the two
+                // positions are exact negatives as `f32`s (always, for a
+                // power-of-two step count at ordinary widths): then the
+                // value is the one this cell would compute, bit for bit.
+                let mirror = if s == 0 {
+                    Some((0, taps - 1 - k))
+                } else {
+                    (k > 0).then(|| (steps - s, taps - k))
+                };
+                let reused = mirror
+                    .filter(|&(ms, mk)| (ms, mk) < (s, k) && tap_x(ms, mk) == -x)
+                    .map(|(ms, mk)| kernel_table[ms * taps + mk]);
                 // Scale by 2·fc: the ideal low-pass impulse response is
                 // 2·fc·sinc(2·fc·x).
-                *cell = sinc(x * two_cutoff)
-                    * kaiser_window_input(x, half_f, quality.kaiser_beta, inv_i0_beta)
-                    * two_cutoff;
+                kernel_table[s * taps + k] = reused.unwrap_or_else(|| {
+                    kernel_cell(x, two_cutoff, half_f, quality.kaiser_beta, inv_i0_beta)
+                });
             }
         }
 
@@ -337,7 +364,6 @@ impl SincResampler {
         let n_out = ((n_in as u64 * self.to_sr as u64).div_ceil(self.from_sr as u64)) as usize;
         let ratio = self.from_sr as f64 / self.to_sr as f64;
         let half = self.quality.half_taps;
-        let steps = self.quality.polyphase_steps as usize;
         let taps = 2 * half + 1;
 
         // Determine the output-sample range where the kernel is fully
@@ -356,7 +382,7 @@ impl SincResampler {
         // actually compute clears `half`; the product is monotone in `n`,
         // so this runs at most a couple of iterations.
         let mut n_safe_start = (((half as f64) / ratio).ceil() as usize).min(n_out);
-        while n_safe_start < n_out && ((n_safe_start as f64 * ratio).floor() as usize) < half {
+        while n_safe_start < n_out && self.phase(n_safe_start, ratio).0 < half {
             n_safe_start += 1;
         }
         let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
@@ -367,64 +393,94 @@ impl SincResampler {
 
         // Left boundary: kernel may extend past the start of input.
         for n in 0..n_safe_start {
-            let pos = n as f64 * ratio;
-            self.convolve_bounded(input, pos, taps, steps, half, out);
+            self.convolve_bounded(input, n, ratio, out);
         }
 
-        // Middle: kernel is fully inside input — no bounds check.
-        for n in n_safe_start..n_safe_end {
-            let pos = n as f64 * ratio;
-            let i_centre = pos.floor() as usize;
-            let frac = (pos - pos.floor()) as f32;
-            let step = ((frac * steps as f32) as usize).min(steps - 1);
-            let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
-
-            // `n_safe_start` was chosen so the f64 product above floors to
-            // at least `half`, so this cannot wrap.
+        // Middle: kernel is fully inside input — no bounds check. Four
+        // outputs per step: each is an independent dot product, and
+        // running their accumulator chains side by side is several times
+        // faster than one after the other (see `simd::dot_core_x4`).
+        //
+        // `n_safe_start` was chosen so the f64 product floors to at least
+        // `half`, so `centre - half` cannot wrap.
+        let window = |centre: usize| {
             debug_assert!(
-                i_centre >= half,
-                "safe-start bound violated: i_centre={i_centre}, half={half}"
+                centre >= half,
+                "safe-start bound violated: i_centre={centre}, half={half}"
             );
-            let base = i_centre - half;
-            let acc = super::simd::dot_core(&input[base..base + taps], kernel);
-            out.push(acc);
+            &input[centre - half..centre - half + taps]
+        };
+        let mut n = n_safe_start;
+        while n + 4 <= n_safe_end {
+            let phases: [(usize, usize); 4] = core::array::from_fn(|j| self.phase(n + j, ratio));
+            let acc = super::simd::dot_core_x4(
+                phases.map(|(centre, _)| window(centre)),
+                phases.map(|(_, step)| self.kernel(step)),
+            );
+            out.extend_from_slice(&acc);
+            n += 4;
+        }
+        for n in n..n_safe_end {
+            let (centre, step) = self.phase(n, ratio);
+            out.push(super::simd::dot_core(window(centre), self.kernel(step)));
         }
 
         // Right boundary: kernel may extend past the end of input.
         for n in n_safe_end..n_out {
-            let pos = n as f64 * ratio;
-            self.convolve_bounded(input, pos, taps, steps, half, out);
+            self.convolve_bounded(input, n, ratio, out);
         }
     }
 
-    /// Single output sample with bounds-checked kernel gather. Shared by
-    /// the left/right boundary loops (whose bodies were identical); the
-    /// middle region keeps its own unchecked `simd::dot_core` fast path.
-    fn convolve_bounded(
-        &self,
-        input: &[f32],
-        pos: f64,
-        taps: usize,
-        steps: usize,
-        half: usize,
-        out: &mut Vec<f32>,
-    ) {
-        let n_in = input.len();
-        let i_centre = pos.floor() as isize;
-        let frac = (pos - pos.floor()) as f32;
+    /// Where output sample `n` sits in the input: the input index under
+    /// the kernel centre, and the polyphase row for the fractional part.
+    #[inline]
+    fn phase(&self, n: usize, ratio: f64) -> (usize, usize) {
+        let steps = self.quality.polyphase_steps as usize;
+        let pos = n as f64 * ratio;
+        // `pos` is never negative, so the cast truncates to `floor(pos)`
+        // exactly — without the libm call `f64::floor` compiles to on
+        // targets that lack a rounding instruction (baseline x86_64).
+        let centre = pos as usize;
+        let frac = (pos - centre as f64) as f32;
         let step = ((frac * steps as f32) as usize).min(steps - 1);
-        let kernel = &self.kernel_table[step * taps..(step + 1) * taps];
+        (centre, step)
+    }
+
+    /// Kernel coefficients of polyphase row `step`.
+    #[inline]
+    fn kernel(&self, step: usize) -> &[f32] {
+        let taps = 2 * self.quality.half_taps + 1;
+        &self.kernel_table[step * taps..(step + 1) * taps]
+    }
+
+    /// Output sample `n` with a bounds-checked kernel gather: taps that
+    /// fall outside `input` read as silence. Used for the left and right
+    /// edges; the middle region takes the unchecked SIMD path.
+    fn convolve_bounded(&self, input: &[f32], n: usize, ratio: f64, out: &mut Vec<f32>) {
+        let half = self.quality.half_taps;
+        let (centre, step) = self.phase(n, ratio);
 
         let mut acc = 0.0_f32;
-        for (k, &coeff) in kernel.iter().enumerate() {
-            let idx = i_centre + k as isize - half as isize;
-            if idx < 0 || (idx as usize) >= n_in {
-                continue;
+        for (k, &coeff) in self.kernel(step).iter().enumerate() {
+            // Input index of tap `k` is `centre + k - half`.
+            if let Some(&sample) = (centre + k).checked_sub(half).and_then(|i| input.get(i)) {
+                acc += sample * coeff;
             }
-            acc += input[idx as usize] * coeff;
         }
         out.push(acc);
     }
+}
+
+/// One kernel coefficient before DC normalisation: the ideal low-pass
+/// impulse response `2·fc·sinc(2·fc·x)` under the Kaiser window, for a tap
+/// `x` input samples from the kernel centre.
+///
+/// Even in `x` down to the last bit: `sinc` divides an odd `sin` by an
+/// odd argument and the window only sees `x²`. The constructor relies on
+/// that to fill mirrored cells without recomputing them.
+#[inline]
+fn kernel_cell(x: f32, two_cutoff: f32, half: f32, beta: f32, inv_i0_beta: f32) -> f32 {
+    sinc(x * two_cutoff) * kaiser_window_input(x, half, beta, inv_i0_beta) * two_cutoff
 }
 
 /// Normalised sinc: `sin(π·x) / (π·x)`, with `sinc(0) = 1`.
@@ -790,13 +846,233 @@ mod tests {
                 && (message.contains("exceeds") || message.contains("too large"))));
     }
 
+    /// The kernel table as originally built: every cell computed directly.
+    fn reference_table(from_sr: u32, to_sr: u32, q: SincQuality) -> Vec<f32> {
+        let half = q.half_taps;
+        let steps = q.polyphase_steps as usize;
+        let taps = 2 * half + 1;
+        let two_cutoff = 2.0 * (from_sr.min(to_sr) as f32 / from_sr as f32 / 2.0);
+        let inv_i0_beta = 1.0 / modified_bessel_i0(q.kaiser_beta);
+        let mut table = vec![0.0_f32; steps * taps];
+        for s in 0..steps {
+            let frac = s as f32 / steps as f32;
+            for k in 0..taps {
+                let x = (k as isize - half as isize) as f32 - frac;
+                table[s * taps + k] = sinc(x * two_cutoff)
+                    * kaiser_window_input(x, half as f32, q.kaiser_beta, inv_i0_beta)
+                    * two_cutoff;
+            }
+        }
+        let mut dc_gain = 0.0_f32;
+        for &v in &table[..taps] {
+            dc_gain += v;
+        }
+        if dc_gain.abs() < 1e-10 {
+            dc_gain = 1.0;
+        }
+        let inv_dc_gain = 1.0 / dc_gain;
+        for v in table.iter_mut() {
+            *v *= inv_dc_gain;
+        }
+        table
+    }
+
+    /// The convolution as originally written: positions through
+    /// `f64::floor`, one output at a time. The optimised paths must
+    /// reproduce it bit for bit.
+    fn reference_process(
+        input: &[f32],
+        table: &[f32],
+        from_sr: u32,
+        to_sr: u32,
+        q: SincQuality,
+    ) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let half = q.half_taps;
+        let steps = q.polyphase_steps as usize;
+        let taps = 2 * half + 1;
+        let n_in = input.len();
+        let n_out = ((n_in as u64 * to_sr as u64).div_ceil(from_sr as u64)) as usize;
+        let ratio = from_sr as f64 / to_sr as f64;
+        let mut n_safe_start = (((half as f64) / ratio).ceil() as usize).min(n_out);
+        while n_safe_start < n_out && ((n_safe_start as f64 * ratio).floor() as usize) < half {
+            n_safe_start += 1;
+        }
+        let n_safe_end = (((n_in.saturating_sub(1 + half)) as f64) / ratio).floor() as usize + 1;
+        let n_safe_end = n_safe_end.min(n_out).max(n_safe_start);
+
+        let mut out = Vec::with_capacity(n_out);
+        for n in 0..n_out {
+            let pos = n as f64 * ratio;
+            let frac = (pos - pos.floor()) as f32;
+            let step = ((frac * steps as f32) as usize).min(steps - 1);
+            let kernel = &table[step * taps..(step + 1) * taps];
+            if (n_safe_start..n_safe_end).contains(&n) {
+                let base = pos.floor() as usize - half;
+                out.push(crate::dsp::simd::dot_core(
+                    &input[base..base + taps],
+                    kernel,
+                ));
+            } else {
+                let i_centre = pos.floor() as isize;
+                let mut acc = 0.0_f32;
+                for (k, &coeff) in kernel.iter().enumerate() {
+                    let idx = i_centre + k as isize - half as isize;
+                    if idx < 0 || (idx as usize) >= n_in {
+                        continue;
+                    }
+                    acc += input[idx as usize] * coeff;
+                }
+                out.push(acc);
+            }
+        }
+        out
+    }
+
+    /// Deterministic noise in (-1, 1) built from exact operations.
+    fn noise(seed: u32, n: usize) -> Vec<f32> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as i32 as f32 * (1.0 / 2_147_483_648.0)
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The mirrored kernel table, the cast-based phase split and the
+    /// four-at-a-time convolution are optimisations only: output must match
+    /// the reference bit for bit, including widths and step counts the
+    /// mirror cannot apply to and inputs shorter than the kernel.
+    #[test]
+    fn process_matches_the_reference_bit_for_bit() {
+        let qualities = [
+            SincQuality::default(),
+            SincQuality {
+                half_taps: 6,
+                kaiser_beta: 5.0,
+                polyphase_steps: 64,
+            },
+            // Odd step count: the phases are not exact binary fractions,
+            // so no cell may be mirrored.
+            SincQuality {
+                half_taps: 9,
+                kaiser_beta: 8.6,
+                polyphase_steps: 100,
+            },
+            SincQuality {
+                half_taps: 1,
+                kaiser_beta: 2.0,
+                polyphase_steps: 1,
+            },
+            SincQuality {
+                half_taps: 40,
+                kaiser_beta: 12.0,
+                polyphase_steps: 3,
+            },
+        ];
+        let rates = [
+            (44_100_u32, 8_000_u32),
+            (44_100, 5_000),
+            (48_000, 16_000),
+            (22_050, 44_100),
+            (8_000, 48_000),
+            (16_000, 8_000),
+            (1_920, 44_100),
+            (48_000, 44_100),
+            (7, 3),
+            (3, 7),
+        ];
+        for (qi, &q) in qualities.iter().enumerate() {
+            for &(from, to) in &rates {
+                let r = SincResampler::with_quality(from, to, q);
+                let table = reference_table(from, to, q);
+                assert!(
+                    bits(&r.kernel_table) == bits(&table),
+                    "kernel table: quality #{qi}, {from} -> {to}"
+                );
+                for n_in in [1, 2, 13, 64, 65, 66, 127, 200, 1_000, 4_099] {
+                    let x = noise(0x5EED ^ n_in as u32, n_in);
+                    let want = reference_process(&x, &table, from, to, q);
+                    assert!(
+                        bits(&r.process(&x)) == bits(&want),
+                        "quality #{qi}, {from} -> {to}, n_in {n_in}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mirror must cover the whole default table (otherwise the test
+    /// above proves nothing about it), and the exactness guard must have
+    /// something to reject: with a step count that is not a power of two
+    /// some phase pairs do not add up to exactly one tap.
+    #[test]
+    fn kernel_mirror_applies_only_to_exact_phases() {
+        let mirrored = |q: SincQuality| {
+            let half = q.half_taps;
+            let steps = q.polyphase_steps as usize;
+            let taps = 2 * half + 1;
+            let x =
+                |s: usize, k: usize| (k as isize - half as isize) as f32 - s as f32 / steps as f32;
+            (1..steps)
+                .flat_map(|s| (1..taps).map(move |k| (s, k)))
+                .filter(|&(s, k)| x(steps - s, taps - k) == -x(s, k))
+                .count()
+        };
+        let q = SincQuality::default();
+        let all = |q: SincQuality| (q.polyphase_steps as usize - 1) * 2 * q.half_taps;
+        assert_eq!(mirrored(q), all(q));
+        let odd = SincQuality {
+            half_taps: 9,
+            polyphase_steps: 100,
+            ..q
+        };
+        let n = mirrored(odd);
+        assert!(0 < n && n < all(odd), "{n} of {} cells mirror", all(odd));
+    }
+
+    /// `sinc` is even to the last bit: the kernel mirror depends on it.
+    #[test]
+    fn kernel_cell_is_exactly_even() {
+        let inv = 1.0 / modified_bessel_i0(8.6);
+        let mut x = 0x9E37_79B9_u32;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // Positions across the default kernel width, any fraction.
+            let pos = (x >> 8) as f32 * (33.0 / 16_777_216.0);
+            for two_cutoff in [1.0_f32, 0.181_405_9, 0.333_333_34, 0.5] {
+                let a = kernel_cell(pos, two_cutoff, 32.0, 8.6, inv);
+                let b = kernel_cell(-pos, two_cutoff, 32.0, 8.6, inv);
+                assert_eq!(a.to_bits(), b.to_bits(), "x = {pos}, 2fc = {two_cutoff}");
+            }
+        }
+    }
+
+    #[test]
+    fn passthrough_resampler_builds_no_kernel_table() {
+        let r = SincResampler::new(48_000, 48_000);
+        assert!(r.kernel_table.is_empty());
+        let x = noise(3, 257);
+        assert_eq!(r.process(&x), x);
+    }
+
     /// `ceil(half / ratio)` alone is not a safe middle-region start: the
     /// f64 product `n * ratio` the loop floors can land one ULP below
     /// `half`, which wrapped `i_centre - half` and panicked on slicing
     /// (1920 → 44 100 was one of 63 such pairs among common rates).
     #[test]
     fn rate_pairs_whose_safe_start_rounds_below_half_do_not_panic() {
-        let x = vec![0.1_f32; 4096];
         let rates = [
             15_u32, 960, 1_800, 1_920, 3_840, 5_000, 8_000, 11_025, 16_000, 22_050, 32_000, 44_100,
             48_000, 88_200, 96_000,
@@ -808,6 +1084,14 @@ mod tests {
                         half_taps,
                         ..SincQuality::default()
                     };
+                    // The wrap happened at the first middle-region output,
+                    // so the input only has to be longer than the kernel.
+                    // Aim for about 4096 outputs: a fixed 4096-sample input
+                    // made the steep upsamples (15 Hz → 96 kHz) produce
+                    // 26M samples each and the test run for minutes.
+                    let taps = 2 * half_taps + 1;
+                    let n_in = (4096 * from as usize / to as usize).clamp(taps + 8, 4096);
+                    let x = vec![0.1_f32; n_in];
                     let y = SincResampler::with_quality(from, to, q).process(&x);
                     let expected = (x.len() as u64 * to as u64).div_ceil(from as u64) as usize;
                     assert_eq!(y.len(), expected, "{from} -> {to}, half_taps {half_taps}");
