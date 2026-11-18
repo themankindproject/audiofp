@@ -121,6 +121,17 @@ written up in `BREAKING-PROPOSALS.md`, and none of it is implemented.
   apply to index queries; more than 64 channels in a WAV / AIFF is reported as
   `Io`, in other containers as `UnsupportedChannels`;
   `StreamingNeuralEmbedder::new` does not range-check `batch_size`.
+- **Bakeoff rerun on the unreleased tree.** `BENCHMARKS.md` was regenerated
+  with `bakeoff/ --report` at `7ea47b0` (7 commits past v0.4.6, the 0.4.7
+  tree); the report now labels such a build `v0.4.6+unreleased` instead of
+  passing it off as the release. The overlap and identification tables are
+  byte-identical to the v0.4.4 run and all 92 invariants hold. Against the
+  v0.4.6 tag measured on the same host in the same session, the median kernel
+  drops 8.8 → 7.6 ms (1.16×) and resample 2.3 → 1.5 ms (1.53×), while decode
+  (6.5 ms) and chromaprint (6.9 → 6.8 ms) are flat controls; the
+  audiofp-vs-chromaprint kernel ratio improves 1.16× (median over the 26
+  files, min 1.08×, max 1.19×). The older published v0.4.4 absolute latencies
+  are host-state shifted and are not an A/B baseline.
 - The three indexes share their vote cap, vote filtering, posting insertion
   and removal code, the Panako matcher and index share their scale binning,
   and the streaming anchor emitters share one loop, instead of carrying copies.

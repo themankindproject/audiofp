@@ -23,7 +23,6 @@ dependencies = [
  "bytemuck",
  "libm",
  "num-complex",
- "num-traits",
  "rustfft",
  "rustix",
  "symphonia",

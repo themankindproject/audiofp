@@ -480,6 +480,46 @@ fn git_commit() -> String {
         .unwrap_or_default()
 }
 
+/// Parse `git describe --tags --long --dirty` output
+/// (`v0.4.6-7-g7ea47b0`, optionally `-dirty`) into
+/// (tag, commits after tag, short hash, dirty).
+fn parse_describe(s: &str) -> Option<(String, u32, String, bool)> {
+    let (s, dirty) = match s.strip_suffix("-dirty") {
+        Some(rest) => (rest, true),
+        None => (s, false),
+    };
+    let (rest, hash) = s.rsplit_once("-g")?;
+    let (tag, n) = rest.rsplit_once('-')?;
+    Some((tag.to_string(), n.parse().ok()?, hash.to_string(), dirty))
+}
+
+/// The audiofp build under test, labelled by its position relative to the
+/// newest tag. HEAD past a tag is unreleased code (`+unreleased`), so a
+/// published report can never pass unreleased numbers off as a release.
+fn audiofp_label() -> String {
+    let ver = audiofp_version();
+    let Some((tag, n, hash, dirty)) = git_describe() else {
+        return format!("v{ver} (commit {})", git_commit());
+    };
+    let suffix = if dirty { ", dirty" } else { "" };
+    if n == 0 {
+        format!("v{ver} (commit {hash}{suffix})")
+    } else {
+        format!("v{ver}+unreleased ({n} commits after {tag}, commit {hash}{suffix})")
+    }
+}
+
+fn git_describe() -> Option<(String, u32, String, bool)> {
+    let o = std::process::Command::new("git")
+        .args(["describe", "--tags", "--long", "--always"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    parse_describe(String::from_utf8(o.stdout).ok()?.trim())
+}
+
 fn audiofp_version() -> String {
     // The harness package is 0.0.0 (unpublished); the audiofp under test is
     // the path dependency at the repo root. Read its version straight from
@@ -535,12 +575,11 @@ fn environment() -> String {
         "- CPU: {cpu} ({nproc} logical)\n\
          - OS: {os}\n\
          - rustc: {rustc}\n\
-         - audiofp: v{ver} (commit {commit})\n\
+         - audiofp: {label}\n\
          - chromaprint: {cp_ver} (libchromaprint-dev, system package)\n\
          - build: release, lto = \"fat\", codegen-units = 1 (harness + audiofp)\n\
          - chromaprint flags: algorithm = DEFAULT (TEST2), mono, native rate (internal resample)",
-        ver = audiofp_version(),
-        commit = git_commit(),
+        label = audiofp_label(),
         cp_ver = cp::version(),
     )
 }
@@ -969,10 +1008,9 @@ fn main() {
         out.push_str("    cd bakeoff && cargo run --release -- --report\n");
         out.push_str("    cd bakeoff && cargo run --release -- --check\n");
         out.push_str(&format!(
-            "\nGenerated: {date}, audiofp v{ver} (commit {commit}), chromaprint {cpv}\n",
+            "\nGenerated: {date}, audiofp {label}, chromaprint {cpv}\n",
             date = today(),
-            ver = audiofp_version(),
-            commit = git_commit(),
+            label = audiofp_label(),
             cpv = cp::version(),
         ));
         print!("{out}");
@@ -1032,6 +1070,24 @@ mod tests {
         let (sim, k) = cp_shift_sim(&a, &b);
         assert!((sim - 1.0).abs() < 1e-6);
         assert_eq!(k, 1);
+    }
+
+    #[test]
+    fn describe_parses_tag_distance_and_dirt() {
+        assert_eq!(
+            parse_describe("v0.4.6-7-g7ea47b0"),
+            Some(("v0.4.6".into(), 7, "7ea47b0".into(), false))
+        );
+        assert_eq!(
+            parse_describe("v0.4.6-7-g7ea47b0-dirty"),
+            Some(("v0.4.6".into(), 7, "7ea47b0".into(), true))
+        );
+        assert_eq!(
+            parse_describe("v0.4.6-0-g1234abc"),
+            Some(("v0.4.6".into(), 0, "1234abc".into(), false))
+        );
+        // No tag reachable (shallow clone without tags).
+        assert_eq!(parse_describe("7ea47b0"), None);
     }
 
     #[test]
