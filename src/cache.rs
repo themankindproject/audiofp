@@ -292,12 +292,20 @@ fn read_handle_with_limit(path: &Path, file: &mut File, cap: u64) -> Result<Vec<
             provided: usize::try_from(meta.len()).unwrap_or(usize::MAX),
         });
     }
-    read_limited(path, file, cap)
+    // `len <= cap` here, and `cap` never exceeds `MAX_CACHE_FILE_BYTES`.
+    read_limited(path, file, cap, usize::try_from(meta.len()).unwrap_or(0))
 }
 
-fn read_limited(path: &Path, reader: impl Read, cap: u64) -> Result<Vec<u8>> {
+/// Read `reader` to its end, failing once more than `cap` bytes arrive.
+///
+/// `expected_len` sizes the buffer up front. `Take` hides a file's length
+/// from `read_to_end`, which then grows an empty buffer in doubling steps —
+/// around fifteen `read` calls and ten reallocations for a 70 KB `.afp`
+/// where two reads and one allocation do. It is only a hint: the bound on
+/// what is read stays `cap + 1` bytes.
+fn read_limited(path: &Path, reader: impl Read, cap: u64, expected_len: usize) -> Result<Vec<u8>> {
     let mut limited = reader.take(cap.saturating_add(1));
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(expected_len);
     limited
         .read_to_end(&mut bytes)
         .map_err(|e| AfpError::io_with_path(path, e))?;
@@ -497,8 +505,16 @@ pub fn load_all_cached_limited(
     dir: &Path,
     limits: CacheLoadLimits,
 ) -> Result<Vec<(PathBuf, CachedFingerprint)>> {
-    let mut out = Vec::new();
-    for item in iter_cached(dir, limits)? {
+    let files = iter_cached(dir, limits)?;
+    // The scan already knows the directory holds more files than allowed.
+    // Say so before reading any of them: the limit is there to bound the
+    // work, and loading the first `max_files` only to discard them and
+    // report the overflow spent all of it.
+    if files.excess_files {
+        return Err(files.too_many_files());
+    }
+    let mut out = Vec::with_capacity(files.paths.len());
+    for item in files {
         out.push(item?);
     }
     Ok(out)
@@ -591,6 +607,27 @@ impl core::fmt::Debug for CacheDirIter {
     }
 }
 
+impl CacheDirIter {
+    /// The error for a directory holding more `.afp` files than
+    /// `max_files` allows.
+    fn too_many_files(&self) -> AfpError {
+        AfpError::InputTooLarge {
+            limit: self.limits.max_files.unwrap_or(0),
+            provided: self.afp_count,
+        }
+    }
+
+    /// The error for a file of `file_bytes` that does not fit in what is
+    /// left of the `max_total` byte budget.
+    fn over_byte_budget(&self, max_total: u64, file_bytes: u64) -> AfpError {
+        let saturate = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        AfpError::InputTooLarge {
+            limit: saturate(max_total),
+            provided: saturate(self.bytes_loaded.saturating_add(file_bytes)),
+        }
+    }
+}
+
 impl Iterator for CacheDirIter {
     type Item = Result<(PathBuf, CachedFingerprint)>;
 
@@ -598,68 +635,53 @@ impl Iterator for CacheDirIter {
         if self.done {
             return None;
         }
-        let path = match self.paths.get(self.index) {
-            Some(p) => {
+        let path = match self.paths.get_mut(self.index) {
+            Some(path) => {
                 self.index += 1;
-                p.clone()
+                // Each path is yielded once; move it out rather than clone.
+                core::mem::take(path)
             }
             None => {
                 if self.excess_files {
                     self.excess_files = false;
                     self.done = true;
-                    let max_files = self.limits.max_files.unwrap_or(0);
-                    return Some(Err(AfpError::InputTooLarge {
-                        limit: max_files,
-                        provided: self.afp_count,
-                    }));
+                    return Some(Err(self.too_many_files()));
                 }
                 return None;
             }
         };
-        if let Some(max_total) = self.limits.max_total_bytes {
-            let remaining = max_total.saturating_sub(self.bytes_loaded);
-            if remaining == 0 {
-                self.done = true;
-                return Some(Err(AfpError::InputTooLarge {
-                    limit: max_total as usize,
-                    provided: self.bytes_loaded as usize + 1,
-                }));
-            }
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) => return Some(Err(AfpError::io_with_path(&path, e))),
-            };
-            if meta.is_file() && meta.len() > remaining {
-                self.done = true;
-                return Some(Err(AfpError::InputTooLarge {
-                    limit: max_total as usize,
-                    provided: (self.bytes_loaded + meta.len()) as usize,
-                }));
-            }
-        }
-        let cap = self
+        let remaining = self
             .limits
             .max_total_bytes
-            .map_or(MAX_CACHE_FILE_BYTES, |max| {
-                max.saturating_sub(self.bytes_loaded)
-                    .min(MAX_CACHE_FILE_BYTES)
-            });
+            .map(|max_total| (max_total, max_total.saturating_sub(self.bytes_loaded)));
+        if let Some((max_total, 0)) = remaining {
+            self.done = true;
+            return Some(Err(self.over_byte_budget(max_total, 1)));
+        }
+        // The size check happens on the opened handle, inside the read: a
+        // file is rejected before any of its content is read, and the size
+        // belongs to the file actually opened (a separate `lstat` by path
+        // used to run first, for the same answer).
+        let cap = remaining.map_or(MAX_CACHE_FILE_BYTES, |(_, left)| {
+            left.min(MAX_CACHE_FILE_BYTES)
+        });
         let bytes = match open_cache_file_for_read(&path)
             .and_then(|mut file| read_handle_with_limit(&path, &mut file, cap))
         {
             Ok(b) => b,
             Err(e) => {
-                // A read capped below the per-file maximum was capped by
-                // the remaining total budget (the file grew after the
-                // metadata check above): that is the aggregate limit.
-                if cap < MAX_CACHE_FILE_BYTES && matches!(e, AfpError::InputTooLarge { .. }) {
+                // Too large for what is left of the total budget: that is
+                // the aggregate limit, and it ends the scan.
+                if let (AfpError::InputTooLarge { provided, .. }, Some((max_total, left))) =
+                    (&e, remaining)
+                    && *provided as u64 > left
+                {
                     self.done = true;
+                    return Some(Err(self.over_byte_budget(max_total, *provided as u64)));
                 }
                 return Some(Err(e));
             }
         };
-        // The actual read above is capped to the remaining total budget,
-        // even if the file grows after metadata is inspected.
         let fp = match CachedFingerprint::from_blob(&bytes).map_err(|e| match e {
             AfpError::Deserialize(msg) => {
                 AfpError::Deserialize(format!("{}: {msg}", path.display()))
@@ -702,6 +724,42 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A directory over `max_files` is refused before any file is read.
+    /// The first file here is not a valid `.afp`: loading used to open,
+    /// read and parse the first `max_files` entries before the count was
+    /// reported, so this returned that file's parse error instead.
+    #[test]
+    fn too_many_files_is_reported_before_any_file_is_read() {
+        let dir = TempDir::new("too_many");
+        std::fs::write(dir.0.join("a.afp"), b"not a fingerprint").unwrap();
+        for n in 0..3 {
+            cache_to_file(&one_hash_fp(n), &dir.0.join(format!("b{n}.afp"))).unwrap();
+        }
+        let limits = CacheLoadLimits {
+            max_files: Some(3),
+            max_total_bytes: None,
+        };
+        let err = load_all_cached_limited(&dir.0, limits).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AfpError::InputTooLarge {
+                    limit: 3,
+                    provided: 4
+                }
+            ),
+            "{err:?}"
+        );
+        // The streaming iterator keeps its contract: items first, then the
+        // overflow.
+        let items: Vec<_> = iter_cached(&dir.0, limits).unwrap().collect();
+        assert!(matches!(items[0], Err(AfpError::Deserialize(_))));
+        assert!(matches!(
+            items.last(),
+            Some(Err(AfpError::InputTooLarge { limit: 3, .. }))
+        ));
     }
 
     #[test]
@@ -1334,7 +1392,7 @@ mod tests {
     fn actual_read_rejects_growth_without_trusting_metadata() {
         let path = Path::new("growing.afp");
         let mut source = std::io::Cursor::new(vec![7; 64]);
-        let result = read_limited(path, &mut source, 8);
+        let result = read_limited(path, &mut source, 8, 0);
         assert!(matches!(
             result,
             Err(AfpError::InputTooLarge {
@@ -1343,7 +1401,7 @@ mod tests {
             })
         ));
         assert_eq!(source.position(), 9, "read only one byte beyond budget");
-        let exact = read_limited(path, std::io::Cursor::new(vec![7; 8]), 8).unwrap();
+        let exact = read_limited(path, std::io::Cursor::new(vec![7; 8]), 8, 8).unwrap();
         assert_eq!(exact, vec![7; 8]);
     }
 

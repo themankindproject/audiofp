@@ -44,7 +44,9 @@ pub enum AfpError {
     #[error("unsupported sample rate: {0} Hz")]
     UnsupportedSampleRate(u32),
 
-    /// The audio has a channel count `audiofp` cannot consume (must be mono).
+    /// The audio has a channel count `audiofp` cannot consume. The decoder
+    /// downmixes up to 64 channels to mono; this is what a file outside
+    /// that range reports.
     #[error("unsupported channel count: {0}")]
     UnsupportedChannels(u16),
 
